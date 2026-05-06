@@ -569,7 +569,7 @@
         async _bootstrap() {
             // 1. Validate that the project has a configured AI platform.
             if (!this.platform) {
-                this._renderFatal('This project does not have an AI agent configured yet. Set one in your project settings.');
+                this._renderFatal('This project does not have an AI agent configured yet. Please ask the project owner to set up an AI agent in the project settings page.');
                 return;
             }
 
