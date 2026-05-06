@@ -1,0 +1,23 @@
+{
+  "name": "bunnyquery",
+  "version": "1.0.0",
+  "description": "BunnyQuery AI chat client",
+  "main": "bunnyquery.js",
+  "files": [
+    "bunnyquery.js",
+    "bunnyquery.css"
+  ],
+  "scripts": {
+    "dev": "npx bns port=3333"
+  },
+  "keywords": [
+    "chatbot",
+    "ai",
+    "mcp"
+  ],
+  "author": "Baksa Gimm",
+  "license": "ISC",
+  "devDependencies": {
+    "basic-node-server": "^1.1.0"
+  }
+}
