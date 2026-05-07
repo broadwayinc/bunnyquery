@@ -1089,7 +1089,17 @@
         _schedulePendingPoll() {
             if (this.pendingTimer) clearTimeout(this.pendingTimer);
             if (!this._anyPending()) return;
+            // Bail if a poll is already in flight — its `finally` will
+            // schedule the next one. Without this guard, any caller that
+            // fires while we're awaiting `getChatHistory` (e.g. another
+            // _sendMessage, _loadFirstHistoryPage, or our own previous
+            // tick whose timer already elapsed) would spawn a second
+            // concurrent poller, and each subsequent cycle would compound
+            // — making the polling appear faster and faster.
+            if (this._pollingPending) return;
             this.pendingTimer = setTimeout(async () => {
+                this.pendingTimer = null;
+                this._pollingPending = true;
                 try {
                     const res = await getChatHistory(
                         this.skapi,
@@ -1110,6 +1120,7 @@
                 } catch (err) {
                     console.error('[BunnyQuery] pending poll failed', err);
                 } finally {
+                    this._pollingPending = false;
                     this._schedulePendingPoll();
                 }
             }, DEFAULTS.PENDING_POLL_INTERVAL_MS);
