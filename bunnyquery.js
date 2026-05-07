@@ -36,7 +36,7 @@
     // The embed has no build-time env, so we always point at the production
     // MCP host. Override BunnyQuery.MCP_BASE_URL before init() to swap.
     const DEFAULTS = {
-        MCP_BASE_URL: 'https://mcp-dev.broadwayinc.computer',
+        MCP_BASE_URL: 'https://mcp.broadwayinc.computer',
         MCP_NAME: 'BunnyQuery',
         DEFAULT_CLAUDE_MODEL: 'claude-sonnet-4-6',
         DEFAULT_OPENAI_MODEL: 'gpt-5.4',
