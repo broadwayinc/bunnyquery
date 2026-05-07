@@ -492,6 +492,50 @@
         return 'Request failed. Please try again.';
     }
 
+    // Detect MCP / upstream "your access token is no longer valid" failures
+    // so we can transparently re-mint the MCP token from the live skapi
+    // session and retry the call once. Patterns observed in the wild:
+    //   - skapi-js inside the MCP server throws "Token has expired"
+    //     (surfaces here as part of err.message or response body text)
+    //   - MCP returns OAuth-style error codes: invalid_token / expired_token
+    //   - Proxy wraps it with INVALID_REQUEST + 401
+    function _isAuthExpiredError(input) {
+        if (!input) return false;
+        const blobs = [];
+        const push = (v) => { if (typeof v === 'string' && v) blobs.push(v); };
+        if (typeof input === 'string') push(input);
+        else {
+            push(input.message);
+            push(input.code);
+            if (input.error) {
+                push(input.error.message);
+                push(input.error.code);
+                push(input.error.type);
+            }
+            if (input.body) {
+                push(input.body.message);
+                if (input.body.error) {
+                    push(input.body.error.message);
+                    push(input.body.error.code);
+                    push(input.body.error.type);
+                }
+            }
+            if (typeof input.status === 'number' && input.status === 401) return true;
+            if (typeof input.status_code === 'number' && input.status_code === 401) return true;
+        }
+        const hay = blobs.join(' | ').toLowerCase();
+        if (!hay) return false;
+        return (
+            hay.includes('token has expired') ||
+            hay.includes('token is expired') ||
+            hay.includes('expired_token') ||
+            hay.includes('invalid_token') ||
+            hay.includes('unauthorized') ||
+            hay.includes('not authorized') ||
+            (hay.includes('invalid_request') && hay.includes('token'))
+        );
+    }
+
     // Mirror of agent.vue's isErrorResponseBody — detects provider/proxy
     // error payloads that should render as a red error bubble even when
     // no exception was thrown.
@@ -1090,12 +1134,24 @@
 
         // ---- history ------------------------------------------------------
         async _loadFirstHistoryPage() {
+            const fetchPage = () => getChatHistory(
+                this.skapi,
+                { service: this.serviceId, owner: this.ownerId, platform: this.platform },
+                { ascending: false }
+            );
             try {
-                const res = await getChatHistory(
-                    this.skapi,
-                    { service: this.serviceId, owner: this.ownerId, platform: this.platform },
-                    { ascending: false }
-                );
+                let res;
+                try {
+                    res = await fetchPage();
+                } catch (err) {
+                    if (_isAuthExpiredError(err)) {
+                        this.oauth.clearToken();
+                        await this.oauth.exchangeSession(this.skapi.session);
+                        res = await fetchPage();
+                    } else {
+                        throw err;
+                    }
+                }
                 this.startKeyHistory = res && res.startKeyHistory;
                 const list = this._filterByClearHorizon((res && res.list) || []);
                 // If the clear horizon has filtered the entire first page,
@@ -1374,13 +1430,42 @@ The same pattern applies to other formats: \`\`\`my-data.json, \`\`\`index.html,
                     model: this.model || undefined,
                 };
 
-                const result = this.platform === 'claude'
-                    ? await buildClaudeRequest(this.skapi, args)
-                    : await buildOpenAIRequest(this.skapi, args);
+                const argsBuilder = () => (this.platform === 'claude'
+                    ? buildClaudeRequest(this.skapi, args)
+                    : buildOpenAIRequest(this.skapi, args));
+
+                let result;
+                try {
+                    result = await argsBuilder();
+                } catch (err) {
+                    if (_isAuthExpiredError(err)) {
+                        // The MCP-side skapi session expired. Re-mint a fresh
+                        // MCP token bundle from the live host skapi session
+                        // (skapi-js auto-refreshes its own tokens), then retry
+                        // the call once.
+                        try {
+                            this.oauth.clearToken();
+                            await this.oauth.exchangeSession(this.skapi.session);
+                        } catch (reauthErr) {
+                            throw reauthErr;
+                        }
+                        result = await argsBuilder();
+                    } else {
+                        throw err;
+                    }
+                }
 
                 // The proxy may resolve with an error-shaped body instead of
                 // throwing; surface that as an error bubble with the
                 // upstream message rather than dropping it.
+                if (isErrorResponseBody(result) && _isAuthExpiredError(result)) {
+                    try {
+                        this.oauth.clearToken();
+                        await this.oauth.exchangeSession(this.skapi.session);
+                        result = await argsBuilder();
+                    } catch (_reauthErr) { /* fall through to normal error rendering */ }
+                }
+
                 if (isErrorResponseBody(result)) {
                     const errMsg = getErrorMessage(result);
                     const last = this.messages[this.messages.length - 1];
