@@ -34,9 +34,12 @@
 
     // ---- MCP OAuth constants (mirrors src/code/mcp_oauth.ts) ---------------
     // The embed has no build-time env, so we always point at the production
-    // MCP host. Override BunnyQuery.MCP_BASE_URL before init() to swap.
+    // MCP host. Override BunnyQuery.MCP_BASE_URL before init() to swap, or
+    // pass `true` as the third arg to BunnyQuery.init() to target the dev
+    // host (mcp-dev.broadwayinc.computer).
     const DEFAULTS = {
         MCP_BASE_URL: 'https://mcp.broadwayinc.computer',
+        MCP_DEV_BASE_URL: 'https://mcp-dev.broadwayinc.computer',
         MCP_NAME: 'BunnyQuery',
         DEFAULT_CLAUDE_MODEL: 'claude-sonnet-4-6',
         DEFAULT_OPENAI_MODEL: 'gpt-5.4',
@@ -57,6 +60,11 @@
     const CLIENT_KEY = STORAGE_PREFIX + 'mcp_client';
     const TOKEN_KEY = STORAGE_PREFIX + 'mcp_token';
     const STATE_KEY = STORAGE_PREFIX + 'mcp_state';
+
+    // Resolve the active MCP base URL each time it's needed so a runtime
+    // override of `BunnyQuery.MCP_BASE_URL` (e.g. via the `dev` flag on
+    // init()) is reflected in subsequent send/auth calls.
+    const _mcpBaseUrl = () => (global.BunnyQuery && global.BunnyQuery.MCP_BASE_URL) || DEFAULTS.MCP_BASE_URL;
 
     // ----- helpers ----------------------------------------------------------
     const $ = (tag, attrs, children) => {
@@ -376,7 +384,7 @@
                     {
                         type: 'url',
                         name: DEFAULTS.MCP_NAME,
-                        url: DEFAULTS.MCP_BASE_URL,
+                        url: _mcpBaseUrl(),
                         authorization_token: '$ACCESS_TOKEN',
                     },
                 ],
@@ -422,7 +430,7 @@
                     {
                         type: 'mcp',
                         server_label: DEFAULTS.MCP_NAME,
-                        server_url: DEFAULTS.MCP_BASE_URL,
+                        server_url: _mcpBaseUrl(),
                         require_approval: 'never',
                         headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
                     },
@@ -576,7 +584,7 @@
 
             this.readOnly = !!(info.opt && info.opt.freeze_database);
 
-            this.oauth = new McpOAuth(BunnyQuery.MCP_BASE_URL || DEFAULTS.MCP_BASE_URL);
+            this.oauth = new McpOAuth(_mcpBaseUrl());
 
             this.messages = [];
             this.attachments = [];
@@ -585,6 +593,7 @@
             this.sending = false;
             this.uploading = false;
             this.pendingTimer = null;
+            this._pollingPending = false;
             this._loadingOlder = false;
 
             this.refs = {};
@@ -593,11 +602,17 @@
             this._bootstrap();
         }
 
-        static async init(skapi, elementId) {
+        static async init(skapi, elementId, dev) {
             const container = typeof elementId === 'string'
                 ? document.getElementById(elementId)
                 : elementId;
             if (!container) throw new Error(`BunnyQuery: container "${elementId}" not found`);
+            // When `dev` is truthy, route every MCP call (Claude tool URL,
+            // OpenAI tool URL, and OAuth) to the dev host. Setting the
+            // static here makes the change visible to any subsequent
+            // BunnyQuery instance on the page; pass `false` (or omit) to
+            // pin back to production.
+            BunnyQuery.MCP_BASE_URL = dev ? DEFAULTS.MCP_DEV_BASE_URL : DEFAULTS.MCP_BASE_URL;
             const info = await skapi.__connection;
             console.log('[BunnyQuery] initializing with info', info);
             return new BunnyQuery(skapi, info, container);
@@ -1124,44 +1139,55 @@
             }
         }
 
+        // Polling state machine. Invariant: at most ONE of the following
+        // is true at any moment — (a) `pendingTimer` is armed, or (b)
+        // `_pollingPending` is true (fetch in flight). Any call to
+        // `_schedulePendingPoll` while either is true is a no-op; the
+        // in-flight cycle's `finally` will continue the loop.
+        //
+        // This replaces an earlier clear-and-rearm pattern that, under
+        // overlapping callers (`_sendMessage`, `_loadFirstHistoryPage`,
+        // and the poll's own `finally`), could leave two timers
+        // concurrently armed. Each tick's `finally` then scheduled
+        // another, and the effective polling rate kept compounding —
+        // the chat looked like it was polling faster and faster.
         _schedulePendingPoll() {
-            if (this.pendingTimer) clearTimeout(this.pendingTimer);
-            if (!this._anyPending()) return;
-            // Bail if a poll is already in flight — its `finally` will
-            // schedule the next one. Without this guard, any caller that
-            // fires while we're awaiting `getChatHistory` (e.g. another
-            // _sendMessage, _loadFirstHistoryPage, or our own previous
-            // tick whose timer already elapsed) would spawn a second
-            // concurrent poller, and each subsequent cycle would compound
-            // — making the polling appear faster and faster.
+            if (this.pendingTimer != null) return;
             if (this._pollingPending) return;
-            this.pendingTimer = setTimeout(async () => {
+            if (!this._anyPending()) return;
+            this.pendingTimer = setTimeout(() => {
                 this.pendingTimer = null;
-                this._pollingPending = true;
-                try {
-                    const res = await getChatHistory(
-                        this.skapi,
-                        { service: this.serviceId, owner: this.ownerId, platform: this.platform },
-                        { ascending: false }
-                    );
-                    const fresh = mapHistoryToMessages(
-                        this._filterByClearHorizon((res && res.list) || []),
-                        this.platform
-                    );
-                    // Keep older messages whose ids are not on the freshly
-                    // fetched first page. The fresh page is appended last so
-                    // it always reflects the latest server state.
-                    const freshIds = new Set(fresh.filter((m) => m.id).map((m) => m.id));
-                    const older = this.messages.filter((m) => m.id && !freshIds.has(m.id));
-                    this.messages = older.concat(fresh);
-                    this._renderMessages();
-                } catch (err) {
-                    console.error('[BunnyQuery] pending poll failed', err);
-                } finally {
-                    this._pollingPending = false;
-                    this._schedulePendingPoll();
-                }
+                this._runPendingPoll();
             }, DEFAULTS.PENDING_POLL_INTERVAL_MS);
+        }
+
+        async _runPendingPoll() {
+            // Defensive: if somehow re-entered, drop the duplicate.
+            if (this._pollingPending) return;
+            this._pollingPending = true;
+            try {
+                const res = await getChatHistory(
+                    this.skapi,
+                    { service: this.serviceId, owner: this.ownerId, platform: this.platform },
+                    { ascending: false }
+                );
+                const fresh = mapHistoryToMessages(
+                    this._filterByClearHorizon((res && res.list) || []),
+                    this.platform
+                );
+                // Keep older messages whose ids are not on the freshly
+                // fetched first page. The fresh page is appended last so
+                // it always reflects the latest server state.
+                const freshIds = new Set(fresh.filter((m) => m.id).map((m) => m.id));
+                const older = this.messages.filter((m) => m.id && !freshIds.has(m.id));
+                this.messages = older.concat(fresh);
+                this._renderMessages();
+            } catch (err) {
+                console.error('[BunnyQuery] pending poll failed', err);
+            } finally {
+                this._pollingPending = false;
+                this._schedulePendingPoll();
+            }
         }
 
         // ---- attachments --------------------------------------------------
