@@ -470,6 +470,44 @@
         return typeof c === 'string' ? c : '';
     }
 
+    // Mirror of agent.vue's getErrorMessage — pulls the most useful string
+    // out of either a thrown error or an error-shaped response body.
+    function getErrorMessage(err) {
+        if (typeof err === 'string') return err;
+        if (err && err.body && err.body.error && typeof err.body.error.message === 'string') {
+            return err.body.error.message;
+        }
+        if (err && err.error && typeof err.error.message === 'string') {
+            return err.error.message;
+        }
+        if (err && typeof err.message === 'string') return err.message;
+        return 'Request failed. Please try again.';
+    }
+
+    // Mirror of agent.vue's isErrorResponseBody — detects provider/proxy
+    // error payloads that should render as a red error bubble even when
+    // no exception was thrown.
+    function isErrorResponseBody(response) {
+        if (!response || typeof response !== 'object') return false;
+        if (typeof response.status_code === 'number' && response.status_code >= 400) return true;
+        if (response.type === 'error') return true;
+        if (response.error && (response.error.message || response.error.type)) return true;
+        const body = response.body;
+        if (body && typeof body === 'object') {
+            if (body.type === 'error') return true;
+            if (body.error && (body.error.message || body.error.type)) return true;
+        }
+        if (typeof response.message === 'string' && response.message.length) {
+            const hasClaudeBody = Array.isArray(response.content);
+            const hasOpenAIBody =
+                typeof response.output_text === 'string' ||
+                Array.isArray(response.output) ||
+                Array.isArray(response.choices);
+            if (!hasClaudeBody && !hasOpenAIBody) return true;
+        }
+        return false;
+    }
+
     // Walk the persisted history list returned by clientSecretRequestHistory
     // and turn it into a flat user/assistant list ordered oldest -> newest.
     function mapHistoryToMessages(list, platform) {
@@ -500,10 +538,10 @@
 
             if (item.status === 'pending') {
                 out.push({ role: 'assistant', content: '', id: item.id, isPending: true });
-            } else if (item.status === 'failed' || (res && res.error)) {
+            } else if (item.status === 'failed' || isErrorResponseBody(res)) {
                 out.push({
                     role: 'assistant',
-                    content: (res && res.error && res.error.message) || 'Request failed.',
+                    content: getErrorMessage(res),
                     id: item.id,
                     isError: true,
                 });
@@ -1295,6 +1333,24 @@
                     ? await buildClaudeRequest(this.skapi, args)
                     : await buildOpenAIRequest(this.skapi, args);
 
+                // The proxy may resolve with an error-shaped body instead of
+                // throwing; surface that as an error bubble with the
+                // upstream message rather than dropping it.
+                if (isErrorResponseBody(result)) {
+                    const errMsg = getErrorMessage(result);
+                    const last = this.messages[this.messages.length - 1];
+                    if (last && last.isPending) {
+                        last.isPending = false;
+                        last.isError = true;
+                        last.content = errMsg;
+                    } else {
+                        this.messages.push({ role: 'assistant', content: errMsg, isError: true });
+                    }
+                    this._renderMessages();
+                    this._schedulePendingPoll();
+                    return;
+                }
+
                 const responseText = this.platform === 'claude'
                     ? extractClaudeText(result)
                     : extractOpenAIText(result);
@@ -1311,7 +1367,7 @@
                 this._schedulePendingPoll();
             } catch (err) {
                 const last = this.messages[this.messages.length - 1];
-                const errMsg = (err && err.message) || String(err);
+                const errMsg = getErrorMessage(err);
                 if (last && last.isPending) {
                     last.isPending = false;
                     last.isError = true;
