@@ -66,6 +66,165 @@
     // init()) is reflected in subsequent send/auth calls.
     const _mcpBaseUrl = () => (global.BunnyQuery && global.BunnyQuery.MCP_BASE_URL) || DEFAULTS.MCP_BASE_URL;
 
+    // ----- file-fence helpers (mirrors agent.vue) ---------------------------
+    // Bare language tags we treat as downloadable files. Maps to the
+    // extension used in the synthesized filename. Mirrors the file types the
+    // host agent (agent.vue) is known to emit as ```filename.ext fences.
+    const FENCE_LANGUAGE_EXTENSIONS = {
+        html: 'html',
+        htm: 'html',
+        csv: 'csv',
+        tsv: 'tsv',
+        json: 'json',
+        xml: 'xml',
+        svg: 'svg',
+        md: 'md',
+        markdown: 'md',
+        yaml: 'yaml',
+        yml: 'yml',
+        txt: 'txt',
+        sql: 'sql',
+        css: 'css',
+    };
+
+    const FENCE_MIME_TYPES = {
+        html: 'text/html',
+        csv: 'text/csv',
+        tsv: 'text/tab-separated-values',
+        json: 'application/json',
+        xml: 'application/xml',
+        svg: 'image/svg+xml',
+        md: 'text/markdown',
+        yaml: 'text/yaml',
+        yml: 'text/yaml',
+        txt: 'text/plain',
+        sql: 'application/sql',
+        css: 'text/css',
+    };
+
+    // Closed fences with `filename.ext` after the opening backticks.
+    const FENCE_FILENAME_RE = /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g;
+    // Closed fences whose info-string is one of the known language tags
+    // above. The model often emits ```html ... ``` or ```csv ... ``` instead
+    // of a full filename — surface those as downloadable files too.
+    const FENCE_LANG_RE = new RegExp(
+        '```(' + Object.keys(FENCE_LANGUAGE_EXTENSIONS).join('|') + ')[ \\t]*\\n([\\s\\S]*?)```',
+        'gi'
+    );
+    // Open (still-streaming) fences for either pattern, used to suppress the
+    // raw fence text mid-typewriter.
+    const OPEN_FENCE_FILENAME_RE = /```([\w.-]+\.[a-zA-Z0-9]+)\n?/;
+    const OPEN_FENCE_LANG_RE = new RegExp(
+        '```(' + Object.keys(FENCE_LANGUAGE_EXTENSIONS).join('|') + ')[ \\t]*\\n?',
+        'i'
+    );
+
+    // Cache blob URLs keyed by (filename + content) so re-renders don't leak
+    // a fresh ObjectURL on every tick of streaming text.
+    const _fileBlobCache = new Map();
+    const _getOrCreateFileHref = (filename, body) => {
+        const key = filename + '\u0000' + body;
+        const existing = _fileBlobCache.get(key);
+        if (existing) return existing;
+        const ext = (filename.split('.').pop() || '').toLowerCase();
+        const type = FENCE_MIME_TYPES[ext] || 'text/plain';
+        const blob = new Blob([body], { type });
+        const href = URL.createObjectURL(blob);
+        _fileBlobCache.set(key, href);
+        return href;
+    };
+
+    // Counter used to mint stable filenames for bare-language fences within
+    // a single rendered message ("download.html", "download-2.html", ...).
+    // Keyed by message identity so re-renders of the same message reuse the
+    // same names (which lets the blob cache hit).
+    const _bareFenceNameCounters = new WeakMap();
+    const _bareFilenameFor = (msgKey, ext, occurrence) => {
+        const base = 'download';
+        return occurrence === 0 ? `${base}.${ext}` : `${base}-${occurrence + 1}.${ext}`;
+    };
+
+    // Split message content into a sequence of {type:'text'|'file'} parts,
+    // mirroring agent.vue's parseMsgParts behavior for fenced code blocks.
+    // Bare-language fences (```html, ```csv, ...) are also lifted into
+    // downloadable file parts with a synthesized filename.
+    const parseMsgParts = (content, msgKey, isTyping) => {
+        const parts = [];
+        if (!content) return parts;
+
+        // Combine matches from both fence regexes, sorted by position.
+        const matches = [];
+        FENCE_FILENAME_RE.lastIndex = 0;
+        let mm;
+        while ((mm = FENCE_FILENAME_RE.exec(content)) !== null) {
+            matches.push({ index: mm.index, length: mm[0].length, filename: mm[1], body: mm[2], kind: 'filename' });
+        }
+        FENCE_LANG_RE.lastIndex = 0;
+        let bareCounters = _bareFenceNameCounters.get(msgKey);
+        if (!bareCounters) {
+            bareCounters = {};
+            if (msgKey) _bareFenceNameCounters.set(msgKey, bareCounters);
+        }
+        const bareSeen = {};
+        while ((mm = FENCE_LANG_RE.exec(content)) !== null) {
+            const lang = mm[1].toLowerCase();
+            const ext = FENCE_LANGUAGE_EXTENSIONS[lang];
+            const occurrence = bareSeen[ext] || 0;
+            bareSeen[ext] = occurrence + 1;
+            matches.push({
+                index: mm.index,
+                length: mm[0].length,
+                filename: _bareFilenameFor(msgKey, ext, occurrence),
+                body: mm[2],
+                kind: 'lang',
+            });
+        }
+        // If both regexes matched the same span (a `filename.ext` fence is
+        // also a bare-language fence when the language coincides), prefer
+        // the filename match.
+        matches.sort((a, b) => a.index - b.index || (a.kind === 'filename' ? -1 : 1));
+        const dedup = [];
+        for (const m of matches) {
+            if (dedup.length && dedup[dedup.length - 1].index === m.index) continue;
+            dedup.push(m);
+        }
+
+        let last = 0;
+        for (const m of dedup) {
+            if (m.index > last) {
+                parts.push({ type: 'text', text: content.slice(last, m.index) });
+            }
+            parts.push({
+                type: 'file',
+                filename: m.filename,
+                href: _getOrCreateFileHref(m.filename, m.body),
+            });
+            last = m.index + m.length;
+        }
+
+        let tail = content.slice(last);
+
+        // Mid-typewriter: hide raw source for a still-open fence so the user
+        // doesn't watch literal code stream by character-by-character.
+        if (isTyping && tail) {
+            const fnOpen = tail.match(OPEN_FENCE_FILENAME_RE);
+            const langOpen = tail.match(OPEN_FENCE_LANG_RE);
+            const open = fnOpen && (!langOpen || fnOpen.index <= langOpen.index)
+                ? { match: fnOpen, label: fnOpen[1] }
+                : langOpen
+                    ? { match: langOpen, label: 'download.' + FENCE_LANGUAGE_EXTENSIONS[langOpen[1].toLowerCase()] }
+                    : null;
+            if (open) {
+                const before = tail.slice(0, open.match.index);
+                if (before) parts.push({ type: 'text', text: before });
+                parts.push({ type: 'text', text: `\n[generating ${open.label}...]` });
+                tail = '';
+            }
+        }
+        if (tail) parts.push({ type: 'text', text: tail });
+        return parts;
+    };
+
     // ----- helpers ----------------------------------------------------------
     const $ = (tag, attrs, children) => {
         const el = document.createElement(tag);
@@ -916,7 +1075,29 @@
                 if (msg.isPending) {
                     bubble.appendChild($('span', { class: 'bq-loader' }, 'Thinking'));
                 } else {
-                    bubble.textContent = msg.content || '';
+                    // Render fenced file blocks (```filename.ext``` or
+                    // ```html / ```csv / etc.) as inline download links;
+                    // everything else stays plain text. Mirrors the
+                    // behavior of agent.vue's parseMsgParts.
+                    const parts = parseMsgParts(msg.content || '', msg, !!this.typing);
+                    if (!parts.length) {
+                        bubble.textContent = msg.content || '';
+                    } else {
+                        for (const part of parts) {
+                            if (part.type === 'file') {
+                                const a = $('a', {
+                                    class: 'bq-file-download',
+                                    href: part.href,
+                                    target: '_blank',
+                                    rel: 'noopener noreferrer',
+                                    download: part.filename,
+                                }, '\u2197 ' + part.filename);
+                                bubble.appendChild(a);
+                            } else {
+                                bubble.appendChild(document.createTextNode(part.text));
+                            }
+                        }
+                    }
                 }
                 const wrapper = $('div', {
                     class:
