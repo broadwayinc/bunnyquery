@@ -514,11 +514,11 @@
     }
 
     // ===== AI agent calls (mirrors src/code/ai_agent.ts) ====================
-    function buildClaudeRequest(skapi, { service, owner, prompt, messages, system, model }) {
+    function buildClaudeRequest(skapi, { service, owner, prompt, messages, system, model, mcpAccessToken }) {
         const msgList = messages && messages.length
             ? messages
             : [{ role: 'user', content: prompt }];
-        return skapi.clientSecretRequest({
+        const request = {
             clientSecretName: 'claude',
             poll: DEFAULTS.POLL_INTERVAL,
             queue: service,
@@ -544,7 +544,7 @@
                         type: 'url',
                         name: DEFAULTS.MCP_NAME,
                         url: _mcpBaseUrl(),
-                        authorization_token: '$ACCESS_TOKEN',
+                        authorization_token: mcpAccessToken || '$ACCESS_TOKEN',
                     },
                 ],
                 tools: [
@@ -558,10 +558,11 @@
                     },
                 ],
             },
-        });
+        };
+        return skapi.clientSecretRequest(request);
     }
 
-    function buildOpenAIRequest(skapi, { service, owner, prompt, messages, system, model }) {
+    function buildOpenAIRequest(skapi, { service, owner, prompt, messages, system, model, mcpAccessToken }) {
         const msgList = messages && messages.length
             ? messages
             : [{ role: 'user', content: prompt }];
@@ -591,7 +592,7 @@
                         server_label: DEFAULTS.MCP_NAME,
                         server_url: _mcpBaseUrl(),
                         require_approval: 'never',
-                        headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
+                        headers: { Authorization: `Bearer ${mcpAccessToken || '$ACCESS_TOKEN'}` },
                     },
                     { type: 'web_search', external_web_access: true },
                 ],
@@ -1610,6 +1611,11 @@ The same pattern applies to other formats: \`\`\`my-data.json, \`\`\`index.html,
                     system: this._buildSystemPrompt(),
                     model: this.model || undefined,
                 };
+
+                const mcpToken = this.oauth.getStoredToken()?.access_token;
+                if (mcpToken) {
+                    args.mcpAccessToken = mcpToken;
+                }
 
                 const argsBuilder = () => (this.platform === 'claude'
                     ? buildClaudeRequest(this.skapi, args)
