@@ -50,7 +50,7 @@
         OPENAI_RESPONSES_API_URL: 'https://api.openai.com/v1/responses',
         MAX_TOKENS: 25000,
         POLL_INTERVAL: 1500,
-        PENDING_POLL_INTERVAL_MS: 4000,
+        PENDING_POLL_INTERVAL_MS: 1000,
         ATTACHMENT_URL_EXPIRES_SECONDS: 600, // 10 min
     };
 
@@ -65,6 +65,101 @@
     // override of `BunnyQuery.MCP_BASE_URL` (e.g. via the `dev` flag on
     // init()) is reflected in subsequent send/auth calls.
     const _mcpBaseUrl = () => (global.BunnyQuery && global.BunnyQuery.MCP_BASE_URL) || DEFAULTS.MCP_BASE_URL;
+
+    // ----- link parsing helpers -----
+    // Matches markdown links `[label](url)` and bare https URLs.
+    // Handles balanced parentheses in URLs (e.g. for filenames like image (1).png).
+    const LINK_REGEX = /\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]+|\([^\s()]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
+
+    const normalizeBareUrl = (url) => {
+        if (!url) return '';
+        let out = url;
+
+        // Trim sentence punctuation that often trails pasted URLs.
+        out = out.replace(/[.,;:!?]+$/, '');
+
+        // Remove unmatched closing wrappers but preserve balanced pairs.
+        const trimUnmatched = (openCh, closeCh) => {
+            while (out.endsWith(closeCh)) {
+                const openCount = (out.match(new RegExp('\\' + openCh, 'g')) || []).length;
+                const closeCount = (out.match(new RegExp('\\' + closeCh, 'g')) || []).length;
+                if (closeCount > openCount) {
+                    out = out.slice(0, -1);
+                } else {
+                    break;
+                }
+            }
+        };
+
+        trimUnmatched('(', ')');
+        trimUnmatched('[', ']');
+        trimUnmatched('{', '}');
+
+        return out;
+    };
+
+    const truncateLabel = (label, maxLen = 50, options = {}) => {
+        const { stripTrailing = false } = options;
+        if (!label) return '';
+        const trimmed = label.trim();
+        const unwrapped = trimmed
+            .replace(/^\*\*(.*)\*\*$/, '$1')
+            .replace(/^__(.*)__$/, '$1');
+        const cleaned = stripTrailing
+            ? unwrapped.replace(/[`'"*\]\>.,;:!?]+$/, '')
+            : unwrapped;
+        if (cleaned.length <= maxLen) return cleaned;
+        return cleaned.slice(0, maxLen - 1) + '\u2026'; // ellipsis
+    };
+
+    // Helper: parse markdown links from a text segment
+    const parseMsgLinks = (text, offsetInContent, parts) => {
+        LINK_REGEX.lastIndex = 0;
+        let last = 0;
+        let lm;
+        while ((lm = LINK_REGEX.exec(text)) !== null) {
+            if (lm.index > last) {
+                const prevText = text.slice(last, lm.index);
+                if (parts.length && parts[parts.length - 1].type === 'text') {
+                    parts[parts.length - 1].text += prevText;
+                } else {
+                    parts.push({ type: 'text', text: prevText });
+                }
+            }
+
+            // Markdown link: [label](url)
+            if (lm[1] && lm[2]) {
+                const label = truncateLabel(lm[1]);
+                const href = lm[2];
+                parts.push({
+                    type: 'link',
+                    label: label,
+                    href: href,
+                });
+            }
+            // Bare URL
+            else if (lm[3]) {
+                const href = normalizeBareUrl(lm[3]);
+                const label = truncateLabel(href);
+                parts.push({
+                    type: 'link',
+                    label: label,
+                    href: href,
+                });
+            }
+
+            last = lm.index + lm[0].length;
+        }
+
+        if (last < text.length) {
+            const tail = text.slice(last);
+            if (parts.length && parts[parts.length - 1].type === 'text') {
+                parts[parts.length - 1].text += tail;
+            } else {
+                parts.push({ type: 'text', text: tail });
+            }
+        }
+    };
 
     // ----- file-fence helpers (mirrors agent.vue) ---------------------------
     // Bare language tags we treat as downloadable files. Maps to the
@@ -152,12 +247,13 @@
         const parts = [];
         if (!content) return parts;
 
-        // Combine matches from both fence regexes, sorted by position.
-        const matches = [];
+        // First pass: extract file fences (existing logic)
+        const fenceParts = [];
+        const fenceMatches = [];
         FENCE_FILENAME_RE.lastIndex = 0;
         let mm;
         while ((mm = FENCE_FILENAME_RE.exec(content)) !== null) {
-            matches.push({ index: mm.index, length: mm[0].length, filename: mm[1], body: mm[2], kind: 'filename' });
+            fenceMatches.push({ index: mm.index, length: mm[0].length, filename: mm[1], body: mm[2], kind: 'filename' });
         }
         FENCE_LANG_RE.lastIndex = 0;
         let bareCounters = _bareFenceNameCounters.get(msgKey);
@@ -171,7 +267,7 @@
             const ext = FENCE_LANGUAGE_EXTENSIONS[lang];
             const occurrence = bareSeen[ext] || 0;
             bareSeen[ext] = occurrence + 1;
-            matches.push({
+            fenceMatches.push({
                 index: mm.index,
                 length: mm[0].length,
                 filename: _bareFilenameFor(msgKey, ext, occurrence),
@@ -179,30 +275,35 @@
                 kind: 'lang',
             });
         }
-        // If both regexes matched the same span (a `filename.ext` fence is
-        // also a bare-language fence when the language coincides), prefer
-        // the filename match.
-        matches.sort((a, b) => a.index - b.index || (a.kind === 'filename' ? -1 : 1));
-        const dedup = [];
-        for (const m of matches) {
-            if (dedup.length && dedup[dedup.length - 1].index === m.index) continue;
-            dedup.push(m);
+        fenceMatches.sort((a, b) => a.index - b.index || (a.kind === 'filename' ? -1 : 1));
+        const dedupFences = [];
+        for (const m of fenceMatches) {
+            if (dedupFences.length && dedupFences[dedupFences.length - 1].index === m.index) continue;
+            dedupFences.push(m);
         }
 
-        let last = 0;
-        for (const m of dedup) {
-            if (m.index > last) {
-                parts.push({ type: 'text', text: content.slice(last, m.index) });
+        // Second pass: extract links from text segments between fences
+        let lastFenceEnd = 0;
+        for (const fence of dedupFences) {
+            // Parse links in text before this fence
+            const beforeFence = content.slice(lastFenceEnd, fence.index);
+            if (beforeFence) {
+                parseMsgLinks(beforeFence, lastFenceEnd, parts);
             }
+            // Add the fence
             parts.push({
                 type: 'file',
-                filename: m.filename,
-                href: _getOrCreateFileHref(m.filename, m.body),
+                filename: fence.filename,
+                href: _getOrCreateFileHref(fence.filename, fence.body),
             });
-            last = m.index + m.length;
+            lastFenceEnd = fence.index + fence.length;
         }
 
-        let tail = content.slice(last);
+        // Parse links in remaining text after last fence
+        let tail = content.slice(lastFenceEnd);
+        if (tail) {
+            parseMsgLinks(tail, lastFenceEnd, parts);
+        }
 
         // Mid-typewriter: hide raw source for a still-open fence so the user
         // doesn't watch literal code stream by character-by-character.
@@ -216,12 +317,15 @@
                     : null;
             if (open) {
                 const before = tail.slice(0, open.match.index);
-                if (before) parts.push({ type: 'text', text: before });
-                parts.push({ type: 'text', text: `\n[generating ${open.label}...]` });
-                tail = '';
+                if (before && parts.length && parts[parts.length - 1].type === 'text') {
+                    parts[parts.length - 1].text += '\n[generating ' + open.label + '...]';
+                } else if (before) {
+                    parts.push({ type: 'text', text: before + '\n[generating ' + open.label + '...]' });
+                } else {
+                    parts.push({ type: 'text', text: '\n[generating ' + open.label + '...]' });
+                }
             }
         }
-        if (tail) parts.push({ type: 'text', text: tail });
         return parts;
     };
 
@@ -514,7 +618,7 @@
     }
 
     // ===== AI agent calls (mirrors src/code/ai_agent.ts) ====================
-    function buildClaudeRequest(skapi, { service, owner, prompt, messages, system, model, mcpAccessToken }) {
+    function buildClaudeRequest(skapi, { service, owner, prompt, messages, system, model }) {
         const msgList = messages && messages.length
             ? messages
             : [{ role: 'user', content: prompt }];
@@ -544,7 +648,7 @@
                         type: 'url',
                         name: DEFAULTS.MCP_NAME,
                         url: _mcpBaseUrl(),
-                        authorization_token: mcpAccessToken || '$ACCESS_TOKEN',
+                        authorization_token: '$ACCESS_TOKEN',
                     },
                 ],
                 tools: [
@@ -562,7 +666,7 @@
         return skapi.clientSecretRequest(request);
     }
 
-    function buildOpenAIRequest(skapi, { service, owner, prompt, messages, system, model, mcpAccessToken }) {
+    function buildOpenAIRequest(skapi, { service, owner, prompt, messages, system, model }) {
         const msgList = messages && messages.length
             ? messages
             : [{ role: 'user', content: prompt }];
@@ -592,7 +696,7 @@
                         server_label: DEFAULTS.MCP_NAME,
                         server_url: _mcpBaseUrl(),
                         require_approval: 'never',
-                        headers: { Authorization: `Bearer ${mcpAccessToken || '$ACCESS_TOKEN'}` },
+                        headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
                     },
                     { type: 'web_search', external_web_access: true },
                 ],
@@ -799,6 +903,8 @@
             this.pendingTimer = null;
             this._pollingPending = false;
             this._loadingOlder = false;
+            this._loadingFirstHistory = false;
+            this._initialHistoryLoaded = false;
 
             this.refs = {};
 
@@ -824,6 +930,16 @@
 
         // ---- bootstrap order ----------------------------------------------
         async _bootstrap() {
+            // 0. Refresh connection info to ensure latest configuration.
+            try {
+                const info = await this.skapi.getConnectionInfo({ refresh: true });
+                const ai = String(info.ai_agent || '').split('#');
+                this.platform = (ai[0] || '').toLowerCase(); // 'claude' | 'openai'
+                this.model = ai[1] || '';
+            } catch (_) {
+                // Non-fatal; continue with existing connection info
+            }
+
             // 1. Validate that the project has a configured AI platform.
             if (!this.platform) {
                 this._renderFatal('This project does not have an AI agent configured yet. Please ask the project owner to set up an AI agent in the project settings page.');
@@ -965,8 +1081,20 @@
             const titleText = this.projectName
                 ? this.projectName
                 : 'BunnyQuery';
+            const platformLabel = this.platform === 'claude'
+                ? 'Claude'
+                : this.platform === 'openai'
+                    ? 'OpenAI'
+                    : 'Unknown';
+            const modelLabel = this.model || (
+                this.platform === 'claude'
+                    ? DEFAULTS.DEFAULT_CLAUDE_MODEL
+                    : this.platform === 'openai'
+                        ? DEFAULTS.DEFAULT_OPENAI_MODEL
+                        : 'N/A'
+            );
             const titleLeft = $('div', { class: 'bq-title-left' }, [
-                $('h2', null, titleText),
+                $('span', { class: 'bq-ai-status', title: `AI: ${platformLabel} / ${modelLabel}` }, `${platformLabel} · ${modelLabel}`),
             ]);
 
             const clearIcon = $('button', {
@@ -1009,7 +1137,7 @@
             const textarea = $('textarea', {
                 class: 'bq-input',
                 rows: '1',
-                placeholder: 'Ask anything about the project...',
+                placeholder: `Ask anything about ${this.projectName || 'the project'}...`,
                 oninput: (e) => this._autoGrow(e.target),
                 onkeydown: (e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1061,7 +1189,15 @@
                 box.scrollHeight - box.scrollTop - box.clientHeight < 80;
             box.innerHTML = '';
 
-            if (!this.messages.length) {
+            if (!this._initialHistoryLoaded) {
+                box.appendChild(
+                    $('div', { class: 'bq-message is-assistant bq-empty-greeting' }, [
+                        $('div', { class: 'bq-bubble' }, [
+                            $('span', { class: 'bq-loader' }, 'Loading chat history'),
+                        ]),
+                    ])
+                );
+            } else if (!this.messages.length) {
                 box.appendChild(
                     $('div', { class: 'bq-message is-assistant bq-empty-greeting' }, [
                         $('div', { class: 'bq-bubble' },
@@ -1094,6 +1230,15 @@
                                     download: part.filename,
                                 }, '\u2197 ' + part.filename);
                                 bubble.appendChild(a);
+                                } else if (part.type === 'link') {
+                                    const a = $('a', {
+                                        class: 'bq-link-button',
+                                        href: part.href,
+                                        target: '_blank',
+                                        rel: 'noopener noreferrer',
+                                        title: part.href,
+                                    }, '\u2197 ' + part.label);
+                                    bubble.appendChild(a);
                             } else {
                                 bubble.appendChild(document.createTextNode(part.text));
                             }
@@ -1126,12 +1271,12 @@
         }
 
         _updateInputDisabled() {
-            const busy = this.sending || this.uploading || this._anyPending();
+            const busy = this.sending || this.uploading || this._anyPending() || this._loadingFirstHistory;
             if (this.refs.textarea) {
                 this.refs.textarea.disabled = busy;
                 this.refs.textarea.placeholder = busy
                     ? 'Request in process. Please wait...'
-                    : 'Ask anything about the project...';
+                    : `Ask anything about ${this.projectName || 'the project'}...`;
             }
             if (this.refs.sendBtn) this.refs.sendBtn.disabled = busy;
             if (this.refs.attachBtn) this.refs.attachBtn.disabled = busy;
@@ -1316,6 +1461,10 @@
 
         // ---- history ------------------------------------------------------
         async _loadFirstHistoryPage() {
+            this._loadingFirstHistory = true;
+            this._initialHistoryLoaded = false;
+            this._renderMessages();
+
             const fetchPage = () => getChatHistory(
                 this.skapi,
                 { service: this.serviceId, owner: this.ownerId, platform: this.platform },
@@ -1340,10 +1489,13 @@
                 // there are no older entries the user is allowed to see.
                 this.endOfList = !!(res && res.endOfList) || (this._getClearedAt() > 0 && list.length === 0);
                 this.messages = mapHistoryToMessages(list, this.platform);
-                this._renderMessages();
                 this._schedulePendingPoll();
             } catch (err) {
                 console.error('[BunnyQuery] history load failed', err);
+            } finally {
+                this._loadingFirstHistory = false;
+                this._initialHistoryLoaded = true;
+                this._renderMessages();
             }
         }
 
@@ -1611,11 +1763,6 @@ The same pattern applies to other formats: \`\`\`my-data.json, \`\`\`index.html,
                     system: this._buildSystemPrompt(),
                     model: this.model || undefined,
                 };
-
-                const mcpToken = this.oauth.getStoredToken()?.access_token;
-                if (mcpToken) {
-                    args.mcpAccessToken = mcpToken;
-                }
 
                 const argsBuilder = () => (this.platform === 'claude'
                     ? buildClaudeRequest(this.skapi, args)

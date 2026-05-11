@@ -1,6 +1,6 @@
 {
   "name": "bunnyquery",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "BunnyQuery AI chat client",
   "main": "bunnyquery.js",
   "files": [
