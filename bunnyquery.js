@@ -1254,8 +1254,17 @@
                 box.appendChild(wrapper);
             });
 
-            if (stickToBottom) {
-                box.scrollTop = box.scrollHeight;
+
+            // Scroll to bottom if stickToBottom, or if the last message is a resolved assistant response
+            const lastMsg = this.messages[this.messages.length - 1];
+            if (
+                stickToBottom ||
+                (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isPending && !lastMsg.isError)
+            ) {
+                // Use setTimeout to ensure DOM is updated before scrolling
+                setTimeout(() => {
+                    box.scrollTop = box.scrollHeight;
+                }, 0);
             }
 
             // Hide the clear-history icon when there's nothing to clear.
