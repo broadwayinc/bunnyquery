@@ -66,99 +66,257 @@
     // init()) is reflected in subsequent send/auth calls.
     const _mcpBaseUrl = () => (global.BunnyQuery && global.BunnyQuery.MCP_BASE_URL) || DEFAULTS.MCP_BASE_URL;
 
-    // ----- link parsing helpers -----
-    // Matches markdown links `[label](url)` and bare https URLs.
-    // Handles balanced parentheses in URLs (e.g. for filenames like image (1).png).
-    const LINK_REGEX = /\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]+|\([^\s()]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
+    // ----- markdown loader (lazy) ------------------------------------------
+    // Pulled from CDN on first use. While loading, parseMsgParts renders a
+    // plain-text fallback; once `marked` resolves the instance re-renders.
+    const MARKED_CDN_URL = 'https://cdn.jsdelivr.net/npm/marked@15.0.4/marked.min.js';
+    let _markedReadyPromise = null;
+    const _getMarked = () => {
+        if (typeof global.marked !== 'undefined' && global.marked && global.marked.parse) {
+            return Promise.resolve(global.marked);
+        }
+        if (_markedReadyPromise) return _markedReadyPromise;
+        _markedReadyPromise = new Promise((resolve, reject) => {
+            const existing = document.querySelector('script[data-bq-marked]');
+            if (existing) {
+                existing.addEventListener('load', () => resolve(global.marked), { once: true });
+                existing.addEventListener('error', reject, { once: true });
+                return;
+            }
+            const s = document.createElement('script');
+            s.src = MARKED_CDN_URL;
+            s.async = true;
+            s.dataset.bqMarked = '1';
+            s.addEventListener('load', () => resolve(global.marked), { once: true });
+            s.addEventListener('error', reject, { once: true });
+            document.head.appendChild(s);
+        }).catch((err) => {
+            console.error('[BunnyQuery] failed to load marked', err);
+            _markedReadyPromise = null;
+            return null;
+        });
+        return _markedReadyPromise;
+    };
+    // Eager kick-off so the first message render almost always has marked
+    // ready by the time history finishes loading.
+    if (typeof window !== 'undefined') {
+        try { _getMarked(); } catch (_) { /* noop */ }
+    }
 
-    const normalizeBareUrl = (url) => {
-        if (!url) return '';
-        let out = url;
+    // ----- link parsing helpers (mirrors agent.vue) ------------------------
+    // createInlineLinkRegex groups (in order):
+    //   1: `src::<token>` — model-emitted reference to a db file (path or URL)
+    //   2: markdown link label where href IS an http(s) URL
+    //   3: markdown link href (URL)
+    //   4: markdown link label where href is NOT a URL (storage path)
+    //   5: markdown link path (non-URL) — treated like `src::<path>`
+    //   6: bare http(s) URL
+    const createInlineLinkRegex = () =>
+        /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]+|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]+|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
 
-        // Trim sentence punctuation that often trails pasted URLs.
+    const EXPIRED_ATTACHMENT_URL_HOST = '_expired_.url';
+    const EXPIRED_ATTACHMENT_URL_ORIGIN = `https://${EXPIRED_ATTACHMENT_URL_HOST}`;
+
+    const _safeDecode = (v) => {
+        try { return decodeURIComponent(v); } catch { return v; }
+    };
+
+    const _encodePathSegments = (p) =>
+        p.split('/').filter(Boolean).map((s) => encodeURIComponent(s)).join('/');
+
+    const normalizeAttachmentPathCandidate = (value) =>
+        _safeDecode((value || '').trim())
+            .replace(/\\/g, '/')
+            .replace(/^\/+/, '')
+            .replace(/\/+/g, '/');
+
+    const extractRemotePathFromAttachmentHref = (href, serviceId) => {
+        try {
+            const parsed = new URL(href);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+            const path = normalizeAttachmentPathCandidate(parsed.pathname || '');
+            const segs = path.split('/').filter(Boolean);
+            if (!segs.length) return null;
+            const HEX_HASH_RE = /^[a-f0-9]{32,}$/i;
+            let start = 0;
+            while (start < segs.length) {
+                const seg = segs[start];
+                if (seg === serviceId || HEX_HASH_RE.test(seg)) { start++; continue; }
+                break;
+            }
+            const real = segs.slice(start).join('/');
+            return real || null;
+        } catch { return null; }
+    };
+
+    const getExpiredAttachmentVisiblePath = (remotePath, fallback = 'file') => {
+        const n = normalizeAttachmentPathCandidate(remotePath);
+        if (n) return n;
+        return normalizeAttachmentPathCandidate(fallback) || 'file';
+    };
+
+    const buildDisplayExpiredAttachmentHref = (remotePath, fallback = 'file') => {
+        const visible = getExpiredAttachmentVisiblePath(remotePath, fallback);
+        return `${EXPIRED_ATTACHMENT_URL_ORIGIN}/${_encodePathSegments(visible)}`;
+    };
+
+    const LINK_LABEL_MAX_DISPLAY_CHARS = 32;
+    const truncateLabelForDisplay = (label) => {
+        if (!label) return label;
+        if (label.length <= LINK_LABEL_MAX_DISPLAY_CHARS) return label;
+        return '\u2026' + label.slice(label.length - (LINK_LABEL_MAX_DISPLAY_CHARS - 1));
+    };
+
+    const normalizeTrailingInlineToken = (value) => {
+        if (!value) return value;
+        let out = value;
         out = out.replace(/[.,;:!?]+$/, '');
-
-        // Remove unmatched closing wrappers but preserve balanced pairs.
         const trimUnmatched = (openCh, closeCh) => {
             while (out.endsWith(closeCh)) {
                 const openCount = (out.match(new RegExp('\\' + openCh, 'g')) || []).length;
                 const closeCount = (out.match(new RegExp('\\' + closeCh, 'g')) || []).length;
-                if (closeCount > openCount) {
-                    out = out.slice(0, -1);
-                } else {
-                    break;
-                }
+                if (closeCount > openCount) out = out.slice(0, -1);
+                else break;
             }
         };
-
         trimUnmatched('(', ')');
         trimUnmatched('[', ']');
         trimUnmatched('{', '}');
-
+        out = out.replace(/[`'"*>]+$/, '');
         return out;
     };
 
-    const truncateLabel = (label, maxLen = 50, options = {}) => {
-        const { stripTrailing = false } = options;
-        if (!label) return '';
-        const trimmed = label.trim();
-        const unwrapped = trimmed
-            .replace(/^\*\*(.*)\*\*$/, '$1')
-            .replace(/^__(.*)__$/, '$1');
-        const cleaned = stripTrailing
-            ? unwrapped.replace(/[`'"*\]\>.,;:!?]+$/, '')
-            : unwrapped;
-        if (cleaned.length <= maxLen) return cleaned;
-        return cleaned.slice(0, maxLen - 1) + '\u2026'; // ellipsis
+    // HTML-escape a string for use as element text or attribute value.
+    const escapeAttr = (s) => String(s).replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+
+    // Render an extracted file fence as an `<a>` HTML string. Embedded into
+    // the markdown source via placeholder; marked passes raw HTML through.
+    const fileToAnchorHtml = (filename, href) => {
+        const text = '\u2197 ' + filename;
+        return `<a class="bq-file-download" href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer" download="${escapeAttr(filename)}">${escapeAttr(text)}</a>`;
     };
 
-    // Helper: parse markdown links from a text segment
-    const parseMsgLinks = (text, offsetInContent, parts) => {
-        LINK_REGEX.lastIndex = 0;
-        let last = 0;
-        let lm;
-        while ((lm = LINK_REGEX.exec(text)) !== null) {
-            if (lm.index > last) {
-                const prevText = text.slice(last, lm.index);
-                if (parts.length && parts[parts.length - 1].type === 'text') {
-                    parts[parts.length - 1].text += prevText;
-                } else {
-                    parts.push({ type: 'text', text: prevText });
-                }
-            }
+    // Render an extracted link (link/src::/path/url) as an `<a>` HTML string
+    // carrying data-bq-* attributes that the bubble's click delegation reads
+    // to dispatch expired-link refresh.
+    const linkToAnchorHtml = (link, ctx) => {
+        const refreshing = !!(ctx && ctx.refreshingSet && ctx.refreshingSet.has(link.expiredHref || link.href));
+        const cls = ['bq-link-button'];
+        if (link.expired) cls.push('is-expired');
+        if (refreshing) cls.push('is-refreshing');
+        const labelText = '\u2197 ' + link.label + (refreshing ? ' (fetching...)' : '');
+        const attrs = [
+            `class="${cls.join(' ')}"`,
+            `href="${escapeAttr(link.href)}"`,
+            `target="_blank"`,
+            `rel="noopener noreferrer"`,
+            `title="${escapeAttr(link.fullLabel || link.label)}"`,
+            `download="${escapeAttr(link.fullLabel || link.label)}"`,
+            `data-bq-link="1"`,
+        ];
+        if (link.expired) attrs.push(`data-bq-expired="1"`);
+        if (link.expiredHref) attrs.push(`data-bq-expired-href="${escapeAttr(link.expiredHref)}"`);
+        if (link.remotePath) attrs.push(`data-bq-remote-path="${escapeAttr(link.remotePath)}"`);
+        if (link.originalHref) attrs.push(`data-bq-original-href="${escapeAttr(link.originalHref)}"`);
+        if (link.fullLabel) attrs.push(`data-bq-full-label="${escapeAttr(link.fullLabel)}"`);
+        return `<a ${attrs.join(' ')}>${escapeAttr(labelText)}</a>`;
+    };
 
-            // Markdown link: [label](url)
-            if (lm[1] && lm[2]) {
-                const label = truncateLabel(lm[1]);
-                const href = lm[2];
-                parts.push({
-                    type: 'link',
-                    label: label,
-                    href: href,
-                });
+    // Resolve a regex match from createInlineLinkRegex into a link object,
+    // or null if it can't be parsed. ctx provides `serviceId` (for CDN-prefix
+    // stripping) and `refreshedMap` (cached fresh hrefs keyed by expiredHref).
+    const buildLinkPartFromGroups = (full, g1, g2, g3, g4, g5, g6, ctx) => {
+        const serviceId = ctx && ctx.serviceId;
+        const refreshedMap = (ctx && ctx.refreshedMap) || {};
+        if (g1) {
+            const rawPath = normalizeTrailingInlineToken(g1);
+            const consumed = 'src::' + rawPath;
+            const tail = full.slice(consumed.length);
+            const isUrl = /^https?:\/\//i.test(rawPath);
+            if (isUrl && /^https:\/\//i.test(rawPath)) {
+                return {
+                    part: {
+                        label: truncateLabelForDisplay(rawPath),
+                        fullLabel: rawPath,
+                        href: rawPath,
+                        expired: false,
+                    },
+                    tail,
+                };
             }
-            // Bare URL
-            else if (lm[3]) {
-                const href = normalizeBareUrl(lm[3]);
-                const label = truncateLabel(href);
-                parts.push({
-                    type: 'link',
-                    label: label,
-                    href: href,
-                });
-            }
-
-            last = lm.index + lm[0].length;
+            const remotePath = isUrl
+                ? (extractRemotePathFromAttachmentHref(rawPath, serviceId) || normalizeAttachmentPathCandidate(rawPath))
+                : normalizeAttachmentPathCandidate(rawPath);
+            if (!remotePath) return null;
+            const expiredHref = buildDisplayExpiredAttachmentHref(remotePath, remotePath);
+            const cached = refreshedMap[expiredHref];
+            const originalHref = isUrl ? rawPath : undefined;
+            return {
+                part: {
+                    label: truncateLabelForDisplay(remotePath),
+                    fullLabel: remotePath,
+                    href: cached || expiredHref,
+                    expired: !cached,
+                    expiredHref,
+                    remotePath,
+                    originalHref,
+                },
+                tail,
+            };
         }
-
-        if (last < text.length) {
-            const tail = text.slice(last);
-            if (parts.length && parts[parts.length - 1].type === 'text') {
-                parts[parts.length - 1].text += tail;
-            } else {
-                parts.push({ type: 'text', text: tail });
-            }
+        if (g4 && g5) {
+            const rawPath = g5;
+            const remotePath = normalizeAttachmentPathCandidate(rawPath);
+            if (!remotePath) return null;
+            const expiredHref = buildDisplayExpiredAttachmentHref(remotePath, remotePath);
+            const cached = refreshedMap[expiredHref];
+            return {
+                part: {
+                    label: truncateLabelForDisplay(g4),
+                    fullLabel: g4,
+                    href: cached || expiredHref,
+                    expired: !cached,
+                    expiredHref,
+                    remotePath,
+                },
+            };
         }
+        const originalHref = g3 || g6 || '';
+        if (!originalHref) return null;
+        if (/^https:\/\//i.test(originalHref)) {
+            const plainLabel = g2 || originalHref;
+            return {
+                part: {
+                    label: truncateLabelForDisplay(plainLabel),
+                    fullLabel: plainLabel,
+                    href: originalHref,
+                    expired: false,
+                },
+            };
+        }
+        const remotePath = extractRemotePathFromAttachmentHref(originalHref, serviceId);
+        const fallbackLabel = g2 || originalHref;
+        const expiredHref = remotePath
+            ? buildDisplayExpiredAttachmentHref(remotePath, fallbackLabel)
+            : originalHref;
+        const cached = refreshedMap[expiredHref];
+        const expired = !!remotePath && !cached;
+        const fullLabel = remotePath
+            ? getExpiredAttachmentVisiblePath(remotePath, g2 || originalHref)
+            : (g2 || originalHref);
+        return {
+            part: {
+                label: truncateLabelForDisplay(fullLabel),
+                fullLabel,
+                href: cached || expiredHref,
+                expired,
+                expiredHref,
+                remotePath: remotePath || undefined,
+                originalHref,
+            },
+        };
     };
 
     // ----- file-fence helpers (mirrors agent.vue) ---------------------------
@@ -239,94 +397,126 @@
         return occurrence === 0 ? `${base}.${ext}` : `${base}-${occurrence + 1}.${ext}`;
     };
 
-    // Split message content into a sequence of {type:'text'|'file'} parts,
-    // mirroring agent.vue's parseMsgParts behavior for fenced code blocks.
-    // Bare-language fences (```html, ```csv, ...) are also lifted into
-    // downloadable file parts with a synthesized filename.
-    const parseMsgParts = (content, msgKey, isTyping) => {
-        const parts = [];
-        if (!content) return parts;
+    // Split message content into renderable parts. When `marked` is loaded,
+    // returns a single `{type:'html', html}` part containing the full
+    // markdown-rendered bubble (with file/link anchors spliced back in).
+    // When marked is not yet loaded, returns `{type:'fallback', text}` so the
+    // bubble can render plain text until marked finishes loading.
+    //
+    // Mirrors agent.vue's parseMsgParts:
+    //   1. extract closed file fences `\`\`\`filename.ext\n...\`\`\`` → file anchors
+    //   2. mid-typewriter unclosed file fence → `[generating filename...]`
+    //   3. mask inline `\`code\`` spans so links inside aren't extracted
+    //   4. extract inline links (src::, [label](url), [label](path), bare URL)
+    //      via createInlineLinkRegex → link anchors with data-bq-* attrs
+    //   5. restore code masks
+    //   6. marked.parse(working, { gfm:true, breaks:true })
+    //   7. splice placeholders back as raw anchor HTML
+    const parseMsgParts = (content, msgKey, ctx) => {
+        if (!content) return [];
+        ctx = ctx || {};
+        const marked = (typeof global.marked !== 'undefined' && global.marked && global.marked.parse) ? global.marked : null;
 
-        // First pass: extract file fences (existing logic)
-        const fenceParts = [];
-        const fenceMatches = [];
-        FENCE_FILENAME_RE.lastIndex = 0;
-        let mm;
-        while ((mm = FENCE_FILENAME_RE.exec(content)) !== null) {
-            fenceMatches.push({ index: mm.index, length: mm[0].length, filename: mm[1], body: mm[2], kind: 'filename' });
+        // Always extract files/links so the fallback text branch can still
+        // render placeholders if we hit it. But the placeholder strategy
+        // only works when marked is available; otherwise just hand the raw
+        // content back as a plain-text fallback (marked load triggers a
+        // re-render).
+        if (!marked) {
+            // Trigger lazy load if not already in flight, then re-render
+            // once it resolves. The instance hooks this callback in via
+            // `ctx.onMarkedReady`.
+            if (ctx.onMarkedReady) {
+                _getMarked().then((m) => { if (m) ctx.onMarkedReady(); });
+            }
+            return [{ type: 'fallback', text: content }];
         }
-        FENCE_LANG_RE.lastIndex = 0;
-        let bareCounters = _bareFenceNameCounters.get(msgKey);
-        if (!bareCounters) {
+
+        const placeholderHtml = [];
+        const PH = (idx) => `\uE000BQ${idx}\uE001`;
+        const push = (anchorHtml) => {
+            const idx = placeholderHtml.length;
+            placeholderHtml.push(anchorHtml);
+            return PH(idx);
+        };
+
+        // Bare-fence filename minting state, keyed per-message so re-renders
+        // (typewriter ticks) reuse the same synthesized names → blob cache
+        // hits instead of leaking ObjectURLs every frame.
+        let bareCounters = msgKey ? _bareFenceNameCounters.get(msgKey) : null;
+        if (!bareCounters && msgKey) {
             bareCounters = {};
-            if (msgKey) _bareFenceNameCounters.set(msgKey, bareCounters);
+            _bareFenceNameCounters.set(msgKey, bareCounters);
         }
         const bareSeen = {};
-        while ((mm = FENCE_LANG_RE.exec(content)) !== null) {
-            const lang = mm[1].toLowerCase();
-            const ext = FENCE_LANGUAGE_EXTENSIONS[lang];
+
+        // 1a. Closed filename fences: ```filename.ext\n...\n```
+        let working = content.replace(
+            /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g,
+            (_full, filename, body) =>
+                push(fileToAnchorHtml(filename, _getOrCreateFileHref(filename, body))),
+        );
+
+        // 1b. Closed bare-language fences: ```html ... ``` etc.
+        working = working.replace(FENCE_LANG_RE, (_full, lang, body) => {
+            const ext = FENCE_LANGUAGE_EXTENSIONS[lang.toLowerCase()] || 'txt';
             const occurrence = bareSeen[ext] || 0;
             bareSeen[ext] = occurrence + 1;
-            fenceMatches.push({
-                index: mm.index,
-                length: mm[0].length,
-                filename: _bareFilenameFor(msgKey, ext, occurrence),
-                body: mm[2],
-                kind: 'lang',
-            });
-        }
-        fenceMatches.sort((a, b) => a.index - b.index || (a.kind === 'filename' ? -1 : 1));
-        const dedupFences = [];
-        for (const m of fenceMatches) {
-            if (dedupFences.length && dedupFences[dedupFences.length - 1].index === m.index) continue;
-            dedupFences.push(m);
-        }
+            const filename = _bareFilenameFor(msgKey, ext, occurrence);
+            return push(fileToAnchorHtml(filename, _getOrCreateFileHref(filename, body)));
+        });
 
-        // Second pass: extract links from text segments between fences
-        let lastFenceEnd = 0;
-        for (const fence of dedupFences) {
-            // Parse links in text before this fence
-            const beforeFence = content.slice(lastFenceEnd, fence.index);
-            if (beforeFence) {
-                parseMsgLinks(beforeFence, lastFenceEnd, parts);
-            }
-            // Add the fence
-            parts.push({
-                type: 'file',
-                filename: fence.filename,
-                href: _getOrCreateFileHref(fence.filename, fence.body),
-            });
-            lastFenceEnd = fence.index + fence.length;
-        }
-
-        // Parse links in remaining text after last fence
-        let tail = content.slice(lastFenceEnd);
-        if (tail) {
-            parseMsgLinks(tail, lastFenceEnd, parts);
-        }
-
-        // Mid-typewriter: hide raw source for a still-open fence so the user
-        // doesn't watch literal code stream by character-by-character.
-        if (isTyping && tail) {
-            const fnOpen = tail.match(OPEN_FENCE_FILENAME_RE);
-            const langOpen = tail.match(OPEN_FENCE_LANG_RE);
+        // 2. Mid-typewriter unclosed fence → hide raw streaming source.
+        if (ctx.isTyping) {
+            const fnOpen = working.match(OPEN_FENCE_FILENAME_RE);
+            const langOpen = working.match(OPEN_FENCE_LANG_RE);
             const open = fnOpen && (!langOpen || fnOpen.index <= langOpen.index)
                 ? { match: fnOpen, label: fnOpen[1] }
                 : langOpen
-                    ? { match: langOpen, label: 'download.' + FENCE_LANGUAGE_EXTENSIONS[langOpen[1].toLowerCase()] }
+                    ? { match: langOpen, label: 'download.' + (FENCE_LANGUAGE_EXTENSIONS[langOpen[1].toLowerCase()] || 'txt') }
                     : null;
-            if (open) {
-                const before = tail.slice(0, open.match.index);
-                if (before && parts.length && parts[parts.length - 1].type === 'text') {
-                    parts[parts.length - 1].text += '\n[generating ' + open.label + '...]';
-                } else if (before) {
-                    parts.push({ type: 'text', text: before + '\n[generating ' + open.label + '...]' });
-                } else {
-                    parts.push({ type: 'text', text: '\n[generating ' + open.label + '...]' });
-                }
+            if (open && typeof open.match.index === 'number') {
+                const dots = '.'.repeat(((ctx.dotTick || 0) % 3) + 1);
+                working = working.slice(0, open.match.index) + `\n[generating ${open.label}${dots}]`;
             }
         }
-        return parts;
+
+        // 3. Mask inline code spans so links inside backticks survive.
+        const codeMasks = [];
+        working = working.replace(/`[^`\n]+`/g, (m) => {
+            const idx = codeMasks.length;
+            codeMasks.push(m);
+            return `\uE002C${idx}\uE003`;
+        });
+
+        // 4. Extract inline links/sources via createInlineLinkRegex.
+        const linkRe = createInlineLinkRegex();
+        working = working.replace(linkRe, (full, g1, g2, g3, g4, g5, g6) => {
+            const built = buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6, ctx);
+            if (!built) return full;
+            const placeholder = push(linkToAnchorHtml(built.part, ctx));
+            return placeholder + (built.tail || '');
+        });
+
+        // 5. Restore code spans for marked to format.
+        working = working.replace(/\uE002C(\d+)\uE003/g, (_m, idx) => codeMasks[Number(idx)] || '');
+
+        // 6. Markdown → HTML.
+        let html;
+        try {
+            html = marked.parse(working, { gfm: true, breaks: true, async: false });
+        } catch (err) {
+            console.error('[BunnyQuery] marked.parse failed', err);
+            html = escapeAttr(working);
+        }
+
+        // 7. Splice anchor placeholders back.
+        const finalHtml = html.replace(
+            /\uE000BQ(\d+)\uE001/g,
+            (_m, idx) => placeholderHtml[Number(idx)] || '',
+        );
+
+        return [{ type: 'html', html: finalHtml }];
     };
 
     // ----- helpers ----------------------------------------------------------
@@ -908,6 +1098,29 @@
 
             this.refs = {};
 
+            // Cache of expired-href -> fresh signed URL. Populated on
+            // demand the first time a user clicks a `[label](path)` or
+            // `src::token` source link, so subsequent clicks (and reflows
+            // that re-render the bubble) reuse the same signed URL.
+            this._refreshedLinkMap = Object.create(null);
+
+            // Set of expired-hrefs currently in flight to getTemporaryUrl,
+            // used to render "(fetching...)" labels and dedupe parallel
+            // clicks on the same anchor.
+            this._refreshingLinkSet = new Set();
+            this._refreshingLinkPromises = new Map();
+
+            // Animated dots for typewriter [generating filename...] labels.
+            this._dotTick = 0;
+            this._dotTickTimer = null;
+
+            // Typewriter state. While `typing` is true the latest assistant
+            // bubble streams character-by-character; while `typingAbort` is
+            // true any active typewriter unwinds to the full text.
+            this.typing = false;
+            this._typingAbort = false;
+            this._typewriterQueue = Promise.resolve();
+
             this._injectStylesheetOnce();
             this._bootstrap();
         }
@@ -1212,37 +1425,31 @@
                 if (msg.isPending) {
                     bubble.appendChild($('span', { class: 'bq-loader' }, 'Thinking'));
                 } else {
-                    // Render fenced file blocks (```filename.ext``` or
-                    // ```html / ```csv / etc.) as inline download links;
-                    // everything else stays plain text. Mirrors the
-                    // behavior of agent.vue's parseMsgParts.
-                    const parts = parseMsgParts(msg.content || '', msg, !!this.typing);
+                    // Full markdown rendering via marked + placeholder
+                    // substitution that preserves the bq-file-download /
+                    // bq-link-button anchors with their data-bq-* attrs.
+                    // A single delegated click handler dispatches expired-
+                    // link refresh.
+                    const parts = parseMsgParts(msg.content || '', msg, {
+                        serviceId: this.serviceId,
+                        refreshedMap: this._refreshedLinkMap,
+                        refreshingSet: this._refreshingLinkSet,
+                        isTyping: !!this.typing,
+                        dotTick: this._dotTick,
+                        onMarkedReady: () => this._renderMessages(),
+                    });
                     if (!parts.length) {
                         bubble.textContent = msg.content || '';
-                    } else {
-                        for (const part of parts) {
-                            if (part.type === 'file') {
-                                const a = $('a', {
-                                    class: 'bq-file-download',
-                                    href: part.href,
-                                    target: '_blank',
-                                    rel: 'noopener noreferrer',
-                                    download: part.filename,
-                                }, '\u2197 ' + part.filename);
-                                bubble.appendChild(a);
-                                } else if (part.type === 'link') {
-                                    const a = $('a', {
-                                        class: 'bq-link-button',
-                                        href: part.href,
-                                        target: '_blank',
-                                        rel: 'noopener noreferrer',
-                                        title: part.href,
-                                    }, '\u2197 ' + part.label);
-                                    bubble.appendChild(a);
-                            } else {
-                                bubble.appendChild(document.createTextNode(part.text));
-                            }
-                        }
+                    } else if (parts.length === 1 && parts[0].type === 'html') {
+                        const md = document.createElement('div');
+                        md.className = 'bq-md';
+                        md.innerHTML = parts[0].html;
+                        md.addEventListener('click', (e) => this._onBubbleLinkClick(e));
+                        bubble.appendChild(md);
+                    } else if (parts.length === 1 && parts[0].type === 'fallback') {
+                        // marked not loaded yet — show plain text; will
+                        // re-render once `_getMarked()` resolves.
+                        bubble.textContent = parts[0].text;
                     }
                 }
                 const wrapper = $('div', {
@@ -1280,7 +1487,7 @@
         }
 
         _updateInputDisabled() {
-            const busy = this.sending || this.uploading || this._anyPending() || this._loadingFirstHistory;
+            const busy = this.sending || this.uploading || this.typing || this._anyPending() || this._loadingFirstHistory;
             if (this.refs.textarea) {
                 this.refs.textarea.disabled = busy;
                 this.refs.textarea.placeholder = busy
@@ -1300,6 +1507,170 @@
 
         _anyPending() {
             return this.messages.some((m) => m.isPending);
+        }
+
+        // ---- expired-link refresh + bubble click delegation ----------------
+        // Click handler attached once per rendered bubble. Finds the closest
+        // `a[data-bq-link]` ancestor; if the anchor is marked expired (i.e.
+        // a source-path link the user has not refreshed yet), preventDefault
+        // and round-trip through `getTemporaryUrl` to obtain a fresh signed
+        // URL, then open it in a new tab. Cached on the instance so repeat
+        // clicks (and re-renders) reuse the same URL.
+        _onBubbleLinkClick(e) {
+            const target = e.target;
+            if (!target || !target.closest) return;
+            const anchor = target.closest('a[data-bq-link]');
+            if (!anchor) return;
+            if (anchor.dataset.bqExpired !== '1') return; // normal link
+
+            const expiredHref = anchor.dataset.bqExpiredHref || anchor.getAttribute('href') || '';
+            const cached = this._refreshedLinkMap[expiredHref];
+            if (cached) {
+                anchor.href = cached;
+                anchor.classList.remove('is-expired');
+                return; // let the click proceed naturally
+            }
+
+            e.preventDefault();
+            const remotePath = anchor.dataset.bqRemotePath || '';
+            const originalHref = anchor.dataset.bqOriginalHref || '';
+            this._fetchFreshHrefForExpiredLink(expiredHref, remotePath, originalHref)
+                .then((fresh) => {
+                    if (!fresh) return;
+                    anchor.href = fresh;
+                    anchor.classList.remove('is-expired');
+                    anchor.classList.remove('is-refreshing');
+                    // Re-render so the cached URL replaces all other live
+                    // copies of the same expired anchor in the chat.
+                    this._renderMessages();
+                    // Open in new tab — preserves the user's click intent.
+                    window.open(fresh, '_blank', 'noopener,noreferrer');
+                })
+                .catch((err) => {
+                    console.error('[BunnyQuery] failed to refresh expired link', err);
+                    alert('Failed to refresh this expired link. Please try again.');
+                });
+        }
+
+        async _fetchFreshHrefForExpiredLink(expiredHref, remotePath, originalHref) {
+            const cached = this._refreshedLinkMap[expiredHref];
+            if (cached) return cached;
+            const inFlight = this._refreshingLinkPromises.get(expiredHref);
+            if (inFlight) return inFlight;
+
+            this._refreshingLinkSet.add(expiredHref);
+            this._renderMessages();
+
+            const run = async () => {
+                // Prefer the original full URL captured at parse time. The
+                // user-facing Skapi.getFile() needs a real http(s) URL to a
+                // skapi CDN endpoint; it cannot resolve bare storage paths.
+                const sourceUrl = (originalHref && /^https?:\/\//i.test(originalHref))
+                    ? originalHref
+                    : null;
+                if (!sourceUrl) {
+                    throw new Error('Unable to refresh this expired attachment link: missing source URL.');
+                }
+                const res = await this.skapi.getFile(sourceUrl, {
+                    dataType: 'endpoint',
+                    expires: DEFAULTS.ATTACHMENT_URL_EXPIRES_SECONDS,
+                });
+                const fresh = typeof res === 'string' ? res : (res && (res.url || res.cdn_url));
+                if (!fresh) throw new Error('Empty signed URL response.');
+                this._refreshedLinkMap[expiredHref] = fresh;
+                return fresh;
+            };
+            const p = run().finally(() => {
+                this._refreshingLinkSet.delete(expiredHref);
+                this._refreshingLinkPromises.delete(expiredHref);
+            });
+            this._refreshingLinkPromises.set(expiredHref, p);
+            return p;
+        }
+
+        // ---- typewriter ----------------------------------------------------
+        // Reveal `fullText` into messages[idx].content character-by-character.
+        // Fast-forwards through fenced file blocks (rendered as a
+        // [generating filename...] placeholder anyway) and inline link
+        // tokens (kept atomic so half-rendered `[label]` doesn't show up).
+        async _typewriteIntoIndex(idx, fullText) {
+            if (!fullText) return;
+            const TICK_MS = 16;
+            const charsPerTick = 3;
+            const FENCE_REVEAL_MS = 200;
+            const fenceTicks = Math.max(1, Math.floor(FENCE_REVEAL_MS / TICK_MS));
+
+            const fenceRegions = [];
+            const fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
+            let fm;
+            while ((fm = fenceRegex.exec(fullText)) !== null) {
+                fenceRegions.push({ start: fm.index, end: fm.index + fm[0].length });
+            }
+
+            const linkRegions = [];
+            const linkRegex = createInlineLinkRegex();
+            let lm;
+            while ((lm = linkRegex.exec(fullText)) !== null) {
+                linkRegions.push({ start: lm.index, end: lm.index + lm[0].length });
+            }
+
+            // Start the dotTick animation while typewriting.
+            this._startDotTick();
+            this.typing = true;
+            this._typingAbort = false;
+
+            try {
+                let i = 0;
+                while (i < fullText.length) {
+                    if (this._typingAbort) break;
+                    let step = charsPerTick;
+                    const region = fenceRegions.find((r) => i >= r.start && i < r.end);
+                    const linkRegion = linkRegions.find((r) => i >= r.start && i < r.end);
+                    if (region) {
+                        step = Math.max(charsPerTick, Math.ceil((region.end - i) / fenceTicks));
+                    } else if (linkRegion) {
+                        step = Math.max(charsPerTick, linkRegion.end - i);
+                    } else {
+                        const next = linkRegions.find((r) => i < r.start && i + step > r.start);
+                        if (next) step = next.end - i;
+                    }
+                    i = Math.min(fullText.length, i + step);
+                    const target = this.messages[idx];
+                    if (!target) break;
+                    target.content = fullText.slice(0, i);
+                    this._renderMessages();
+                    await new Promise((r) => setTimeout(r, TICK_MS));
+                }
+            } finally {
+                const target = this.messages[idx];
+                if (target) target.content = fullText;
+                this.typing = false;
+                this._stopDotTick();
+                this._renderMessages();
+            }
+        }
+
+        _enqueueTypewrite(idx, fullText) {
+            this._typewriterQueue = this._typewriterQueue.then(() => this._typewriteIntoIndex(idx, fullText));
+            return this._typewriterQueue;
+        }
+
+        _startDotTick() {
+            if (this._dotTickTimer) return;
+            this._dotTickTimer = setInterval(() => {
+                this._dotTick = (this._dotTick + 1) % 3;
+                // No full re-render here — the dots only matter while a
+                // fence is open mid-typewriter, which the next typewriter
+                // tick will repaint anyway.
+            }, 400);
+        }
+
+        _stopDotTick() {
+            if (this._dotTickTimer) {
+                clearInterval(this._dotTickTimer);
+                this._dotTickTimer = null;
+            }
+            this._dotTick = 0;
         }
 
         // ---- clear history (soft delete via localStorage horizon) -------
@@ -1337,7 +1708,7 @@
         }
 
         _onClearHistoryClick() {
-            const busy = this.sending || this.uploading || this._anyPending();
+            const busy = this.sending || this.uploading || this.typing || this._anyPending();
             if (busy || !this.messages.length) return;
             this._openClearHistoryModal();
         }
@@ -1397,7 +1768,7 @@
         }
 
         async _logout() {
-            const busy = this.sending || this.uploading || this._anyPending();
+            const busy = this.sending || this.uploading || this.typing || this._anyPending();
             if (busy) return;
             this._openLogoutModal();
         }
@@ -1671,15 +2042,19 @@
                                 }
                             },
                         });
-                        // After upload, fetch a temporary URL the AI can read.
+                        // After upload, fetch a temporary signed URL the AI
+                        // can read. uploadHostFiles returns an object whose
+                        // `url` is a full https endpoint; getFile() turns it
+                        // into a short-lived signed CDN URL.
                         const completed = (res && (res.completed || res)) || [];
                         const first = Array.isArray(completed) ? completed[0] : completed;
-                        const path = (first && (first.path || first.url || first.key)) || a.name;
-                        const url = await this.skapi.getTemporaryUrl({
-                            request: 'get-db',
-                            path,
+                        const sourceUrl = first && (first.url || first.path || first.key);
+                        if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
+                            throw new Error('Upload response missing a usable URL.');
+                        }
+                        const url = await this.skapi.getFile(sourceUrl, {
+                            dataType: 'endpoint',
                             expires: DEFAULTS.ATTACHMENT_URL_EXPIRES_SECONDS,
-                            generate_temporary_cdn_url: true,
                         });
                         a.uploadedUrl = typeof url === 'string' ? url : (url && (url.url || url.cdn_url));
                         a.status = 'done';
@@ -1726,7 +2101,7 @@ The same pattern applies to other formats: \`\`\`my-data.json, \`\`\`index.html,
         }
 
         async _sendMessage() {
-            if (this.sending || this.uploading || this._anyPending()) return;
+            if (this.sending || this.uploading || this.typing || this._anyPending()) return;
             const text = (this.refs.textarea.value || '').trim();
             if (!text && !this.attachments.length) return;
 
@@ -1828,15 +2203,22 @@ The same pattern applies to other formats: \`\`\`my-data.json, \`\`\`index.html,
                     ? extractClaudeText(result)
                     : extractOpenAIText(result);
 
-                // Replace the trailing pending assistant with the result.
+                const finalText = responseText || '(no response)';
+                // Replace the trailing pending assistant with an empty
+                // shell, then stream the full response in via typewriter.
+                // Mirrors agent.vue's typewriteLatestReply flow.
                 const last = this.messages[this.messages.length - 1];
+                let idx;
                 if (last && last.isPending) {
                     last.isPending = false;
-                    last.content = responseText || '(no response)';
+                    last.content = '';
+                    idx = this.messages.length - 1;
                 } else {
-                    this.messages.push({ role: 'assistant', content: responseText || '(no response)' });
+                    this.messages.push({ role: 'assistant', content: '' });
+                    idx = this.messages.length - 1;
                 }
                 this._renderMessages();
+                this._enqueueTypewrite(idx, finalText);
                 this._schedulePendingPoll();
             } catch (err) {
                 const last = this.messages[this.messages.length - 1];
