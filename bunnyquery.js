@@ -320,28 +320,16 @@
     };
 
     // ----- file-fence helpers (mirrors agent.vue) ---------------------------
-    // Bare language tags we treat as downloadable files. Maps to the
-    // extension used in the synthesized filename. Mirrors the file types the
-    // host agent (agent.vue) is known to emit as ```filename.ext fences.
-    const FENCE_LANGUAGE_EXTENSIONS = {
-        html: 'html',
-        htm: 'html',
-        csv: 'csv',
-        tsv: 'tsv',
-        json: 'json',
-        xml: 'xml',
-        svg: 'svg',
-        md: 'md',
-        markdown: 'md',
-        yaml: 'yaml',
-        yml: 'yml',
-        txt: 'txt',
-        sql: 'sql',
-        css: 'css',
-    };
+    // Only `\`\`\`filename.ext\n...\n\`\`\`` fences become downloadable file
+    // anchors (matches the host system prompt in agent.vue). Bare-language
+    // fences like \`\`\`html / \`\`\`csv render as normal code blocks.
 
+    // Minimal MIME table for the file extensions the host agent is known to
+    // emit. Anything else falls back to text/plain so the browser still
+    // downloads the blob as a text file.
     const FENCE_MIME_TYPES = {
         html: 'text/html',
+        htm: 'text/html',
         csv: 'text/csv',
         tsv: 'text/tab-separated-values',
         json: 'application/json',
@@ -355,22 +343,9 @@
         css: 'text/css',
     };
 
-    // Closed fences with `filename.ext` after the opening backticks.
-    const FENCE_FILENAME_RE = /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g;
-    // Closed fences whose info-string is one of the known language tags
-    // above. The model often emits ```html ... ``` or ```csv ... ``` instead
-    // of a full filename — surface those as downloadable files too.
-    const FENCE_LANG_RE = new RegExp(
-        '```(' + Object.keys(FENCE_LANGUAGE_EXTENSIONS).join('|') + ')[ \\t]*\\n([\\s\\S]*?)```',
-        'gi'
-    );
-    // Open (still-streaming) fences for either pattern, used to suppress the
-    // raw fence text mid-typewriter.
+    // Open (still-streaming) filename fence, used to suppress the raw fence
+    // text mid-typewriter.
     const OPEN_FENCE_FILENAME_RE = /```([\w.-]+\.[a-zA-Z0-9]+)\n?/;
-    const OPEN_FENCE_LANG_RE = new RegExp(
-        '```(' + Object.keys(FENCE_LANGUAGE_EXTENSIONS).join('|') + ')[ \\t]*\\n?',
-        'i'
-    );
 
     // Cache blob URLs keyed by (filename + content) so re-renders don't leak
     // a fresh ObjectURL on every tick of streaming text.
@@ -385,16 +360,6 @@
         const href = URL.createObjectURL(blob);
         _fileBlobCache.set(key, href);
         return href;
-    };
-
-    // Counter used to mint stable filenames for bare-language fences within
-    // a single rendered message ("download.html", "download-2.html", ...).
-    // Keyed by message identity so re-renders of the same message reuse the
-    // same names (which lets the blob cache hit).
-    const _bareFenceNameCounters = new WeakMap();
-    const _bareFilenameFor = (msgKey, ext, occurrence) => {
-        const base = 'download';
-        return occurrence === 0 ? `${base}.${ext}` : `${base}-${occurrence + 1}.${ext}`;
     };
 
     // Split message content into renderable parts. When `marked` is loaded,
@@ -440,44 +405,19 @@
             return PH(idx);
         };
 
-        // Bare-fence filename minting state, keyed per-message so re-renders
-        // (typewriter ticks) reuse the same synthesized names → blob cache
-        // hits instead of leaking ObjectURLs every frame.
-        let bareCounters = msgKey ? _bareFenceNameCounters.get(msgKey) : null;
-        if (!bareCounters && msgKey) {
-            bareCounters = {};
-            _bareFenceNameCounters.set(msgKey, bareCounters);
-        }
-        const bareSeen = {};
-
-        // 1a. Closed filename fences: ```filename.ext\n...\n```
+        // 1. Closed filename fences: ```filename.ext\n...\n```
         let working = content.replace(
             /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g,
             (_full, filename, body) =>
                 push(fileToAnchorHtml(filename, _getOrCreateFileHref(filename, body))),
         );
 
-        // 1b. Closed bare-language fences: ```html ... ``` etc.
-        working = working.replace(FENCE_LANG_RE, (_full, lang, body) => {
-            const ext = FENCE_LANGUAGE_EXTENSIONS[lang.toLowerCase()] || 'txt';
-            const occurrence = bareSeen[ext] || 0;
-            bareSeen[ext] = occurrence + 1;
-            const filename = _bareFilenameFor(msgKey, ext, occurrence);
-            return push(fileToAnchorHtml(filename, _getOrCreateFileHref(filename, body)));
-        });
-
         // 2. Mid-typewriter unclosed fence → hide raw streaming source.
         if (ctx.isTyping) {
-            const fnOpen = working.match(OPEN_FENCE_FILENAME_RE);
-            const langOpen = working.match(OPEN_FENCE_LANG_RE);
-            const open = fnOpen && (!langOpen || fnOpen.index <= langOpen.index)
-                ? { match: fnOpen, label: fnOpen[1] }
-                : langOpen
-                    ? { match: langOpen, label: 'download.' + (FENCE_LANGUAGE_EXTENSIONS[langOpen[1].toLowerCase()] || 'txt') }
-                    : null;
-            if (open && typeof open.match.index === 'number') {
+            const open = working.match(OPEN_FENCE_FILENAME_RE);
+            if (open && typeof open.index === 'number') {
                 const dots = '.'.repeat(((ctx.dotTick || 0) % 3) + 1);
-                working = working.slice(0, open.match.index) + `\n[generating ${open.label}${dots}]`;
+                working = working.slice(0, open.index) + `\n[generating ${open[1]}${dots}]`;
             }
         }
 
@@ -1909,6 +1849,13 @@
                 },
             }, 'Clear');
 
+            const closeBtn = $('button', {
+                type: 'button',
+                class: 'bq-modal-close',
+                'aria-label': 'Close',
+                onclick: close,
+            }, '×');
+
             const modal = $('div', {
                 class: 'bq-modal-backdrop',
                 onclick: (e) => { if (e.target === modal) close(); },
@@ -1916,6 +1863,7 @@
                 $('div', { class: 'bq-modal-delete' }, [
                     $('div', { class: 'bq-modal-delete-header' }, [
                         $('span', null, 'Clear chat history'),
+                        closeBtn,
                     ]),
                     $('div', { class: 'bq-modal-delete-body' }, [
                         $('p', null, 'Hide all previous messages from this chat?'),
@@ -1965,6 +1913,13 @@
                 },
             }, 'Logout');
 
+            const closeBtn = $('button', {
+                type: 'button',
+                class: 'bq-modal-close',
+                'aria-label': 'Close',
+                onclick: close,
+            }, '×');
+
             const modal = $('div', {
                 class: 'bq-modal-backdrop',
                 onclick: (e) => { if (e.target === modal) close(); },
@@ -1972,6 +1927,7 @@
                 $('div', { class: 'bq-modal-delete' }, [
                     $('div', { class: 'bq-modal-delete-header' }, [
                         $('span', null, 'Logout'),
+                        closeBtn,
                     ]),
                     $('div', { class: 'bq-modal-delete-body' }, [
                         $('p', null, 'Log out of this chat?'),
