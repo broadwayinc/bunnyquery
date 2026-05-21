@@ -1181,6 +1181,11 @@
                 profile = await this.skapi.getProfile();
             } catch (_) { profile = null; }
 
+            // Cache for the settings modal so it can show the current email
+            // and decide whether to expose the password form (openid users
+            // can't change passwords through Cognito).
+            this.profile = profile;
+
             if (!profile) {
                 this._renderLogin();
                 return;
@@ -1227,14 +1232,20 @@
             );
         }
 
-        _renderLogin() {
+        _renderLogin(prefill) {
             this._clear();
             const errLabel = $('p', { class: 'bq-apikey-error', style: { display: 'none' } });
+            const noteLabel = $('p', { class: 'bq-login-note', style: { display: 'none' } });
+            if (prefill && prefill.notice) {
+                noteLabel.textContent = prefill.notice;
+                noteLabel.style.display = '';
+            }
             const userInput = $('input', {
                 type: 'text',
                 class: 'bq-input',
                 placeholder: 'Email or username',
                 autocomplete: 'username',
+                value: (prefill && prefill.email) || '',
             });
             const passInput = $('input', {
                 type: 'password',
@@ -1245,6 +1256,12 @@
             const submitBtn = $('button', { type: 'submit', class: 'btn bq-login-submit' }, [
                 $('span', { class: 'bq-login-submit-label' }, 'Login'),
             ]);
+
+            const forgotLink = $('button', {
+                type: 'button',
+                class: 'bq-login-link',
+                onclick: () => this._renderForgotPassword({ email: userInput.value.trim() }),
+            }, 'Forgot password?');
 
             const form = $('form', {
                 class: 'bq-login-form',
@@ -1270,10 +1287,148 @@
                     }
                 },
             }, [
+                noteLabel,
                 errLabel,
                 userInput,
                 passInput,
                 submitBtn,
+                $('div', { class: 'bq-login-actions' }, [forgotLink]),
+            ]);
+
+            this.container.appendChild(
+                $('div', { class: 'bq-apikey-overlay' }, [
+                    $('div', { class: 'bq-apikey-overlay-inner' }, [form]),
+                ])
+            );
+        }
+
+        _renderForgotPassword(prefill) {
+            this._clear();
+            const initialEmail = (prefill && prefill.email) || '';
+
+            const errLabel = $('p', { class: 'bq-apikey-error', style: { display: 'none' } });
+            const okLabel = $('p', { class: 'bq-login-note', style: { display: 'none' } });
+            const setMsg = (text, ok) => {
+                errLabel.style.display = 'none';
+                okLabel.style.display = 'none';
+                if (!text) return;
+                const node = ok ? okLabel : errLabel;
+                node.textContent = text;
+                node.style.display = '';
+            };
+
+            const title = $('p', { class: 'bq-login-title' }, 'Reset password');
+
+            // ----- Step 1: email -----------------------------------------
+            const emailInput = $('input', {
+                type: 'email',
+                class: 'bq-input',
+                placeholder: 'Email',
+                autocomplete: 'username',
+                value: initialEmail,
+                required: true,
+            });
+            const sendBtn = $('button', { type: 'submit', class: 'btn bq-login-submit' }, [
+                $('span', { class: 'bq-login-submit-label' }, 'Send code'),
+            ]);
+            const sendLabel = sendBtn.querySelector('.bq-login-submit-label');
+
+            // ----- Step 2: code + new password (hidden until step 1 OK) --
+            const codeInput = $('input', {
+                type: 'text',
+                class: 'bq-input',
+                placeholder: 'Verification code',
+                autocomplete: 'one-time-code',
+                inputmode: 'numeric',
+            });
+            const newPwInput = $('input', {
+                type: 'password',
+                class: 'bq-input',
+                placeholder: 'New password',
+                autocomplete: 'new-password',
+                minlength: '6',
+            });
+            const confirmPwInput = $('input', {
+                type: 'password',
+                class: 'bq-input',
+                placeholder: 'Confirm new password',
+                autocomplete: 'new-password',
+                minlength: '6',
+            });
+            const resetBtn = $('button', { type: 'button', class: 'btn bq-login-submit' }, [
+                $('span', { class: 'bq-login-submit-label' }, 'Reset password'),
+            ]);
+            const step2 = $('div', { class: 'bq-login-step', style: { display: 'none' } }, [
+                codeInput,
+                newPwInput,
+                confirmPwInput,
+                resetBtn,
+            ]);
+
+            resetBtn.onclick = async () => {
+                setMsg('');
+                const code = codeInput.value.trim();
+                const np = newPwInput.value;
+                const cp = confirmPwInput.value;
+                if (!code) { setMsg('Enter the verification code.', false); return; }
+                if (!np || np.length < 6) { setMsg('New password must be at least 6 characters.', false); return; }
+                if (np !== cp) { setMsg('New password and confirmation do not match.', false); return; }
+                resetBtn.disabled = true;
+                resetBtn.classList.add('is-loading');
+                try {
+                    await this.skapi.resetPassword({
+                        email: emailInput.value.trim(),
+                        code,
+                        new_password: np,
+                    });
+                    this._renderLogin({
+                        email: emailInput.value.trim(),
+                        notice: 'Password reset. Sign in with your new password.',
+                    });
+                } catch (err) {
+                    setMsg((err && err.message) || String(err), false);
+                    resetBtn.disabled = false;
+                    resetBtn.classList.remove('is-loading');
+                }
+            };
+
+            const backLink = $('button', {
+                type: 'button',
+                class: 'bq-login-link',
+                onclick: () => this._renderLogin({ email: emailInput.value.trim() }),
+            }, 'Back to login');
+
+            const form = $('form', {
+                class: 'bq-login-form',
+                onsubmit: async (e) => {
+                    e.preventDefault();
+                    // Step 1 only: request the code.
+                    const email = emailInput.value.trim();
+                    if (!email) { setMsg('Enter your account email.', false); return; }
+                    setMsg('');
+                    sendBtn.disabled = true;
+                    sendBtn.classList.add('is-loading');
+                    try {
+                        await this.skapi.forgotPassword({ email });
+                        sendLabel.textContent = 'Resend code';
+                        step2.style.display = '';
+                        codeInput.focus();
+                        setMsg('Verification code sent. Check your inbox.', true);
+                    } catch (err) {
+                        setMsg((err && err.message) || String(err), false);
+                    } finally {
+                        sendBtn.disabled = false;
+                        sendBtn.classList.remove('is-loading');
+                    }
+                },
+            }, [
+                title,
+                okLabel,
+                errLabel,
+                emailInput,
+                sendBtn,
+                step2,
+                $('div', { class: 'bq-login-actions' }, [backLink]),
             ]);
 
             this.container.appendChild(
@@ -1318,6 +1473,14 @@
                 onclick: () => this._onClearHistoryClick(),
             }, 'Clear');
 
+            const settingsIcon = $('button', {
+                type: 'button',
+                class: 'bq-text-btn',
+                title: 'Account settings',
+                'aria-label': 'Account settings',
+                onclick: () => this._openSettingsModal(),
+            }, 'Settings');
+
             const logoutIcon = $('button', {
                 type: 'button',
                 class: 'bq-text-btn',
@@ -1328,6 +1491,7 @@
 
             const titleRight = $('div', { class: 'bq-title-right' }, [
                 clearIcon,
+                settingsIcon,
                 logoutIcon,
             ]);
 
@@ -1820,6 +1984,238 @@
             ]);
 
             this._logoutModal = modal;
+            document.body.appendChild(modal);
+        }
+
+        _openSettingsModal() {
+            // Tear down any previous settings modal node first.
+            if (this._settingsModal) {
+                this._settingsModal.remove();
+                this._settingsModal = null;
+            }
+
+            const profile = this.profile || {};
+            const isOpenId = !!profile.openid_id;
+
+            const close = () => {
+                if (this._settingsModal) {
+                    this._settingsModal.remove();
+                    this._settingsModal = null;
+                }
+            };
+
+            // ----- helpers ------------------------------------------------
+            const mkMsg = () => $('p', { class: 'bq-modal-msg', style: { display: 'none' } });
+            const setMsg = (node, text, ok) => {
+                node.textContent = text || '';
+                node.className = 'bq-modal-msg ' + (ok ? 'bq-modal-msg--ok' : 'bq-modal-msg--err');
+                node.style.display = text ? '' : 'none';
+            };
+            const lockBtn = (btn, locked, label) => {
+                btn.disabled = !!locked;
+                if (locked) btn.classList.add('is-loading');
+                else btn.classList.remove('is-loading');
+                if (label != null) btn.textContent = label;
+            };
+
+            // ----- Email section -----------------------------------------
+            const emailValueEl = $('span', { class: 'bq-modal-value' }, profile.email || '—');
+            const verifiedBadge = $('span', {
+                class: 'bq-modal-badge ' + (profile.email_verified ? 'bq-modal-badge--ok' : 'bq-modal-badge--warn'),
+            }, profile.email_verified ? 'verified' : 'unverified');
+
+            const emailMsg = mkMsg();
+            const verifyCodeInput = $('input', {
+                type: 'text',
+                class: 'bq-settings-input',
+                placeholder: 'Verification code',
+                autocomplete: 'one-time-code',
+                inputmode: 'numeric',
+                style: { display: profile.email_verified ? 'none' : '' },
+            });
+            const sendCodeBtn = $('button', {
+                type: 'button',
+                class: 'bq-settings-btn',
+                style: { display: profile.email_verified ? 'none' : '' },
+                onclick: async () => {
+                    setMsg(emailMsg, '', true);
+                    lockBtn(sendCodeBtn, true, 'Sending…');
+                    try {
+                        // verifyEmail() with no args asks Cognito to send the
+                        // verification code to the pending email address.
+                        await this.skapi.verifyEmail();
+                        setMsg(emailMsg, 'Verification code sent. Check your inbox.', true);
+                        lockBtn(sendCodeBtn, false, 'Resend code');
+                    } catch (err) {
+                        setMsg(emailMsg, (err && err.message) || String(err), false);
+                        lockBtn(sendCodeBtn, false, 'Send code');
+                    }
+                },
+            }, 'Send code');
+            const confirmCodeBtn = $('button', {
+                type: 'button',
+                class: 'bq-settings-btn bq-settings-btn--primary',
+                style: { display: profile.email_verified ? 'none' : '' },
+                onclick: async () => {
+                    const code = verifyCodeInput.value.trim();
+                    if (!code) {
+                        setMsg(emailMsg, 'Enter the verification code first.', false);
+                        return;
+                    }
+                    setMsg(emailMsg, '', true);
+                    lockBtn(confirmCodeBtn, true, 'Verifying…');
+                    try {
+                        await this.skapi.verifyEmail({ code });
+                        if (this.profile) this.profile.email_verified = true;
+                        setMsg(emailMsg, 'Email verified.', true);
+                        verifiedBadge.textContent = 'verified';
+                        verifiedBadge.className = 'bq-modal-badge bq-modal-badge--ok';
+                        verifyCodeInput.style.display = 'none';
+                        sendCodeBtn.style.display = 'none';
+                        confirmCodeBtn.style.display = 'none';
+                        lockBtn(confirmCodeBtn, false, 'Verify');
+                    } catch (err) {
+                        setMsg(emailMsg, (err && err.message) || String(err), false);
+                        lockBtn(confirmCodeBtn, false, 'Verify');
+                    }
+                },
+            }, 'Verify');
+
+            const newEmailInput = $('input', {
+                type: 'email',
+                class: 'bq-settings-input',
+                placeholder: 'New email address',
+                autocomplete: 'email',
+                required: true,
+            });
+            const changeEmailMsg = mkMsg();
+            const changeEmailBtn = $('button', {
+                type: 'submit',
+                class: 'bq-settings-btn bq-settings-btn--primary',
+            }, 'Change email');
+            const changeEmailForm = $('form', {
+                class: 'bq-modal-form',
+                onsubmit: async (e) => {
+                    e.preventDefault();
+                    const next = newEmailInput.value.trim();
+                    if (!next) return;
+                    setMsg(changeEmailMsg, '', true);
+                    lockBtn(changeEmailBtn, true, 'Saving…');
+                    try {
+                        await this.skapi.updateProfile({ email: next });
+                        if (this.profile) {
+                            this.profile.email = next;
+                            this.profile.email_verified = false;
+                        }
+                        emailValueEl.textContent = next;
+                        verifiedBadge.textContent = 'unverified';
+                        verifiedBadge.className = 'bq-modal-badge bq-modal-badge--warn';
+                        verifyCodeInput.style.display = '';
+                        sendCodeBtn.style.display = '';
+                        confirmCodeBtn.style.display = '';
+                        newEmailInput.value = '';
+                        setMsg(changeEmailMsg, 'Email updated. Use "Send code" above to verify the new address.', true);
+                        lockBtn(changeEmailBtn, false, 'Change email');
+                    } catch (err) {
+                        setMsg(changeEmailMsg, (err && err.message) || String(err), false);
+                        lockBtn(changeEmailBtn, false, 'Change email');
+                    }
+                },
+            }, [
+                newEmailInput,
+                $('div', { class: 'bq-modal-form-actions' }, [changeEmailBtn]),
+                changeEmailMsg,
+            ]);
+
+            const emailSection = $('section', { class: 'bq-modal-section' }, [
+                $('h3', { class: 'bq-modal-section-title' }, 'Email'),
+                $('div', { class: 'bq-modal-row' }, [emailValueEl, verifiedBadge]),
+                $('div', { class: 'bq-modal-verify-row' }, [
+                    verifyCodeInput,
+                    sendCodeBtn,
+                    confirmCodeBtn,
+                ]),
+                emailMsg,
+                changeEmailForm,
+            ]);
+
+            // ----- Password section --------------------------------------
+            let passwordSection = null;
+            if (!isOpenId) {
+                const currPw = $('input', { type: 'password', class: 'bq-settings-input', placeholder: 'Current password', autocomplete: 'current-password', required: true });
+                const newPw = $('input', { type: 'password', class: 'bq-settings-input', placeholder: 'New password', autocomplete: 'new-password', minlength: '6', required: true });
+                const confirmPw = $('input', { type: 'password', class: 'bq-settings-input', placeholder: 'Confirm new password', autocomplete: 'new-password', minlength: '6', required: true });
+                const pwMsg = mkMsg();
+                const pwBtn = $('button', {
+                    type: 'submit',
+                    class: 'bq-settings-btn bq-settings-btn--primary',
+                }, 'Change password');
+
+                const pwForm = $('form', {
+                    class: 'bq-modal-form',
+                    onsubmit: async (e) => {
+                        e.preventDefault();
+                        setMsg(pwMsg, '', true);
+                        if (newPw.value !== confirmPw.value) {
+                            setMsg(pwMsg, 'New password and confirmation do not match.', false);
+                            return;
+                        }
+                        lockBtn(pwBtn, true, 'Saving…');
+                        try {
+                            await this.skapi.changePassword({
+                                current_password: currPw.value,
+                                new_password: newPw.value,
+                            });
+                            currPw.value = '';
+                            newPw.value = '';
+                            confirmPw.value = '';
+                            setMsg(pwMsg, 'Password changed.', true);
+                            lockBtn(pwBtn, false, 'Change password');
+                        } catch (err) {
+                            setMsg(pwMsg, (err && err.message) || String(err), false);
+                            lockBtn(pwBtn, false, 'Change password');
+                        }
+                    },
+                }, [
+                    currPw,
+                    newPw,
+                    confirmPw,
+                    $('div', { class: 'bq-modal-form-actions' }, [pwBtn]),
+                    pwMsg,
+                ]);
+
+                passwordSection = $('section', { class: 'bq-modal-section' }, [
+                    $('h3', { class: 'bq-modal-section-title' }, 'Password'),
+                    pwForm,
+                ]);
+            }
+
+            // ----- Modal shell -------------------------------------------
+            const closeBtn = $('button', {
+                type: 'button',
+                class: 'bq-modal-close',
+                'aria-label': 'Close settings',
+                onclick: close,
+            }, '×');
+
+            const header = $('div', { class: 'bq-modal-header' }, [
+                $('span', { class: 'bq-modal-title' }, 'Account Settings'),
+                closeBtn,
+            ]);
+
+            const body = $('div', { class: 'bq-modal-body' }, [
+                emailSection,
+                passwordSection,
+            ].filter(Boolean));
+
+            const card = $('div', { class: 'bq-modal-card' }, [header, body]);
+
+            const modal = $('div', {
+                class: 'bq-modal-backdrop',
+                onclick: (e) => { if (e.target === modal) close(); },
+            }, [card]);
+
+            this._settingsModal = modal;
             document.body.appendChild(modal);
         }
 

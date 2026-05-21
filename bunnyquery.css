@@ -729,6 +729,43 @@ a.bq-link-button:hover {
     align-self: stretch;
 }
 
+.bq-login-actions {
+    display: flex;
+    justify-content: center;
+    margin-top: 0.25rem;
+}
+
+.bq-login-link {
+    all: unset;
+    cursor: pointer;
+    font-family: var(--bq-mono);
+    font-size: 0.78rem;
+    color: var(--bq-muted);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    padding: 0.25rem 0.5rem;
+}
+
+.bq-login-link:hover {
+    color: var(--bq-ink);
+}
+
+.bq-login-note {
+    margin: 0;
+    color: var(--bq-muted);
+    font-size: 0.8rem;
+    line-height: 1.4;
+}
+
+.bq-login-step {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    margin-top: 0.5rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--bq-line);
+}
+
 /*
  * Loading state for the login submit button.
  *
@@ -741,7 +778,7 @@ a.bq-link-button:hover {
  *   .bq-agent .bq-login-submit.is-loading::after { content: "..."; }
  */
 .bq-agent .bq-login-submit {
-    --bq-login-loading-label: "Logging in...";
+    --bq-login-loading-label: "...";
     position: relative;
 }
 
@@ -877,6 +914,234 @@ a.bq-link-button:hover {
     color: var(--bq-danger);
 }
 
+/* ---- modal: account settings ------------------------------------------- */
+
+.bq-modal-card {
+    width: 100%;
+    max-width: 26rem;
+    max-height: calc(100vh - 6rem);
+    overflow: auto;
+    margin: 0 auto;
+    background: var(--bq-paper);
+    border: 1px solid #d0d0d0;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.1);
+    font-family: var(--bq-mono);
+    color: var(--bq-ink);
+    display: flex;
+    flex-direction: column;
+}
+
+.bq-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--bq-line);
+    position: sticky;
+    top: 0;
+    background: var(--bq-paper);
+    z-index: 1;
+}
+
+.bq-modal-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--bq-ink);
+    letter-spacing: 0.01em;
+}
+
+.bq-modal-close {
+    all: unset;
+    box-sizing: border-box;
+    width: 1.75rem;
+    height: 1.75rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.4rem;
+    line-height: 1;
+    color: var(--bq-muted);
+    cursor: pointer;
+    border-radius: 2px;
+    transition: background 0.15s, color 0.15s;
+}
+
+.bq-modal-close:hover {
+    color: var(--bq-ink);
+    background: var(--bq-hover-bg);
+}
+
+.bq-modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    padding: 1.25rem;
+}
+
+.bq-modal-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding-bottom: 1.25rem;
+    border-bottom: 1px solid var(--bq-line);
+}
+
+.bq-modal-section:last-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+}
+
+.bq-modal-section-title {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--bq-muted);
+    margin: 0;
+}
+
+.bq-modal-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    min-width: 0;
+}
+
+.bq-modal-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.bq-modal-badge {
+    flex: 0 0 auto;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.15rem 0.45rem;
+    border: 1px solid var(--bq-line);
+    color: var(--bq-muted);
+    line-height: 1;
+}
+
+.bq-modal-badge--ok {
+    color: #2a7;
+    border-color: #2a7;
+}
+
+.bq-modal-badge--warn {
+    color: var(--bq-danger);
+    border-color: var(--bq-danger);
+}
+
+.bq-modal-verify-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: stretch;
+}
+
+.bq-modal-verify-row .bq-settings-input {
+    flex: 1 1 9rem;
+    min-width: 0;
+}
+
+.bq-modal-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.bq-modal-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.25rem;
+}
+
+.bq-modal-msg {
+    margin: 0.25rem 0 0;
+    font-size: 0.75rem;
+    line-height: 1.4;
+}
+
+.bq-modal-msg--ok {
+    color: #2a7;
+}
+
+.bq-modal-msg--err {
+    color: var(--bq-danger);
+}
+
+/* Dedicated input for settings dialog — does NOT inherit chat .bq-input
+   left-padding (which is reserved for the attach button). */
+.bq-settings-input {
+    box-sizing: border-box;
+    width: 100%;
+    height: 2.25rem;
+    padding: 0 0.7rem;
+    border: 1px solid var(--bq-line);
+    background: var(--bq-paper);
+    color: var(--bq-ink);
+    font-family: var(--bq-mono);
+    font-size: 0.82rem;
+    line-height: 1.2;
+    outline: none;
+    border-radius: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    resize: none;
+}
+
+.bq-settings-input:focus {
+    border-color: var(--bq-ink);
+}
+
+.bq-settings-input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Dedicated settings buttons — same visual language as the delete modal
+   buttons but without the delete-specific naming and with a tighter size
+   that pairs cleanly with the input height. */
+.bq-settings-btn {
+    font-family: var(--bq-mono);
+    font-size: 0.78rem;
+    line-height: 1;
+    padding: 0 0.9rem;
+    height: 2.25rem;
+    border: 1px solid var(--bq-line);
+    background: var(--bq-paper);
+    color: var(--bq-ink);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.bq-settings-btn:hover {
+    border-color: var(--bq-ink);
+}
+
+.bq-settings-btn--primary {
+    background: var(--bq-ink);
+    color: var(--bq-paper);
+    border-color: var(--bq-ink);
+}
+
+.bq-settings-btn--primary:hover {
+    background: var(--bq-paper);
+    color: var(--bq-ink);
+}
+
+.bq-settings-btn:disabled,
+.bq-settings-btn.is-loading {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
 @media (max-width: 800px) {
     .bq-modal-backdrop {
         padding: 0;
@@ -887,6 +1152,28 @@ a.bq-link-button:hover {
     .bq-modal-delete {
         max-width: calc(100% - 1rem);
         max-height: calc(100% - 1rem);
+    }
+
+    .bq-modal-card {
+        max-width: 100%;
+        max-height: calc(100vh - 1rem);
+    }
+
+    .bq-modal-header {
+        padding: 0.85rem 1rem;
+    }
+
+    .bq-modal-body {
+        padding: 1rem;
+        gap: 1.25rem;
+    }
+
+    .bq-modal-form-actions {
+        justify-content: stretch;
+    }
+
+    .bq-modal-form-actions .bq-settings-btn {
+        flex: 1 1 auto;
     }
 }
 
