@@ -1035,6 +1035,7 @@
             this._loadingOlder = false;
             this._loadingFirstHistory = false;
             this._initialHistoryLoaded = false;
+            this._isPromptComposing = false;
 
             this.refs = {};
 
@@ -1456,12 +1457,11 @@
                 rows: '1',
                 placeholder: `Ask anything about ${this.projectName || 'the project'}...`,
                 oninput: (e) => this._autoGrow(e.target),
-                onkeydown: (e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        this._sendMessage();
-                    }
+                onkeydown: (e) => this._handlePromptEnter(e),
+                oncompositionstart: () => {
+                    this._isPromptComposing = true;
                 },
+                oncompositionend: () => this._handlePromptCompositionEnd(),
             });
             const sendBtn = $('button', { type: 'submit', class: 'btn' }, 'Send');
 
@@ -1607,6 +1607,23 @@
         _autoGrow(el) {
             el.style.height = 'auto';
             el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+        }
+
+        _handlePromptCompositionEnd() {
+            this._isPromptComposing = false;
+            if (this.refs.textarea) {
+                this._autoGrow(this.refs.textarea);
+            }
+        }
+
+        _handlePromptEnter(e) {
+            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (e.isComposing || this._isPromptComposing || e.keyCode === 229 || e.which === 229) {
+                return;
+            }
+
+            e.preventDefault();
+            Promise.resolve().then(() => this._sendMessage());
         }
 
         _anyPending() {
