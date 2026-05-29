@@ -982,7 +982,11 @@
             }
             if (userTurn) out.push({ role: 'user', content: userTurn, id: item.id });
 
-            if (item.status === 'pending') {
+            // Treat 'running' (worker has claimed the item) identically to
+            // 'pending'. The list endpoint returns the raw stts value; the
+            // single-item polling path normalises it server-side but the list
+            // path does not — same fix as agent.vue mapHistoryListToMessages.
+            if (item.status === 'pending' || item.status === 'running') {
                 out.push({ role: 'assistant', content: '', id: item.id, isPending: true });
             } else if (item.status === 'failed' || isErrorResponseBody(res)) {
                 out.push({
@@ -2303,6 +2307,16 @@
         async _runPendingPoll() {
             // Defensive: if somehow re-entered, drop the duplicate.
             if (this._pollingPending) return;
+            // When _sendMessage is actively dispatching or the typewriter is
+            // running, skip replacing this.messages. The locally-pushed
+            // optimistic messages (user turn + pending assistant) have no
+            // server id and would be silently dropped by the merge, causing
+            // the message to transiently disappear. Reschedule so polling
+            // resumes as soon as the send/typewrite finishes.
+            if (this.sending || this.typing) {
+                this._schedulePendingPoll();
+                return;
+            }
             this._pollingPending = true;
             try {
                 const res = await getChatHistory(
