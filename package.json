@@ -1,0 +1,24 @@
+{
+  "name": "bunnychat",
+  "version": "0.1.0",
+  "description": "Embeddable AI chat widget for Skapi-powered projects",
+  "main": "bunnychat.js",
+  "files": [
+    "bunnychat.js",
+    "bunnychat.css"
+  ],
+  "keywords": [
+    "skapi",
+    "chat",
+    "ai",
+    "embeddable",
+    "widget"
+  ],
+  "scripts": {
+    "dev": "npx bns port=3333"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "basic-node-server": "^1.1.1"
+  }
+}
