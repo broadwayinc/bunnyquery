@@ -403,10 +403,12 @@
             ssSet(skey(SK.mcpState), JSON.stringify({
                 state: state, codeVerifier: verifier, redirectAfter: redirectAfter || "chat",
             }));
+            var currentUri = mcpRedirectUri();
             var params = new URLSearchParams({
                 response_type: "code",
                 client_id: client.client_id,
-                redirect_uri: mcpRedirectUri(),
+                redirect_uri: currentUri,
+                login_page: currentUri,
                 state: state,
                 code_challenge: cc.challenge,
                 code_challenge_method: cc.method,
@@ -498,7 +500,11 @@
     function googleLogin() {
         if (!googleEnabled()) return;
         var redirectUrl = window.location.origin + window.location.pathname;
-        var rnd = Math.random().toString(36).substring(2);
+        // During an inbound platform flow, reuse the caller's state so the
+        // post-Google IdP bounce returns the right state (oauth.ts useExistingState).
+        var rnd = isInboundPlatformOAuth()
+            ? getQueryParam("state")
+            : Math.random().toString(36).substring(2);
         ssSet(skey(SK.googleInProgress), "1");
         ssSet(skey(SK.googleRedirect), redirectUrl);
         var url = GOOGLE_AUTH_URL +
@@ -517,8 +523,8 @@
     }
 
     // Exchange the Google auth code for a token via skapi's "ggl" client secret,
-    // then openIdLogin. Mirrors oauth.ts handleGoogleOAuthReturn (minus the
-    // inbound IdP bounce, which bunnychat doesn't act as).
+    // then openIdLogin. Mirrors oauth.ts handleGoogleOAuthReturn; the inbound
+    // IdP bounce (oauth=platform) is handled by the caller in boot().
     function completeGoogleOAuthReturn() {
         var code = getQueryParam("code");
         var redirectUrl = ssGet(skey(SK.googleRedirect)) || (window.location.origin + window.location.pathname);
@@ -556,6 +562,80 @@
                     throw err;
                 });
         });
+    }
+
+    /* ---- Inbound IdP bounce (oauth=platform) ----------------------------- */
+    // The MCP server's /oauth/authorize step authenticates the user against
+    // skapi by redirecting the browser back here with
+    //   ?oauth=platform&redirect_uri=<caller_cb>&state=<s>
+    // bunnychat then acts as the identity provider: it packages the skapi
+    // session tokens into a `code` and bounces back to the caller's
+    // redirect_uri. WITHOUT this, boot() would treat the logged-in user as
+    // "needs MCP grant" and call beginMcpOAuthOnLogin() again — and the MCP
+    // authorize step would bounce back here once more → infinite loop.
+    // Mirrors oauth.ts (genOAuthCallbackUrl) + login.vue (returnOAuthToMCP).
+
+    function isInboundPlatformOAuth() {
+        return getQueryParam("oauth") === "platform" &&
+            !!getQueryParam("state") &&
+            !!getQueryParam("redirect_uri");
+    }
+
+    function genOAuthCallbackUrl(state, session, params) {
+        var redirectUri = (params && params.redirect_uri) || getQueryParam("redirect_uri") || "";
+        var code = {
+            access_token: session.accessToken && session.accessToken.jwtToken,
+            refresh_token: session.refreshToken && session.refreshToken.token,
+            id_token: session.idToken && session.idToken.jwtToken,
+        };
+        var encoded = btoa(JSON.stringify(code));
+        return redirectUri +
+            (redirectUri.indexOf("?") !== -1 ? "&" : "?") +
+            "code=" + encodeURIComponent(encoded) +
+            "&state=" + encodeURIComponent(state);
+    }
+
+    // Bounce the browser back to the calling platform with a session-derived
+    // code. Includes login.vue's race-guard: on refresh the logged-in user can
+    // resolve before skapi.session is wired, so poll briefly before reading it.
+    function returnOAuthToMCP() {
+        var state = getQueryParam("state");
+        if (!state) { renderLogin(); return; }
+        var stashed = safeJsonParse(ssGet("oauth:" + state), null);
+        var params = stashed || {
+            oauth: "platform",
+            state: state,
+            redirect_uri: getQueryParam("redirect_uri"),
+        };
+        var waited = 0;
+        (function attempt() {
+            var session = S.skapi.session;
+            if (session && session.accessToken && session.accessToken.jwtToken) {
+                ssDel("oauth:" + state);
+                window.location.href = genOAuthCallbackUrl(state, session, params);
+                return;
+            }
+            if (waited >= 3000) {
+                console.error("[bunnychat] OAuth bounce aborted: no skapi session.");
+                renderLogin();
+                return;
+            }
+            waited += 100;
+            setTimeout(attempt, 100);
+        })();
+    }
+
+    // Persist the inbound params so a fresh login (or a Google round-trip) can
+    // recover redirect_uri after navigation. Keyed by state (no per-service
+    // namespace) to match login.vue / oauth.ts.
+    function stashInboundPlatformOAuth() {
+        var state = getQueryParam("state");
+        if (!state) return;
+        try {
+            var all = {};
+            new URLSearchParams(window.location.search).forEach(function (v, k) { all[k] = v; });
+            ssSet("oauth:" + state, JSON.stringify(all));
+        } catch (e) { /* noop */ }
     }
 
     /* ========================================================================
@@ -649,6 +729,12 @@
                 setBusy(true);
                 S.skapi.login({ email: emailInput.value, password: pwInput.value })
                     .then(function () {
+                        // Inbound platform OAuth (e.g. MCP using skapi as IdP):
+                        // bounce back to the caller instead of starting our own
+                        // MCP oauth (which would loop).
+                        if (isInboundPlatformOAuth()) {
+                            return returnOAuthToMCP();
+                        }
                         return beginMcpOAuthOnLogin("chat").catch(function (err) {
                             console.error("[bunnychat] MCP OAuth bootstrap failed", err);
                             enterAfterLogin(); // MCP down — chat still works off skapi JWT
@@ -1112,10 +1198,27 @@
     function boot() {
         showLoading("Loading");
 
+        // 0. INBOUND IdP: the MCP authorize step (or another platform) sent the
+        // user here to authenticate against skapi. Bounce back with a session
+        // code if logged in; otherwise show login (the submit handler bounces
+        // after a successful login). This is what breaks the MCP-authorize loop.
+        if (isInboundPlatformOAuth()) {
+            stashInboundPlatformOAuth();
+            return getProfile().then(function (user) {
+                S.user = user;
+                if (user) { returnOAuthToMCP(); return; } // browser leaves
+                renderLogin();
+            });
+        }
+
         // 1. Returning from Google's authorize endpoint?
         if (isGoogleOAuthReturn()) {
             return completeGoogleOAuthReturn()
                 .then(function () {
+                    // If a platform initiated this (inbound), bounce back with a
+                    // code instead of starting our own MCP grant.
+                    var st = getQueryParam("state");
+                    if (st && ssGet("oauth:" + st)) { returnOAuthToMCP(); return; }
                     cleanUrl();
                     return beginMcpOAuthOnLogin("chat"); // also establish MCP grant
                 })
