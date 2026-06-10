@@ -160,10 +160,10 @@
 /* ============================================================================
  * AUTH VIEWS (login / signup / forgot / verify / settings)
  * ==========================================================================*/
-.bq-auth {
+.bq-settings {
     flex: 1;
-    min-height: 0;
-    overflow-y: auto;
+    /* min-height: 0; */
+    /* overflow-y: auto; */
     width: 100%;
     max-width: 440px;
     margin: 0 auto;
@@ -172,22 +172,14 @@
     color: var(--bq-ink);
 }
 
-.bq-auth-logo {
-    display: block;
-    font-size: 1.3rem;
-    letter-spacing: 0.04em;
-    color: var(--bq-ink);
-    margin-bottom: 1.25rem;
-}
-
-.bq-auth-title {
+.bq-settings-title {
     font-size: 1.5rem;
     font-weight: 700;
     margin: 1.5rem 0 1.25rem;
     letter-spacing: -0.01em;
 }
 
-.bq-auth-sub {
+.bq-settings-sub {
     font-size: 0.82rem;
     color: var(--bq-muted);
     line-height: 1.6;
@@ -316,8 +308,8 @@
 .bq-google:hover:not(:disabled) { border-color: var(--bq-ink); }
 .bq-google:disabled { opacity: 0.4; pointer-events: none; }
 
-/* small top nav inside auth views (back link + theme toggle) */
-.bq-auth-top {
+/* small top nav inside setting views (back link + theme toggle) */
+.bq-settings-top {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -331,6 +323,91 @@
     margin-bottom: 1rem;
     line-height: 1.6;
 }
+
+/* ---- settings ------------------------------------------------------------ */
+.bq-settings-section-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--bq-ink);
+    margin: 1.75rem 0 0.25rem;
+}
+.bq-link--danger { color: var(--bq-danger); }
+.bq-account-tip {
+    padding: 0.85rem 1rem;
+    margin-bottom: 1.5rem;
+    border: 1px solid var(--bq-warning-border);
+    background: var(--bq-warning-bg);
+    color: var(--bq-warning);
+    font-size: 0.82rem;
+    line-height: 1.5;
+}
+.bq-account-section { display: flex; flex-direction: column; }
+.bq-account-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--bq-line);
+}
+.bq-account-row:last-child { border-bottom: 0; }
+.bq-account-row-main { min-width: 0; }
+.bq-account-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--bq-muted);
+    text-transform: uppercase;
+}
+.bq-account-value {
+    font-size: 0.9rem;
+    margin-top: 0.25rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bq-account-value.is-muted { color: var(--bq-muted); }
+.bq-verify-badge {
+    display: inline-block;
+    margin-left: 0.5rem;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.66rem;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--bq-line);
+    vertical-align: middle;
+}
+.bq-verify-badge.is-verified { color: var(--bq-success); border-color: var(--bq-success-border); background: var(--bq-success-bg); }
+.bq-verify-badge.is-unverified { color: var(--bq-warning); border-color: var(--bq-warning-border); background: var(--bq-warning-bg); }
+.bq-account-logout {
+    margin-top: 1.5rem;
+    text-align: right;
+}
+.bq-account-danger {
+    margin-top: 2rem;
+    padding: 1.25rem;
+    border: 1px solid var(--bq-danger);
+    background: var(--bq-danger-bg);
+}
+.bq-account-danger-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--bq-danger);
+    margin-bottom: 1rem;
+}
+.bq-account-danger-desc { font-size: 0.8rem; color: var(--bq-muted); line-height: 1.5; margin: 0 0 1rem; }
+.bq-danger-item {
+    padding: 0.85rem 0;
+    border-top: 1px solid var(--bq-danger);
+}
+.bq-danger-item:first-of-type { border-top: 0; padding-top: 0; }
+.bq-danger-item:last-child { padding-bottom: 0; }
+.bq-danger-item-title { font-size: 0.85rem; font-weight: 600; color: var(--bq-danger); margin-bottom: 0.35rem; }
+.bq-danger-item-desc { font-size: 0.78rem; color: var(--bq-muted); line-height: 1.5; margin: 0 0 0.85rem; }
+.bq-danger-item .btn { min-width: 0; }
 
 /* ============================================================================
  * CHAT VIEW
@@ -694,7 +771,7 @@
     min-height: var(--chat-control-height);
     max-height: 12rem;
     box-sizing: border-box;
-    overflow-y: auto;
+    overflow-y: hidden; /* autoGrowInput switches to auto only at the max-height cap */
     resize: none;
     border: 1px solid var(--bq-line);
     background: var(--bq-paper);
@@ -866,7 +943,7 @@
     .bq-input-wrap { width: 100%; flex: 0 0 auto; }
     .bq-input-row .btn { width: 100%; }
     .bq-bubble { max-width: 100%; }
-    .bq-auth { padding: 2rem 1.25rem; }
+    .bq-settings { padding: 2rem 1.25rem; }
 }
 
 /* dark-mode: brighten any inline dark SVG icons (e.g. provider logos) */

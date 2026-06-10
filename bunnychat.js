@@ -53,6 +53,8 @@
     var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
+    var ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024; // soft per-file limit (warns, skips)
+    var IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 
     // Google OAuth endpoint (token exchange goes through skapi clientSecretRequest
     // with the project's "ggl" client secret, exactly like bunnyquery oauth.ts).
@@ -232,7 +234,10 @@
      * ======================================================================*/
 
     function loadTheme() {
-        var stored = lsGet(skey(SK.theme));
+        // Fixed key (NOT per-service): theme is a global UI preference, and at
+        // init() serviceId isn't known yet — a per-service key would save/load
+        // under different names and never persist.
+        var stored = lsGet(SK.theme);
         if (stored === "dark" || stored === "light") return stored;
         if (S.opts.theme === "dark" || S.opts.theme === "light") return S.opts.theme;
         // fall back to OS preference
@@ -252,7 +257,7 @@
         for (var i = 0; i < modals.length; i++) {
             modals[i].setAttribute("data-bq-theme", S.theme);
         }
-        lsSet(skey(SK.theme), S.theme);
+        lsSet(SK.theme, S.theme); // fixed key (see loadTheme) so the choice persists
         // swap theme-toggle icons in place (avoids re-rendering / losing form input)
         var toggles = document.querySelectorAll("[data-bq-theme-toggle]");
         for (var j = 0; j < toggles.length; j++) {
@@ -324,7 +329,7 @@
 
     function showLoading(label) {
         render("loading", function () {
-            return h("div", { class: "bq-auth" },
+            return h("div", { class: "bq-settings" },
                 h("div", { class: "bq-disabled-inner", style: { marginTop: "3rem" } },
                     h("span", { class: "bq-loader", text: label || "Loading" })
                 )
@@ -413,7 +418,9 @@
                 code_challenge: cc.challenge,
                 code_challenge_method: cc.method,
             });
-            window.location.href = mcpBaseUrl() + "/oauth/authorize?" + params.toString();
+            // replace() so the host page isn't left in history — Back won't land
+            // on a stale ?code/?state URL that re-triggers an expired exchange.
+            window.location.replace(mcpBaseUrl() + "/oauth/authorize?" + params.toString());
         });
     }
 
@@ -515,7 +522,7 @@
             "&prompt=consent" +
             "&state=" + encodeURIComponent(rnd) +
             "&access_type=offline";
-        window.location.href = url;
+        window.location.replace(url); // replace() so Back won't return to a stale OAuth URL
     }
 
     function isGoogleOAuthReturn() {
@@ -612,7 +619,7 @@
             var session = S.skapi.session;
             if (session && session.accessToken && session.accessToken.jwtToken) {
                 ssDel("oauth:" + state);
-                window.location.href = genOAuthCallbackUrl(state, session, params);
+                window.location.replace(genOAuthCallbackUrl(state, session, params));
                 return;
             }
             if (waited >= 3000) {
@@ -644,11 +651,7 @@
 
     function authHeader(title) {
         return [
-            h("div", { class: "bq-auth-top" },
-                h("span", { class: "bq-auth-logo", text: "₍ᐢ•⩊•ᐢ₎ bunnychat" }),
-                themeToggleButton()
-            ),
-            title ? h("h1", { class: "bq-auth-title", text: title }) : null,
+            title ? h("h1", { class: "bq-settings-title", text: title }) : null,
         ];
     }
 
@@ -745,14 +748,17 @@
                         setError(loginErrorMessage(err));
                         if (err && err.code === "SIGNUP_CONFIRMATION_NEEDED") {
                             renderSignupConfirmation(emailInput.value);
+                        } else if (err && err.code === "USER_IS_DISABLED" && S.opts.signup) {
+                            // disabled account + signup enabled → offer recovery
+                            renderEnableAccount(emailInput.value);
                         }
                     });
             }
 
             var actions = h("div", { class: "bq-actions" });
+            actions.appendChild(h("button", { class: "bq-link", type: "button",
+                onclick: function () { renderForgotPassword(emailInput.value); }, text: "Forgot password?" }));
             if (S.opts.signup) {
-                actions.appendChild(h("button", { class: "bq-link", type: "button",
-                    onclick: function () { renderForgotPassword(emailInput.value); }, text: "Forgot password?" }));
                 actions.appendChild(h("button", { class: "bq-link", type: "button",
                     onclick: function () { renderSignup(); }, text: "Sign up →" }));
             }
@@ -781,11 +787,11 @@
                 );
             }
 
-            return h("div", { class: "bq-auth" }, children);
+            return h("div", { class: "bq-settings" }, children);
         });
     }
 
-    // Shared auth-view shell: header + optional "back to login" link.
+    // Shared settings-view shell: header + optional "back to login" link.
     function authShell(title, children, opts) {
         opts = opts || {};
         var kids = authHeader(title).concat(children);
@@ -795,7 +801,7 @@
                     onclick: function () { renderLogin(opts.backPrefill); },
                     text: "← Back to login" })));
         }
-        return h("div", { class: "bq-auth" }, kids);
+        return h("div", { class: "bq-settings" }, kids);
     }
 
     function genericErrorMessage(err) {
@@ -897,7 +903,7 @@
             });
 
             return authShell("Verify your email", [
-                h("p", { class: "bq-auth-sub" },
+                h("p", { class: "bq-settings-sub" },
                     "We sent a confirmation link to ",
                     h("strong", { text: email || "your email" }),
                     ". Click it to activate your account, then log in."),
@@ -1090,6 +1096,253 @@
         go();
     }
 
+    /* ---- settings (reached from the chat header gear icon) --------------- */
+    function accountShell(title, children) {
+        return h("div", { class: "bq-settings" }, [
+            h("div", { class: "bq-settings-top" },
+                h("button", { class: "bq-link", type: "button", onclick: function () { renderChat(); }, text: "← Back to chat" })),
+            h("h1", { class: "bq-settings-title", text: title }),
+        ].concat(children));
+    }
+    function settingsSectionTitle(text) {
+        return h("div", { class: "bq-settings-section-title", text: text });
+    }
+    function accountRow(label, valueNodes, actionLabel, onAction, opts) {
+        opts = opts || {};
+        return h("div", { class: "bq-account-row" },
+            h("div", { class: "bq-account-row-main" },
+                h("div", { class: "bq-account-label", text: label }),
+                h("div", { class: "bq-account-value" + (opts.muted ? " is-muted" : "") }, valueNodes)),
+            onAction ? h("button", { class: "bq-link" + (opts.dangerAction ? " bq-link--danger" : ""), type: "button", onclick: onAction, text: actionLabel || "Change" }) : null);
+    }
+    function getNewsletterStatus() {
+        // getNewsletterSubscription returns [{ active, group, subscribed_email, timestamp }]
+        // (or a DatabaseResponse with that as .list). An UNSUBSCRIBED user can still have a
+        // record with active:false, so check for an *active* record in the authorized group (1).
+        try {
+            return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized" }))
+                .then(function (res) {
+                    var list = res && res.list ? res.list : res;
+                    if (!Array.isArray(list)) return false;
+                    return list.some(function (s) { return s && s.active && s.group === 1; });
+                })
+                .catch(function () { return false; });
+        } catch (e) { return Promise.resolve(false); }
+    }
+    function renderAccount() {
+        CS.messagesBox = null; // stop in-flight chat renders from touching a detached node
+        showLoading("");
+        Promise.all([getProfile(), getNewsletterStatus()]).then(function (res) {
+            if (res[0]) S.user = res[0];
+            S.newsletterSubscribed = res[1];
+            accountView();
+        }).catch(function () { accountView(); });
+    }
+    function newsletterRow() {
+        var checkbox = h("input", { type: "checkbox", checked: !!S.newsletterSubscribed });
+        var busy = false;
+        checkbox.addEventListener("change", function () {
+            if (busy) return;
+            busy = true;
+            var want = checkbox.checked;
+            var op = want ? S.skapi.subscribeNewsletter({ group: "authorized" })
+                : S.skapi.unsubscribeNewsletter({ group: "authorized" });
+            Promise.resolve(op).then(function () { S.newsletterSubscribed = want; busy = false; })
+                .catch(function (err) { checkbox.checked = !want; busy = false; alert((err && err.message) || "Could not update subscription."); });
+        });
+        return h("div", { class: "bq-account-row" },
+            h("div", { class: "bq-account-row-main" },
+                h("div", { class: "bq-account-label", text: "Newsletter" }),
+                h("div", { class: "bq-account-value is-muted", text: "Receive newsletter from admin" })),
+            h("label", { class: "bq-checkbox" }, checkbox));
+    }
+    function themeRow() {
+        var isDark = S.theme === "dark";
+        return accountRow("Theme",
+            [document.createTextNode(isDark ? "Dark mode" : "Light mode")],
+            isDark ? "Switch to light" : "Switch to dark",
+            function () { toggleTheme(); accountView(); });
+    }
+    function dangerItem(label, desc, btnLabel, onClick) {
+        return h("div", { class: "bq-danger-item" },
+            h("div", { class: "bq-danger-item-title", text: label }),
+            h("p", { class: "bq-danger-item-desc", text: desc }),
+            h("button", { class: "btn btn--danger", type: "button", onclick: onClick, text: btnLabel }));
+    }
+    function accountView() {
+        render("account", function () {
+            var u = S.user || {};
+            var children = [];
+            if (!u.email_verified) {
+                children.push(h("div", { class: "bq-account-tip" },
+                    h("strong", { text: "Verify your email. " }),
+                    document.createTextNode("A verified email is required to recover your password or re-enable your account if you ever lose access."),
+                    h("div", { style: { marginTop: "0.75rem" } },
+                        h("button", { class: "btn", type: "button",
+                            onclick: function () { renderEmailVerification(renderAccount); }, text: "Verify now" }))));
+            }
+
+            // ── Chat box section ──
+            children.push(settingsSectionTitle("Chat box"));
+            children.push(h("div", { class: "bq-account-section" }, themeRow()));
+
+            // ── Account section ──
+            var emailValue = [
+                document.createTextNode(u.email || "—"),
+                h("span", { class: "bq-verify-badge " + (u.email_verified ? "is-verified" : "is-unverified"),
+                    text: u.email_verified ? "verified" : "unverified" }),
+            ];
+            children.push(settingsSectionTitle("Account"));
+            children.push(h("div", { class: "bq-account-section" },
+                accountRow("Email", emailValue, "Change", function () { openChangeEmailModal(); }),
+                accountRow("Name", [document.createTextNode(u.name || "Unnamed user")], "Change", function () { openChangeNameModal(); }),
+                (u.signup_ticket === "OIDPASS"
+                    ? accountRow("Password", [document.createTextNode("Managed by your login provider")], null, null, { muted: true })
+                    : accountRow("Password", [document.createTextNode("••••••••")], "Change", function () { openChangePasswordModal(); })),
+                newsletterRow()
+            ));
+            children.push(h("div", { class: "bq-account-logout" },
+                h("button", { class: "bq-link", type: "button", onclick: function () { logout(); }, text: "Logout →" })));
+            // ── Danger zone (clear history always; remove account when signup) ──
+            var danger = [h("div", { class: "bq-account-danger-title", text: "Danger zone" })];
+            danger.push(dangerItem("Clear history",
+                "Hide the current conversation. Your messages stay on the server but won't be shown here again.",
+                "Clear history", function () { openClearHistoryModal(); }));
+            if (S.opts.signup) {
+                danger.push(dangerItem("Remove account",
+                    "Remove your account and delete all your data. You can re-enable within 30 days by logging in.",
+                    "Remove account", function () { openDeleteAccountModal(); }));
+            }
+            children.push(h("div", { class: "bq-account-danger" }, danger));
+
+            return accountShell("Settings", children);
+        });
+    }
+
+    // edit modals
+    function modalForm(title, desc, fields, submitLabel, onSubmit) {
+        return openModal(function (close) {
+            var err = h("div", { class: "bq-error", style: { display: "none" } });
+            var btn = h("button", { class: "btn", type: "submit" }, submitLabel);
+            var busy = false;
+            function setBusy(b) { busy = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, submitLabel)); }
+            function setErr(m) { err.style.display = m ? "" : "none"; err.textContent = m || ""; }
+            function submit(e) {
+                e.preventDefault();
+                if (busy) return;
+                setErr("");
+                setBusy(true);
+                Promise.resolve(onSubmit(close)).then(function (msg) {
+                    if (msg && msg.error) { setBusy(false); setErr(msg.error); }
+                }).catch(function (e2) { setBusy(false); setErr((e2 && e2.message) || "Something went wrong."); });
+            }
+            var labels = fields.map(function (f) { return h("label", { class: "bq-label" }, h("span", { text: f.label }), f.input); });
+            return h("div", { class: "bq-modal" },
+                h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
+                h("h2", { class: "bq-modal-title", text: title }),
+                desc ? h("p", { class: "bq-modal-desc", text: desc }) : null,
+                h("form", { class: "bq-form", onsubmit: submit }, labels.concat([err,
+                    h("div", { class: "bq-modal-btns" },
+                        h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Cancel"), btn)])));
+        });
+    }
+    function openChangeNameModal() {
+        var input = h("input", { class: "bq-input-text", type: "text", value: (S.user && S.user.name) || "", placeholder: "Your name", required: true });
+        modalForm("Change name", null, [{ label: "Name", input: input }], "Save", function (close) {
+            return S.skapi.updateProfile({ name: input.value }).then(function () {
+                if (S.user) S.user.name = input.value;
+                close(); renderAccount();
+            });
+        });
+    }
+    function openChangeEmailModal() {
+        var input = h("input", { class: "bq-input-text", type: "email", value: (S.user && S.user.email) || "", placeholder: "your@email.com", required: true });
+        modalForm("Change email",
+            "After changing your email you'll need to verify it. A verified email is required to recover your account.",
+            [{ label: "New email", input: input }], "Save", function (close) {
+                return S.skapi.updateProfile({ email: input.value }).then(function () {
+                    if (S.user) { S.user.email = input.value; S.user.email_verified = false; }
+                    close(); renderEmailVerification(renderAccount);
+                });
+            });
+    }
+    function openChangePasswordModal() {
+        var cur = h("input", { class: "bq-input-text", type: "password", autocomplete: "current-password", placeholder: "Current password", required: true });
+        var pw = h("input", { class: "bq-input-text", type: "password", autocomplete: "new-password", placeholder: "New password", required: true, minlength: "6", maxlength: "60" });
+        var pw2 = h("input", { class: "bq-input-text", type: "password", autocomplete: "new-password", placeholder: "Confirm new password", required: true, minlength: "6", maxlength: "60" });
+        modalForm("Change password", null,
+            [{ label: "Current password", input: cur }, { label: "New password", input: pw }, { label: "Confirm new password", input: pw2 }],
+            "Change password", function (close) {
+                if (pw.value !== pw2.value) return { error: "New passwords do not match." };
+                return S.skapi.changePassword({ current_password: cur.value, new_password: pw.value }).then(function () {
+                    close();
+                });
+            });
+    }
+    function openDeleteAccountModal() {
+        openModal(function (close) {
+            var agree = h("input", { type: "checkbox" });
+            var err = h("div", { class: "bq-error", style: { display: "none" } });
+            var btn = h("button", { class: "btn btn--danger", type: "button" }, "Disable account");
+            var busy = false;
+            btn.addEventListener("click", function () {
+                if (busy) return;
+                if (!agree.checked) { err.style.display = ""; err.textContent = "Please confirm you want to disable your account."; return; }
+                err.style.display = "none";
+                busy = true; btn.disabled = true; clear(btn).appendChild(loadingBtnLabel(true, "Disable account"));
+                Promise.resolve(S.skapi.disableAccount()).then(function () {
+                    clearStoredMcpToken(); S.user = null; close(); renderBye();
+                }).catch(function (e2) {
+                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Disable account"));
+                    err.style.display = ""; err.textContent = (e2 && e2.message) || "Could not disable account.";
+                });
+            });
+            return h("div", { class: "bq-modal" },
+                h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
+                h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Disable account" })),
+                h("p", { class: "bq-modal-desc" }, "Your data and projects will be hidden and permanently removed after 30 days. You can re-enable within that window by logging in."),
+                h("label", { class: "bq-checkbox", style: { marginBottom: "1rem" } }, agree, h("span", { text: "I understand and want to disable my account." })),
+                err,
+                h("div", { class: "bq-modal-btns" },
+                    h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Cancel"), btn));
+        });
+    }
+    function renderBye() {
+        render("bye", function () {
+            return h("div", { class: "bq-settings" }, authHeader("Account disabled").concat([
+                h("p", { class: "bq-settings-sub" }, "Your account has been disabled. All your data will be removed after 90 days. You can recover within that period by logging in and following the recovery email."),
+                h("div", { class: "bq-form-bottom", style: { marginTop: "1.5rem" } },
+                    h("button", { class: "btn", type: "button", onclick: function () { renderLogin(); }, text: "Back to login" })),
+            ]));
+        });
+    }
+    function renderEnableAccount(email) {
+        var sent = false;
+        render("enable-account", function () {
+            var busy = false;
+            var btn = h("button", { class: "btn", type: "button" }, "Re-send recovery email");
+            var note = h("div", { style: { display: "none" } });
+            function send() {
+                if (busy) return;
+                busy = true; btn.disabled = true; clear(btn).appendChild(loadingBtnLabel(true, "Re-send recovery email"));
+                Promise.resolve(S.skapi.recoverAccount(window.location.origin + window.location.pathname)).then(function () {
+                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+                    note.style.display = ""; note.className = "bq-success-box"; note.textContent = "Recovery email sent. Check your inbox.";
+                }).catch(function (err) {
+                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+                    note.style.display = ""; note.className = "bq-error"; note.textContent = (err && err.message) || "Could not send recovery email.";
+                });
+            }
+            btn.addEventListener("click", send);
+            if (!sent) { sent = true; send(); } // auto-send on first entry
+            return authShell("Re-enable account", [
+                h("p", { class: "bq-settings-sub" }, "We've sent a recovery link to ", h("strong", { text: email || "your email" }),
+                    ". Click it to re-enable your account."),
+                h("div", { class: "bq-form-bottom", style: { marginTop: "1.5rem" } }, btn, note),
+            ]);
+        });
+    }
+
     /* ========================================================================
      * CHAT ENGINE
      * Ported from agent.vue + ai_agent.ts. Vue reactivity → explicit
@@ -1142,6 +1395,12 @@
         gateRefreshToken: 0,
         clearing: false,
         pollTimer: null,
+        attachments: [],          // [{ id, name, file, status, progress, uploadedUrl, storagePath, errorMessage }]
+        uploadingAttachments: false,
+        attachmentWarning: "",
+        attachmentsRow: null,     // .bq-attachments DOM node
+        attachBtnEl: null,
+        sendBtnEl: null,
     };
     var aiChatHistoryCache = {};
     var pendingAgentRequests = {};
@@ -1287,7 +1546,7 @@
         }
         return S.skapi.clientSecretRequest({
             clientSecretName: "claude", queue: userId || service, service: service, owner: owner,
-            poll: POLL_INTERVAL, // let skapi run the poll loop and resolve with the final body
+            poll: 0, // poll:0 → skapi returns the early ack (with id + manual .poll()) so we can cancel queued items
             url: ANTHROPIC_MESSAGES_API_URL, method: "POST",
             headers: {
                 "content-type": "application/json", "x-api-key": "$CLIENT_SECRET",
@@ -1314,7 +1573,7 @@
         }
         return S.skapi.clientSecretRequest({
             clientSecretName: "openai", queue: userId || service, service: service, owner: owner,
-            poll: POLL_INTERVAL, // let skapi run the poll loop and resolve with the final body
+            poll: 0, // poll:0 → skapi returns the early ack (with id + manual .poll()) so we can cancel queued items
             url: OPENAI_RESPONSES_API_URL, method: "POST",
             headers: { "content-type": "application/json", Authorization: "Bearer $CLIENT_SECRET" },
             data: { model: resolvedModel, max_output_tokens: MAX_TOKENS, input: input, tools: tools },
@@ -1517,21 +1776,57 @@
         var inputEl = CS.messagesBox && CS.messagesBox.parentNode &&
             CS.messagesBox.parentNode.querySelector(".bq-input");
         var text = (inputEl ? inputEl.value : "").trim();
-        if (!text) return;
+        var hasAttachments = CS.attachments.length > 0;
+        if (!text && !hasAttachments) return;
+        if (!chatEnabled() || S.aiPlatform === "none") return;
+        if (CS.uploadingAttachments) return; // already uploading; ignore double-submit
+
+        if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
+
+        if (!hasAttachments) { dispatchComposedMessage(text, false); return; }
+
+        // Upload attachments to db storage first, kick off background indexing,
+        // then send the (optional) chat turn on the bg queue so it runs AFTER
+        // the newly uploaded files have been indexed.
+        var bgBefore = bgTaskQueue.length;
+        uploadPendingAttachments().then(function (attachmentUrls) {
+            var hasNewIndexing = bgTaskQueue.length > bgBefore;
+            clearAttachments();
+            if (hasNewIndexing) drainBgTaskQueue();
+            if (!text) return; // attachment-only turn: index, no chat message
+            var composed = text;
+            if (attachmentUrls.length) {
+                composed = text + "\n\nAttached files:\n" + attachmentUrls.map(function (u) {
+                    return "- [" + u.name + "](" + u.url + ")";
+                }).join("\n");
+            }
+            dispatchComposedMessage(composed, hasNewIndexing);
+        }).catch(function (err) {
+            console.error("[bunnychat] attachment upload failed", err);
+            clearAttachments();
+            CS.messages.push({ role: "assistant", content: "Some attachments failed to upload. " + ((err && err.message) || ""), isError: true });
+            renderMessages(); scrollToBottom(true);
+        });
+    }
+
+    function dispatchComposedMessage(composed, useBgQueue) {
+        if (!composed) return;
         if (!chatEnabled() || S.aiPlatform === "none") return;
 
-        var isQueuedSend = CS.sending || CS.messages.some(function (m) {
+        // A bg-queue-routed turn (post-attachment chat that must run AFTER
+        // indexing on the "-bg" queue) ALWAYS takes the queued path: that path
+        // does not set the foreground CS.sending flag, and we stamp the bubble
+        // with _useBgQueue so it is excluded from foreground queue detection /
+        // promotion and so cancel routes to the "-bg" queue.
+        var isQueuedSend = useBgQueue || CS.sending || CS.messages.some(function (m) {
             return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
         });
 
-        var composed = text;
         var aiPlatform = S.aiPlatform;
         var aiModel = S.aiModel || undefined;
         var systemPrompt = buildSystemPrompt();
         var userId = (S.user && S.user.user_id) || S.serviceId;
-        var chatQueue = userId; // no bg indexing tasks in core chat yet
-
-        if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
+        var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
 
         if (isQueuedSend) {
             var resolvedHistory = CS.messages.filter(function (m) {
@@ -1542,16 +1837,38 @@
                 platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt,
                 history: resolvedHistory.concat([{ role: "user", content: composed }]),
             });
-            // skapi auto-polls (poll param), so there's no early ack / _serverItemId.
-            // Track the queued bubble purely locally: it shows "(In queue)" until the
-            // request ahead of it finishes (promoteNextQueuedToRunning then turns it
-            // white + Thinking), and its own auto-poll resolves it to the answer.
-            CS.messages.push({ role: "user", content: composed, isPendingQueued: true });
+            // Shown dimmed + yellow "(In queue)" until the early ack returns; then the
+            // ack's id becomes _serverItemId (enables cancel) and the dim clears. The
+            // queued→running display transition is driven by promoteNextQueuedToRunning
+            // (called when the request ahead of it finishes). NOTE: there is no periodic
+            // re-map (schedulePendingPoll is a no-op), so the local bubble is never
+            // duplicated by a server re-map.
+            var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true };
+            if (useBgQueue) queuedBubble._useBgQueue = true;
+            CS.messages.push(queuedBubble);
             renderMessages(); updateHistoryCache(); scrollToBottom(true);
 
             var capturedComposed = composed, capturedPlatform = aiPlatform;
             Promise.resolve(callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue))
-                .then(function (result) { return onQueuedSendResponse(capturedComposed, result, capturedPlatform); })
+                .then(function (result) {
+                    // Early ack (poll:0): capture the server item id for cancel and clear
+                    // the dimmed "sending" state (FIFO: the first dimmed bubble is ours).
+                    var sendingIdx = CS.messages.findIndex(function (m) {
+                        return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user";
+                    });
+                    var serverId = result && typeof result.id === "string" ? result.id : undefined;
+                    if (sendingIdx >= 0) {
+                        var upd = Object.assign({}, CS.messages[sendingIdx], { isSendingToServer: false });
+                        if (serverId) upd._serverItemId = serverId;
+                        CS.messages[sendingIdx] = upd; renderMessages();
+                    }
+                    if (result && result.poll && (result.status === "pending" || result.status === "running")) {
+                        return result.poll({ latency: POLL_INTERVAL })
+                            .then(function (res) { return onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId); })
+                            .catch(function (err) { return onQueuedSendError(capturedComposed, err, serverId); });
+                    }
+                    return onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId);
+                })
                 .catch(function (err) { return onQueuedSendError(capturedComposed, err); });
             return;
         }
@@ -2000,8 +2317,364 @@
     }
 
     /* ---- expired-link refresh (wired fully in the attachments phase) ----- */
-    function getPublicTemporaryUrl(_remotePath) {
-        return Promise.reject(new Error("Attachment link refresh isn't available yet."));
+    /* ====================================================================== *
+     * ATTACHMENTS — db-storage upload + AI indexing (agent.vue model)
+     *
+     * Public end-user uploads go to the project's `db` host-storage exactly
+     * like the admin client's Service.uploadHostFiles({target:'db'}) /
+     * getTemporaryUrl({request:'get-db'}). We replicate those calls on the
+     * public instance via skapi.util.request('get-signed-url', ...), which the
+     * skapi request router resolves to the record_private gateway (auth:true).
+     * NOTE: requires the backend `db` upload gate (get_signed_url is_master
+     * check) to be relaxed for authenticated end users.
+     * ====================================================================== */
+    var _uploadReservedKey = null;
+    function uploadReservedKey() {
+        if (!_uploadReservedKey) _uploadReservedKey = randomLowerString(16);
+        return _uploadReservedKey;
+    }
+    function randomLowerString(n) {
+        var c = "abcdefghijklmnopqrstuvwxyz0123456789", s = "";
+        for (var i = 0; i < n; i++) s += c.charAt(Math.floor(Math.random() * c.length));
+        return s;
+    }
+    function formatBytes(n) {
+        n = Number(n) || 0;
+        if (n < 1024) return n + " B";
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+        return (n / (1024 * 1024)).toFixed(1) + " MB";
+    }
+    function fileExtension(name) {
+        var dot = (name || "").lastIndexOf(".");
+        return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+    }
+    function attachmentStoragePath(name) {
+        // namespace by user so end users don't collide on a shared db namespace
+        var uid = (S.user && S.user.user_id) ? S.user.user_id : "anon";
+        return uid + "/" + name;
+    }
+
+    function xhrUploadForm(url, form, onProgress, setAbort) {
+        return new Promise(function (resolve, reject) {
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", url);
+            xhr.onload = function () {
+                var result = xhr.responseText;
+                try { result = JSON.parse(result); } catch (e) {}
+                if (xhr.status >= 200 && xhr.status < 300) resolve(result);
+                else reject(result);
+            };
+            xhr.onerror = function () { reject(new Error("Network error")); };
+            xhr.onabort = function () { reject(new Error("Aborted")); };
+            xhr.ontimeout = function () { reject(new Error("Timeout")); };
+            if (xhr.upload && typeof onProgress === "function") xhr.upload.onprogress = onProgress;
+            if (typeof setAbort === "function") setAbort(function () { try { xhr.abort(); } catch (e) {} });
+            xhr.send(form);
+        });
+    }
+    // Upload one File to db host storage. Resolves on success; rejects with
+    // { code:"EXISTS" } when the file already exists (check_existence).
+    function uploadFileToDb(file, storagePath, onProgress, setAbort) {
+        return S.skapi.util.request("get-signed-url", {
+            reserved_key: uploadReservedKey(),
+            service: S.serviceId,
+            owner: S.owner,
+            request: "db",
+            key: storagePath,
+            size: file.size || 0,
+            contentType: file.type || mimeGetType(file.name) || null,
+            check_existence: true,
+        }, { auth: true }).then(function (signed) {
+            var form = new FormData();
+            var fields = signed && signed.fields ? signed.fields : {};
+            for (var name in fields) form.append(name, fields[name]);
+            form.append("file", file);
+            return xhrUploadForm(signed.url, form, onProgress, setAbort);
+        });
+    }
+    // Mint a temporary CDN url for a db file (request:'get-db'), matching
+    // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
+    // https://db.<hostDomain>/.
+    function getTemporaryUrlDb(path, expires) {
+        return S.skapi.util.request("get-signed-url", {
+            service: S.serviceId,
+            owner: S.owner,
+            request: "get-db",
+            key: path,
+            expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
+            contentType: mimeGetType(path) || "application/octet-stream",
+            generate_temporary_cdn_url: true,
+        }, { auth: true, method: "post" }).then(function (res) {
+            var u = typeof res === "string" ? res : (res && res.url);
+            if (!u) throw new Error("No temporary URL returned.");
+            return "https://db." + hostDomain() + "/" + u;
+        });
+    }
+
+    // Upload a single attachment: db upload → temp url → (if newly uploaded)
+    // queue a background indexing request. Resolves to [{ name, url }].
+    function uploadSingleAttachment(att) {
+        att.status = "uploading"; att.progress = 0; att.errorMessage = "";
+        renderAttachmentChips();
+        var storagePath = attachmentStoragePath(att.name);
+        var alreadyExisted = false;
+        return uploadFileToDb(att.file, storagePath, function (p) {
+            if (p && p.total) { att.progress = Math.floor((p.loaded / p.total) * 100); renderAttachmentChips(); }
+        }, function (abort) { att._abort = abort; }).catch(function (err) {
+            var code = err && (err.code || (err.body && err.body.code));
+            var msg = err && (err.message || (err.body && err.body.message) || (typeof err === "string" ? err : ""));
+            if (code === "EXISTS" || (msg && /exist/i.test(msg))) { alreadyExisted = true; return; }
+            throw err;
+        }).then(function () {
+            return getTemporaryUrlDb(storagePath, ATTACHMENT_URL_EXPIRES_SECONDS);
+        }).then(function (url) {
+            att.progress = 100; att.status = "done"; att.uploadedUrl = url; att.storagePath = storagePath;
+            att._abort = null;
+            renderAttachmentChips();
+            if (!alreadyExisted) {
+                return notifyAgentSaveAttachment({
+                    name: att.name, storagePath: storagePath,
+                    mime: att.file.type || mimeGetType(att.name), size: att.file.size, url: url,
+                }).then(function (ack) {
+                    if (ack && typeof ack.id === "string") {
+                        bgTaskQueue.push({
+                            serviceId: S.serviceId, platform: S.aiPlatform, id: ack.id,
+                            filename: att.name,
+                            status: ack.status === "running" ? "running" : "pending",
+                            poll: ack.poll,
+                        });
+                    }
+                    return [{ name: att.name, url: url }];
+                }).catch(function (e) {
+                    console.error("[bunnychat] indexing request failed", e);
+                    return [{ name: att.name, url: url }];
+                });
+            }
+            return [{ name: att.name, url: url }];
+        });
+    }
+    // Upload all not-yet-done attachments sequentially. Resolves to the full
+    // list of { name, url } for composing the chat message.
+    function uploadPendingAttachments() {
+        CS.uploadingAttachments = true;
+        updateComposerControls();
+        var collected = [];
+        var snapshot = CS.attachments.slice();
+        var chain = Promise.resolve();
+        snapshot.forEach(function (att) {
+            chain = chain.then(function () {
+                if (!CS.attachments.some(function (a) { return a.id === att.id; })) return; // removed mid-upload
+                if (att.status === "done") { if (att.uploadedUrl) collected.push({ name: att.name, url: att.uploadedUrl }); return; }
+                return uploadSingleAttachment(att).then(function (urls) {
+                    collected.push.apply(collected, urls);
+                }).catch(function (err) {
+                    // User removed/aborted this attachment mid-upload: skip it
+                    // without failing the rest of the batch.
+                    var removed = !CS.attachments.some(function (a) { return a.id === att.id; });
+                    var aborted = err && (err.message === "Aborted" || err === "Aborted");
+                    if (removed || aborted) return;
+                    att.status = "error";
+                    att.errorMessage = (err && err.message) ? String(err.message) : "Upload failed";
+                    renderAttachmentChips();
+                    throw err;
+                });
+            });
+        });
+        return chain.then(function () {
+            CS.uploadingAttachments = false; updateComposerControls();
+            return collected;
+        }, function (err) {
+            CS.uploadingAttachments = false; updateComposerControls();
+            throw err;
+        });
+    }
+
+    function buildAttachmentSaveSystemPrompt() {
+        var sp = "You are a background indexing agent for project " + S.serviceId + ".\n" +
+            "- Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.\n" +
+            "- For all other file types (text, code, csv, json, pdf, etc.), use your web_fetch tool to download and read each URL. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.\n" +
+            "- Do NOT reply conversationally. This is a background indexing task: use the MCP tools to save what you learn, be exhaustive about meaning and terse about bytes, and only let the user know when indexing is complete.";
+        if (S.serviceName || S.serviceDescription) {
+            sp += "\nProject name: \"" + (S.serviceName || "") + "\"";
+            if (S.serviceDescription) sp += "\nProject description: \"\"\"" + S.serviceDescription + "\"\"\"";
+        }
+        return sp;
+    }
+    // Background indexing request (poll:0 → returns ack with id + manual .poll()).
+    function notifyAgentSaveAttachment(attachment) {
+        var platform = S.aiPlatform, service = S.serviceId, owner = S.owner;
+        var userId = (S.user && S.user.user_id) || service;
+        var queue = userId + BG_INDEXING_QUEUE_SUFFIX;
+        var systemPrompt = buildAttachmentSaveSystemPrompt();
+        var userMessage = "A new file has just been uploaded. Index it now.\n\n" +
+            "File metadata:\n" +
+            "- name: " + attachment.name + "\n" +
+            "- storage path: " + attachment.storagePath + "\n" +
+            (attachment.mime ? "- mime type: " + attachment.mime + "\n" : "") +
+            (typeof attachment.size === "number" ? "- size (bytes): " + attachment.size + "\n" : "") +
+            "- temporary URL (fetch this to read the file contents): " + attachment.url;
+        if (platform === "openai") {
+            var oModel = S.aiModel || DEFAULT_OPENAI_MODEL;
+            var detail = getOpenAIImageDetail(oModel);
+            var oTools = [{ type: "mcp", server_label: MCP_NAME, server_url: mcpBaseUrl(),
+                require_approval: "never", headers: { Authorization: "Bearer $ACCESS_TOKEN" } }];
+            if (OPENAI_WEB_SEARCH_ENABLED) oTools.push({ type: "web_search", external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS });
+            return S.skapi.clientSecretRequest({
+                clientSecretName: "openai", queue: queue, service: service, owner: owner, poll: 0,
+                url: OPENAI_RESPONSES_API_URL, method: "POST",
+                headers: { "content-type": "application/json", Authorization: "Bearer $CLIENT_SECRET" },
+                data: {
+                    model: oModel, max_output_tokens: MAX_TOKENS,
+                    input: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: transformContentWithOpenAIImages(userMessage, detail) },
+                    ],
+                    tools: oTools,
+                },
+            });
+        }
+        var cModel = S.aiModel || DEFAULT_CLAUDE_MODEL;
+        return S.skapi.clientSecretRequest({
+            clientSecretName: "claude", queue: queue, service: service, owner: owner, poll: 0,
+            url: ANTHROPIC_MESSAGES_API_URL, method: "POST",
+            headers: {
+                "content-type": "application/json", "x-api-key": "$CLIENT_SECRET",
+                "anthropic-version": ANTHROPIC_VERSION, "anthropic-beta": ANTHROPIC_BETA_HEADER,
+            },
+            data: {
+                model: cModel, max_tokens: MAX_TOKENS,
+                system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+                messages: [{ role: "user", content: transformContentWithImages(userMessage) }],
+                mcp_servers: [{ type: "url", name: MCP_NAME, url: mcpBaseUrl(), authorization_token: "$ACCESS_TOKEN" }],
+                tools: [
+                    { type: "mcp_toolset", mcp_server_name: MCP_NAME },
+                    { type: "web_fetch_20250910", name: "web_fetch", max_uses: WEB_FETCH_MAX_USES,
+                      citations: { enabled: true }, max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS },
+                ],
+            },
+        });
+    }
+
+    /* ---- attachment UI: chips, file input, drag-drop --------------------- */
+    var ATTACH_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+    var FILE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+
+    function addFilesToAttachments(files) {
+        var arr = Array.prototype.slice.call(files || []);
+        var changed = false;
+        CS.attachmentWarning = "";
+        arr.forEach(function (f) {
+            if (!f || typeof f.size !== "number") return;
+            if (ATTACHMENT_MAX_BYTES && f.size > ATTACHMENT_MAX_BYTES) {
+                CS.attachmentWarning = '"' + f.name + '" exceeds the ' + formatBytes(ATTACHMENT_MAX_BYTES) + " upload limit and was skipped.";
+                return;
+            }
+            if (CS.attachments.some(function (a) { return a.name === f.name && a.file && a.file.size === f.size; })) return;
+            CS.attachments.push({ id: "att_" + randomLowerString(10), name: f.name, file: f, status: "pending", progress: 0, uploadedUrl: "", storagePath: "", errorMessage: "" });
+            changed = true;
+        });
+        if (changed || CS.attachmentWarning) renderAttachmentChips();
+        updateComposerControls();
+    }
+    function removeAttachment(id) {
+        var i = CS.attachments.findIndex(function (a) { return a.id === id; });
+        if (i === -1) return;
+        var att = CS.attachments[i];
+        if (att._abort) { try { att._abort(); } catch (e) {} }
+        CS.attachments.splice(i, 1);
+        renderAttachmentChips();
+        updateComposerControls();
+    }
+    function clearAttachments() {
+        CS.attachments.forEach(function (a) { if (a._abort) { try { a._abort(); } catch (e) {} } });
+        CS.attachments = [];
+        CS.attachmentWarning = "";
+        renderAttachmentChips();
+        updateComposerControls();
+    }
+    function renderAttachmentChips() {
+        var row = CS.attachmentsRow;
+        if (!row) return;
+        row.innerHTML = "";
+        if (!CS.attachments.length && !CS.attachmentWarning) { row.style.display = "none"; return; }
+        row.style.display = "";
+        if (CS.attachmentWarning) {
+            row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentWarning })));
+        }
+        CS.attachments.forEach(function (att) {
+            var clickable = att.status === "done" && !!att.uploadedUrl;
+            var cls = "bq-attachment";
+            if (att.status === "uploading") cls += " is-uploading";
+            else if (att.status === "error") cls += " is-error";
+            else if (att.status === "done") cls += " is-done";
+            if (clickable) cls += " is-clickable";
+            var chip = h("div", { class: cls });
+            if (att.status === "uploading") chip.style.setProperty("--att-progress", (att.progress || 0) + "%");
+            if (clickable) {
+                chip.title = "Open " + att.name;
+                chip.addEventListener("click", function () { window.open(att.uploadedUrl, "_blank", "noopener,noreferrer"); });
+            }
+            chip.appendChild(h("span", { class: "bq-attachment-icon", html: FILE_ICON_SVG }));
+            chip.appendChild(h("span", { class: "bq-attachment-name", text: att.name, title: att.name }));
+            var meta = att.status === "error"
+                ? (att.errorMessage || "Failed")
+                : formatBytes(att.file ? att.file.size : att.size);
+            chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
+            if (clickable) chip.appendChild(h("span", { class: "bq-attachment-arrow", text: "↗" }));
+            var rm = h("button", { class: "bq-attachment-remove", type: "button", title: "Remove", text: "×" });
+            rm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachment(att.id); });
+            chip.appendChild(rm);
+            row.appendChild(chip);
+        });
+    }
+    function updateComposerControls() {
+        var uploading = CS.uploadingAttachments;
+        if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
+        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading;
+    }
+    function onAttachInputChange(inputEl) {
+        if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
+        if (inputEl) inputEl.value = ""; // allow re-selecting the same file
+    }
+    function setupDragAndDrop(chatEl) {
+        var depth = 0, overlay = null;
+        function showOverlay() {
+            if (overlay || S.aiPlatform === "none") return;
+            overlay = h("div", { class: "bq-drop-overlay" },
+                h("div", { class: "bq-drop-overlay-inner" },
+                    h("span", { html: ATTACH_ICON_SVG }),
+                    h("span", { text: "Drop files to attach" })));
+            chatEl.appendChild(overlay);
+        }
+        function hideOverlay() { if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay); overlay = null; }
+        function hasFiles(e) {
+            var dt = e.dataTransfer;
+            if (!dt) return false;
+            if (dt.types) { for (var i = 0; i < dt.types.length; i++) if (dt.types[i] === "Files") return true; return false; }
+            return true;
+        }
+        chatEl.addEventListener("dragenter", function (e) {
+            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            e.preventDefault(); depth++; showOverlay();
+        });
+        chatEl.addEventListener("dragover", function (e) {
+            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+        });
+        chatEl.addEventListener("dragleave", function (e) {
+            if (!hasFiles(e)) return;
+            depth--; if (depth <= 0) { depth = 0; hideOverlay(); }
+        });
+        chatEl.addEventListener("drop", function (e) {
+            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            e.preventDefault(); depth = 0; hideOverlay();
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFilesToAttachments(e.dataTransfer.files);
+        });
+    }
+
+    function getPublicTemporaryUrl(remotePath) {
+        if (!remotePath) return Promise.reject(new Error("Missing attachment path."));
+        return getTemporaryUrlDb(remotePath, ATTACHMENT_URL_EXPIRES_SECONDS);
     }
     function fetchFreshHrefForExpiredLink(expiredHref, remotePath) {
         var cached = refreshedExpiredLinkMap[expiredHref];
@@ -2150,7 +2823,54 @@
             startKeyHistory: CS.historyStartKeyHistory.slice(),
         };
     }
-    function drainBgTaskQueue() { /* bg-task injection lands in the attachments phase */ }
+    // Inject "Indexing: <file>" bubbles for queued background tasks and attach
+    // their polls. Bubbles match the same _serverItemId resolution path as
+    // normal pending messages (handleHistoryItemResolution).
+    function drainBgTaskQueue() {
+        var svcId = S.serviceId, plat = S.aiPlatform;
+        if (!svcId || plat === "none" || !chatEnabled() || !CS.messagesBox) return;
+        // drop entries whose bubble has already resolved
+        for (var i = bgTaskQueue.length - 1; i >= 0; i--) {
+            var e = bgTaskQueue[i];
+            if (e.serviceId !== svcId || e.platform !== plat) continue;
+            var present = CS.messages.some(function (m) { return m._serverItemId === e.id; });
+            var stillPending = CS.messages.some(function (m) {
+                return m._serverItemId === e.id && (m.isPending || m.isPendingInProcess || m.isPendingQueued);
+            });
+            if (present && !stillPending) bgTaskQueue.splice(i, 1);
+        }
+        bgTaskQueue.forEach(function (entry) {
+            if (entry.serviceId !== svcId || entry.platform !== plat) return;
+            if (CS.messages.some(function (m) { return m._serverItemId === entry.id; })) return;
+            var isRunning = entry.status === "running";
+            var userBubble = { role: "user", content: "Indexing: " + entry.filename, isBackgroundTask: true, _serverItemId: entry.id };
+            if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
+            CS.messages.push(userBubble);
+            if (isRunning) {
+                CS.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
+            }
+            renderMessages(); updateHistoryCache(); scrollToBottom(false);
+            if (!historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+                historyItemPolls.set(entry.id, true);
+                var capturedId = entry.id, capturedPlat = plat;
+                entry.poll({ latency: POLL_INTERVAL }).then(function (response) {
+                    handleHistoryItemResolution(capturedId, response, capturedPlat);
+                }).catch(function (err) {
+                    historyItemPolls.delete(capturedId);
+                    var isNotExists = err && (err.code === "NOT_EXISTS" || (err.body && err.body.code === "NOT_EXISTS"));
+                    var bi = CS.messages.findIndex(function (m) { return m.isPending && m._serverItemId === capturedId; });
+                    if (bi !== -1) {
+                        if (isNotExists) CS.messages.splice(bi, 1);
+                        else CS.messages[bi] = { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
+                        renderMessages(); updateHistoryCache();
+                    }
+                }).then(function () {
+                    var qi = bgTaskQueue.findIndex(function (q) { return q.id === capturedId; });
+                    if (qi !== -1) bgTaskQueue.splice(qi, 1);
+                });
+            }
+        });
+    }
     function handleHistoryItemResolution(itemId, response, platform) {
         historyItemPolls.delete(itemId);
         var isErr = isErrorResponseBody(response);
@@ -2366,7 +3086,20 @@
     function autoGrowInput(el) {
         if (!el) return;
         el.style.height = "auto";
-        el.style.height = Math.min(el.scrollHeight, 192) + "px";
+        // scrollHeight covers content+padding but NOT the border under
+        // box-sizing:border-box, so add the border or the last line overflows
+        // by the border width and a scrollbar appears.
+        var cs = window.getComputedStyle(el);
+        var border = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+        var max = 192; // 12rem at the widget's 16px root
+        var h = el.scrollHeight + border;
+        if (h > max) {
+            el.style.height = max + "px";
+            el.style.overflowY = "auto";
+        } else {
+            el.style.height = h + "px";
+            el.style.overflowY = "hidden";
+        }
     }
 
     function buildMessageEl(msg, idx) {
@@ -2409,7 +3142,7 @@
             var greet = h("div", { class: "bq-message is-assistant bq-empty-greeting" },
                 h("div", { class: "bq-bubble" },
                     document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
-                        ". You can also add data by pasting text into the chat.")));
+                        ".")));
             CS.messagesBox.appendChild(greet);
             return;
         }
@@ -2433,22 +3166,21 @@
         // reset transient chat state on (re)entry
         CS.messages = []; CS.messageEls = []; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
+        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = "";
+        CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null;
         CS.gateRefreshToken += 1;
         historyItemPolls.clear();
         if (CS.pollTimer) { clearInterval(CS.pollTimer); CS.pollTimer = null; }
 
         render("chat", function () {
-            var logoutBtn = h("button", { class: "bq-icon-btn", type: "button", title: "Log out",
-                html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
-                onclick: function () { logout(); } });
-            var clearBtn = h("button", { class: "bq-icon-btn bq-icon-btn--danger", type: "button", title: "Clear chat history",
-                html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>',
-                onclick: function () { openClearHistoryModal(); } });
+            var settingsBtn = h("button", { class: "bq-icon-btn", type: "button", title: "Settings",
+                html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+                onclick: function () { renderAccount(); } });
 
             var header = h("div", { class: "bq-section-title" },
                 h("div", { class: "bq-title-row" },
                     h("div", { class: "bq-title-left" }, h("span", { class: "bq-agent-badge", text: agentBadgeText() })),
-                    h("div", { class: "bq-title-right" }, themeToggleButton(), clearBtn, logoutBtn)));
+                    h("div", { class: "bq-title-right" }, settingsBtn)));
 
             var chatArea;
             if (S.aiPlatform === "none") {
@@ -2463,7 +3195,8 @@
             box.addEventListener("scroll", onHistoryScroll, { passive: true });
             CS.messagesBox = box;
 
-            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Ask anything about the project…" });
+            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
+                        "." });
             var composing = false;
             input.addEventListener("compositionstart", function () { composing = true; });
             input.addEventListener("compositionend", function () { composing = false; });
@@ -2471,11 +3204,28 @@
             input.addEventListener("keydown", function (e) {
                 if (e.key === "Enter" && !e.shiftKey && !composing) { e.preventDefault(); sendMessage(); }
             });
+            // size the empty input correctly once it's in the DOM (avoids a
+            // first-keystroke height jump / bottom clip from the CSS min-height)
+            requestAnimationFrame(function () { autoGrowInput(input); });
+
+            var attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
+            attachFileInput.addEventListener("change", function () { onAttachInputChange(attachFileInput); });
+            var attachBtn = h("button", { class: "bq-attach-btn", type: "button", title: "Attach files", html: ATTACH_ICON_SVG });
+            attachBtn.addEventListener("click", function () { attachFileInput.click(); });
+            CS.attachBtnEl = attachBtn;
+
+            var attachmentsRow = h("div", { class: "bq-attachments" });
+            attachmentsRow.style.display = "none";
+            CS.attachmentsRow = attachmentsRow;
+
             var sendBtn = h("button", { class: "btn", type: "submit" }, "Send");
+            CS.sendBtnEl = sendBtn;
             var composer = h("form", { class: "bq-input-row", onsubmit: function (e) { e.preventDefault(); sendMessage(); } },
-                h("div", { class: "bq-input-wrap" }, input), sendBtn);
+                attachmentsRow,
+                h("div", { class: "bq-input-wrap" }, attachBtn, attachFileInput, input), sendBtn);
 
             chatArea = h("div", { class: "bq-chat" }, box, composer);
+            setupDragAndDrop(chatArea);
             return h("div", { class: "bq-meta" }, header, chatArea);
         });
 
@@ -2539,7 +3289,7 @@
      * ======================================================================*/
 
     function logout() {
-        showLoading("Signing out");
+        showLoading("");
         clearStoredMcpToken();
         Promise.resolve()
             .then(function () { return S.skapi.logout(); })
@@ -2553,8 +3303,14 @@
     // Called once the user is authenticated and (optionally) the MCP grant is
     // settled: load agent config and show the chat.
     function enterAfterLogin() {
-        showLoading("Loading");
-        return loadServiceInfo()
+        showLoading("");
+        // S.user may be unset here: the MCP-OAuth callback path reaches this
+        // function without going through the boot getProfile() that populates
+        // it, leaving every (S.user && S.user.user_id) check to fall back to
+        // "anon". Ensure the profile is loaded before rendering the chat.
+        return Promise.resolve()
+            .then(function () { return S.user ? S.user : getProfile().then(function (u) { S.user = u; return u; }); })
+            .then(function () { return loadServiceInfo(); })
             .then(function (conn) { S.service = conn; applyAgentConfig(); })
             .then(function () { renderChat(); })
             .catch(function (err) {
@@ -2568,7 +3324,7 @@
      * ======================================================================*/
 
     function boot() {
-        showLoading("Loading");
+        showLoading("");
 
         // 0. INBOUND IdP: the MCP authorize step (or another platform) sent the
         // user here to authenticate against skapi. Bounce back with a session
@@ -2646,7 +3402,7 @@
         S.skapi = skapi;
         S.opts = Object.assign({
             theme: "light",
-            signup: true,        // include signup (and thus delete/recover account)
+            signup: false,        // include signup (and thus delete/recover account)
             dev: false,          // use the MCP dev host (mcp-dev.broadwayinc.computer)
             mcpBaseUrl: null,    // override the MCP OAuth server base entirely
             googleClientId: null,
