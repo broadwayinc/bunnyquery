@@ -53,8 +53,6 @@
     var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
-    var ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024; // soft per-file limit (warns, skips)
-    var IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "gif", "webp"];
 
     // Google OAuth endpoint (token exchange goes through skapi clientSecretRequest
     // with the project's "ggl" client secret, exactly like bunnyquery oauth.ts).
@@ -327,9 +325,21 @@
         if (node) S.root.appendChild(node);
     }
 
+    // Standalone-page parent: a padded scroll container wrapping the centered
+    // .bq-settings content. (The chat view supplies its own padding on
+    // .bq-messages / .bq-input-row, so page padding lives here.)
+    function pageRoot(content) {
+        return h("div", { class: "bq-page" }, h("div", { class: "bq-settings" }, content), pageFooter());
+    }
+    // Gray "www.bunnyquery.com" link, centered at the bottom of standalone pages.
+    function pageFooter() {
+        return h("div", { class: "bq-page-footer" },
+            h("a", { class: "bq-page-footer-link", href: "https://www.bunnyquery.com",
+                target: "_blank", rel: "noopener noreferrer", text: "www.bunnyquery.com" }));
+    }
     function showLoading(label) {
         render("loading", function () {
-            return h("div", { class: "bq-settings" },
+            return pageRoot(
                 h("div", { class: "bq-disabled-inner", style: { marginTop: "3rem" } },
                     h("span", { class: "bq-loader", text: label || "Loading" })
                 )
@@ -787,7 +797,7 @@
                 );
             }
 
-            return h("div", { class: "bq-settings" }, children);
+            return pageRoot(children);
         });
     }
 
@@ -801,7 +811,7 @@
                     onclick: function () { renderLogin(opts.backPrefill); },
                     text: "← Back to login" })));
         }
-        return h("div", { class: "bq-settings" }, kids);
+        return pageRoot(kids);
     }
 
     function genericErrorMessage(err) {
@@ -861,7 +871,7 @@
                 h("label", { class: "bq-label" }, h("span", { text: "Name" }), name),
                 h("label", { class: "bq-label" }, h("span", { text: "Password" }), pw),
                 h("label", { class: "bq-label" }, h("span", { text: "Confirm password" }), pw2),
-                h("label", { class: "bq-checkbox" }, subscribe, h("span", { text: "Send me product updates" })),
+                h("label", { class: "bq-checkbox" }, subscribe, h("span", { text: "Receive newsletters from admin" })),
                 errBox,
                 h("div", { class: "bq-form-bottom" }, btn)
             );
@@ -1096,14 +1106,7 @@
         go();
     }
 
-    /* ---- settings (reached from the chat header gear icon) --------------- */
-    function accountShell(title, children) {
-        return h("div", { class: "bq-settings" }, [
-            h("div", { class: "bq-settings-top" },
-                h("button", { class: "bq-link", type: "button", onclick: function () { renderChat(); }, text: "← Back to chat" })),
-            h("h1", { class: "bq-settings-title", text: title }),
-        ].concat(children));
-    }
+    /* ---- settings (in-place panel reached from the chat header gear) ------ */
     function settingsSectionTitle(text) {
         return h("div", { class: "bq-settings-section-title", text: text });
     }
@@ -1129,14 +1132,39 @@
                 .catch(function () { return false; });
         } catch (e) { return Promise.resolve(false); }
     }
+    // Settings opens IN PLACE inside the chat's messages area (the header stays;
+    // the composer is swapped for a "Close" bar; the gear turns pink). Toggling
+    // the gear again — or the close bar — returns to the chat.
+    function toggleChatSettings() {
+        if (CS.chatSettingsOpen) closeChatSettings(); else openChatSettings();
+    }
+    function openChatSettings() {
+        if (!CS.messagesBox || !CS.chatEl || !CS.composerEl) return;
+        CS.chatSettingsOpen = true;
+        if (CS.settingsBtnEl) CS.settingsBtnEl.classList.add("is-active");
+        // remove the composer entirely so the settings panel fills the chat area
+        if (CS.composerEl.parentNode === CS.chatEl) CS.chatEl.removeChild(CS.composerEl);
+        renderAccount();
+    }
+    function closeChatSettings() {
+        CS.chatSettingsOpen = false;
+        if (CS.settingsBtnEl) CS.settingsBtnEl.classList.remove("is-active");
+        // restore the composer
+        if (CS.composerEl && CS.chatEl && CS.composerEl.parentNode !== CS.chatEl) CS.chatEl.appendChild(CS.composerEl);
+        renderMessages();   // restore the chat (renderMessages no-ops while settings is open)
+        scrollToBottom();
+    }
+    // Fetch profile/newsletter, then render the settings panel into the box.
     function renderAccount() {
-        CS.messagesBox = null; // stop in-flight chat renders from touching a detached node
-        showLoading("");
+        if (!CS.messagesBox) return;
+        clear(CS.messagesBox);
+        CS.messagesBox.appendChild(h("div", { class: "bq-chat-settings" },
+            h("div", { class: "bq-chat-settings-loading" }, h("span", { class: "bq-loader", text: "Loading" }))));
         Promise.all([getProfile(), getNewsletterStatus()]).then(function (res) {
             if (res[0]) S.user = res[0];
             S.newsletterSubscribed = res[1];
-            accountView();
-        }).catch(function () { accountView(); });
+            renderSettingsIntoBox();
+        }).catch(function () { renderSettingsIntoBox(); });
     }
     function newsletterRow() {
         var checkbox = h("input", { type: "checkbox", checked: !!S.newsletterSubscribed });
@@ -1151,17 +1179,23 @@
                 .catch(function (err) { checkbox.checked = !want; busy = false; alert((err && err.message) || "Could not update subscription."); });
         });
         return h("div", { class: "bq-account-row" },
-            h("div", { class: "bq-account-row-main" },
-                h("div", { class: "bq-account-label", text: "Newsletter" }),
-                h("div", { class: "bq-account-value is-muted", text: "Receive newsletter from admin" })),
-            h("label", { class: "bq-checkbox" }, checkbox));
+            h("label", { class: "bq-checkbox" }, checkbox,
+                h("span", { text: "Receive newsletter from admin" })));
     }
     function themeRow() {
-        var isDark = S.theme === "dark";
-        return accountRow("Theme",
-            [document.createTextNode(isDark ? "Dark mode" : "Light mode")],
-            isDark ? "Switch to light" : "Switch to dark",
-            function () { toggleTheme(); accountView(); });
+        var current = S.theme === "dark" ? "dark" : "light";
+        function themeRadio(value, label) {
+            var input = h("input", { type: "radio", name: "bq-theme" });
+            input.checked = (value === current);
+            input.addEventListener("change", function () { if (input.checked) applyTheme(value); });
+            return h("label", { class: "bq-checkbox" }, input, h("span", { text: label }));
+        }
+        return h("div", { class: "bq-account-row" },
+            // h("div", { class: "bq-account-row-main" },
+            //     h("div", { class: "bq-account-label", text: "Theme" })),
+            h("div", { class: "bq-theme-radios" },
+                themeRadio("light", "Light mode"),
+                themeRadio("dark", "Dark mode")));
     }
     function dangerItem(label, desc, btnLabel, onClick) {
         return h("div", { class: "bq-danger-item" },
@@ -1169,54 +1203,58 @@
             h("p", { class: "bq-danger-item-desc", text: desc }),
             h("button", { class: "btn btn--danger", type: "button", onclick: onClick, text: btnLabel }));
     }
-    function accountView() {
-        render("account", function () {
-            var u = S.user || {};
-            var children = [];
-            if (!u.email_verified) {
-                children.push(h("div", { class: "bq-account-tip" },
-                    h("strong", { text: "Verify your email. " }),
-                    document.createTextNode("A verified email is required to recover your password or re-enable your account if you ever lose access."),
-                    h("div", { style: { marginTop: "0.75rem" } },
-                        h("button", { class: "btn", type: "button",
-                            onclick: function () { renderEmailVerification(renderAccount); }, text: "Verify now" }))));
-            }
+    function renderSettingsIntoBox() {
+        if (!CS.messagesBox) return;
+        var u = S.user || {};
+        var children = [];
+        children.push(h("div", { class: "bq-settings-top" },
+            h("button", { class: "bq-link", type: "button", onclick: function () { closeChatSettings(); }, text: "← Back to chat" })));
+        children.push(h("h1", { class: "bq-settings-title", text: "Settings" }));
+        if (!u.email_verified) {
+            children.push(h("div", { class: "bq-account-tip" },
+                h("strong", { text: "Verify your email. " }),
+                document.createTextNode("A verified email is required to recover your password or re-enable your account if you ever lose access."),
+                h("div", { style: { marginTop: "0.75rem" } },
+                    h("button", { class: "btn", type: "button",
+                        onclick: function () { renderEmailVerification(renderChat); }, text: "Verify now" }))));
+        }
 
-            // ── Chat box section ──
-            children.push(settingsSectionTitle("Chat box"));
-            children.push(h("div", { class: "bq-account-section" }, themeRow()));
+        // ── Chat box section ──
+        children.push(settingsSectionTitle("Theme"));
+        children.push(h("div", { class: "bq-account-section" }, themeRow()));
 
-            // ── Account section ──
-            var emailValue = [
-                document.createTextNode(u.email || "—"),
-                h("span", { class: "bq-verify-badge " + (u.email_verified ? "is-verified" : "is-unverified"),
-                    text: u.email_verified ? "verified" : "unverified" }),
-            ];
-            children.push(settingsSectionTitle("Account"));
-            children.push(h("div", { class: "bq-account-section" },
-                accountRow("Email", emailValue, "Change", function () { openChangeEmailModal(); }),
-                accountRow("Name", [document.createTextNode(u.name || "Unnamed user")], "Change", function () { openChangeNameModal(); }),
-                (u.signup_ticket === "OIDPASS"
-                    ? accountRow("Password", [document.createTextNode("Managed by your login provider")], null, null, { muted: true })
-                    : accountRow("Password", [document.createTextNode("••••••••")], "Change", function () { openChangePasswordModal(); })),
-                newsletterRow()
-            ));
-            children.push(h("div", { class: "bq-account-logout" },
-                h("button", { class: "bq-link", type: "button", onclick: function () { logout(); }, text: "Logout →" })));
-            // ── Danger zone (clear history always; remove account when signup) ──
-            var danger = [h("div", { class: "bq-account-danger-title", text: "Danger zone" })];
-            danger.push(dangerItem("Clear history",
-                "Hide the current conversation. Your messages stay on the server but won't be shown here again.",
-                "Clear history", function () { openClearHistoryModal(); }));
-            if (S.opts.signup) {
-                danger.push(dangerItem("Remove account",
-                    "Remove your account and delete all your data. You can re-enable within 30 days by logging in.",
-                    "Remove account", function () { openDeleteAccountModal(); }));
-            }
-            children.push(h("div", { class: "bq-account-danger" }, danger));
+        // ── Account section ──
+        var emailValue = [
+            document.createTextNode(u.email || "—"),
+            h("span", { class: "bq-verify-badge " + (u.email_verified ? "is-verified" : "is-unverified"),
+                text: u.email_verified ? "verified" : "unverified" }),
+        ];
+        children.push(settingsSectionTitle("Account"));
+        children.push(h("div", { class: "bq-account-section" },
+            accountRow("Email", emailValue, "Change", function () { openChangeEmailModal(); }),
+            accountRow("Name", [document.createTextNode(u.name || "Unnamed user")], "Change", function () { openChangeNameModal(); }),
+            (u.signup_ticket === "OIDPASS"
+                ? accountRow("Password", [document.createTextNode("Managed by your login provider")], null, null, { muted: true })
+                : accountRow("Password", [document.createTextNode("••••••••")], "Change", function () { openChangePasswordModal(); })),
+            newsletterRow()
+        ));
+        // ── Danger zone (clear history always; remove account when signup) ──
+        var danger = [h("div", { class: "bq-account-danger-title", text: "Danger zone" })];
+        danger.push(dangerItem("Clear history",
+            "Hide the current conversation. Your messages stay on the server but won't be shown here again.",
+            "Clear history", function () { openClearHistoryModal(); }));
+        if (S.opts.signup) {
+            danger.push(dangerItem("Remove account",
+                "Remove your account and delete all your data. You can re-enable within 30 days by logging in.",
+                "Remove account", function () { openDeleteAccountModal(); }));
+        }
+        children.push(h("div", { class: "bq-account-danger" }, danger));
+        children.push(h("div", { class: "bq-account-logout" },
+            h("button", { class: "bq-link", type: "button", onclick: function () { logout(); }, text: "Logout →" })));
+        children.push(pageFooter());
 
-            return accountShell("Settings", children);
-        });
+        clear(CS.messagesBox);
+        CS.messagesBox.appendChild(h("div", { class: "bq-chat-settings" }, children));
     }
 
     // edit modals
@@ -1262,7 +1300,7 @@
             [{ label: "New email", input: input }], "Save", function (close) {
                 return S.skapi.updateProfile({ email: input.value }).then(function () {
                     if (S.user) { S.user.email = input.value; S.user.email_verified = false; }
-                    close(); renderEmailVerification(renderAccount);
+                    close(); renderEmailVerification(renderChat);
                 });
             });
     }
@@ -1309,7 +1347,7 @@
     }
     function renderBye() {
         render("bye", function () {
-            return h("div", { class: "bq-settings" }, authHeader("Account disabled").concat([
+            return pageRoot(authHeader("Account disabled").concat([
                 h("p", { class: "bq-settings-sub" }, "Your account has been disabled. All your data will be removed after 90 days. You can recover within that period by logging in and following the recovery email."),
                 h("div", { class: "bq-form-bottom", style: { marginTop: "1.5rem" } },
                     h("button", { class: "btn", type: "button", onclick: function () { renderLogin(); }, text: "Back to login" })),
@@ -1401,6 +1439,9 @@
         attachmentsRow: null,     // .bq-attachments DOM node
         attachBtnEl: null,
         sendBtnEl: null,
+        inputEl: null,            // .bq-input textarea
+        chatEl: null,             // .bq-chat (for overflow height measurement)
+        visibleAttachmentCount: Infinity, // how many chips fit before "...(x) more"
     };
     var aiChatHistoryCache = {};
     var pendingAgentRequests = {};
@@ -1413,7 +1454,10 @@
     var fileBlobCache = new Map();
     var markedReady = null;
 
-    function hostDomain() { return S.opts.hostDomain || "skapi.com"; }
+    // db-CDN host for temporary file URLs. Mirrors bunnyquery's env split:
+    // dev files are served from db.skapi.app, prod from db.skapi.com. An
+    // explicit opts.hostDomain always wins (e.g. a project on a custom domain).
+    function hostDomain() { return S.opts.hostDomain || (S.opts.dev ? "skapi.app" : "skapi.com"); }
     function getHistoryCacheKey() {
         if (!S.serviceId || S.aiPlatform === "none") return "";
         return S.serviceId + "#" + S.aiPlatform;
@@ -1781,6 +1825,12 @@
         if (!chatEnabled() || S.aiPlatform === "none") return;
         if (CS.uploadingAttachments) return; // already uploading; ignore double-submit
 
+        // Over the attachment limit *with* a chat message: block the send. The
+        // send button is disabled in this state, but the Enter key would bypass
+        // it. The warning clears when the user removes files or clears the text.
+        recomputeAttachmentWarning();
+        if (CS.attachmentWarning) { renderAttachmentChips(); updateComposerControls(); return; }
+
         if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
 
         if (!hasAttachments) { dispatchComposedMessage(text, false); return; }
@@ -1791,8 +1841,10 @@
         var bgBefore = bgTaskQueue.length;
         uploadPendingAttachments().then(function (attachmentUrls) {
             var hasNewIndexing = bgTaskQueue.length > bgBefore;
-            clearAttachments();
-            if (hasNewIndexing) drainBgTaskQueue();
+            // Per-file "Indexing:" bubbles were already injected during upload (#1).
+            // Keep only the FAILED chips (red/yellow) so the user can see/retry;
+            // clear the successful ones.
+            clearSuccessfulAttachments();
             if (!text) return; // attachment-only turn: index, no chat message
             var composed = text;
             if (attachmentUrls.length) {
@@ -1803,8 +1855,8 @@
             dispatchComposedMessage(composed, hasNewIndexing);
         }).catch(function (err) {
             console.error("[bunnychat] attachment upload failed", err);
-            clearAttachments();
-            CS.messages.push({ role: "assistant", content: "Some attachments failed to upload. " + ((err && err.message) || ""), isError: true });
+            CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
+            CS.messages.push({ role: "assistant", content: "Something went wrong while uploading attachments. " + ((err && err.message) || ""), isError: true });
             renderMessages(); scrollToBottom(true);
         });
     }
@@ -1912,7 +1964,27 @@
     }
 
     // queue resolution helpers (agent.vue)
-    function promoteNextBgQueuedToRunning() { /* bg tasks land in the attachments phase */ }
+    function promoteNextBgQueuedToRunning() {
+        // Only one bg-indexing task shows as "running" at a time. If a bg
+        // "Thinking" placeholder is already present, the current task is still
+        // running — wait for it to finish before promoting the next.
+        if (CS.messages.some(function (m) { return m.isPending && m.role === "assistant" && m.isBackgroundTask; })) return;
+        var nextIdx = CS.messages.findIndex(function (m) {
+            return m.isPendingQueued && m.role === "user" && m.isBackgroundTask;
+        });
+        if (nextIdx === -1) return;
+        var existing = CS.messages[nextIdx];
+        var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
+        if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
+        CS.messages[nextIdx] = promoted;
+        // Insert a "Thinking" placeholder carrying the same _serverItemId so the
+        // bg task's poll resolution (handleHistoryItemResolution running branch)
+        // replaces it in place.
+        var placeholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true };
+        if (existing._serverItemId !== undefined) placeholder._serverItemId = existing._serverItemId;
+        CS.messages.splice(nextIdx + 1, 0, placeholder);
+        renderMessages();
+    }
     function promoteNextQueuedToRunning() {
         if (CS.messages.some(function (m) { return m.isPending && m.role === "assistant" && !m.isBackgroundTask; })) return;
         var nextIdx = CS.messages.findIndex(function (m) {
@@ -2142,7 +2214,7 @@
         return Promise.resolve();
     }
     function onHistoryScroll() {
-        if (!CS.messagesBox) return;
+        if (!CS.messagesBox || CS.chatSettingsOpen) return;
         var el = CS.messagesBox;
         CS.stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
         if (el.scrollTop <= 60) fetchOlderHistoryIfNeeded();
@@ -2344,14 +2416,26 @@
         if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
         return (n / (1024 * 1024)).toFixed(1) + " MB";
     }
-    function fileExtension(name) {
-        var dot = (name || "").lastIndexOf(".");
-        return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+    function sanitizeStorageSegment(name) {
+        // The db CDN serves files through a %-encoded path; object keys that
+        // contain spaces (or other chars that round-trip badly through
+        // encodeURIComponent) are stored raw but requested encoded, so they
+        // 404 at CloudFront/S3. Normalize the stored key so it ALWAYS matches
+        // the served path. The original name is kept separately for display.
+        var n = String(name == null ? "file" : name).trim()
+            .replace(/[^A-Za-z0-9._-]+/g, "_")
+            .replace(/_{2,}/g, "_")
+            .replace(/^[_]+/, "");
+        return n || "file";
     }
-    function attachmentStoragePath(name) {
-        // namespace by user so end users don't collide on a shared db namespace
+    function attachmentStoragePath(relPath) {
+        // namespace by user so end users don't collide on a shared db namespace.
+        // Sanitize EACH path segment so folder structure (folder/file) is kept
+        // while spaces/odd chars are normalized.
         var uid = (S.user && S.user.user_id) ? S.user.user_id : "anon";
-        return uid + "/" + name;
+        var sanitized = String(relPath == null ? "file" : relPath).split("/")
+            .map(sanitizeStorageSegment).filter(Boolean).join("/");
+        return uid + "/" + (sanitized || "file");
     }
 
     function xhrUploadForm(url, form, onProgress, setAbort) {
@@ -2411,46 +2495,68 @@
         });
     }
 
-    // Upload a single attachment: db upload → temp url → (if newly uploaded)
-    // queue a background indexing request. Resolves to [{ name, url }].
+    // Upload a single attachment — a file (1 member) or a folder (every file in
+    // it) — to db storage and queue indexing per member. Resolves to [{name,url}].
+    // Status: "error" (red, an upload failed), "indexError" (yellow, uploaded but
+    // an index request failed), or "done" (green, uploaded + indexing queued).
     function uploadSingleAttachment(att) {
         att.status = "uploading"; att.progress = 0; att.errorMessage = "";
         renderAttachmentChips();
-        var storagePath = attachmentStoragePath(att.name);
-        var alreadyExisted = false;
-        return uploadFileToDb(att.file, storagePath, function (p) {
-            if (p && p.total) { att.progress = Math.floor((p.loaded / p.total) * 100); renderAttachmentChips(); }
-        }, function (abort) { att._abort = abort; }).catch(function (err) {
-            var code = err && (err.code || (err.body && err.body.code));
-            var msg = err && (err.message || (err.body && err.body.message) || (typeof err === "string" ? err : ""));
-            if (code === "EXISTS" || (msg && /exist/i.test(msg))) { alreadyExisted = true; return; }
-            throw err;
-        }).then(function () {
-            return getTemporaryUrlDb(storagePath, ATTACHMENT_URL_EXPIRES_SECONDS);
-        }).then(function (url) {
-            att.progress = 100; att.status = "done"; att.uploadedUrl = url; att.storagePath = storagePath;
-            att._abort = null;
-            renderAttachmentChips();
-            if (!alreadyExisted) {
-                return notifyAgentSaveAttachment({
-                    name: att.name, storagePath: storagePath,
-                    mime: att.file.type || mimeGetType(att.name), size: att.file.size, url: url,
-                }).then(function (ack) {
-                    if (ack && typeof ack.id === "string") {
-                        bgTaskQueue.push({
-                            serviceId: S.serviceId, platform: S.aiPlatform, id: ack.id,
-                            filename: att.name,
-                            status: ack.status === "running" ? "running" : "pending",
-                            poll: ack.poll,
-                        });
+        var members = (att.kind === "folder")
+            ? (att.files || []).map(function (f) { return { file: f.file, relPath: f.path, storagePath: attachmentStoragePath(f.path) }; })
+            : [{ file: att.file, relPath: att.name, storagePath: attachmentStoragePath(att.name) }];
+        var total = members.length;
+        if (!total) return Promise.reject(new Error("Empty attachment"));
+        var urls = [];
+        var anyIndexFailed = false;
+        var chain = Promise.resolve();
+        members.forEach(function (member, idx) {
+            chain = chain.then(function () {
+                var alreadyExisted = false;
+                return uploadFileToDb(member.file, member.storagePath, function (p) {
+                    if (p && p.total) {
+                        att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
+                        renderAttachmentChips();
                     }
-                    return [{ name: att.name, url: url }];
-                }).catch(function (e) {
-                    console.error("[bunnychat] indexing request failed", e);
-                    return [{ name: att.name, url: url }];
+                }, function (abort) { att._abort = abort; }).catch(function (err) {
+                    var code = err && (err.code || (err.body && err.body.code));
+                    var msg = err && (err.message || (err.body && err.body.message) || (typeof err === "string" ? err : ""));
+                    if (code === "EXISTS" || (msg && /exist/i.test(msg))) { alreadyExisted = true; return; }
+                    throw err; // a member upload failed → the whole attachment fails (red)
+                }).then(function () {
+                    return getTemporaryUrlDb(member.storagePath, ATTACHMENT_URL_EXPIRES_SECONDS);
+                }).then(function (url) {
+                    urls.push({ name: member.relPath, url: url });
+                    if (att.kind !== "folder") { att.uploadedUrl = url; att.storagePath = member.storagePath; }
+                    if (alreadyExisted) return; // already indexed on a previous upload
+                    return notifyAgentSaveAttachment({
+                        name: member.file.name, storagePath: member.storagePath,
+                        mime: member.file.type || mimeGetType(member.file.name), size: member.file.size, url: url,
+                    }).then(function (ack) {
+                        if (ack && typeof ack.id === "string") {
+                            bgTaskQueue.push({
+                                serviceId: S.serviceId, platform: S.aiPlatform, id: ack.id,
+                                filename: member.file.name,
+                                status: ack.status === "running" ? "running" : "pending",
+                                poll: ack.poll,
+                            });
+                            // #1: surface "Indexing: <file>" as soon as THIS file uploads.
+                            drainBgTaskQueue();
+                        }
+                    }, function (e) {
+                        console.error("[bunnychat] indexing request failed", e);
+                        anyIndexFailed = true; // uploaded but not indexed → yellow
+                    });
                 });
-            }
-            return [{ name: att.name, url: url }];
+            });
+        });
+        return chain.then(function () {
+            att._abort = null; att.progress = 100;
+            if (att.kind === "folder") att.uploadedUrls = urls.map(function (u) { return { path: u.name, url: u.url }; });
+            att.status = anyIndexFailed ? "indexError" : "done";
+            if (att.status === "indexError") att.errorMessage = "File indexing failed";
+            renderAttachmentChips();
+            return urls;
         });
     }
     // Upload all not-yet-done attachments sequentially. Resolves to the full
@@ -2458,35 +2564,41 @@
     function uploadPendingAttachments() {
         CS.uploadingAttachments = true;
         updateComposerControls();
+        renderAttachmentChips(); // re-render: hide the × buttons now uploading started (#2)
         var collected = [];
         var snapshot = CS.attachments.slice();
         var chain = Promise.resolve();
         snapshot.forEach(function (att) {
             chain = chain.then(function () {
-                if (!CS.attachments.some(function (a) { return a.id === att.id; })) return; // removed mid-upload
-                if (att.status === "done") { if (att.uploadedUrl) collected.push({ name: att.name, url: att.uploadedUrl }); return; }
+                if (!CS.attachments.some(function (a) { return a.id === att.id; })) return; // removed
+                // already uploaded (green) or uploaded-but-index-failed (yellow):
+                // contribute the cached URL(s), don't re-upload.
+                if (att.status === "done" || att.status === "indexError") {
+                    if (att.kind === "folder" && att.uploadedUrls) {
+                        att.uploadedUrls.forEach(function (u) { collected.push({ name: u.path, url: u.url }); });
+                        return;
+                    }
+                    if (att.uploadedUrl) { collected.push({ name: att.name, url: att.uploadedUrl }); return; }
+                }
                 return uploadSingleAttachment(att).then(function (urls) {
                     collected.push.apply(collected, urls);
                 }).catch(function (err) {
-                    // User removed/aborted this attachment mid-upload: skip it
-                    // without failing the rest of the batch.
                     var removed = !CS.attachments.some(function (a) { return a.id === att.id; });
                     var aborted = err && (err.message === "Aborted" || err === "Aborted");
                     if (removed || aborted) return;
+                    // Genuine UPLOAD failure → red "Failed". Do NOT throw — keep
+                    // uploading the rest; this failed chip persists for the user.
                     att.status = "error";
-                    att.errorMessage = (err && err.message) ? String(err.message) : "Upload failed";
+                    att.errorMessage = "File upload has failed";
                     renderAttachmentChips();
-                    throw err;
                 });
             });
         });
-        return chain.then(function () {
-            CS.uploadingAttachments = false; updateComposerControls();
+        var done = function () {
+            CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
             return collected;
-        }, function (err) {
-            CS.uploadingAttachments = false; updateComposerControls();
-            throw err;
-        });
+        };
+        return chain.then(done, done);
     }
 
     function buildAttachmentSaveSystemPrompt() {
@@ -2558,23 +2670,188 @@
     /* ---- attachment UI: chips, file input, drag-drop --------------------- */
     var ATTACH_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
     var FILE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+    var FOLDER_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
 
-    function addFilesToAttachments(files) {
-        var arr = Array.prototype.slice.call(files || []);
-        var changed = false;
+    /* ---- attachment budget warning (agent.vue) --------------------------- *
+     * The warning is recomputed from the CURRENT attachment set on every add/
+     * remove, so it appears when limits are exceeded and clears as the user
+     * removes files back down to an acceptable level. Files are never rejected
+     * — they are all attached and the warning is informational.
+     * ---------------------------------------------------------------------- */
+    var MAX_CHATBOX_FILE_COUNT = 20;
+    var ESTIMATED_BYTES_PER_TOKEN = 3;
+    var ESTIMATED_PDF_BYTES_PER_TOKEN = 5000;
+    var ESTIMATED_IMAGE_TOKENS = 800;
+    var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock)$/i;
+    var PDF_EXTENSION_RE = /\.pdf$/i;
+    var IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg)$/i;
+    function estimateFileTokenCost(file) {
+        var name = file.name || "", size = file.size || 0, type = (file.type || "").toLowerCase();
+        if (TEXTLIKE_EXTENSION_RE.test(name) || type.indexOf("text/") === 0 || type.indexOf("json") !== -1 || type.indexOf("xml") !== -1) {
+            return Math.ceil(size / ESTIMATED_BYTES_PER_TOKEN);
+        }
+        if (PDF_EXTENSION_RE.test(name) || type === "application/pdf") return Math.ceil(size / ESTIMATED_PDF_BYTES_PER_TOKEN);
+        if (IMAGE_EXTENSION_RE.test(name) || type.indexOf("image/") === 0) return ESTIMATED_IMAGE_TOKENS;
+        return 0; // unknown/opaque binary: web_fetch likely returns nothing useful
+    }
+    function attachmentsTokenEstimate() {
+        var total = 0;
+        CS.attachments.forEach(function (a) {
+            if (a.kind === "folder") { (a.files || []).forEach(function (f) { total += estimateFileTokenCost(f.file); }); }
+            else if (a.file) total += estimateFileTokenCost(a.file);
+        });
+        return total;
+    }
+    // Total FILE count (a folder counts as its file count), for the 20-file cap.
+    function attachmentFileCount() {
+        var n = 0;
+        CS.attachments.forEach(function (a) { n += (a.kind === "folder") ? (a.files ? a.files.length : 0) : 1; });
+        return n;
+    }
+    function currentInputTokenBudget() {
+        var platform = S.aiPlatform;
+        if (platform !== "claude" && platform !== "openai") return 0;
+        var contextWindow = getContextWindow(platform, S.aiModel);
+        var contextBased = Math.max(MIN_INPUT_TOKEN_BUDGET, contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER);
+        return platform === "claude" ? Math.min(contextBased, CLAUDE_PER_REQUEST_INPUT_CAP) : contextBased;
+    }
+    function formatTokenCount(tokens) {
+        if (tokens >= 1000) { var k = tokens / 1000; return (k >= 10 ? Math.round(k) : k.toFixed(1)) + "k"; }
+        return String(tokens);
+    }
+    function currentChatInputText() {
+        var el = CS.inputEl || (CS.messagesBox && CS.messagesBox.parentNode &&
+            CS.messagesBox.parentNode.querySelector(".bq-input"));
+        return el ? (el.value || "").trim() : "";
+    }
+    function recomputeAttachmentWarning() {
+        // The per-request overload only happens when a chat message bundles all
+        // the file URLs into one prompt. Attachment-only sends index the files
+        // one-by-one (no aggregate per-request cost), so the limit — and the
+        // warning — applies ONLY when there is chat input text.
+        if (!currentChatInputText()) { CS.attachmentWarning = ""; return; }
+        var count = attachmentFileCount();
+        if (count > MAX_CHATBOX_FILE_COUNT) {
+            CS.attachmentWarning = "You've attached " + count + " files. Up to " + MAX_CHATBOX_FILE_COUNT +
+                " per message is recommended — remove " + (count - MAX_CHATBOX_FILE_COUNT) + " to send with a message.";
+            return;
+        }
+        var budget = currentInputTokenBudget();
+        var est = attachmentsTokenEstimate();
+        if (budget && est > budget) {
+            CS.attachmentWarning = "Attachments are ~" + formatTokenCount(est) + " tokens, which may exceed the ~" +
+                formatTokenCount(budget) + "-token per-request limit. Remove some files to send with a message.";
+            return;
+        }
         CS.attachmentWarning = "";
-        arr.forEach(function (f) {
-            if (!f || typeof f.size !== "number") return;
-            if (ATTACHMENT_MAX_BYTES && f.size > ATTACHMENT_MAX_BYTES) {
-                CS.attachmentWarning = '"' + f.name + '" exceeds the ' + formatBytes(ATTACHMENT_MAX_BYTES) + " upload limit and was skipped.";
-                return;
-            }
-            if (CS.attachments.some(function (a) { return a.name === f.name && a.file && a.file.size === f.size; })) return;
-            CS.attachments.push({ id: "att_" + randomLowerString(10), name: f.name, file: f, status: "pending", progress: 0, uploadedUrl: "", storagePath: "", errorMessage: "" });
+    }
+
+    // Stable content key so repeat drops of the same file/folder don't stack
+    // duplicate chips. Files use name+size+lastModified; folders name+count+size.
+    function attachmentKey(a) {
+        if (a.kind === "folder") {
+            var total = 0; (a.files || []).forEach(function (f) { total += (f.file && f.file.size) || 0; });
+            return "d|" + a.name + "|" + (a.files ? a.files.length : 0) + "|" + total;
+        }
+        return "f|" + a.name + "|" + (a.file ? a.file.size : 0) + "|" + (a.file ? a.file.lastModified : 0);
+    }
+    function newAttachment(props) {
+        return Object.assign({ id: "att_" + randomLowerString(10), status: "pending", progress: 0,
+            uploadedUrl: "", storagePath: "", errorMessage: "" }, props);
+    }
+    // Append pre-built attachment objects (kind:"file" | "folder"), de-duped.
+    function appendAttachments(attObjs) {
+        var seen = {};
+        CS.attachments.forEach(function (a) { seen[attachmentKey(a)] = true; });
+        var changed = false;
+        (attObjs || []).forEach(function (a) {
+            if (!a) return;
+            var k = attachmentKey(a);
+            if (seen[k]) return;
+            seen[k] = true;
+            CS.attachments.push(a);
             changed = true;
         });
-        if (changed || CS.attachmentWarning) renderAttachmentChips();
+        if (changed) { recomputeAttachmentWarning(); renderAttachmentChips(); scheduleAttachmentOverflowRecompute(); }
         updateComposerControls();
+    }
+    function addFilesToAttachments(files) {
+        var objs = [];
+        Array.prototype.slice.call(files || []).forEach(function (f) {
+            if (!f || typeof f.size !== "number") return;
+            objs.push(newAttachment({ kind: "file", name: f.name, file: f }));
+        });
+        if (objs.length) appendAttachments(objs);
+    }
+    // Recursively read a drag-dropped FileSystemEntry (file or directory) into a
+    // flat [{file, path}] list; paths are prefixed for nested directories.
+    function readEntry(entry, prefix) {
+        prefix = prefix || "";
+        return new Promise(function (resolve) {
+            if (!entry) { resolve([]); return; }
+            if (entry.isFile) {
+                entry.file(function (file) { resolve([{ file: file, path: prefix + file.name }]); }, function () { resolve([]); });
+                return;
+            }
+            if (entry.isDirectory) {
+                var reader = entry.createReader();
+                var all = [];
+                var readBatch = function () {
+                    reader.readEntries(function (entries) {
+                        if (!entries.length) { resolve(all); return; }
+                        Promise.all(entries.map(function (e) { return readEntry(e, prefix + entry.name + "/"); }))
+                            .then(function (groups) {
+                                groups.forEach(function (g) { all.push.apply(all, g); });
+                                readBatch(); // readEntries returns chunks; keep going
+                            });
+                    }, function () { resolve(all); });
+                };
+                readBatch();
+                return;
+            }
+            resolve([]);
+        });
+    }
+    // #8/#9: hide overflowing chips behind a "...(x) more" pill once the wrap row
+    // would exceed 30% of the chat height. sortedAttachments keeps the uploading
+    // file first, so it's always within the visible slice.
+    var ATTACHMENTS_MAX_HEIGHT_RATIO = 0.3;
+    var _attOverflowFrame = 0;
+    function scheduleAttachmentOverflowRecompute() {
+        if (typeof requestAnimationFrame !== "function") { recomputeAttachmentOverflow(); return; }
+        if (_attOverflowFrame) cancelAnimationFrame(_attOverflowFrame);
+        _attOverflowFrame = requestAnimationFrame(function () { _attOverflowFrame = 0; recomputeAttachmentOverflow(); });
+    }
+    function recomputeAttachmentOverflow() {
+        var row = CS.attachmentsRow, chat = CS.chatEl;
+        var total = CS.attachments.length;
+        if (!row || !chat) return;
+        if (!total) { CS.visibleAttachmentCount = Infinity; return; }
+        CS.visibleAttachmentCount = total; // start by showing all, then shrink to fit
+        renderAttachmentChips();
+        var maxHeight = chat.clientHeight * ATTACHMENTS_MAX_HEIGHT_RATIO;
+        if (maxHeight <= 0) return;
+        var count = total;
+        while (count > 0 && row.scrollHeight > maxHeight) {
+            count--;
+            CS.visibleAttachmentCount = count;
+            renderAttachmentChips();
+        }
+    }
+    // Remove a set of attachments at once (used by the "...(x) more" × and
+    // remove-all), without re-rendering per item.
+    function removeAttachments(ids) {
+        var idset = {};
+        ids.forEach(function (id) { idset[id] = true; });
+        CS.attachments = CS.attachments.filter(function (a) {
+            if (idset[a.id]) { if (a._abort) { try { a._abort(); } catch (e) {} } return false; }
+            return true;
+        });
+        CS.visibleAttachmentCount = Infinity;
+        recomputeAttachmentWarning();
+        renderAttachmentChips();
+        updateComposerControls();
+        scheduleAttachmentOverflowRecompute();
     }
     function removeAttachment(id) {
         var i = CS.attachments.findIndex(function (a) { return a.id === id; });
@@ -2582,8 +2859,10 @@
         var att = CS.attachments[i];
         if (att._abort) { try { att._abort(); } catch (e) {} }
         CS.attachments.splice(i, 1);
+        recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
+        scheduleAttachmentOverflowRecompute();
     }
     function clearAttachments() {
         CS.attachments.forEach(function (a) { if (a._abort) { try { a._abort(); } catch (e) {} } });
@@ -2591,6 +2870,32 @@
         CS.attachmentWarning = "";
         renderAttachmentChips();
         updateComposerControls();
+        scheduleAttachmentOverflowRecompute();
+    }
+    // Keep only failed chips (red upload-fail / yellow index-fail) after a send so
+    // the user can see/retry them; clear the successfully-handled ones.
+    function clearSuccessfulAttachments() {
+        CS.attachments = CS.attachments.filter(function (a) {
+            return a.status === "error" || a.status === "indexError";
+        });
+        CS.attachments.forEach(function (a) { a._abort = null; });
+        recomputeAttachmentWarning();
+        renderAttachmentChips();
+        updateComposerControls();
+        scheduleAttachmentOverflowRecompute();
+    }
+    // Display order: in-flight uploads first (so the file being uploaded sits at
+    // the front), then pending, failures, and finished uploads last. Mirrors
+    // agent.vue's sortedAttachments.
+    var ATTACHMENT_STATUS_PRIORITY = { uploading: 0, pending: 1, error: 2, indexError: 2, done: 3 };
+    function sortedAttachments() {
+        return CS.attachments.map(function (a, i) { return { a: a, i: i }; }).sort(function (x, y) {
+            var px = ATTACHMENT_STATUS_PRIORITY[x.a.status]; if (px === undefined) px = 99;
+            var py = ATTACHMENT_STATUS_PRIORITY[y.a.status]; if (py === undefined) py = 99;
+            if (px !== py) return px - py;
+            if (px === 0) return y.i - x.i; // newer uploads bubble to the front
+            return x.i - y.i;               // otherwise keep insertion order
+        }).map(function (e) { return e.a; });
     }
     function renderAttachmentChips() {
         var row = CS.attachmentsRow;
@@ -2601,36 +2906,76 @@
         if (CS.attachmentWarning) {
             row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentWarning })));
         }
-        CS.attachments.forEach(function (att) {
-            var clickable = att.status === "done" && !!att.uploadedUrl;
+        var sorted = sortedAttachments();
+        var vis = CS.visibleAttachmentCount;
+        var shown = (vis >= sorted.length) ? sorted : sorted.slice(0, Math.max(0, vis));
+        var hidden = sorted.slice(shown.length);
+        shown.forEach(function (att) {
+            var isFolder = att.kind === "folder";
+            var clickable = att.status === "done" && !isFolder && !!att.uploadedUrl;
             var cls = "bq-attachment";
             if (att.status === "uploading") cls += " is-uploading";
-            else if (att.status === "error") cls += " is-error";
-            else if (att.status === "done") cls += " is-done";
+            else if (att.status === "error") cls += " is-error";            // red: upload failed
+            else if (att.status === "indexError") cls += " is-index-error"; // yellow: indexing failed
+            else if (att.status === "done") cls += " is-done";              // green: uploaded + indexed
             if (clickable) cls += " is-clickable";
             var chip = h("div", { class: cls });
             if (att.status === "uploading") chip.style.setProperty("--att-progress", (att.progress || 0) + "%");
-            if (clickable) {
-                chip.title = "Open " + att.name;
-                chip.addEventListener("click", function () { window.open(att.uploadedUrl, "_blank", "noopener,noreferrer"); });
-            }
-            chip.appendChild(h("span", { class: "bq-attachment-icon", html: FILE_ICON_SVG }));
+            // Hover title: failure explanation, or open-hint for finished files.
+            chip.title = att.status === "error" ? "File upload has failed"
+                : att.status === "indexError" ? "File indexing failed"
+                : clickable ? "Open " + att.name
+                : isFolder ? att.name + "/ — " + (att.files ? att.files.length : 0) + " file(s)"
+                : att.name;
+            if (clickable) chip.addEventListener("click", function () { window.open(att.uploadedUrl, "_blank", "noopener,noreferrer"); });
+            chip.appendChild(h("span", { class: "bq-attachment-icon", html: isFolder ? FOLDER_ICON_SVG : FILE_ICON_SVG }));
             chip.appendChild(h("span", { class: "bq-attachment-name", text: att.name, title: att.name }));
-            var meta = att.status === "error"
-                ? (att.errorMessage || "Failed")
+            var meta = att.status === "error" ? "(Failed)"
+                : att.status === "indexError" ? "(Error)"
+                : att.status === "uploading" ? (att.progress || 0) + "%"
+                : isFolder ? "(" + (att.files ? att.files.length : 0) + ")"
                 : formatBytes(att.file ? att.file.size : att.size);
             chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
             if (clickable) chip.appendChild(h("span", { class: "bq-attachment-arrow", text: "↗" }));
-            var rm = h("button", { class: "bq-attachment-remove", type: "button", title: "Remove", text: "×" });
-            rm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachment(att.id); });
-            chip.appendChild(rm);
+            // Remove button: hidden during the upload batch (#2) and for finished
+            // (done) chips (the ↗ replaces it). Shown for pending + persisted
+            // failures so the user can clear them.
+            if (!CS.uploadingAttachments && att.status !== "done") {
+                var rm = h("button", { class: "bq-attachment-remove", type: "button", title: "Remove", text: "×" });
+                rm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachment(att.id); });
+                chip.appendChild(rm);
+            }
             row.appendChild(chip);
         });
+        // #10: when chips overflow, a "...(x) more" pill whose × drops the hidden
+        // files; when nothing is hidden, a single "Remove all" button instead.
+        if (hidden.length > 0) {
+            var moreChip = h("div", { class: "bq-attachment bq-attachment-more",
+                title: hidden.map(function (a) { return a.kind === "folder" ? a.name + "/" : a.name; }).join("\n") });
+            moreChip.appendChild(h("span", { class: "bq-attachment-name", text: "…(" + hidden.length + ") more" }));
+            if (!CS.uploadingAttachments) {
+                var moreRm = h("button", { class: "bq-attachment-remove", type: "button",
+                    title: "Remove these " + hidden.length, text: "×" });
+                moreRm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachments(hidden.map(function (a) { return a.id; })); });
+                moreChip.appendChild(moreRm);
+            }
+            row.appendChild(moreChip);
+        } else if (!CS.uploadingAttachments && CS.attachments.length >= 2) {
+            var removeAll = h("button", { class: "bq-attachment-remove-all", type: "button",
+                title: "Remove all attachments" }, "Remove all ×");
+            removeAll.addEventListener("click", function (e) { e.stopPropagation(); clearAttachments(); });
+            row.appendChild(removeAll);
+        }
     }
     function updateComposerControls() {
         var uploading = CS.uploadingAttachments;
         if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
-        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading;
+        // #3: lock the chat input while the upload batch runs.
+        if (CS.inputEl) CS.inputEl.disabled = uploading;
+        // Block sending while uploading, or while an attachment warning is shown
+        // (too many files / over budget together with a chat message). The
+        // warning is only set when there is chat input text (recomputeAttachmentWarning).
+        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading || !!CS.attachmentWarning;
     }
     function onAttachInputChange(inputEl) {
         if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -2654,11 +2999,11 @@
             return true;
         }
         chatEl.addEventListener("dragenter", function (e) {
-            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            if (!hasFiles(e) || S.aiPlatform === "none" || CS.chatSettingsOpen) return;
             e.preventDefault(); depth++; showOverlay();
         });
         chatEl.addEventListener("dragover", function (e) {
-            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            if (!hasFiles(e) || S.aiPlatform === "none" || CS.chatSettingsOpen) return;
             e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
         });
         chatEl.addEventListener("dragleave", function (e) {
@@ -2666,10 +3011,44 @@
             depth--; if (depth <= 0) { depth = 0; hideOverlay(); }
         });
         chatEl.addEventListener("drop", function (e) {
-            if (!hasFiles(e) || S.aiPlatform === "none") return;
+            if (!hasFiles(e) || S.aiPlatform === "none" || CS.chatSettingsOpen) return;
             e.preventDefault(); depth = 0; hideOverlay();
-            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFilesToAttachments(e.dataTransfer.files);
+            handleDrop(e.dataTransfer);
         });
+    }
+    // Build file/folder attachments from a drop. Uses webkitGetAsEntry so dropped
+    // directories become folder attachments (recursively read via readEntry).
+    function handleDrop(dt) {
+        if (!dt) return;
+        var items = dt.items;
+        if (items && items.length) {
+            var entries = [];
+            for (var i = 0; i < items.length; i++) {
+                var it = items[i];
+                if (it.kind !== "file") continue;
+                var entry = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
+                entries.push(entry || it.getAsFile());
+            }
+            Promise.all(entries.map(function (entry) {
+                if (!entry) return Promise.resolve(null);
+                if (entry instanceof File) return Promise.resolve(newAttachment({ kind: "file", name: entry.name, file: entry }));
+                if (entry.isFile) {
+                    return readEntry(entry).then(function (files) {
+                        return files[0] ? newAttachment({ kind: "file", name: files[0].file.name, file: files[0].file }) : null;
+                    });
+                }
+                if (entry.isDirectory) {
+                    return readEntry(entry).then(function (files) {
+                        return newAttachment({ kind: "folder", name: entry.name, files: files });
+                    });
+                }
+                return Promise.resolve(null);
+            })).then(function (objs) {
+                appendAttachments(objs.filter(Boolean));
+            });
+        } else if (dt.files && dt.files.length) {
+            addFilesToAttachments(dt.files);
+        }
     }
 
     function getPublicTemporaryUrl(remotePath) {
@@ -2870,8 +3249,18 @@
                 });
             }
         });
+        // Promote the first bg task to "running" if its ack came back "pending"
+        // (otherwise nothing turns the very first queued "Indexing:" into a
+        // running bubble + Thinking until it resolves).
+        promoteNextBgQueuedToRunning();
     }
     function handleHistoryItemResolution(itemId, response, platform) {
+        applyHistoryItemResolution(itemId, response, platform);
+        // A task just resolved; advance the bg-indexing queue so the next queued
+        // "Indexing: <file>" turns into a running bubble + "Thinking".
+        promoteNextBgQueuedToRunning();
+    }
+    function applyHistoryItemResolution(itemId, response, platform) {
         historyItemPolls.delete(itemId);
         var isErr = isErrorResponseBody(response);
         var answer = isErr ? getErrorMessage(response)
@@ -2919,6 +3308,7 @@
         if (fetchMore) CS.loadingOlderHistory = true;
         var prevScrollHeight = CS.messagesBox ? CS.messagesBox.scrollHeight : 0;
         var prevScrollTop = CS.messagesBox ? CS.messagesBox.scrollTop : 0;
+        renderMessages(); // surface "Fetching history..." (initial centered / scroll-up at top) while it loads
         var platform = S.aiPlatform;
         var serviceId = S.serviceId, owner = S.owner;
         var options = { fetchMore: fetchMore };
@@ -2986,6 +3376,10 @@
                 var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
                 if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) CS.historyEndOfList = true;
             }
+            // Clear the loading flags BEFORE this render so the final paint has
+            // no "Fetching history..." indicator (and the scroll-restore math
+            // below uses indicator-free heights on both sides).
+            if (CS.historyRequestToken === token) { CS.loadingHistory = false; CS.loadingOlderHistory = false; }
             updateHistoryCache();
             renderMessages();
 
@@ -3038,7 +3432,13 @@
             // history is optional; ignore if unavailable
             console.warn("[bunnychat] getChatHistory failed", err);
         }).then(function () {
-            if (CS.historyRequestToken === token) { CS.loadingHistory = false; CS.loadingOlderHistory = false; }
+            if (CS.historyRequestToken === token) {
+                var wasLoading = CS.loadingHistory || CS.loadingOlderHistory;
+                CS.loadingHistory = false; CS.loadingOlderHistory = false;
+                // Success already reset+rendered above; this clears a leftover
+                // indicator on the error path.
+                if (wasLoading) renderMessages();
+            }
         });
     }
 
@@ -3134,11 +3534,23 @@
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
     }
 
+    function historyLoadingEl(initial) {
+        return h("div", { class: "bq-history-loading" + (initial ? " is-initial" : "") },
+            h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" }));
+    }
     function renderMessages() {
         if (!CS.messagesBox) return;
+        if (CS.chatSettingsOpen) return; // the settings panel occupies the messages area
         clear(CS.messagesBox);
         CS.messageEls = [];
+        // "Fetching history..." pinned at the top while paginating older history (scroll-up).
+        if (CS.loadingOlderHistory) CS.messagesBox.appendChild(historyLoadingEl(false));
         if (!CS.messages.length) {
+            // Initial load: show "Fetching history..." instead of the greeting.
+            if (CS.loadingHistory && !CS.loadingOlderHistory) {
+                CS.messagesBox.appendChild(historyLoadingEl(true));
+                return;
+            }
             var greet = h("div", { class: "bq-message is-assistant bq-empty-greeting" },
                 h("div", { class: "bq-bubble" },
                     document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
@@ -3167,7 +3579,9 @@
         CS.messages = []; CS.messageEls = []; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = "";
-        CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null;
+        CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
+        CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
+        CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null;
         CS.gateRefreshToken += 1;
         historyItemPolls.clear();
         if (CS.pollTimer) { clearInterval(CS.pollTimer); CS.pollTimer = null; }
@@ -3175,7 +3589,8 @@
         render("chat", function () {
             var settingsBtn = h("button", { class: "bq-icon-btn", type: "button", title: "Settings",
                 html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
-                onclick: function () { renderAccount(); } });
+                onclick: function () { toggleChatSettings(); } });
+            CS.settingsBtnEl = settingsBtn;
 
             var header = h("div", { class: "bq-section-title" },
                 h("div", { class: "bq-title-row" },
@@ -3197,10 +3612,18 @@
 
             var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
                         "." });
+            CS.inputEl = input;
             var composing = false;
             input.addEventListener("compositionstart", function () { composing = true; });
             input.addEventListener("compositionend", function () { composing = false; });
-            input.addEventListener("input", function () { autoGrowInput(input); });
+            input.addEventListener("input", function () {
+                autoGrowInput(input);
+                // The attachment warning + send-disable depend on whether there is
+                // chat text. Re-evaluate when it crosses the empty/non-empty line.
+                var prev = CS.attachmentWarning;
+                recomputeAttachmentWarning();
+                if (CS.attachmentWarning !== prev) { renderAttachmentChips(); updateComposerControls(); scheduleAttachmentOverflowRecompute(); }
+            });
             input.addEventListener("keydown", function (e) {
                 if (e.key === "Enter" && !e.shiftKey && !composing) { e.preventDefault(); sendMessage(); }
             });
@@ -3225,6 +3648,7 @@
                 h("div", { class: "bq-input-wrap" }, attachBtn, attachFileInput, input), sendBtn);
 
             chatArea = h("div", { class: "bq-chat" }, box, composer);
+            CS.chatEl = chatArea; CS.composerEl = composer;
             setupDragAndDrop(chatArea);
             return h("div", { class: "bq-meta" }, header, chatArea);
         });
@@ -3251,8 +3675,7 @@
 
     function agentBadgeText() {
         if (S.aiPlatform === "none") return "No agent configured";
-        var plat = S.aiPlatform === "claude" ? "Claude" : "OpenAI";
-        return S.aiModel ? plat + " · " + S.aiModel : plat;
+        return S.serviceName ? "BunnyQuery · " + S.serviceName : "BunnyQuery";
     }
 
     /* ========================================================================
@@ -3369,6 +3792,11 @@
         }
 
         // 3. Normal boot — check for an existing (auto-login) session.
+        // Strip any leftover OAuth callback params: reaching here means none of
+        // the recognized return-flows above matched (saved state already
+        // consumed, a reload mid-exchange, or a replayed/foreign code), so the
+        // params are stale — don't let them linger in the address bar.
+        if (getQueryParam("code") || getQueryParam("oauth")) cleanUrl();
         return getProfile().then(function (user) {
             S.user = user;
             if (!user) {
@@ -3408,7 +3836,7 @@
             googleClientId: null,
             googleClientSecretName: "ggl",
             signupConfirmationUrl: null, // defaults to current host page
-            hostDomain: "skapi.com",     // used to detect db-CDN links in AI replies
+            hostDomain: null,            // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
         }, opts || {});
         S.mountEl = mountEl;
 
@@ -3419,6 +3847,13 @@
 
         applyTheme(loadTheme());
         S.booted = true;
+
+        // Recompute the attachment "...(x) more" overflow when the viewport
+        // changes (no-op when the chat/attachments aren't mounted).
+        if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
+            S._resizeBound = true;
+            window.addEventListener("resize", function () { scheduleAttachmentOverflowRecompute(); });
+        }
 
         boot();
         return PUBLIC;

@@ -160,17 +160,36 @@
 /* ============================================================================
  * AUTH VIEWS (login / signup / forgot / verify / settings)
  * ==========================================================================*/
+/* padded parent that nests a standalone page (login / signup / verify / …) */
+.bq-page {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    padding: 2.5rem 1.5rem;
+}
 .bq-settings {
     flex: 1;
-    /* min-height: 0; */
-    /* overflow-y: auto; */
     width: 100%;
     max-width: 440px;
     margin: 0 auto;
-    padding: 2.5rem 1.5rem;
     font-family: var(--bq-mono);
     color: var(--bq-ink);
 }
+
+.bq-page-footer {
+    flex-shrink: 0;
+    text-align: center;
+    padding-top: 2rem;
+}
+.bq-page-footer-link {
+    font-family: var(--bq-mono);
+    font-size: 0.75rem;
+    color: var(--bq-muted);
+    text-decoration: none;
+}
+.bq-page-footer-link:hover { text-decoration: underline; }
 
 .bq-settings-title {
     font-size: 1.5rem;
@@ -354,6 +373,12 @@
 }
 .bq-account-row:last-child { border-bottom: 0; }
 .bq-account-row-main { min-width: 0; }
+.bq-theme-radios {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
 .bq-account-label {
     font-size: 0.7rem;
     font-weight: 600;
@@ -417,7 +442,7 @@
     flex-direction: column;
     flex: 1;
     min-height: 0;
-    padding: 1rem 1.25rem 1.25rem;
+    /* padding: 1rem 1.25rem 1.25rem; */
 }
 
 .bq-section-title {
@@ -426,7 +451,8 @@
     gap: 0.5rem;
     font-size: 1.1rem;
     font-weight: 700;
-    padding-bottom: 0.75rem;
+    /* padding-bottom: 0.75rem; */
+    padding: 1rem 1.25rem 0.75rem;
     flex-shrink: 0;
 }
 
@@ -486,9 +512,19 @@
     border-radius: 0;
 }
 .bq-icon-btn:hover { color: var(--bq-pink); }
+.bq-icon-btn.is-active { color: var(--bq-pink); }
 .bq-icon-btn--danger:hover { color: var(--bq-danger); }
 .bq-icon-btn:disabled { opacity: 0.3; pointer-events: none; }
 .bq-icon-btn svg { width: 1.25rem; height: 1.25rem; display: block; }
+
+/* settings shown in place inside the chat's messages area */
+.bq-chat-settings {
+    width: 100%;
+    max-width: 440px;
+    margin: 0 auto;
+    padding: 1.25rem 0 2rem;
+}
+.bq-chat-settings-loading { text-align: center; padding: 2.5rem 0; color: var(--bq-muted); }
 
 /* chat container + scroll area */
 .bq-chat {
@@ -504,7 +540,7 @@
     overflow-x: hidden;
     flex: 1;
     min-height: 0;
-    padding: 0.25rem 0;
+    padding: 0.25rem 1.25rem;
     background: var(--bq-paper);
 }
 
@@ -514,10 +550,18 @@
     z-index: 1;
     display: flex;
     justify-content: center;
+    gap: 0.1em;
     padding: 0.5rem 0 1rem;
     font-size: 0.8rem;
     color: var(--bq-muted);
     background: var(--bq-paper);
+}
+/* initial first-page load: center it in the (empty) messages area */
+.bq-history-loading.is-initial {
+    position: absolute;
+    inset: 0;
+    align-items: center;
+    padding: 0;
 }
 
 /* "admin hasn't set up the agent" / disabled overlay */
@@ -737,7 +781,7 @@
     display: flex;
     flex-shrink: 0;
     gap: 0.65rem;
-    padding: 0.65rem 0 0;
+    padding: 0.65rem 1.25rem 1.25rem;
     background: var(--bq-paper);
     flex-wrap: wrap;
 }
@@ -824,8 +868,14 @@
     pointer-events: none;
 }
 .bq-attachment.is-uploading > * { position: relative; z-index: 1; }
-.bq-attachment.is-error { border-color: var(--bq-danger); }
-.bq-attachment.is-error .bq-attachment-meta { color: var(--bq-danger); }
+.bq-attachment.is-error { border-color: var(--bq-danger); background: var(--bq-danger-bg); }
+.bq-attachment.is-error .bq-attachment-meta,
+.bq-attachment.is-error .bq-attachment-name { color: var(--bq-danger); }
+.bq-attachment.is-index-error { border-color: var(--bq-warning-border); background: var(--bq-warning-bg); }
+.bq-attachment.is-index-error .bq-attachment-meta,
+.bq-attachment.is-index-error .bq-attachment-name { color: var(--bq-warning); }
+.bq-attachment.is-done { border-color: var(--bq-success-border); background: var(--bq-success-bg); }
+.bq-attachment.is-done .bq-attachment-meta { color: var(--bq-success); }
 .bq-attachment.is-clickable { cursor: pointer; transition: background 0.12s, border-color 0.12s; }
 .bq-attachment.is-clickable:hover { background: var(--bq-hover-bg); border-color: var(--bq-ink); }
 .bq-attachment-icon { flex: 0 0 16px; color: var(--bq-muted); display: inline-flex; }
@@ -839,7 +889,21 @@
     max-width: 12rem;
 }
 .bq-attachment-meta { color: var(--bq-muted); flex-shrink: 0; }
-.bq-attachment-more { color: var(--bq-muted); font-style: italic; cursor: default; }
+.bq-attachment-more { color: var(--bq-muted); font-style: italic; }
+.bq-attachment-remove-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px dashed var(--bq-line);
+    background: transparent;
+    color: var(--bq-muted);
+    font-family: var(--bq-mono);
+    font-size: 0.72rem;
+    cursor: pointer;
+    align-self: center;
+}
+.bq-attachment-remove-all:hover { color: var(--bq-danger); border-color: var(--bq-danger); }
 .bq-attachment-remove {
     display: inline-flex;
     align-items: center;
@@ -938,12 +1002,14 @@
  * RESPONSIVE
  * ==========================================================================*/
 @media (max-width: 600px) {
-    .bq-meta { padding: 0.75rem; }
-    .bq-input-row { flex-direction: column; }
+    /* .bq-meta { padding: 0.75rem; } */
+    .bq-input-row { flex-direction: column; padding: 0.65rem 0.75rem 0.75rem; }
     .bq-input-wrap { width: 100%; flex: 0 0 auto; }
     .bq-input-row .btn { width: 100%; }
     .bq-bubble { max-width: 100%; }
-    .bq-settings { padding: 2rem 1.25rem; }
+    .bq-page { padding: 2rem 1.25rem; }
+    .bq-section-title { padding: 0.75rem; }
+    .bq-messages { padding: 0.25rem 0.75rem; }
 }
 
 /* dark-mode: brighten any inline dark SVG icons (e.g. provider logos) */

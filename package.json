@@ -1,7 +1,7 @@
 {
-  "name": "bunnychat",
-  "version": "0.1.0",
-  "description": "Embeddable AI chat widget for Skapi-powered projects",
+  "name": "bunnyquery",
+  "version": "1.2.0",
+  "description": "Embeddable BunnyQuery AI chat widget",
   "main": "bunnychat.js",
   "files": [
     "bunnychat.js",
