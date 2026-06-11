@@ -5,9 +5,9 @@
  * (www.skapi.com) agent.vue chatbox + account/auth views.
  *
  * Usage:
- *   <link rel="stylesheet" href="bunnychat.css">
+ *   <link rel="stylesheet" href="bunnyquery.css">
  *   <script src="https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js"></script>
- *   <script src="bunnychat.js"></script>
+ *   <script src="bunnyquery.js"></script>
  *   <script>
  *     const skapi = new Skapi("<service_id>", { autoLogin: true }, { hostDomain, target_cdn });
  *     BunnyChat.init(skapi, "chatbox", { theme: "light", signup: true });
@@ -301,7 +301,7 @@
                 return S.skapi.connection || null;
             })
             .then(function (conn) {
-                console.log("[bunnychat] loadServiceInfo", conn)
+                console.log("[bunnyquery] loadServiceInfo", conn)
                 if (conn) {
                     S.serviceId = conn.service || S.serviceId;
                     S.owner = conn.owner || S.owner;
@@ -386,7 +386,7 @@
 
     function registerMcpClient() {
         var body = {
-            client_name: "bunnychat",
+            client_name: "bunnyquery",
             grant_types: ["authorization_code", "refresh_token"],
             response_types: ["code"],
             redirect_uris: [mcpRedirectUri()],
@@ -585,7 +585,7 @@
     // The MCP server's /oauth/authorize step authenticates the user against
     // skapi by redirecting the browser back here with
     //   ?oauth=platform&redirect_uri=<caller_cb>&state=<s>
-    // bunnychat then acts as the identity provider: it packages the skapi
+    // bunnyquery then acts as the identity provider: it packages the skapi
     // session tokens into a `code` and bounces back to the caller's
     // redirect_uri. WITHOUT this, boot() would treat the logged-in user as
     // "needs MCP grant" and call beginMcpOAuthOnLogin() again — and the MCP
@@ -633,7 +633,7 @@
                 return;
             }
             if (waited >= 3000) {
-                console.error("[bunnychat] OAuth bounce aborted: no skapi session.");
+                console.error("[bunnyquery] OAuth bounce aborted: no skapi session.");
                 renderLogin();
                 return;
             }
@@ -749,7 +749,7 @@
                             return returnOAuthToMCP();
                         }
                         return beginMcpOAuthOnLogin("chat").catch(function (err) {
-                            console.error("[bunnychat] MCP OAuth bootstrap failed", err);
+                            console.error("[bunnyquery] MCP OAuth bootstrap failed", err);
                             enterAfterLogin(); // MCP down — chat still works off skapi JWT
                         });
                     })
@@ -1854,7 +1854,7 @@
             }
             dispatchComposedMessage(composed, hasNewIndexing);
         }).catch(function (err) {
-            console.error("[bunnychat] attachment upload failed", err);
+            console.error("[bunnyquery] attachment upload failed", err);
             CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
             CS.messages.push({ role: "assistant", content: "Something went wrong while uploading attachments. " + ((err && err.message) || ""), isError: true });
             renderMessages(); scrollToBottom(true);
@@ -2544,7 +2544,7 @@
                             drainBgTaskQueue();
                         }
                     }, function (e) {
-                        console.error("[bunnychat] indexing request failed", e);
+                        console.error("[bunnyquery] indexing request failed", e);
                         anyIndexFailed = true; // uploaded but not indexed → yellow
                     });
                 });
@@ -3086,7 +3086,7 @@
         fetchFreshHrefForExpiredLink(originalHref, anchor.dataset.bqRemotePath).then(function (fresh) {
             anchor.href = fresh; anchor.dataset.bqExpired = "0"; anchor.click();
         }).catch(function (err) {
-            console.error("[bunnychat] expired link refresh failed", err);
+            console.error("[bunnyquery] expired link refresh failed", err);
             alert((err && err.message) || "Failed to refresh this expired link.");
         });
     }
@@ -3430,7 +3430,7 @@
             if (!fetchMore) return scrollToBottom();
         }).catch(function (err) {
             // history is optional; ignore if unavailable
-            console.warn("[bunnychat] getChatHistory failed", err);
+            console.warn("[bunnyquery] getChatHistory failed", err);
         }).then(function () {
             if (CS.historyRequestToken === token) {
                 var wasLoading = CS.loadingHistory || CS.loadingOlderHistory;
@@ -3737,7 +3737,7 @@
             .then(function (conn) { S.service = conn; applyAgentConfig(); })
             .then(function () { renderChat(); })
             .catch(function (err) {
-                console.error("[bunnychat] enterAfterLogin failed", err);
+                console.error("[bunnyquery] enterAfterLogin failed", err);
                 renderChat();
             });
     }
@@ -3774,7 +3774,7 @@
                     return beginMcpOAuthOnLogin("chat"); // also establish MCP grant
                 })
                 .catch(function (err) {
-                    console.error("[bunnychat] Google OAuth return failed", err);
+                    console.error("[bunnyquery] Google OAuth return failed", err);
                     cleanUrl();
                     renderLogin();
                 });
@@ -3785,7 +3785,7 @@
             return completeMcpAuthorize()
                 .then(function () { cleanUrl(); return enterAfterLogin(); })
                 .catch(function (err) {
-                    console.error("[bunnychat] MCP OAuth token exchange failed", err);
+                    console.error("[bunnyquery] MCP OAuth token exchange failed", err);
                     cleanUrl();
                     return enterAfterLogin(); // chat still works off skapi JWT
                 });
@@ -3805,7 +3805,7 @@
             }
             if (mcpGrantNeedsRefresh(user)) {
                 return beginMcpOAuthOnLogin("chat").catch(function (err) {
-                    console.error("[bunnychat] MCP refresh failed", err);
+                    console.error("[bunnyquery] MCP refresh failed", err);
                     return enterAfterLogin();
                 });
             }
@@ -3819,7 +3819,7 @@
 
     function init(skapi, target, opts) {
         if (S.booted) {
-            console.warn("[bunnychat] already initialised");
+            console.warn("[bunnyquery] already initialised");
             return PUBLIC;
         }
         if (!skapi) throw new Error("BunnyChat.init: a Skapi instance is required");

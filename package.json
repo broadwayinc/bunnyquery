@@ -2,10 +2,10 @@
   "name": "bunnyquery",
   "version": "1.2.0",
   "description": "Embeddable BunnyQuery AI chat widget",
-  "main": "bunnychat.js",
+  "main": "bunnyquery.js",
   "files": [
-    "bunnychat.js",
-    "bunnychat.css"
+    "bunnyquery.js",
+    "bunnyquery.css"
   ],
   "keywords": [
     "skapi",

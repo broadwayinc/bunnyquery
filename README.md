@@ -44,8 +44,8 @@ call `BunnyChat.init()`:
 
   <!-- Skapi SDK + BunnyChat -->
   <script src="https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js"></script>
-  <link rel="stylesheet" href="bunnychat.css" />
-  <script src="bunnychat.js"></script>
+  <link rel="stylesheet" href="bunnyquery.css" />
+  <script src="bunnyquery.js"></script>
 </head>
 <body style="margin: 0">
   <!-- The widget fills this element, so give it a height -->
@@ -72,8 +72,8 @@ chat view depending on the user's session.
 
 | File            | Purpose                                                        |
 | --------------- | ------------------------------------------------------------- |
-| `bunnychat.js`  | The widget. Exposes the global `window.BunnyChat`.            |
-| `bunnychat.css` | All styles, scoped under `.bq-agent` / `[data-bq-theme]`.    |
+| `bunnyquery.js`  | The widget. Exposes the global `window.BunnyChat`.            |
+| `bunnyquery.css` | All styles, scoped under `.bq-agent` / `[data-bq-theme]`.    |
 
 Host them yourself (same origin recommended) or from a CDN.
 
@@ -127,7 +127,7 @@ BunnyChat.logout();
 BunnyChat is themed with CSS custom properties (`--bq-*`) under a
 `[data-bq-theme="light"|"dark"]` attribute that the widget sets on its own root.
 To customize colors, override the variables in your own stylesheet **after**
-`bunnychat.css`, scoped to `.bq-agent`:
+`bunnyquery.css`, scoped to `.bq-agent`:
 
 ```css
 .bq-agent {
