@@ -44,8 +44,8 @@ call `BunnyQuery.init()`:
 
   <!-- Skapi SDK + BunnyQuery -->
   <script src="https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js"></script>
-  <link rel="stylesheet" href="bunnyquery.css" />
-  <script src="bunnyquery.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bunnyquery@latest/bunnyquery.css" />
+  <script src="https://cdn.jsdelivr.net/npm/bunnyquery@latest/bunnyquery.js"></script>
 </head>
 <body style="margin: 0">
   <!-- The widget fills this element, so give it a height -->
