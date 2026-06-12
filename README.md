@@ -131,7 +131,7 @@ To customize colors, override the variables in your own stylesheet **after**
 
 ```css
 .bq-agent {
-  --bq-pink: #ff4fa3;
+  --bq-main: #ff4fa3;
   --bq-ink: #111;
 }
 ```

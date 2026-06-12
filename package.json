@@ -1,6 +1,6 @@
 {
   "name": "bunnyquery",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "description": "Embeddable BunnyQuery AI chat widget",
   "main": "bunnyquery.js",
   "files": [
@@ -17,8 +17,18 @@
   "scripts": {
     "dev": "npx bns port=3333"
   },
-  "license": "MIT",
   "dependencies": {
     "basic-node-server": "^1.1.1"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/broadwayinc/bunnyquery.git"
+  },
+  "author": "Baksa Gimm",
+  "copyright.owner": "broadway Inc.",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/broadwayinc/bunnyquery/issues"
+  },
+  "homepage": "https://www.bunnyquery.com"
 }

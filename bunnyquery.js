@@ -213,7 +213,7 @@
         service: null,     // resolved service info ({ ai_agent, name, ... })
         serviceId: null,
         owner: null,
-        theme: "light",
+        theme: null,
         // agent config (read-only, admin-provided)
         aiPlatform: "none", // "claude" | "openai" | "none"
         aiModel: "",
@@ -1134,7 +1134,7 @@
         } catch (e) { return Promise.resolve(false); }
     }
     // Settings opens IN PLACE inside the chat's messages area (the header stays;
-    // the composer is swapped for a "Close" bar; the gear turns pink). Toggling
+    // the composer is swapped for a "Close" bar; the gear takes the main color). Toggling
     // the gear again — or the close bar — returns to the chat.
     function toggleChatSettings() {
         if (CS.chatSettingsOpen) closeChatSettings(); else openChatSettings();

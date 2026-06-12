@@ -17,11 +17,11 @@
     --bq-muted: #666;
     --bq-line: #c8c8c8;
     --bq-hover-bg: #ebebeb;
-    --bq-pink: #c2185b;
-    --bq-light-pink: #f06292;
+    --bq-main: #c2185b;
+    --bq-light-main: #f06292;
     --bq-danger: #c44;
     --bq-danger-bg: #fff5f5;
-    --bq-pink-bg: #fff8fa;
+    --bq-main-bg: #fff8fa;
     --bq-success: #2a7d29;
     --bq-success-bg: #eef9f0;
     --bq-success-border: #b8dcbc;
@@ -45,11 +45,11 @@
     --bq-muted: #a0a0a0;
     --bq-line: #3d3d3d;
     --bq-hover-bg: #252525;
-    --bq-pink: #f06292;
-    --bq-light-pink: #f48fb1;
+    --bq-main: #f06292;
+    --bq-light-main: #f48fb1;
     --bq-danger: #ef5350;
     --bq-danger-bg: #2d1616;
-    --bq-pink-bg: #2b1520;
+    --bq-main-bg: #2b1520;
     --bq-success: #6abf66;
     --bq-success-bg: #192e1e;
     --bq-success-border: #4caf50;
@@ -245,7 +245,7 @@
 }
 
 .bq-link {
-    color: var(--bq-pink);
+    color: var(--bq-main);
     cursor: pointer;
     font-size: 0.8rem;
     background: none;
@@ -509,8 +509,8 @@
     transition: color 0.15s;
     border-radius: 0;
 }
-.bq-icon-btn:hover { color: var(--bq-pink); }
-.bq-icon-btn.is-active { color: var(--bq-pink); }
+.bq-icon-btn:hover { color: var(--bq-main); }
+.bq-icon-btn.is-active { color: var(--bq-main); }
 .bq-icon-btn--danger:hover { color: var(--bq-danger); }
 .bq-icon-btn:disabled { opacity: 0.3; pointer-events: none; }
 .bq-icon-btn svg { width: 1.25rem; height: 1.25rem; display: block; }
@@ -594,7 +594,7 @@
     align-items: center;
     justify-content: center;
     background: var(--bq-paper);
-    border: 2px dashed var(--bq-pink);
+    border: 2px dashed var(--bq-main);
     pointer-events: none;
     opacity: 0.92;
 }
@@ -603,7 +603,7 @@
     flex-direction: column;
     align-items: center;
     gap: 0.5rem;
-    color: var(--bq-pink);
+    color: var(--bq-main);
     font-size: 0.9rem;
     font-weight: 600;
 }
@@ -691,7 +691,7 @@
 /* in-bubble file/link anchors */
 .bq-file-download,
 .bq-link-button {
-    color: var(--bq-pink);
+    color: var(--bq-main);
     text-decoration: none;
     cursor: pointer;
     background: transparent;
@@ -734,7 +734,7 @@
     background: rgba(127, 127, 127, 0.08);
 }
 .bq-md hr { border: none; border-top: 1px solid var(--bq-line); margin: 0.8em 0; }
-.bq-md a { color: var(--bq-pink); text-decoration: underline; }
+.bq-md a { color: var(--bq-main); text-decoration: underline; }
 .bq-md a:hover { text-decoration: none; }
 .bq-md code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -805,7 +805,7 @@
     cursor: pointer;
     z-index: 1;
 }
-.bq-attach-btn:hover:not(:disabled) { color: var(--bq-pink); }
+.bq-attach-btn:hover:not(:disabled) { color: var(--bq-main); }
 .bq-attach-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .bq-attach-input { display: none; }
 .bq-input {
