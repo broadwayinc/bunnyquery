@@ -2417,6 +2417,14 @@
         if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
         return (n / (1024 * 1024)).toFixed(1) + " MB";
     }
+    // Build the "Indexing: <file> · <mime> · <size>" label for background
+    // indexing tasks (live bubble + history). mime/size are appended when known.
+    function buildIndexingLabel(name, mime, size) {
+        var extras = [];
+        if (mime) extras.push(mime);
+        if (size != null && size !== "" && !isNaN(Number(size))) extras.push(formatBytes(size));
+        return "Indexing: " + name + (extras.length ? " · " + extras.join(" · ") : "");
+    }
     function sanitizeStorageSegment(name) {
         // The db CDN serves files through a %-encoded path; object keys that
         // contain spaces (or other chars that round-trip badly through
@@ -2538,6 +2546,8 @@
                             bgTaskQueue.push({
                                 serviceId: S.serviceId, platform: S.aiPlatform, id: ack.id,
                                 filename: member.file.name,
+                                mime: member.file.type || mimeGetType(member.file.name),
+                                size: member.file.size,
                                 status: ack.status === "running" ? "running" : "pending",
                                 poll: ack.poll,
                             });
@@ -3160,7 +3170,17 @@
                 var displayContent;
                 if (item._isBgTask) {
                     var nameMatch = userText.match(/^- name: (.+)$/m);
-                    displayContent = nameMatch ? "Indexing: " + nameMatch[1].trim() : userText;
+                    if (nameMatch) {
+                        var mimeMatch = userText.match(/^- mime type: (.+)$/m);
+                        var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
+                        displayContent = buildIndexingLabel(
+                            nameMatch[1].trim(),
+                            mimeMatch ? mimeMatch[1].trim() : "",
+                            sizeMatch ? Number(sizeMatch[1]) : null
+                        );
+                    } else {
+                        displayContent = userText;
+                    }
                 } else {
                     displayContent = sanitizeAttachmentLinksForHistory(userText);
                 }
@@ -3223,7 +3243,7 @@
             if (entry.serviceId !== svcId || entry.platform !== plat) return;
             if (CS.messages.some(function (m) { return m._serverItemId === entry.id; })) return;
             var isRunning = entry.status === "running";
-            var userBubble = { role: "user", content: "Indexing: " + entry.filename, isBackgroundTask: true, _serverItemId: entry.id };
+            var userBubble = { role: "user", content: buildIndexingLabel(entry.filename, entry.mime, entry.size), isBackgroundTask: true, _serverItemId: entry.id };
             if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
             CS.messages.push(userBubble);
             if (isRunning) {
