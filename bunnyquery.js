@@ -1,16 +1,17 @@
 /* ============================================================================
- * BunnyChat — embeddable AI chat widget for Skapi-powered projects.
+ * BunnyQuery — embeddable AI chat widget for Skapi-powered projects.
  *
- * Standalone IIFE exposing `window.BunnyChat`. Vanilla-JS port of the bunnyquery
+ * Standalone IIFE exposing `window.BunnyQuery`. Vanilla-JS port of the bunnyquery
  * (www.skapi.com) agent.vue chatbox + account/auth views.
  *
  * Usage:
  *   <link rel="stylesheet" href="bunnyquery.css">
  *   <script src="https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js"></script>
- *   <script src="bunnyquery.js"></script>
+ *   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bunnyquery@latest/bunnyquery.css"/>
+ *   <script src="https://cdn.jsdelivr.net/npm/bunnyquery@latest/bunnyquery.js"></script>
  *   <script>
- *     const skapi = new Skapi("<service_id>", { autoLogin: true }, { hostDomain, target_cdn });
- *     BunnyChat.init(skapi, "chatbox", { theme: "light", signup: true });
+ *     const skapi = new Skapi("<project_id>", { autoLogin: true });
+ *     BunnyQuery.init(skapi, "chatbox", { theme: "light", signup: true });
  *   </script>
  *
  * Build order in this file:
@@ -357,7 +358,7 @@
         return String(S.opts.mcpBaseUrl || (S.opts.dev ? MCP_DEV : MCP_PROD)).replace(/\/+$/, "");
     }
     // Embeddable: the redirect target is the current host page (sans query),
-    // so the browser returns here and BunnyChat.init() re-runs + completes.
+    // so the browser returns here and BunnyQuery.init() re-runs + completes.
     function mcpRedirectUri() {
         return window.location.origin + window.location.pathname;
     }
@@ -3822,10 +3823,10 @@
             console.warn("[bunnyquery] already initialised");
             return PUBLIC;
         }
-        if (!skapi) throw new Error("BunnyChat.init: a Skapi instance is required");
+        if (!skapi) throw new Error("BunnyQuery.init: a Skapi instance is required");
 
         var mountEl = typeof target === "string" ? document.getElementById(target) : target;
-        if (!mountEl) throw new Error("BunnyChat.init: mount element not found: " + target);
+        if (!mountEl) throw new Error("BunnyQuery.init: mount element not found: " + target);
 
         S.skapi = skapi;
         S.opts = Object.assign({
@@ -3869,6 +3870,6 @@
     };
 
     if (typeof window !== "undefined") {
-        window.BunnyChat = PUBLIC;
+        window.BunnyQuery = PUBLIC;
     }
 })();

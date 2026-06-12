@@ -1,12 +1,12 @@
-# BunnyChat
+# BunnyQuery
 
 An embeddable, dependency-free AI chat widget for [Skapi](https://skapi.com)-powered
 projects. Drop it into any web page and your users get a full chat experience —
 account login/signup, conversation history, file & folder uploads, and a settings
 panel — all talking to your project's **BunnyQuery** AI agent.
 
-BunnyChat is a standalone vanilla-JS port of the BunnyQuery (www.skapi.com) agent
-chatbox. It ships as a single IIFE that exposes `window.BunnyChat`, plus one
+BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.skapi.com) agent
+chatbox. It ships as a single IIFE that exposes `window.BunnyQuery`, plus one
 stylesheet. No build step, no framework, no npm install.
 
 ## Features
@@ -26,14 +26,14 @@ stylesheet. No build step, no framework, no npm install.
 
 ## Requirements
 
-- A Skapi service (you need its **service ID**).
+- A BunnyQuery project (you need its **project ID**).
 - The [`skapi-js`](https://www.npmjs.com/package/skapi-js) SDK loaded on the page.
 - A mount element with an explicit height (the widget fills its container).
 
 ## Quick start
 
-Add the two BunnyChat files and the Skapi SDK, give it a sized container, then
-call `BunnyChat.init()`:
+Add the two BunnyQuery files and the Skapi SDK, give it a sized container, then
+call `BunnyQuery.init()`:
 
 ```html
 <!DOCTYPE html>
@@ -42,7 +42,7 @@ call `BunnyChat.init()`:
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <!-- Skapi SDK + BunnyChat -->
+  <!-- Skapi SDK + BunnyQuery -->
   <script src="https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js"></script>
   <link rel="stylesheet" href="bunnyquery.css" />
   <script src="bunnyquery.js"></script>
@@ -53,10 +53,10 @@ call `BunnyChat.init()`:
 
   <script>
     // 1. Create your Skapi instance
-    const skapi = new Skapi("<your-service-id>", { autoLogin: true });
+    const skapi = new Skapi("<your-project-id>", { autoLogin: true });
 
-    // 2. Mount BunnyChat into the container
-    BunnyChat.init(skapi, "chatbox", {
+    // 2. Mount BunnyQuery into the container
+    BunnyQuery.init(skapi, "chatbox", {
       theme: "light",
       signup: true,
     });
@@ -65,23 +65,23 @@ call `BunnyChat.init()`:
 </html>
 ```
 
-That's it — BunnyChat takes over the `#chatbox` element and renders the login or
+That's it — BunnyQuery takes over the `#chatbox` element and renders the login or
 chat view depending on the user's session.
 
 ## Files
 
 | File            | Purpose                                                        |
 | --------------- | ------------------------------------------------------------- |
-| `bunnyquery.js`  | The widget. Exposes the global `window.BunnyChat`.            |
+| `bunnyquery.js`  | The widget. Exposes the global `window.BunnyQuery`.            |
 | `bunnyquery.css` | All styles, scoped under `.bq-agent` / `[data-bq-theme]`.    |
 
 Host them yourself (same origin recommended) or from a CDN.
 
 ## API
 
-### `BunnyChat.init(skapi, target, opts?)`
+### `BunnyQuery.init(skapi, target, opts?)`
 
-Mounts the widget. Returns the `BunnyChat` object.
+Mounts the widget. Returns the `BunnyQuery` object.
 
 | Argument | Type                  | Description                                                        |
 | -------- | --------------------- | ----------------------------------------------------------------- |
@@ -104,7 +104,7 @@ Mounts the widget. Returns the `BunnyChat` object.
 
 ### Methods
 
-The `BunnyChat` global also exposes:
+The `BunnyQuery` global also exposes:
 
 | Method               | Description                                                        |
 | -------------------- | ----------------------------------------------------------------- |
@@ -114,9 +114,9 @@ The `BunnyChat` global also exposes:
 | `version`            | The widget version string.                                        |
 
 ```js
-BunnyChat.setTheme("dark");
-BunnyChat.toggleTheme();
-BunnyChat.logout();
+BunnyQuery.setTheme("dark");
+BunnyQuery.toggleTheme();
+BunnyQuery.logout();
 ```
 
 > `init()` is idempotent — calling it twice logs a warning and returns the existing
@@ -124,7 +124,7 @@ BunnyChat.logout();
 
 ## Theming
 
-BunnyChat is themed with CSS custom properties (`--bq-*`) under a
+BunnyQuery is themed with CSS custom properties (`--bq-*`) under a
 `[data-bq-theme="light"|"dark"]` attribute that the widget sets on its own root.
 To customize colors, override the variables in your own stylesheet **after**
 `bunnyquery.css`, scoped to `.bq-agent`:
@@ -140,10 +140,10 @@ The active theme is saved to `localStorage`, so a returning user keeps their cho
 
 ## OAuth & redirects
 
-BunnyChat connects to your AI agent through an MCP OAuth server
+BunnyQuery connects to your AI agent through an MCP OAuth server
 (`mcp.broadwayinc.computer` in production, `mcp-dev.broadwayinc.computer` when
 `dev: true`). After authorization, the OAuth server redirects back to **the current
-host page** — BunnyChat reads the `?code=…&state=…` parameters, completes the
+host page** — BunnyQuery reads the `?code=…&state=…` parameters, completes the
 exchange, and cleans them from the URL automatically. No dedicated callback page is
 needed; just make sure the page that hosts the widget is a stable, reachable URL.
 
