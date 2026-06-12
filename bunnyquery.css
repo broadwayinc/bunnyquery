@@ -406,7 +406,7 @@
 .bq-verify-badge.is-verified { color: var(--bq-success); border-color: var(--bq-success-border); background: var(--bq-success-bg); }
 .bq-verify-badge.is-unverified { color: var(--bq-warning); border-color: var(--bq-warning-border); background: var(--bq-warning-bg); }
 .bq-account-logout {
-    margin-top: 1.5rem;
+    margin-top: 2rem;
     text-align: right;
 }
 .bq-account-danger {
@@ -442,7 +442,6 @@
     flex-direction: column;
     flex: 1;
     min-height: 0;
-    /* padding: 1rem 1.25rem 1.25rem; */
 }
 
 .bq-section-title {
@@ -451,7 +450,6 @@
     gap: 0.5rem;
     font-size: 1.1rem;
     font-weight: 700;
-    /* padding-bottom: 0.75rem; */
     padding: 1rem 1.25rem 0.75rem;
     flex-shrink: 0;
 }
