@@ -1,11 +1,11 @@
 # BunnyQuery
 
-An embeddable, dependency-free AI chat widget for [Skapi](https://skapi.com)-powered
+An embeddable, dependency-free AI chat widget for [Skapi](https://www.skapi.com)-powered
 projects. Drop it into any web page and your users get a full chat experience —
 account login/signup, conversation history, file & folder uploads, and a settings
 panel — all talking to your project's **BunnyQuery** AI agent.
 
-BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.skapi.com) agent
+BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.bunnyquery.com) agent
 chatbox. It ships as a single IIFE that exposes `window.BunnyQuery`, plus one
 stylesheet. No build step, no framework, no npm install.
 
