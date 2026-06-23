@@ -1570,7 +1570,40 @@
             return Object.assign({}, m, { content: blocks });
         });
     }
-    function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId) {
+    // --- office-file server-side extraction -------------------------------
+    // Office documents (Microsoft .docx/.xlsx/.pptx, Hancom .hwpx, etc.) cannot
+    // be read by web_fetch (binary/zip). The proxy worker downloads them from db
+    // storage, extracts their text server-side, and substitutes that text for a
+    // placeholder token in the request body before the upstream LLM call. The
+    // directive is carried under the reserved `_skapi_extract` key (the worker
+    // strips it before calling the provider).
+    var OFFICE_FILE_EXTENSIONS = {
+        doc: 1, docx: 1, docm: 1, xls: 1, xlsx: 1, xlsm: 1,
+        ppt: 1, pptx: 1, pptm: 1, hwp: 1, hwpx: 1,
+    };
+    function isOfficeFile(name, mime) {
+        var ext = String(name || "").split(".").pop().toLowerCase();
+        if (OFFICE_FILE_EXTENSIONS[ext]) return true;
+        var m = String(mime || "").toLowerCase();
+        return (
+            m.indexOf("officedocument") !== -1 ||
+            m.indexOf("hwp") !== -1 ||
+            m === "application/msword" ||
+            m === "application/vnd.ms-excel" ||
+            m === "application/vnd.ms-powerpoint"
+        );
+    }
+    // Monotonic counter so placeholders are unique even for same-named files in
+    // one request. Token shape must match the worker's _EXTRACT_PLACEHOLDER_RE:
+    // {{SKAPI_FILE_CONTENT::<id>}}.
+    var _extractPlaceholderSeq = 0;
+    function makeExtractPlaceholder(seed) {
+        _extractPlaceholderSeq += 1;
+        var slug = String(seed || "file").replace(/[^a-zA-Z0-9]+/g, "_").slice(-48);
+        return "{{SKAPI_FILE_CONTENT::" + slug + "-" + _extractPlaceholderSeq + "}}";
+    }
+
+    function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent) {
         var mcpDef = { type: "url", name: MCP_NAME, url: mcpBaseUrl(), authorization_token: "$ACCESS_TOKEN" };
         var preparedMessages = (messages && messages.length)
             ? prepareClaudeMessages(messages)
@@ -1586,6 +1619,10 @@
                   citations: { enabled: true }, max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS },
             ],
         };
+        // Reserved control field: stripped by the producer before the upstream
+        // call. Tells the worker which office files to download + extract and
+        // which placeholder token in this body to substitute.
+        if (extractContent && extractContent.length) data._skapi_extract = extractContent;
         if (system) {
             data.system = [{ type: "text", text: system, cache_control: { type: "ephemeral" } }];
         }
@@ -1600,7 +1637,7 @@
             data: data,
         });
     }
-    function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId) {
+    function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent) {
         var resolvedModel = model || DEFAULT_OPENAI_MODEL;
         var imageDetail = getOpenAIImageDetail(resolvedModel);
         var messageList = (messages && messages.length)
@@ -1616,12 +1653,16 @@
         if (OPENAI_WEB_SEARCH_ENABLED) {
             tools.push({ type: "web_search", external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS });
         }
+        var data = { model: resolvedModel, max_output_tokens: MAX_TOKENS, input: input, tools: tools };
+        // Reserved control field (stripped by the producer): office files to
+        // download + extract server-side and the placeholder token to substitute.
+        if (extractContent && extractContent.length) data._skapi_extract = extractContent;
         return S.skapi.clientSecretRequest({
             clientSecretName: "openai", queue: userId || service, service: service, owner: owner,
             poll: 0, // poll:0 → skapi returns the early ack (with id + manual .poll()) so we can cancel queued items
             url: OPENAI_RESPONSES_API_URL, method: "POST",
             headers: { "content-type": "application/json", Authorization: "Bearer $CLIENT_SECRET" },
-            data: { model: resolvedModel, max_output_tokens: MAX_TOKENS, input: input, tools: tools },
+            data: data,
         });
     }
     function extractClaudeText(response) {
@@ -1756,12 +1797,13 @@
             "\nKnowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with \"I don't know\" or \"I couldn't find that\" after you have actually searched the project's data and come back empty." +
             "\nFile attachments: When a user message contains an \"Attached files:\" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire." +
             "\n- Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer." +
+            "\n- Office documents (Microsoft .docx/.xlsx/.pptx, Hancom .hwpx, etc.) cannot be read by web_fetch (they are binary/zip). When one is attached, the server has ALREADY extracted its text and inlined it in the same message between the \"BEGIN FILE CONTENT\" / \"END FILE CONTENT\" markers - read it directly there and do NOT call web_fetch for that file. A \"[skapi: ...]\" note in that block means the file could not be extracted." +
             "\n- For all other file types (text, code, csv, json, pdf, etc.), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself." +
             "\nFile links: When you find a record whose unique_id starts with \"src::\", the part after \"src::\" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the \"src::\" prefix — do NOT show it. Format: [filename](path/to/file) for storage paths, or [filename](https://...) for external URLs. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand — so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database." +
             "\nFile lookup: When the user asks to see, list, or show files, query the database using getUniqueId with unique_id \"src::\" and condition \"gte\" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage — the file paths are indexed in the database and are always reachable through it." +
-            "\nFile generation: If the user asks you to generate a file and it is possible to do so, output the file contents inside a fenced code block using the file extension as the language identifier. Always use plain text - never base64 or other encodings. Example for CSV:" +
+            "\nFile generation: When the user asks you to generate a file — or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown — put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like \"csv\". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only — never base64 or any other encoding. Example for CSV:" +
             "\n```filename.csv\nitem,qty,total\nCarrots,55,$38.50\nMushrooms,41,$73.80\nZucchini,29,$43.50\n```" +
-            "\nThe same pattern applies to other formats: ```my-data.json, ```index.html, ```sample.txt, etc.";
+            "\nThe same pattern applies to any format — name the block after the file you intend: ```my-data.json, ```index.html, ```sample.txt, and so on.";
         if (S.serviceDescription) {
             sp += "\nProject name: \"" + (S.serviceName || "") + "\"\nProject description: \"\"\"" + S.serviceDescription + "\"\"\"";
         }
@@ -1774,16 +1816,16 @@
     }
 
     /* ---- send / dispatch / queue ----------------------------------------- */
-    function callProviderFor(platform, prompt, messages, system, model, userId) {
+    function callProviderFor(platform, prompt, messages, system, model, userId, extractContent) {
         return platform === "openai"
-            ? callOpenAIWithPublicMcp(prompt, S.serviceId, S.owner, messages, system, model, userId)
-            : callClaudeWithPublicMcp(prompt, S.serviceId, S.owner, messages, system, model, userId);
+            ? callOpenAIWithPublicMcp(prompt, S.serviceId, S.owner, messages, system, model, userId, extractContent)
+            : callClaudeWithPublicMcp(prompt, S.serviceId, S.owner, messages, system, model, userId, extractContent);
     }
 
     function dispatchAgentRequest(params) {
         var sendAndPoll = function () {
             return Promise.resolve(
-                callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId)
+                callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
             ).then(function (initial) {
                 // Belt-and-suspenders: the builders pass `poll`, so skapi already
                 // resolves with the final body. If a build ever returns a raw ack,
@@ -1853,7 +1895,30 @@
                     return "- [" + u.name + "](" + u.url + ")";
                 }).join("\n");
             }
-            dispatchComposedMessage(composed, hasNewIndexing);
+            // Office files (.docx/.xlsx/.pptx/.hwpx) can't be read via web_fetch.
+            // Flag them so the proxy worker downloads + extracts their text
+            // server-side and injects it where the placeholder token sits. The
+            // placeholders go ONLY into the LLM-bound copy (composedForLlm) — the
+            // displayed/history copy (composed) stays clean. The directive `path`
+            // is the db storage path (uid-prefixed; differs from the link label).
+            var composedForLlm = composed;
+            var chatExtractContent;
+            if (attachmentUrls.length) {
+                var officeFiles = attachmentUrls.filter(function (u) { return isOfficeFile(u.name); });
+                if (officeFiles.length) {
+                    var directives = [];
+                    var sections = officeFiles.map(function (u) {
+                        var placeholder = makeExtractPlaceholder(u.storagePath || u.name);
+                        directives.push({ path: u.storagePath || u.name, placeholder: placeholder, name: u.name });
+                        return "===== " + u.name + " =====\n----- BEGIN FILE CONTENT -----\n" + placeholder + "\n----- END FILE CONTENT -----";
+                    });
+                    chatExtractContent = directives;
+                    composedForLlm = composed +
+                        "\n\nExtracted content of attached office files (read inline below; do NOT fetch their URLs):\n\n" +
+                        sections.join("\n\n");
+                }
+            }
+            dispatchComposedMessage(composed, hasNewIndexing, composedForLlm, chatExtractContent);
         }).catch(function (err) {
             console.error("[bunnyquery] attachment upload failed", err);
             CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
@@ -1862,9 +1927,14 @@
         });
     }
 
-    function dispatchComposedMessage(composed, useBgQueue) {
+    function dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent) {
         if (!composed) return;
         if (!chatEnabled() || S.aiPlatform === "none") return;
+
+        // composedForLlm carries the office-extraction placeholders for THIS turn
+        // (sent to the provider); `composed` stays clean for the displayed bubble
+        // and history cache so stale tokens never accumulate across replayed turns.
+        var llmComposed = composedForLlm || composed;
 
         // A bg-queue-routed turn (post-attachment chat that must run AFTER
         // indexing on the "-bg" queue) ALWAYS takes the queued path: that path
@@ -1888,7 +1958,7 @@
             });
             var boundedQ = buildBoundedChatMessages({
                 platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt,
-                history: resolvedHistory.concat([{ role: "user", content: composed }]),
+                history: resolvedHistory.concat([{ role: "user", content: llmComposed }]),
             });
             // Shown dimmed + yellow "(In queue)" until the early ack returns; then the
             // ack's id becomes _serverItemId (enables cancel) and the dim clears. The
@@ -1902,7 +1972,7 @@
             renderMessages(); updateHistoryCache(); scrollToBottom(true);
 
             var capturedComposed = composed, capturedPlatform = aiPlatform;
-            Promise.resolve(callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue))
+            Promise.resolve(callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent))
                 .then(function (result) {
                     // Early ack (poll:0): capture the server item id for cancel and clear
                     // the dimmed "sending" state (FIFO: the first dimmed bubble is ours).
@@ -1933,14 +2003,27 @@
         renderMessages(); updateHistoryCache(); CS.sending = true; scrollToBottom(true);
 
         var key = getHistoryCacheKey();
+        var historyForLlm = CS.messages.filter(function (m) { return !m.isCancelled && !m.isBackgroundTask; });
+        if (llmComposed !== composed) {
+            // Swap the placeholder-bearing copy in for the just-pushed user bubble
+            // (the last user turn) so the provider sees the extraction tokens while
+            // the displayed bubble + history cache stay clean.
+            for (var li = historyForLlm.length - 1; li >= 0; li--) {
+                if (historyForLlm[li].role === "user" && historyForLlm[li].content === composed) {
+                    historyForLlm[li] = Object.assign({}, historyForLlm[li], { content: llmComposed });
+                    break;
+                }
+            }
+        }
         var bounded = buildBoundedChatMessages({
             platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt,
-            history: CS.messages.filter(function (m) { return !m.isCancelled && !m.isBackgroundTask; }),
+            history: historyForLlm,
         });
         var requestToken = CS.gateRefreshToken;
         dispatchAgentRequest({
             key: key, serviceId: S.serviceId, owner: S.owner, aiPlatform: aiPlatform, aiModel: aiModel,
             systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,
+            extractContent: extractContent,
         }).then(function (result) {
             if (requestToken !== CS.gateRefreshToken || getHistoryCacheKey() !== key) return;
             var idx = CS.messages.findIndex(function (m) { return m._localId === lid; });
@@ -2210,15 +2293,43 @@
             else CS.messagesBox.scrollTop = CS.messagesBox.scrollHeight;
         });
     }
+    // Only scrolls if the user is already at the bottom. Used by automated
+    // resolutions (the streaming typewriter, bg-task polls, history polling) so
+    // they don't yank the user away when they've scrolled up to read old
+    // messages. Unlike scrollToBottom, this does NOT force-pin CS.stickToBottom:
+    // it re-checks after the DOM settles and bails if the user scrolled up
+    // mid-tick, so a streamed response can't repeatedly drag them back down.
     function scrollToBottomIfSticky(smooth) {
-        if (CS.stickToBottom) return scrollToBottom(smooth);
-        return Promise.resolve();
+        if (!CS.stickToBottom) return Promise.resolve();
+        return raf2().then(function () {
+            if (!CS.stickToBottom || !CS.messagesBox) return;
+            if (smooth) CS.messagesBox.scrollTo({ top: CS.messagesBox.scrollHeight, behavior: "smooth" });
+            else CS.messagesBox.scrollTop = CS.messagesBox.scrollHeight;
+        });
     }
     function onHistoryScroll() {
         if (!CS.messagesBox || CS.chatSettingsOpen) return;
         var el = CS.messagesBox;
         CS.stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
         if (el.scrollTop <= 60) fetchOlderHistoryIfNeeded();
+    }
+    // Explicit user scroll-UP intent. wheel/touch fire synchronously on the
+    // user's action (and never for programmatic scrolls), so releasing
+    // stickToBottom here beats the streaming typewriter's per-tick auto-scroll —
+    // letting the user scroll up to read earlier messages while a response is
+    // still generating. (Re-sticking on scroll-to-bottom is done by onHistoryScroll.)
+    var _touchStartY = 0;
+    function onMessagesWheel(e) {
+        if (e.deltaY < 0) CS.stickToBottom = false;
+    }
+    function onMessagesTouchStart(e) {
+        _touchStartY = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
+    }
+    function onMessagesTouchMove(e) {
+        // Finger dragging DOWN the screen scrolls content UP (toward earlier
+        // messages), so release stickiness.
+        var y = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
+        if (y > _touchStartY + 4) CS.stickToBottom = false;
     }
 
     /* ---- render helpers (agent.vue) -------------------------------------- */
@@ -2419,11 +2530,18 @@
     }
     // Build the "Indexing: <file> · <mime> · <size>" label for background
     // indexing tasks (live bubble + history). mime/size are appended when known.
-    function buildIndexingLabel(name, mime, size) {
+    // When the storage path is known, the name renders as a *bare* storage-path
+    // markdown link `[name](path)` — the same form the agent is told to emit — so
+    // parseMsgParts routes it through buildLinkPartFromGroups' bare-path branch,
+    // marking it expired so a click fetches a fresh temporary URL. A full
+    // https://_expired_.url/… href must NOT be used here (it would render as a
+    // plain external link that never refreshes). reindex=true shows "Reindexing:".
+    function buildIndexingLabel(name, mime, size, storagePath, reindex) {
         var extras = [];
+        var nameLabel = storagePath ? "[" + name + "](" + storagePath + ")" : name;
         if (mime) extras.push(mime);
         if (size != null && size !== "" && !isNaN(Number(size))) extras.push(formatBytes(size));
-        return "Indexing: " + name + (extras.length ? " · " + extras.join(" · ") : "");
+        return (reindex ? "Reindexing: " : "Indexing: ") + nameLabel + (extras.length ? " · " + extras.join(" · ") : "");
     }
     function sanitizeStorageSegment(name) {
         // The db CDN serves files through a %-encoded path; object keys that
@@ -2466,9 +2584,11 @@
         });
     }
     // Upload one File to db host storage. Resolves on success; rejects with
-    // { code:"EXISTS" } when the file already exists (check_existence).
-    function uploadFileToDb(file, storagePath, onProgress, setAbort) {
-        return S.skapi.util.request("get-signed-url", {
+    // { code:"EXISTS" } when the file already exists AND checkExistence is set
+    // (the default). Pass checkExistence=false to overwrite an existing file.
+    function uploadFileToDb(file, storagePath, onProgress, setAbort, checkExistence) {
+        if (checkExistence === undefined) checkExistence = true;
+        var params = {
             reserved_key: uploadReservedKey(),
             service: S.serviceId,
             owner: S.owner,
@@ -2476,8 +2596,9 @@
             key: storagePath,
             size: file.size || 0,
             contentType: file.type || mimeGetType(file.name) || null,
-            check_existence: true,
-        }, { auth: true }).then(function (signed) {
+        };
+        if (checkExistence) params.check_existence = true;
+        return S.skapi.util.request("get-signed-url", params, { auth: true }).then(function (signed) {
             var form = new FormData();
             var fields = signed && signed.fields ? signed.fields : {};
             for (var name in fields) form.append(name, fields[name]);
@@ -2521,23 +2642,37 @@
         var chain = Promise.resolve();
         members.forEach(function (member, idx) {
             chain = chain.then(function () {
-                var alreadyExisted = false;
-                return uploadFileToDb(member.file, member.storagePath, function (p) {
+                // hadExists: user kept the existing file ("reindex only") — skip the
+                // re-upload, reuse + reindex it (bubble shows "Reindexing:").
+                var hadExists = false;
+                var onProg = function (p) {
                     if (p && p.total) {
                         att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
                         renderAttachmentChips();
                     }
-                }, function (abort) { att._abort = abort; }).catch(function (err) {
+                };
+                var doMemberUpload = function (checkExistence) {
+                    return uploadFileToDb(member.file, member.storagePath, onProg,
+                        function (abort) { att._abort = abort; }, checkExistence);
+                };
+                return doMemberUpload(true).catch(function (err) {
                     var code = err && (err.code || (err.body && err.body.code));
                     var msg = err && (err.message || (err.body && err.body.message) || (typeof err === "string" ? err : ""));
-                    if (code === "EXISTS" || (msg && /exist/i.test(msg))) { alreadyExisted = true; return; }
-                    throw err; // a member upload failed → the whole attachment fails (red)
+                    var isExists = code === "EXISTS" || (msg && /exist/i.test(msg));
+                    if (!isExists) throw err; // a member upload failed → the whole attachment fails (red)
+                    // File already exists — ask how to resolve it.
+                    return promptOverwrite(member.file.name).then(function (choice) {
+                        if (choice === "overwrite") return doMemberUpload(false); // replace the existing file
+                        hadExists = true; // keep it; reindex only
+                    });
                 }).then(function () {
                     return getTemporaryUrlDb(member.storagePath, ATTACHMENT_URL_EXPIRES_SECONDS);
                 }).then(function (url) {
-                    urls.push({ name: member.relPath, url: url });
+                    urls.push({ name: member.relPath, url: url, storagePath: member.storagePath });
                     if (att.kind !== "folder") { att.uploadedUrl = url; att.storagePath = member.storagePath; }
-                    if (alreadyExisted) return; // already indexed on a previous upload
+                    // Index the uploaded file. EXISTS files kept by the user are
+                    // re-indexed too — the bubble shows "Reindexing:" (hadExists)
+                    // instead of "Indexing:".
                     return notifyAgentSaveAttachment({
                         name: member.file.name, storagePath: member.storagePath,
                         mime: member.file.type || mimeGetType(member.file.name), size: member.file.size, url: url,
@@ -2546,6 +2681,8 @@
                             bgTaskQueue.push({
                                 serviceId: S.serviceId, platform: S.aiPlatform, id: ack.id,
                                 filename: member.file.name,
+                                storagePath: member.storagePath,
+                                isReindex: hadExists,
                                 mime: member.file.type || mimeGetType(member.file.name),
                                 size: member.file.size,
                                 status: ack.status === "running" ? "running" : "pending",
@@ -2563,7 +2700,7 @@
         });
         return chain.then(function () {
             att._abort = null; att.progress = 100;
-            if (att.kind === "folder") att.uploadedUrls = urls.map(function (u) { return { path: u.name, url: u.url }; });
+            if (att.kind === "folder") att.uploadedUrls = urls.map(function (u) { return { path: u.name, url: u.url, storagePath: u.storagePath }; });
             att.status = anyIndexFailed ? "indexError" : "done";
             if (att.status === "indexError") att.errorMessage = "File indexing failed";
             renderAttachmentChips();
@@ -2573,6 +2710,9 @@
     // Upload all not-yet-done attachments sequentially. Resolves to the full
     // list of { name, url } for composing the chat message.
     function uploadPendingAttachments() {
+        // Fresh batch — clear any "apply to all" overwrite/reindex choice from a
+        // previous upload.
+        resetOverwriteBatch();
         CS.uploadingAttachments = true;
         updateComposerControls();
         renderAttachmentChips(); // re-render: hide the × buttons now uploading started (#2)
@@ -2586,10 +2726,10 @@
                 // contribute the cached URL(s), don't re-upload.
                 if (att.status === "done" || att.status === "indexError") {
                     if (att.kind === "folder" && att.uploadedUrls) {
-                        att.uploadedUrls.forEach(function (u) { collected.push({ name: u.path, url: u.url }); });
+                        att.uploadedUrls.forEach(function (u) { collected.push({ name: u.path, url: u.url, storagePath: u.storagePath }); });
                         return;
                     }
-                    if (att.uploadedUrl) { collected.push({ name: att.name, url: att.uploadedUrl }); return; }
+                    if (att.uploadedUrl) { collected.push({ name: att.name, url: att.uploadedUrl, storagePath: att.storagePath }); return; }
                 }
                 return uploadSingleAttachment(att).then(function (urls) {
                     collected.push.apply(collected, urls);
@@ -2615,7 +2755,9 @@
     function buildAttachmentSaveSystemPrompt() {
         var sp = "You are a background indexing agent for project " + S.serviceId + ".\n" +
             "- Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.\n" +
+            "- Office documents (Microsoft .docx/.xlsx/.pptx, Hancom .hwpx, etc.) cannot be read by web_fetch (they are binary/zip). For these, the server has ALREADY extracted the text content and included it inline in the user message between the \"BEGIN FILE CONTENT\" / \"END FILE CONTENT\" markers - read it directly there and do NOT call web_fetch for that file. If the inline content is a \"[skapi: ...]\" note, the file could not be extracted - index it from its metadata only.\n" +
             "- For all other file types (text, code, csv, json, pdf, etc.), use your web_fetch tool to download and read each URL. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.\n" +
+            "- Whatever the file type, use the file's storage path (the \"storage path\" metadata line) as the \"src::\" unique_id - never the inline content or a temporary URL.\n" +
             "- Do NOT reply conversationally. This is a background indexing task: use the MCP tools to save what you learn, be exhaustive about meaning and terse about bytes, and only let the user know when indexing is complete.";
         if (S.serviceName || S.serviceDescription) {
             sp += "\nProject name: \"" + (S.serviceName || "") + "\"";
@@ -2629,13 +2771,27 @@
         var userId = (S.user && S.user.user_id) || service;
         var queue = userId + BG_INDEXING_QUEUE_SUFFIX;
         var systemPrompt = buildAttachmentSaveSystemPrompt();
-        var userMessage = "A new file has just been uploaded. Index it now.\n\n" +
+        // Office files can't be read via web_fetch. For them the proxy worker
+        // extracts the text server-side and substitutes it for a placeholder we
+        // embed in the user message (so the URL line is dropped — nothing to fetch).
+        var office = isOfficeFile(attachment.name, attachment.mime);
+        var placeholder = office ? makeExtractPlaceholder(attachment.storagePath) : null;
+        var extractContent = (office && placeholder)
+            ? [{ path: attachment.storagePath, placeholder: placeholder, name: attachment.name, mime: attachment.mime }]
+            : null;
+        var head = "A new file has just been uploaded. Index it now.\n\n" +
             "File metadata:\n" +
             "- name: " + attachment.name + "\n" +
             "- storage path: " + attachment.storagePath + "\n" +
             (attachment.mime ? "- mime type: " + attachment.mime + "\n" : "") +
-            (typeof attachment.size === "number" ? "- size (bytes): " + attachment.size + "\n" : "") +
-            "- temporary URL (fetch this to read the file contents): " + attachment.url;
+            (typeof attachment.size === "number" ? "- size (bytes): " + attachment.size + "\n" : "");
+        var userMessage = placeholder
+            ? head +
+                "\nThe file's text content was extracted on the server and is provided inline below. " +
+                "Read it directly — do NOT fetch any URL for this file. " +
+                "Use the storage path above (not this content) for the \"src::\" unique_id.\n\n" +
+                "----- BEGIN FILE CONTENT -----\n" + placeholder + "\n----- END FILE CONTENT -----"
+            : head + "- temporary URL (fetch this to read the file contents): " + attachment.url;
         if (platform === "openai") {
             var oModel = S.aiModel || DEFAULT_OPENAI_MODEL;
             var detail = getOpenAIImageDetail(oModel);
@@ -2646,14 +2802,14 @@
                 clientSecretName: "openai", queue: queue, service: service, owner: owner, poll: 0,
                 url: OPENAI_RESPONSES_API_URL, method: "POST",
                 headers: { "content-type": "application/json", Authorization: "Bearer $CLIENT_SECRET" },
-                data: {
+                data: Object.assign({
                     model: oModel, max_output_tokens: MAX_TOKENS,
                     input: [
                         { role: "system", content: systemPrompt },
                         { role: "user", content: transformContentWithOpenAIImages(userMessage, detail) },
                     ],
                     tools: oTools,
-                },
+                }, extractContent ? { _skapi_extract: extractContent } : {}),
             });
         }
         var cModel = S.aiModel || DEFAULT_CLAUDE_MODEL;
@@ -2664,7 +2820,7 @@
                 "content-type": "application/json", "x-api-key": "$CLIENT_SECRET",
                 "anthropic-version": ANTHROPIC_VERSION, "anthropic-beta": ANTHROPIC_BETA_HEADER,
             },
-            data: {
+            data: Object.assign({
                 model: cModel, max_tokens: MAX_TOKENS,
                 system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
                 messages: [{ role: "user", content: transformContentWithImages(userMessage) }],
@@ -2674,7 +2830,7 @@
                     { type: "web_fetch_20250910", name: "web_fetch", max_uses: WEB_FETCH_MAX_USES,
                       citations: { enabled: true }, max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS },
                 ],
-            },
+            }, extractContent ? { _skapi_extract: extractContent } : {}),
         });
     }
 
@@ -2895,17 +3051,27 @@
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
     }
-    // Display order: in-flight uploads first (so the file being uploaded sits at
-    // the front), then pending, failures, and finished uploads last. Mirrors
-    // agent.vue's sortedAttachments.
+    // Display order: active chips first, terminal chips last, so the "...(n) more"
+    // truncation tail falls on finished items instead of hiding what's actively
+    // happening. The order is: uploading → queued(pending) → failed → completed.
+    // A chip with no status yet is queued to upload, so a missing status is
+    // treated as "pending". Mirrors agent.vue's sortedAttachments.
     var ATTACHMENT_STATUS_PRIORITY = { uploading: 0, pending: 1, error: 2, indexError: 2, done: 3 };
+    function attachmentStatusPriority(status) {
+        var p = ATTACHMENT_STATUS_PRIORITY[status == null ? "pending" : status];
+        return p === undefined ? 99 : p;
+    }
     function sortedAttachments() {
         return CS.attachments.map(function (a, i) { return { a: a, i: i }; }).sort(function (x, y) {
-            var px = ATTACHMENT_STATUS_PRIORITY[x.a.status]; if (px === undefined) px = 99;
-            var py = ATTACHMENT_STATUS_PRIORITY[y.a.status]; if (py === undefined) py = 99;
+            var px = attachmentStatusPriority(x.a.status);
+            var py = attachmentStatusPriority(y.a.status);
             if (px !== py) return px - py;
-            if (px === 0) return y.i - x.i; // newer uploads bubble to the front
-            return x.i - y.i;               // otherwise keep insertion order
+            // Newest-first within the in-flight uploading group and the failed
+            // group (so the chip that most recently started — or most recently
+            // failed — sits at the front of its group). Queued + completed keep
+            // insertion order.
+            if (px === 0 || px === 2) return y.i - x.i;
+            return x.i - y.i;
         }).map(function (e) { return e.a; });
     }
     function renderAttachmentChips() {
@@ -3092,6 +3258,11 @@
         if (anchor.dataset.bqExpired !== "1") return;
         e.preventDefault();
         var originalHref = anchor.dataset.bqExpiredHref || anchor.href;
+        // A previous click is already re-resolving this link (the chip shows
+        // "(fetching...)"). Swallow further clicks so a rapid repeat doesn't each
+        // await the shared in-flight fetch and then fire anchor.click() — which
+        // would open the file in several tabs at once when it resolves.
+        if (refreshingLinkMap[originalHref]) return;
         var cached = refreshedExpiredLinkMap[originalHref];
         if (cached) { anchor.href = cached; anchor.dataset.bqExpired = "0"; anchor.click(); return; }
         fetchFreshHrefForExpiredLink(originalHref, anchor.dataset.bqRemotePath).then(function (fresh) {
@@ -3173,10 +3344,12 @@
                     if (nameMatch) {
                         var mimeMatch = userText.match(/^- mime type: (.+)$/m);
                         var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
+                        var pathMatch = userText.match(/^- storage path: (.+)$/m);
                         displayContent = buildIndexingLabel(
                             nameMatch[1].trim(),
                             mimeMatch ? mimeMatch[1].trim() : "",
-                            sizeMatch ? Number(sizeMatch[1]) : null
+                            sizeMatch ? Number(sizeMatch[1]) : null,
+                            pathMatch ? pathMatch[1].trim() : undefined
                         );
                     } else {
                         displayContent = userText;
@@ -3243,7 +3416,7 @@
             if (entry.serviceId !== svcId || entry.platform !== plat) return;
             if (CS.messages.some(function (m) { return m._serverItemId === entry.id; })) return;
             var isRunning = entry.status === "running";
-            var userBubble = { role: "user", content: buildIndexingLabel(entry.filename, entry.mime, entry.size), isBackgroundTask: true, _serverItemId: entry.id };
+            var userBubble = { role: "user", content: buildIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
             if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
             CS.messages.push(userBubble);
             if (isRunning) {
@@ -3629,6 +3802,9 @@
 
             var box = h("div", { class: "bq-messages" });
             box.addEventListener("scroll", onHistoryScroll, { passive: true });
+            box.addEventListener("wheel", onMessagesWheel, { passive: true });
+            box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
+            box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
             CS.messagesBox = box;
 
             var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
@@ -3683,15 +3859,57 @@
     }
 
     // generic modal helper (appended to <body>, themed)
-    function openModal(builder) {
+    function openModal(builder, opts) {
+        var dismissible = !(opts && opts.dismissible === false);
         var root = h("div", { class: "bq-modal-root", "data-bq-theme": S.theme });
         var backdrop = h("div", { class: "bq-modal-backdrop" });
         var close = function () { if (root.parentNode) root.parentNode.removeChild(root); };
-        backdrop.addEventListener("click", close);
+        // Non-dismissible modals (e.g. the overwrite/reindex prompt) have no
+        // backdrop-click close and no × button — the user must pick an action.
+        if (dismissible) backdrop.addEventListener("click", close);
         root.appendChild(backdrop);
         root.appendChild(builder(close));
         document.body.appendChild(root);
         return { root: root, close: close };
+    }
+
+    /* ---- overwrite / reindex prompt (agent.vue useOverwritePrompt) -------- *
+     * When an upload hits an existing file, promptOverwrite(filename) surfaces a
+     * NON-DISMISSIBLE modal (no backdrop/×): "Reindex only" keeps the existing
+     * file and just re-indexes it; "Overwrite" replaces it. "Apply to all
+     * remaining" makes the chosen outcome sticky for the rest of the current
+     * upload batch; resetOverwriteBatch() clears it at the start of each batch.
+     * Uploads run sequentially, so only one prompt is ever open at a time. */
+    var overwriteState = { resolver: null, sticky: null, handle: null, applyToAll: false };
+    function resetOverwriteBatch() { overwriteState.sticky = null; overwriteState.applyToAll = false; }
+    function chooseOverwrite(choice) {
+        if (overwriteState.applyToAll) overwriteState.sticky = choice;
+        if (overwriteState.handle) { overwriteState.handle.close(); overwriteState.handle = null; }
+        var r = overwriteState.resolver; overwriteState.resolver = null;
+        if (r) r(choice);
+    }
+    function promptOverwrite(filename) {
+        // A prior file in this batch chose "apply to all" — honor it silently.
+        if (overwriteState.sticky) return Promise.resolve(overwriteState.sticky);
+        overwriteState.applyToAll = false;
+        return new Promise(function (resolve) {
+            overwriteState.resolver = resolve;
+            overwriteState.handle = openModal(function () {
+                var applyCb = h("input", { type: "checkbox" });
+                applyCb.addEventListener("change", function () { overwriteState.applyToAll = !!applyCb.checked; });
+                var applyLabel = h("label", { class: "bq-overwrite-applyall" }, applyCb,
+                    h("span", { text: "Apply to all remaining files" }));
+                return h("div", { class: "bq-modal" },
+                    h("div", { class: "bq-modal-delete-header" }, h("span", { text: "File already exists" })),
+                    h("p", { class: "bq-modal-desc" },
+                        "A file named “" + filename + "” already exists. Keep the existing file and just reindex it, or overwrite it completely?"),
+                    applyLabel,
+                    h("div", { class: "bq-modal-btns" },
+                        h("button", { class: "btn btn--outline", type: "button", onclick: function () { chooseOverwrite("reindex"); } }, "Reindex only"),
+                        h("button", { class: "btn btn--danger", type: "button", onclick: function () { chooseOverwrite("overwrite"); } }, "Overwrite"))
+                );
+            }, { dismissible: false });
+        });
     }
 
     function agentBadgeText() {

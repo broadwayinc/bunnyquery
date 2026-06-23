@@ -709,6 +709,13 @@
     white-space: nowrap;
     vertical-align: bottom;
 }
+/* While the temporary URL is being re-resolved the click is swallowed in
+   onBubbleLinkClick — show a busy cursor and dim it so it reads as
+   "working, don't click again". */
+.bq-link-button.is-refreshing {
+    cursor: progress;
+    opacity: 0.6;
+}
 
 /* ---- markdown body -------------------------------------------------------*/
 .bq-md { white-space: normal; word-break: break-word; }
@@ -860,7 +867,8 @@
     position: absolute;
     inset: 0 auto 0 0;
     width: var(--att-progress, 0%);
-    background: rgba(240, 98, 146, 0.18);
+    /* theme-reactive tint (matches agent.vue's fade()→color-mix() change) */
+    background: color-mix(in srgb, var(--bq-main) 18%, transparent);
     transition: width 0.15s linear;
     z-index: 0;
     pointer-events: none;
@@ -995,6 +1003,19 @@
     border-color: var(--bq-danger);
     color: var(--bq-paper);
 }
+
+/* "apply to all remaining files" checkbox in the overwrite/reindex prompt */
+.bq-overwrite-applyall {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: -0.5rem 0 1.25rem;
+    font-size: 0.82rem;
+    color: var(--bq-ink);
+    cursor: pointer;
+    user-select: none;
+}
+.bq-overwrite-applyall input { cursor: pointer; margin: 0; }
 
 /* ============================================================================
  * RESPONSIVE
