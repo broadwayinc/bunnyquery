@@ -1,11 +1,26 @@
 {
   "name": "bunnyquery",
-  "version": "1.2.3",
-  "description": "Embeddable BunnyQuery AI chat widget",
+  "version": "1.3.0",
+  "description": "Embeddable BunnyQuery AI chat widget + its framework-agnostic chat engine",
   "main": "bunnyquery.js",
+  "exports": {
+    ".": "./bunnyquery.js",
+    "./engine": {
+      "types": "./dist/engine.d.ts",
+      "import": "./dist/engine.mjs",
+      "require": "./dist/engine.cjs",
+      "default": "./dist/engine.mjs"
+    },
+    "./styles/chat.css": "./styles/chat.css",
+    "./package.json": "./package.json"
+  },
   "files": [
     "bunnyquery.js",
-    "bunnyquery.css"
+    "bunnyquery.css",
+    "src/widget.css",
+    "src/engine",
+    "styles",
+    "dist"
   ],
   "keywords": [
     "skapi",
@@ -15,10 +30,16 @@
     "widget"
   ],
   "scripts": {
+    "build": "tsup && node scripts/build-css.mjs",
+    "build:css": "node scripts/build-css.mjs",
     "dev": "npx bns port=3333"
   },
   "dependencies": {
     "basic-node-server": "^1.1.1"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
   },
   "repository": {
     "type": "git",

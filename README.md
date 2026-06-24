@@ -6,8 +6,13 @@ account login/signup, conversation history, file & folder uploads, and a setting
 panel — all talking to your project's **BunnyQuery** AI agent.
 
 BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.bunnyquery.com) agent
-chatbox. It ships as a single IIFE that exposes `window.BunnyQuery`, plus one
-stylesheet. No build step, no framework, no npm install.
+chatbox. The **widget** ships as a single IIFE that exposes `window.BunnyQuery` plus one
+stylesheet — drop it in via `<script>`, no build step or framework required.
+
+The package also exports the **framework-agnostic chat engine** that powers it
+(`bunnyquery/engine`) — the same DOM-free core the Skapi admin chatbox consumes — so
+you can build your own chat UI on top of it. See
+[Importing the chat engine](#importing-the-chat-engine).
 
 ## Features
 
@@ -68,14 +73,18 @@ call `BunnyQuery.init()`:
 That's it — BunnyQuery takes over the `#chatbox` element and renders the login or
 chat view depending on the user's session.
 
-## Files
+## What's in the package
 
-| File            | Purpose                                                        |
-| --------------- | ------------------------------------------------------------- |
-| `bunnyquery.js`  | The widget. Exposes the global `window.BunnyQuery`.            |
-| `bunnyquery.css` | All styles, scoped under `.bq-agent` / `[data-bq-theme]`.    |
+| Path                          | Purpose                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| `bunnyquery.js`               | The widget IIFE. Exposes the global `window.BunnyQuery`. CDN / `<script>` drop-in. |
+| `bunnyquery.css`              | The widget's full stylesheet, scoped under `.bq-agent` / `[data-bq-theme]`.      |
+| `bunnyquery/engine`           | The framework-agnostic chat engine — ships as ESM + CJS with TypeScript types.   |
+| `bunnyquery/styles/chat.css`  | The shared chat-surface styles (bubbles, markdown, links) for an engine-built UI. |
 
-Host them yourself (same origin recommended) or from a CDN.
+The two widget files can be hosted yourself (same origin recommended) or loaded from a
+CDN — no npm needed. The `engine` / `styles` subpaths are for bundler consumers
+(`npm install bunnyquery`); see [Importing the chat engine](#importing-the-chat-engine).
 
 ## API
 
@@ -137,6 +146,67 @@ To customize colors, override the variables in your own stylesheet **after**
 ```
 
 The active theme is saved to `localStorage`, so a returning user keeps their choice.
+
+## Importing the chat engine
+
+`bunnyquery.js` is the ready-made widget. Under it sits a **framework-agnostic,
+DOM-free chat engine** — the same core that powers both this widget and the Skapi
+admin chatbox. Import it from `bunnyquery/engine` when you want to build your own chat
+UI (React, Vue, Svelte, vanilla…) while reusing the engine's message/queue/typewriter/
+cache state machine, request builders, markdown-message composition, and prompts.
+
+Install the package, plus the `skapi-js` SDK (for the transport) and — if you don't
+already have one — a markdown renderer such as `marked`:
+
+```bash
+npm install bunnyquery skapi-js marked
+```
+
+```ts
+import {
+  configureChatEngine,
+  ChatSession,
+  composeUserMessage,
+  type ChatHost,
+} from 'bunnyquery/engine';
+
+// Shared chat-surface styles (message bubbles, rendered markdown, links).
+// Pair it with your own container/layout CSS and the --bq-* design tokens.
+import 'bunnyquery/styles/chat.css';
+
+// 1. Inject the skapi transport + MCP endpoint ONCE at startup.
+configureChatEngine({
+  clientSecretRequest: (opts) => skapi.clientSecretRequest(opts),
+  clientSecretRequestHistory: (params, fetchOptions) =>
+    skapi.clientSecretRequestHistory(params, fetchOptions),
+  mcpBaseUrl: 'https://mcp.broadwayinc.computer',
+  poll: 0, // see the note below
+});
+
+// 2. Implement a ChatHost (identity, render/scroll hooks, the skapi
+//    cancel/refresh surface) for your view, then drive a ChatSession.
+const session = new ChatSession(host); // host: ChatHost
+await session.loadHistory();
+session.dispatchComposedMessage('Hello!'); // send a message
+```
+
+The engine owns chat **state and logic** and calls back into your view through the
+`ChatHost` interface (render, scroll, identity, cancel/refresh). It has **no bundled
+runtime dependencies** — you inject the skapi transport via `configureChatEngine()` and
+render markdown yourself (e.g. with `marked`). Everything is fully typed: `ChatSession`,
+`ChatHost`, `ChatMessage`, `ChatIdentity`, `ChatState`, `composeUserMessage`, the request
+builders (`callClaudeWithPublicMcp` / `callOpenAIWithPublicMcp`, `getChatHistory`,
+`notifyAgentSaveAttachment`), the prompt builders, and the token-budget / link / history
+helpers — see the `.d.ts` shipped with `bunnyquery/engine`.
+
+`configureChatEngine` options:
+
+| Option                        | Type       | Description                                                                                                   |
+| ----------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
+| `clientSecretRequest`         | `function` | `skapi.clientSecretRequest`, bound to your Skapi instance. **Required.**                                      |
+| `clientSecretRequestHistory`  | `function` | `skapi.clientSecretRequestHistory`, bound to your Skapi instance. **Required.**                              |
+| `mcpBaseUrl`                  | `string`   | MCP server base URL (you resolve prod vs dev). **Required.**                                                  |
+| `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `clientSecretRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel — the widget's case). |
 
 ## OAuth & redirects
 
