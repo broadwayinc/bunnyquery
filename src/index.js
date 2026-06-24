@@ -33,6 +33,7 @@ import {
     extractOpenAIText,
     getChatHistory,
     composeUserMessage,
+    groupAttachmentFailures,
     notifyAgentSaveAttachment,
     buildChatSystemPrompt,
     // pure helpers (Tier-1.5) — error detection, token budget, link/path, history mapping
@@ -1619,18 +1620,25 @@ import {
         var bgBefore = bgTaskQueue.length;
         session.uploadPendingAttachments().then(function (attachmentUrls) {
             var hasNewIndexing = bgTaskQueue.length > bgBefore;
+            // Collect any failures (upload or indexing) now, grouped by error
+            // code + description, so we can report them once after the send below.
+            var failureGroups = groupAttachmentFailures(CS.attachments);
             // Per-file "Indexing:" bubbles were already injected during upload (#1).
             // Keep only the FAILED chips (red/yellow) so the user can see/retry;
             // clear the successful ones.
             clearSuccessfulAttachments();
-            if (!text) return; // attachment-only turn: index, no chat message
-            // Compose the user message (attachment-link block + office-extraction
-            // placeholders) via the shared engine helper — identical to agent.vue —
-            // then dispatch through the shared ChatSession (which owns the queued-
-            // vs-immediate decision, the cache+resume immediate-send model, the
-            // office extractContent, and the "-bg" queue routing).
-            var c = composeUserMessage(text, attachmentUrls);
-            session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+            if (text) {
+                // Compose the user message (attachment-link block + office-extraction
+                // placeholders) via the shared engine helper — identical to agent.vue —
+                // then dispatch through the shared ChatSession (which owns the queued-
+                // vs-immediate decision, the cache+resume immediate-send model, the
+                // office extractContent, and the "-bg" queue routing).
+                var c = composeUserMessage(text, attachmentUrls);
+                session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+            }
+            // After the uploads + indexing-queue requests are all made, surface a
+            // single report of everything that failed (grouped by error).
+            if (failureGroups.length) showUploadErrorReport(failureGroups);
         }).catch(function (err) {
             console.error("[bunnyquery] attachment upload failed", err);
             CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
@@ -2673,6 +2681,33 @@ import {
                         h("button", { class: "btn btn--danger", type: "button", onclick: function () { chooseOverwrite("overwrite"); } }, "Overwrite"))
                 );
             }, { dismissible: false });
+        });
+    }
+
+    /* ---- upload error report ------------------------------------------------ *
+     * After a send's uploads + indexing-queue requests all settle, any files that
+     * failed are reported here in ONE dismissible dialog. The failures arrive
+     * pre-grouped by (error code, description) from groupAttachmentFailures(); we
+     * list each distinct error once with the files it affected. The failed chips
+     * stay in the attachment row so the user can remove or retry them. */
+    function showUploadErrorReport(groups) {
+        if (!groups || !groups.length) return;
+        var totalFiles = groups.reduce(function (n, g) { return n + g.files.length; }, 0);
+        openModal(function (close) {
+            var sections = groups.map(function (g) {
+                var heading = g.code ? g.code + " — " + g.message : g.message;
+                return h("div", { class: "bq-upload-error-group" },
+                    h("p", { class: "bq-upload-error-heading", text: heading }),
+                    h("ul", { class: "bq-upload-error-files" },
+                        g.files.map(function (name) { return h("li", { text: name }); })));
+            });
+            return h("div", { class: "bq-modal" },
+                h("div", { class: "bq-modal-delete-header" },
+                    h("span", { text: totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added" })),
+                h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }),
+                h("div", { class: "bq-upload-error-list" }, sections),
+                h("div", { class: "bq-modal-btns" },
+                    h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Close")));
         });
     }
 

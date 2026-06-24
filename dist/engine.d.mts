@@ -64,6 +64,27 @@ declare function composeUserMessage(text: string, attachmentUrls: Array<{
 }>): ComposedUserMessage;
 
 /**
+ * Attachment helpers shared by every consumer's view layer.
+ *
+ * The upload ORCHESTRATION is per-consumer (agent.vue does admin storage
+ * accounting; the widget uses get-signed-url), but the failure-reporting shape
+ * is identical, so it lives here. When an upload or its indexing request fails,
+ * the orchestrator records the original `error.code` / `error.message` on the
+ * attachment (`att.errorCode` / `att.errorDetail`); this groups those failed
+ * attachments by (code, description) so a single report dialog can list each
+ * distinct error once with all the files it affected.
+ */
+interface AttachmentFailureGroup {
+    /** The failing `error.code` (empty string when the error carried none). */
+    code: string;
+    /** The failing `error.message` / human description. */
+    message: string;
+    /** Display names of the attachments that hit this exact (code, message). */
+    files: string[];
+}
+declare function groupAttachmentFailures(attachments: any[]): AttachmentFailureGroup[];
+
+/**
  * BASE PROMPT — Chat assistant
  * ============================================================================
  * System prompt sent on every chat turn. Rebuilt fresh on every send because
@@ -472,4 +493,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, isAuthExpiredError, isErrorResponseBody, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

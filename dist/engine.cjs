@@ -79,6 +79,28 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
   return { composed, composedForLlm, extractContent };
 }
 
+// src/engine/attachments.ts
+function groupAttachmentFailures(attachments) {
+  const groups = {};
+  const order = [];
+  (attachments || []).forEach(function(att) {
+    if (!att || att.status !== "error" && att.status !== "indexError") return;
+    const code = String(att.errorCode || "");
+    const message = String(
+      att.errorDetail || att.errorMessage || (att.status === "indexError" ? "File indexing failed" : "File upload has failed")
+    );
+    const key = code + "\0" + message;
+    if (!groups[key]) {
+      groups[key] = { code, message, files: [] };
+      order.push(key);
+    }
+    groups[key].files.push(String(att.name || "(unnamed file)"));
+  });
+  return order.map(function(k) {
+    return groups[k];
+  });
+}
+
 // src/engine/prompts/chat_system_prompt.ts
 function buildChatSystemPrompt(params) {
   const { formattedServiceId, serviceName, serviceDescription } = params;
@@ -1723,6 +1745,8 @@ var ChatSession = class {
     att.status = "uploading";
     att.progress = 0;
     att.errorMessage = "";
+    att.errorCode = "";
+    att.errorDetail = "";
     this.host.renderAttachmentChips();
     var members = att.kind === "folder" ? (att.files || []).map(function(f) {
       return { file: f.file, relPath: f.path, storagePath: self.host.storagePathFor(f.path) };
@@ -1804,6 +1828,10 @@ var ChatSession = class {
           }, function(e) {
             console.error("[chat-engine] indexing request failed", e);
             anyIndexFailed = true;
+            if (!att.errorCode && !att.errorDetail) {
+              att.errorCode = e && (e.code || e.body && e.body.code) || "";
+              att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
+            }
           });
         });
       });
@@ -1858,6 +1886,8 @@ var ChatSession = class {
           if (removed || aborted) return;
           att.status = "error";
           att.errorMessage = "File upload has failed";
+          att.errorCode = err && (err.code || err.body && err.body.code) || "";
+          att.errorDetail = err && (err.message || err.body && err.body.message) || (typeof err === "string" ? err : "");
           self.host.renderAttachmentChips();
         });
       });
@@ -1922,6 +1952,7 @@ exports.getChatHistory = getChatHistory;
 exports.getContextWindow = getContextWindow;
 exports.getErrorMessage = getErrorMessage;
 exports.getExpiredAttachmentVisiblePath = getExpiredAttachmentVisiblePath;
+exports.groupAttachmentFailures = groupAttachmentFailures;
 exports.isAuthExpiredError = isAuthExpiredError;
 exports.isErrorResponseBody = isErrorResponseBody;
 exports.isOfficeFile = isOfficeFile;

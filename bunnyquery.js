@@ -80,6 +80,28 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
     return { composed, composedForLlm, extractContent };
   }
 
+  // src/engine/attachments.ts
+  function groupAttachmentFailures(attachments) {
+    const groups = {};
+    const order = [];
+    (attachments || []).forEach(function(att) {
+      if (!att || att.status !== "error" && att.status !== "indexError") return;
+      const code = String(att.errorCode || "");
+      const message = String(
+        att.errorDetail || att.errorMessage || (att.status === "indexError" ? "File indexing failed" : "File upload has failed")
+      );
+      const key = code + "\0" + message;
+      if (!groups[key]) {
+        groups[key] = { code, message, files: [] };
+        order.push(key);
+      }
+      groups[key].files.push(String(att.name || "(unnamed file)"));
+    });
+    return order.map(function(k) {
+      return groups[k];
+    });
+  }
+
   // src/engine/prompts/chat_system_prompt.ts
   function buildChatSystemPrompt(params) {
     const { formattedServiceId, serviceName, serviceDescription } = params;
@@ -1696,6 +1718,8 @@ ${options.inlineContentPlaceholder}
       att.status = "uploading";
       att.progress = 0;
       att.errorMessage = "";
+      att.errorCode = "";
+      att.errorDetail = "";
       this.host.renderAttachmentChips();
       var members = att.kind === "folder" ? (att.files || []).map(function(f) {
         return { file: f.file, relPath: f.path, storagePath: self.host.storagePathFor(f.path) };
@@ -1777,6 +1801,10 @@ ${options.inlineContentPlaceholder}
             }, function(e) {
               console.error("[chat-engine] indexing request failed", e);
               anyIndexFailed = true;
+              if (!att.errorCode && !att.errorDetail) {
+                att.errorCode = e && (e.code || e.body && e.body.code) || "";
+                att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
+              }
             });
           });
         });
@@ -1831,6 +1859,8 @@ ${options.inlineContentPlaceholder}
             if (removed || aborted) return;
             att.status = "error";
             att.errorMessage = "File upload has failed";
+            att.errorCode = err && (err.code || err.body && err.body.code) || "";
+            att.errorDetail = err && (err.message || err.body && err.body.message) || (typeof err === "string" ? err : "");
             self.host.renderAttachmentChips();
           });
         });
@@ -3561,10 +3591,13 @@ ${options.inlineContentPlaceholder}
       var bgBefore = bgTaskQueue.length;
       session.uploadPendingAttachments().then(function(attachmentUrls) {
         var hasNewIndexing = bgTaskQueue.length > bgBefore;
+        var failureGroups = groupAttachmentFailures(CS.attachments);
         clearSuccessfulAttachments();
-        if (!text) return;
-        var c = composeUserMessage(text, attachmentUrls);
-        session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+        if (text) {
+          var c = composeUserMessage(text, attachmentUrls);
+          session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+        }
+        if (failureGroups.length) showUploadErrorReport(failureGroups);
       }).catch(function(err) {
         console.error("[bunnyquery] attachment upload failed", err);
         CS.uploadingAttachments = false;
@@ -4728,6 +4761,45 @@ ${options.inlineContentPlaceholder}
             )
           );
         }, { dismissible: false });
+      });
+    }
+    function showUploadErrorReport(groups) {
+      if (!groups || !groups.length) return;
+      var totalFiles = groups.reduce(function(n, g) {
+        return n + g.files.length;
+      }, 0);
+      openModal(function(close) {
+        var sections = groups.map(function(g) {
+          var heading = g.code ? g.code + " \u2014 " + g.message : g.message;
+          return h(
+            "div",
+            { class: "bq-upload-error-group" },
+            h("p", { class: "bq-upload-error-heading", text: heading }),
+            h(
+              "ul",
+              { class: "bq-upload-error-files" },
+              g.files.map(function(name) {
+                return h("li", { text: name });
+              })
+            )
+          );
+        });
+        return h(
+          "div",
+          { class: "bq-modal" },
+          h(
+            "div",
+            { class: "bq-modal-delete-header" },
+            h("span", { text: totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added" })
+          ),
+          h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }),
+          h("div", { class: "bq-upload-error-list" }, sections),
+          h(
+            "div",
+            { class: "bq-modal-btns" },
+            h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Close")
+          )
+        );
       });
     }
     function agentBadgeText() {

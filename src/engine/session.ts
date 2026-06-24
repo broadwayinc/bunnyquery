@@ -783,6 +783,7 @@ export class ChatSession {
 		var self = this;
 		var id = this.host.getIdentity();
 		att.status = 'uploading'; att.progress = 0; att.errorMessage = '';
+		att.errorCode = ''; att.errorDetail = ''; // clear any prior failure (retry)
 		this.host.renderAttachmentChips();
 		var members = (att.kind === 'folder')
 			? (att.files || []).map(function (f: any) { return { file: f.file, relPath: f.path, storagePath: self.host.storagePathFor(f.path) }; })
@@ -851,6 +852,11 @@ export class ChatSession {
 					}, function (e: any) {
 						console.error('[chat-engine] indexing request failed', e);
 						anyIndexFailed = true; // uploaded but not indexed → yellow
+						// Record the first index error's code/message for the report dialog.
+						if (!att.errorCode && !att.errorDetail) {
+							att.errorCode = (e && (e.code || (e.body && e.body.code))) || '';
+							att.errorDetail = (e && (e.message || (e.body && e.body.message))) || (typeof e === 'string' ? e : '');
+						}
 					});
 				});
 			});
@@ -894,6 +900,9 @@ export class ChatSession {
 					if (removed || aborted) return;
 					att.status = 'error';
 					att.errorMessage = 'File upload has failed';
+					// Preserve the original error code/message for the report dialog.
+					att.errorCode = (err && (err.code || (err.body && err.body.code))) || '';
+					att.errorDetail = (err && (err.message || (err.body && err.body.message))) || (typeof err === 'string' ? err : '');
 					self.host.renderAttachmentChips();
 				});
 			});

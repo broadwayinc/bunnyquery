@@ -77,6 +77,28 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
   return { composed, composedForLlm, extractContent };
 }
 
+// src/engine/attachments.ts
+function groupAttachmentFailures(attachments) {
+  const groups = {};
+  const order = [];
+  (attachments || []).forEach(function(att) {
+    if (!att || att.status !== "error" && att.status !== "indexError") return;
+    const code = String(att.errorCode || "");
+    const message = String(
+      att.errorDetail || att.errorMessage || (att.status === "indexError" ? "File indexing failed" : "File upload has failed")
+    );
+    const key = code + "\0" + message;
+    if (!groups[key]) {
+      groups[key] = { code, message, files: [] };
+      order.push(key);
+    }
+    groups[key].files.push(String(att.name || "(unnamed file)"));
+  });
+  return order.map(function(k) {
+    return groups[k];
+  });
+}
+
 // src/engine/prompts/chat_system_prompt.ts
 function buildChatSystemPrompt(params) {
   const { formattedServiceId, serviceName, serviceDescription } = params;
@@ -1721,6 +1743,8 @@ var ChatSession = class {
     att.status = "uploading";
     att.progress = 0;
     att.errorMessage = "";
+    att.errorCode = "";
+    att.errorDetail = "";
     this.host.renderAttachmentChips();
     var members = att.kind === "folder" ? (att.files || []).map(function(f) {
       return { file: f.file, relPath: f.path, storagePath: self.host.storagePathFor(f.path) };
@@ -1802,6 +1826,10 @@ var ChatSession = class {
           }, function(e) {
             console.error("[chat-engine] indexing request failed", e);
             anyIndexFailed = true;
+            if (!att.errorCode && !att.errorDetail) {
+              att.errorCode = e && (e.code || e.body && e.body.code) || "";
+              att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
+            }
           });
         });
       });
@@ -1856,6 +1884,8 @@ var ChatSession = class {
           if (removed || aborted) return;
           att.status = "error";
           att.errorMessage = "File upload has failed";
+          att.errorCode = err && (err.code || err.body && err.body.code) || "";
+          att.errorDetail = err && (err.message || err.body && err.body.message) || (typeof err === "string" ? err : "");
           self.host.renderAttachmentChips();
         });
       });
@@ -1879,6 +1909,6 @@ var ChatSession = class {
   }
 };
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, isAuthExpiredError, isErrorResponseBody, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

@@ -828,6 +828,13 @@
 .bq-modal-desc { margin: 0 0 1.25rem; font-size: 0.85rem; color: var(--bq-muted); line-height: 1.6; }
 .bq-modal-btns { display: flex; gap: 0.75rem; justify-content: flex-end; align-items: center; }
 
+/* upload error report dialog (failed files grouped by error) */
+.bq-upload-error-list { display: flex; flex-direction: column; gap: 0.85rem; margin: 0 0 1.25rem; max-height: 50vh; overflow-y: auto; }
+.bq-upload-error-group { border-left: 3px solid var(--bq-danger); padding-left: 0.7rem; }
+.bq-upload-error-heading { margin: 0 0 0.3rem; font-size: 0.82rem; font-weight: 600; color: var(--bq-danger); word-break: break-word; }
+.bq-upload-error-files { margin: 0; padding-left: 1.1rem; font-size: 0.8rem; color: var(--bq-ink); }
+.bq-upload-error-files li { margin: 0.1rem 0; word-break: break-word; }
+
 /* delete/clear (danger) modal accents */
 .bq-modal-delete-header {
     display: flex;

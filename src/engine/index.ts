@@ -21,6 +21,11 @@ export {
 	type ComposedUserMessage,
 } from './office';
 
+export {
+	groupAttachmentFailures,
+	type AttachmentFailureGroup,
+} from './attachments';
+
 export * from './prompts';
 
 // Pure helpers (Tier-1.5): error detection, token budgeting, link/path
