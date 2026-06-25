@@ -193,6 +193,36 @@ function isErrorResponseBody(response) {
   }
   return false;
 }
+function isNonRetryableRequestError(input) {
+  if (!input || typeof input !== "object") return false;
+  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
+  var param = void 0;
+  var blobs = [];
+  var sources = [input.error, input.body && input.body.error, input.body, input];
+  for (var i = 0; i < sources.length; i++) {
+    var e = sources[i];
+    if (!e) continue;
+    if (typeof e === "string") {
+      blobs.push(e);
+      continue;
+    }
+    if (typeof e !== "object") continue;
+    if (param === void 0 && e.param != null) param = e.param;
+    if (typeof e.code === "string") blobs.push(e.code);
+    if (typeof e.type === "string") blobs.push(e.type);
+    if (typeof e.message === "string") blobs.push(e.message);
+  }
+  var hay = blobs.join(" | ").toLowerCase();
+  if (hay.indexOf("unknown_parameter") !== -1 || hay.indexOf("unknown parameter") !== -1 || hay.indexOf("unsupported_parameter") !== -1 || hay.indexOf("unsupported parameter") !== -1) {
+    return true;
+  }
+  var isClientReqStatus = status === 400 || status === 422;
+  if (isClientReqStatus && param != null && param !== "") return true;
+  if (isClientReqStatus && hay.indexOf("invalid_request") !== -1 && (hay.indexOf("parameter") !== -1 || hay.indexOf("param") !== -1)) {
+    return true;
+  }
+  return false;
+}
 function isAuthExpiredError(input) {
   if (!input) return false;
   var blobs = [];
@@ -975,10 +1005,10 @@ var ChatSession = class {
       });
     };
     var run = sendAndPoll().catch(function(err) {
-      if (isAuthExpiredError(err)) return self.host.refreshSession().then(sendAndPoll);
+      if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(sendAndPoll);
       throw err;
     }).then(function(response) {
-      if (isErrorResponseBody(response) && isAuthExpiredError(response)) {
+      if (isErrorResponseBody(response) && isAuthExpiredError(response) && !isNonRetryableRequestError(response)) {
         return self.host.refreshSession().then(sendAndPoll);
       }
       return response;
@@ -1596,7 +1626,7 @@ var ChatSession = class {
       return getChatHistory({ service: serviceId, owner, platform }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
-      if (isAuthExpiredError(err)) return self.host.refreshSession().then(fetchHistory);
+      if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
       throw err;
     }).then(function(history) {
       if (token !== self.state.gateRefreshToken) return;
@@ -1909,6 +1939,6 @@ var ChatSession = class {
   }
 };
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

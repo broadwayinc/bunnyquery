@@ -30,7 +30,7 @@ export * from './prompts';
 
 // Pure helpers (Tier-1.5): error detection, token budgeting, link/path
 // normalization, and history mapping — shared so both consumers stay identical.
-export { getErrorMessage, isErrorResponseBody, isAuthExpiredError } from './errors';
+export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError } from './errors';
 export * from './budget';
 export * from './links';
 export {

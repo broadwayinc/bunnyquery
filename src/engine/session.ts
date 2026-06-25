@@ -30,7 +30,7 @@ import {
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
 } from './requests';
-import { isErrorResponseBody, isAuthExpiredError, getErrorMessage } from './errors';
+import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
@@ -116,11 +116,15 @@ export class ChatSession {
 		};
 		var run = sendAndPoll()
 			.catch(function (err: any) {
-				if (isAuthExpiredError(err)) return self.host.refreshSession().then(sendAndPoll);
+				// Only auth-expiry is worth a refresh+resend; a malformed-request 400
+				// (e.g. the `_skapi_extract`/unknown-parameter class) re-fails identically,
+				// so never loop on it — guard against isAuthExpiredError's heuristic
+				// misfiring on a param name that merely contains "token".
+				if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(sendAndPoll);
 				throw err;
 			})
 			.then(function (response: any) {
-				if (isErrorResponseBody(response) && isAuthExpiredError(response)) {
+				if (isErrorResponseBody(response) && isAuthExpiredError(response) && !isNonRetryableRequestError(response)) {
 					return self.host.refreshSession().then(sendAndPoll);
 				}
 				return response;
@@ -656,7 +660,7 @@ export class ChatSession {
 		var fetchHistory = function () { return getChatHistory({ service: serviceId, owner: owner, platform: platform }, options); };
 
 		return Promise.resolve().then(fetchHistory).catch(function (err: any) {
-			if (isAuthExpiredError(err)) return self.host.refreshSession().then(fetchHistory);
+			if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
 			throw err;
 		}).then(function (history: any) {
 			if (token !== self.state.gateRefreshToken) return;
