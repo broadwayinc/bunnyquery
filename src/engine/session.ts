@@ -352,6 +352,7 @@ export class ChatSession {
 				this.host.notify(); this.enqueueTypewrite(aiIdx, answer, lid);
 			}
 		}
+		this._removeStrayPendingAssistants();
 		this.promoteNextQueuedToRunning();
 		this.updateHistoryCache();
 		this.host.notify();
@@ -386,12 +387,14 @@ export class ChatSession {
 				if (thPos2 !== -1) this.state.messages.splice(thPos2, 1);
 			}
 			if (serverId) this.cancelledServerIds.delete(serverId);
+			this._removeStrayPendingAssistants();
 			this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottom(true);
 			return;
 		}
 		var targetIdx = this.resolveQueuedUserBubble(serverId);
 		if (targetIdx === undefined) { this.host.notify(); this.updateHistoryCache(); return; }
 		this.insertAtTarget({ role: 'assistant', content: getErrorMessage(err), isError: true }, targetIdx);
+		this._removeStrayPendingAssistants();
 		this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottom(true);
 	}
 
@@ -516,15 +519,50 @@ export class ChatSession {
 		if (pendingIdx === -1) return Promise.resolve();
 		if (latest.isError || !latest.content) {
 			this.state.messages[pendingIdx] = { role: 'assistant', content: latest.content || '', isError: !!latest.isError };
+			this._removeStrayPendingAssistants();
 			this.host.notify();
 			this.promoteNextQueuedToRunning();
 			return Promise.resolve();
 		}
 		var lid = this._newLocalId();
 		this.state.messages[pendingIdx] = { role: 'assistant', content: '', isPending: false, _localId: lid };
+		this._removeStrayPendingAssistants();
 		this.host.notify();
 		this.promoteNextQueuedToRunning();
 		return this.enqueueTypewrite(pendingIdx, latest.content, lid);
+	}
+
+	// Remove any leftover non-background pending ("Thinking…") assistant bubbles.
+	// There is normally at most ONE such bubble at a time (promoteNext* refuses to
+	// add a second), so any extra is a duplicate — it appears when a concurrent
+	// history refetch re-maps the still-"running" turn into a pending placeholder
+	// (with a real _serverItemId) while the local pending bubble (no _serverItemId)
+	// is rescued and re-appended (see loadHistory rescue below). Each resolve path
+	// only replaces the FIRST pending bubble, so without this a stray "Thinking…"
+	// survives next to the reply/error. MUST run AFTER the resolved bubble has been
+	// made non-pending and BEFORE promoteNext*() (so a freshly-promoted Thinking,
+	// which is added only once no pending assistant remains, is preserved).
+	_removeStrayPendingAssistants(): void {
+		for (var k = this.state.messages.length - 1; k >= 0; k--) {
+			var m = this.state.messages[k];
+			if (m.isPending && m.role === 'assistant' && !m.isBackgroundTask) this.state.messages.splice(k, 1);
+		}
+	}
+
+	// Drop the pending flags on the resolved turn's USER bubble (preserving its
+	// content + background-task marker). Needed because a bg "Indexing:" turn's user
+	// bubble carries isPendingInProcess; leaving it set keeps the bubble visually
+	// stuck and keeps its bgTaskQueue entry alive forever.
+	_clearPendingUserBubble(itemId: string): void {
+		var uIdx = this.state.messages.findIndex(function (m) {
+			return m.role === 'user' && m._serverItemId === itemId &&
+				(m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
+		});
+		if (uIdx === -1) return;
+		var u = this.state.messages[uIdx];
+		var cleaned: ChatMessage = { role: 'user', content: u.content, _serverItemId: itemId };
+		if (u.isBackgroundTask) cleaned.isBackgroundTask = true;
+		this.state.messages[uIdx] = cleaned;
 	}
 
 	// If an immediate-send request for the current cache key is still in flight
@@ -561,6 +599,11 @@ export class ChatSession {
 			: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim();
 		var idx = this.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === itemId; });
 		if (idx !== -1) {
+			// A bg "Indexing:" turn pushes a user bubble (isPendingInProcess) ALONGSIDE
+			// the assistant Thinking; replacing only the assistant leaves that user
+			// bubble stuck pending — and drainBgTaskQueue then never clears its queue
+			// entry (its stillPending check stays true). Un-pend it here too.
+			this._clearPendingUserBubble(itemId);
 			if (isErr) {
 				this.state.messages[idx] = { role: 'assistant', content: answer, isError: true, _serverItemId: itemId };
 				this.host.notify(); this.updateHistoryCache(); return;
@@ -690,12 +733,23 @@ export class ChatSession {
 				mapped.forEach(function (m: any) { if (m._serverItemId) serverIds[m._serverItemId] = 1; });
 				var locallyCancelled: any = {};
 				self.state.messages.forEach(function (m) { if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = 1; });
+				// If the freshly-mapped server list ALREADY shows this in-flight turn
+				// as a pending placeholder (a non-bg pending assistant, which carries
+				// a real _serverItemId), re-pushing the local no-_serverItemId
+				// user+Thinking would DUPLICATE it. Each resolve path only clears the
+				// first pending bubble, so the duplicate strands a "Thinking…" beside
+				// the reply/error. There is at most one in-flight regular turn, so a
+				// mapped pending assistant IS this turn — skip the redundant local copy.
+				var mappedHasPendingAssistant = mapped.some(function (m: any) {
+					return m.isPending && m.role === 'assistant' && !m.isBackgroundTask;
+				});
 				var rescued: ChatMessage[] = [];
 				for (var ri = 0; ri < self.state.messages.length; ri++) {
 					var mm = self.state.messages[ri];
 					if (mm.isBackgroundTask) continue;
 					if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
 					if (!mm._serverItemId) {
+						if (mappedHasPendingAssistant) continue;
 						if (mm.isSendingToServer || mm.isPendingQueued || mm.isPendingInProcess || mm.isPending) rescued.push(mm);
 						else if (self.state.sending && mm.role === 'user') {
 							var next = self.state.messages[ri + 1];

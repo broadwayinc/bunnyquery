@@ -475,6 +475,8 @@ declare class ChatSession {
     private typewriterQueue;
     enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any>;
     typewriteLatestReply(key: string): Promise<any>;
+    _removeStrayPendingAssistants(): void;
+    _clearPendingUserBubble(itemId: string): void;
     resumePendingRequest(token: number): Promise<void>;
     handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
     applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
