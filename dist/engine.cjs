@@ -30,13 +30,33 @@ var OFFICE_FILE_EXTENSIONS = /* @__PURE__ */ new Set([
   "pptx",
   "pptm",
   "hwp",
-  "hwpx"
+  "hwpx",
+  "ods",
+  "odt",
+  "odp"
+]);
+var WEB_FETCHABLE_TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
+  "csv",
+  "tsv",
+  "tab",
+  "txt",
+  "text",
+  "md",
+  "markdown",
+  "json",
+  "ndjson",
+  "jsonl",
+  "xml",
+  "yaml",
+  "yml",
+  "log"
 ]);
 function isOfficeFile(name, mime) {
   const ext = (name || "").split(".").pop()?.toLowerCase() || "";
   if (OFFICE_FILE_EXTENSIONS.has(ext)) return true;
+  if (WEB_FETCHABLE_TEXT_EXTENSIONS.has(ext)) return false;
   const m = (mime || "").toLowerCase();
-  return m.includes("officedocument") || m.includes("hwp") || m === "application/msword" || m === "application/vnd.ms-excel" || m === "application/vnd.ms-powerpoint";
+  return m.includes("officedocument") || m.includes("opendocument") || m.includes("hwp") || m === "application/msword" || m === "application/vnd.ms-excel" || m === "application/vnd.ms-powerpoint";
 }
 var _extractPlaceholderSeq = 0;
 function makeExtractPlaceholder(seed) {

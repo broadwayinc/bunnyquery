@@ -21,23 +21,38 @@ export type ExtractDirective = {
 	mime?: string;
 };
 
-// Office formats whose text the model cannot read via web_fetch. OOXML
-// (.docx/.xlsx/.pptx) and Hancom .hwpx are extracted server-side; the other
-// (legacy/macro/binary) extensions are still flagged so the worker returns a
-// graceful note instead of the model fetching binary garbage.
+// Office formats whose text the model cannot read via web_fetch (they are
+// binary/zip). OOXML (.docx/.xlsx/.pptx), Hancom .hwpx, and OpenDocument
+// (.ods/.odt/.odp) are extracted server-side; the other (legacy/macro/binary)
+// extensions are still flagged so the worker returns a graceful note instead of
+// the model fetching binary garbage.
 const OFFICE_FILE_EXTENSIONS = new Set([
 	'doc', 'docx', 'docm',
 	'xls', 'xlsx', 'xlsm',
 	'ppt', 'pptx', 'pptm',
 	'hwp', 'hwpx',
+	'ods', 'odt', 'odp',
+]);
+
+// Plain-text/data formats web_fetch CAN read. These must NEVER be treated as
+// office files even when the OS/browser reports an Office MIME for them — most
+// notably .csv, which Windows/Excel reports as `application/vnd.ms-excel`. The
+// extension is authoritative here; without this guard a .csv is wrongly flagged
+// for server-side extraction, the worker can't extract `.csv`, and the model
+// gets an "unsupported format" note instead of the file's contents.
+const WEB_FETCHABLE_TEXT_EXTENSIONS = new Set([
+	'csv', 'tsv', 'tab', 'txt', 'text', 'md', 'markdown',
+	'json', 'ndjson', 'jsonl', 'xml', 'yaml', 'yml', 'log',
 ]);
 
 export function isOfficeFile(name?: string, mime?: string): boolean {
 	const ext = (name || '').split('.').pop()?.toLowerCase() || '';
 	if (OFFICE_FILE_EXTENSIONS.has(ext)) return true;
+	if (WEB_FETCHABLE_TEXT_EXTENSIONS.has(ext)) return false;
 	const m = (mime || '').toLowerCase();
 	return (
 		m.includes('officedocument') ||
+		m.includes('opendocument') ||
 		m.includes('hwp') ||
 		m === 'application/msword' ||
 		m === 'application/vnd.ms-excel' ||
