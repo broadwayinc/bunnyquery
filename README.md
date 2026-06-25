@@ -24,6 +24,9 @@ you can build your own chat UI on top of it. See
   first load and on scroll-up.
 - **Attachments** — drag-and-drop files and folders, per-file upload status
   (uploading / failed / indexed), and overflow collapsing for large batches.
+  Images are read with vision/OCR, Office/text/code files are extracted
+  server-side, and PDFs are fetched by the model — see
+  [Supported file types](#supported-file-types).
 - **Attachment parser plugins** — register a client-side parser so the widget
   extracts text in the browser from formats the model can't otherwise read, and
   indexes it directly. See [Attachment parser plugins](#attachment-parser-plugins).
@@ -137,12 +140,79 @@ BunnyQuery.logout();
 > instance rather than re-mounting. On a successful mount it logs its version, e.g.
 > `[bunnyquery] v1.3.5`.
 
+## Supported file types
+
+When a user attaches a file, BunnyQuery makes its contents available to the AI
+automatically — detected by extension (with a MIME-type fallback), nothing to
+configure. There are three paths, plus a couple of caveats.
+
+### 1. Images — read directly by the model (vision + OCR)
+
+`.jpg` · `.jpeg` · `.png` · `.gif` · `.webp`
+
+The image is attached to the request inline, so the model both **describes the
+picture** and **reads any text in it (OCR)**. Works on both Claude and OpenAI.
+Only images referenced in the **most recent** message are inlined (older links
+may have expired).
+
+### 2. Documents, data & code — extracted on the server (inlined as text)
+
+The skapi proxy downloads the file, extracts its text **server-side**, and
+inlines that text into the request — the model reads it directly, with no
+fetching. This keeps indexing consistent across model providers.
+
+**Office & e-book** (binary/zip, parsed):
+`.docx` · `.xlsx` · `.pptx` · `.hwp` · `.hwpx` · `.ods` · `.odt` · `.odp` · `.epub`
+
+**Text, data, markup & source code** (decoded as text; `.html`/`.htm` have their
+tags stripped):
+
+```
+.csv .tsv .tab .txt .text .log .md .markdown .rst .json .ndjson .jsonl .geojson
+.xml .yaml .yml .toml .ini .conf .cfg .properties .env .rtf .html .htm
+.js .mjs .cjs .ts .tsx .jsx .py .rb .go .rs .java .kt .c .h .cpp .cc .hpp .cs
+.php .swift .sh .bash .zsh .sql .css .scss .less .vue .svelte .tex .srt .vtt
+```
+
+Plus a **MIME fallback**: any file whose content type is text-like (`text/*`,
+`application/json`, `application/xml`, `*+json`, `*+xml`, `*+yaml`, …) is decoded
+even when its extension isn't in the list above.
+
+Encoding is auto-detected — UTF-8 (BOM-aware) → CP949/EUC-KR (Korean) → Latin-1.
+Extracted text is capped at **200,000 characters**; longer files are truncated
+with a `...[truncated for length; original N characters]` marker.
+
+### 3. PDFs & other links — fetched by the model
+
+`.pdf` (and any file that is neither an image nor server-extractable) is handed
+to the model as a temporary link, which it opens with its built-in web tool:
+**Claude** via `web_fetch`, **OpenAI** via `web_search` (external web access is
+enabled). Both can open and read PDFs, so PDFs work on either provider.
+
+> A provider's web tool opens document/page-style URLs such as PDFs, but not
+> necessarily a bare *data-file* download (e.g. a raw `.csv`/`.tsv` link). That's
+> why those data formats are extracted **server-side** (path 2 above) instead of
+> being left to the model to fetch.
+
+### Caveats
+
+- **Legacy / macro Office** — `.doc` `.xls` `.ppt` (legacy binary) and `.docm`
+  `.xlsm` `.pptm` (macro-enabled) have no reliable server-side reader. They
+  upload fine but are indexed from **metadata only**; re-save as
+  `.docx` / `.xlsx` / `.pptx` (or PDF) to capture their contents.
+- **Anything else** — a format covered by none of the above is indexed from its
+  metadata. To support it, register your own
+  [Attachment parser plugin](#attachment-parser-plugins) — it runs in the browser
+  and feeds parsed text straight into indexing.
+
 ## Attachment parser plugins
 
-By default the chat agent reads most uploads via the model's `web_fetch` tool
-(text, CSV, PDF, …), and Office/OpenDocument/EPUB files are extracted on the
-server. For any format that can be read by **neither** (e.g. a proprietary
-binary format), register a **parser plugin**: it runs in the browser, turns the
+By default the chat agent reads images with vision/OCR, extracts
+Office/OpenDocument/EPUB and text/data/code files on the server, and lets the
+model fetch PDFs with its built-in web tool (`web_fetch` on Claude, `web_search`
+on OpenAI) — see [Supported file types](#supported-file-types). For any format
+read by **none** of these (e.g. a proprietary binary format), register a
+**parser plugin**: it runs in the browser, turns the
 uploaded file into text (or an HTML string), and the widget sends that content
 **inline** for indexing — no `web_fetch`, no server extraction for that file.
 
