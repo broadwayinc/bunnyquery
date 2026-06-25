@@ -11,7 +11,7 @@
  *                                    only the BgTaskEntry TYPE lives here)
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage } from './prompts';
-import { isOfficeFile, makeExtractPlaceholder, type ExtractDirective } from './office';
+import { isServerExtractable, makeExtractPlaceholder, type ExtractDirective } from './office';
 import { chatEngineConfig, pollOpt } from './config';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -439,11 +439,11 @@ export type AttachmentSaveInfo = {
 export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const { platform, service, owner, attachment, parsedContent } = info;
 
-	// Client-parsed content wins over server-side office extraction.
-	const office = !parsedContent && isOfficeFile(attachment.name, attachment.mime);
-	const placeholder = office ? makeExtractPlaceholder(attachment.storagePath) : undefined;
+	// Client-parsed content wins over server-side extraction.
+	const serverExtract = !parsedContent && isServerExtractable(attachment.name, attachment.mime);
+	const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : undefined;
 	const extractContent: ExtractDirective[] | undefined =
-		office && placeholder
+		serverExtract && placeholder
 			? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }]
 			: undefined;
 	const skapiExtract =

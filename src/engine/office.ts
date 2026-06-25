@@ -21,11 +21,14 @@ export type ExtractDirective = {
 	mime?: string;
 };
 
-// Binary/zip document formats the model cannot read via web_fetch. OOXML
-// (.docx/.xlsx/.pptx), Hancom .hwpx, OpenDocument (.ods/.odt/.odp), and EPUB
-// (.epub) are extracted server-side; the other (legacy/macro/binary) extensions
-// are still flagged so the worker returns a graceful note instead of the model
-// fetching binary garbage.
+// Files whose text the worker extracts SERVER-SIDE and inlines for indexing,
+// instead of handing the agent a URL to fetch. Two groups:
+//   (1) BINARY document formats the model can't read at all (OOXML, Hancom
+//       HWP/HWPX, OpenDocument, EPUB) — the worker parses them.
+//   (2) TEXT/data/markup/code formats. These ARE readable via web_fetch, BUT
+//       some providers (OpenAI's Responses API) have no working file-fetch tool,
+//       so the agent can't retrieve the URL at all. Extracting them server-side
+//       (the worker just decodes the bytes) makes indexing provider-independent.
 const OFFICE_FILE_EXTENSIONS = new Set([
 	'doc', 'docx', 'docm',
 	'xls', 'xlsx', 'xlsm',
@@ -35,27 +38,43 @@ const OFFICE_FILE_EXTENSIONS = new Set([
 	'epub',
 ]);
 
-// Plain-text/data formats web_fetch CAN read. These must NEVER be treated as
-// office files even when the OS/browser reports an Office MIME for them — most
-// notably .csv, which Windows/Excel reports as `application/vnd.ms-excel`. The
-// extension is authoritative here; without this guard a .csv is wrongly flagged
-// for server-side extraction, the worker can't extract `.csv`, and the model
-// gets an "unsupported format" note instead of the file's contents.
-const WEB_FETCHABLE_TEXT_EXTENSIONS = new Set([
-	'csv', 'tsv', 'tab', 'txt', 'text', 'md', 'markdown',
-	'json', 'ndjson', 'jsonl', 'xml', 'yaml', 'yml', 'log',
-	// RTF is a TEXT format (not a binary zip), so web_fetch can read it and the
-	// model decodes its control words. Pin it here so a `.rtf` reported as
-	// `application/msword` isn't misrouted to server-side extraction (which has no
-	// .rtf extractor → "unsupported format" note).
-	'rtf', 'htm', 'html',
+const TEXT_FILE_EXTENSIONS = new Set([
+	'csv', 'tsv', 'tab', 'txt', 'text', 'log', 'md', 'markdown', 'rst',
+	'json', 'ndjson', 'jsonl', 'geojson', 'xml', 'yaml', 'yml', 'toml',
+	'ini', 'conf', 'cfg', 'properties', 'env', 'rtf', 'html', 'htm',
+	'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'rb', 'go', 'rs', 'java',
+	'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'php', 'swift', 'sh', 'bash',
+	'zsh', 'sql', 'css', 'scss', 'less', 'vue', 'svelte', 'tex', 'srt', 'vtt',
 ]);
 
-export function isOfficeFile(name?: string, mime?: string): boolean {
+// MIME types that indicate decodable text even when the extension is unknown
+// (the worker has the same fallback, so any text/* file is extracted server-side).
+function isTextMime(m: string): boolean {
+	return (
+		m.startsWith('text/') ||
+		m.endsWith('+json') || m.endsWith('+xml') || m.endsWith('+yaml') ||
+		m === 'application/json' || m === 'application/ld+json' ||
+		m === 'application/xml' || m === 'application/yaml' || m === 'application/x-yaml' ||
+		m === 'application/javascript' || m === 'application/x-javascript' ||
+		m === 'application/x-sh' || m === 'application/x-ndjson' ||
+		m === 'application/csv' || m === 'application/rtf' ||
+		m === 'application/sql' || m === 'application/toml'
+	);
+}
+
+/**
+ * True when a file should be EXTRACTED SERVER-SIDE (text inlined for indexing)
+ * rather than handed to the agent as a URL to fetch — i.e. binary office
+ * documents AND all text/data/code files. Detection is extension-first (so a
+ * .csv reported as an Office MIME is still treated as text), with a text-MIME
+ * fallback for unlisted extensions.
+ */
+export function isServerExtractable(name?: string, mime?: string): boolean {
 	const ext = (name || '').split('.').pop()?.toLowerCase() || '';
 	if (OFFICE_FILE_EXTENSIONS.has(ext)) return true;
-	if (WEB_FETCHABLE_TEXT_EXTENSIONS.has(ext)) return false;
+	if (TEXT_FILE_EXTENSIONS.has(ext)) return true;
 	const m = (mime || '').toLowerCase();
+	if (isTextMime(m)) return true;
 	return (
 		m.includes('officedocument') ||
 		m.includes('opendocument') ||
@@ -66,6 +85,9 @@ export function isOfficeFile(name?: string, mime?: string): boolean {
 		m === 'application/vnd.ms-powerpoint'
 	);
 }
+
+/** @deprecated renamed to {@link isServerExtractable} (now also covers text files). */
+export const isOfficeFile = isServerExtractable;
 
 // Monotonic counter so placeholders are unique even for same-named files in one
 // request. Token shape must match the worker's _EXTRACT_PLACEHOLDER_RE:
@@ -107,10 +129,10 @@ export function composeUserMessage(
 	let composedForLlm = composed;
 	let extractContent: ExtractDirective[] | undefined;
 	if (attachmentUrls.length > 0) {
-		const officeFiles = attachmentUrls.filter((u) => isOfficeFile(u.name));
-		if (officeFiles.length > 0) {
+		const extractFiles = attachmentUrls.filter((u) => isServerExtractable(u.name));
+		if (extractFiles.length > 0) {
 			const directives: ExtractDirective[] = [];
-			const sections = officeFiles.map((u) => {
+			const sections = extractFiles.map((u) => {
 				const storagePath = u.storagePath || u.name;
 				const placeholder = makeExtractPlaceholder(storagePath);
 				directives.push({ path: storagePath, placeholder, name: u.name });

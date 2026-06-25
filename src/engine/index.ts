@@ -14,6 +14,7 @@ export {
 } from './config';
 
 export {
+	isServerExtractable,
 	isOfficeFile,
 	makeExtractPlaceholder,
 	composeUserMessage,
