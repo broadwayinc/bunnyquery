@@ -1,4 +1,9 @@
 import { defineConfig } from 'tsup';
+import { readFileSync } from 'node:fs';
+
+// Injected into the widget build so it can report its package version at runtime
+// (logged on BunnyQuery.init). Single source of truth = package.json.
+const PKG_VERSION = JSON.parse(readFileSync('./package.json', 'utf8')).version;
 
 // This package produces TWO outputs from one source tree:
 //
@@ -34,6 +39,7 @@ export default defineConfig([
     },
     {
         entry: { bunnyquery: 'src/index.js' },
+        define: { __BQ_VERSION__: JSON.stringify(PKG_VERSION) },
         format: ['iife'],
         platform: 'browser',
         target: 'es2020',

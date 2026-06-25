@@ -26,6 +26,18 @@ export {
 	type AttachmentFailureGroup,
 } from './attachments';
 
+// Client-side attachment-parser plugins (e.g. .hwp). Register your own parser to
+// turn an uploaded File into indexable text/HTML, sent inline for indexing.
+export {
+	registerAttachmentParser,
+	clearAttachmentParsers,
+	getAttachmentParsers,
+	findAttachmentParser,
+	parseAttachmentContent,
+	MAX_PARSED_CONTENT_CHARS,
+	type AttachmentParser,
+} from './attachment_parsers';
+
 export * from './prompts';
 
 // Pure helpers (Tier-1.5): error detection, token budgeting, link/path

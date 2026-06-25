@@ -28,6 +28,7 @@
 // transport + MCP base URL + poll value are injected in init() below.
 import {
     configureChatEngine,
+    registerAttachmentParser,
     ChatSession,
     extractClaudeText,
     extractOpenAIText,
@@ -72,6 +73,10 @@ import {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
     var MCP_NAME = "BunnyQuery";
+
+    // Package version, injected at build time by tsup (define: __BQ_VERSION__).
+    // Falls back to "dev" when the source runs unbuilt (e.g. tests).
+    var BQ_VERSION = typeof __BQ_VERSION__ !== "undefined" ? __BQ_VERSION__ : "dev";
 
     // Anthropic (Claude)
     var ANTHROPIC_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages";
@@ -338,7 +343,7 @@ import {
                 return S.skapi.connection || null;
             })
             .then(function (conn) {
-                console.log("[bunnyquery] loadServiceInfo", conn)
+                if (S.opts && S.opts.dev) console.log("[bunnyquery] loadServiceInfo", conn);
                 if (conn) {
                     S.serviceId = conn.service || S.serviceId;
                     S.owner = conn.owner || S.owner;
@@ -2875,6 +2880,7 @@ import {
             googleClientSecretName: "ggl",
             signupConfirmationUrl: null, // defaults to current host page
             hostDomain: null,            // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
+            attachmentParsers: null,     // client-side attachment parsers, e.g. [createHwpParser()]
         }, opts || {});
         S.mountEl = mountEl;
 
@@ -2885,6 +2891,7 @@ import {
 
         applyTheme(loadTheme());
         S.booted = true;
+        console.log("[bunnyquery] v" + BQ_VERSION);
 
         // Inject this widget's transport + MCP endpoint into the shared chat
         // engine. poll: 0 — the deployed skapi-js@latest returns the early ack
@@ -2895,6 +2902,8 @@ import {
             clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
             mcpBaseUrl: mcpBaseUrl(),
             poll: 0,
+            // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
+            attachmentParsers: S.opts.attachmentParsers || undefined,
         });
 
         // Recompute the attachment "...(x) more" overflow when the viewport
@@ -2910,10 +2919,14 @@ import {
 
     var PUBLIC = {
         init: init,
+        // Register a client-side attachment parser (e.g. createHwpParser()) so the
+        // widget parses matching uploads in-browser and sends the text for indexing.
+        // Can be called before or after init(); also settable via init opts.attachmentParsers.
+        registerAttachmentParser: registerAttachmentParser,
         setTheme: function (t) { applyTheme(t); },
         toggleTheme: toggleTheme,
         logout: logout,
-        version: "0.1.0",
+        version: BQ_VERSION,
         _state: S, // exposed for later-phase modules / debugging
     };
 

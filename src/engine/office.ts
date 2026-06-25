@@ -21,17 +21,18 @@ export type ExtractDirective = {
 	mime?: string;
 };
 
-// Office formats whose text the model cannot read via web_fetch (they are
-// binary/zip). OOXML (.docx/.xlsx/.pptx), Hancom .hwpx, and OpenDocument
-// (.ods/.odt/.odp) are extracted server-side; the other (legacy/macro/binary)
-// extensions are still flagged so the worker returns a graceful note instead of
-// the model fetching binary garbage.
+// Binary/zip document formats the model cannot read via web_fetch. OOXML
+// (.docx/.xlsx/.pptx), Hancom .hwpx, OpenDocument (.ods/.odt/.odp), and EPUB
+// (.epub) are extracted server-side; the other (legacy/macro/binary) extensions
+// are still flagged so the worker returns a graceful note instead of the model
+// fetching binary garbage.
 const OFFICE_FILE_EXTENSIONS = new Set([
 	'doc', 'docx', 'docm',
 	'xls', 'xlsx', 'xlsm',
 	'ppt', 'pptx', 'pptm',
 	'hwp', 'hwpx',
 	'ods', 'odt', 'odp',
+	'epub',
 ]);
 
 // Plain-text/data formats web_fetch CAN read. These must NEVER be treated as
@@ -43,6 +44,11 @@ const OFFICE_FILE_EXTENSIONS = new Set([
 const WEB_FETCHABLE_TEXT_EXTENSIONS = new Set([
 	'csv', 'tsv', 'tab', 'txt', 'text', 'md', 'markdown',
 	'json', 'ndjson', 'jsonl', 'xml', 'yaml', 'yml', 'log',
+	// RTF is a TEXT format (not a binary zip), so web_fetch can read it and the
+	// model decodes its control words. Pin it here so a `.rtf` reported as
+	// `application/msword` isn't misrouted to server-side extraction (which has no
+	// .rtf extractor → "unsupported format" note).
+	'rtf', 'htm', 'html',
 ]);
 
 export function isOfficeFile(name?: string, mime?: string): boolean {
@@ -54,6 +60,7 @@ export function isOfficeFile(name?: string, mime?: string): boolean {
 		m.includes('officedocument') ||
 		m.includes('opendocument') ||
 		m.includes('hwp') ||
+		m.includes('epub') ||
 		m === 'application/msword' ||
 		m === 'application/vnd.ms-excel' ||
 		m === 'application/vnd.ms-powerpoint'

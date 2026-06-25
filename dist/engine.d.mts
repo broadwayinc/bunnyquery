@@ -1,4 +1,54 @@
 /**
+ * Client-side attachment-parser plugins.
+ *
+ * Some attachment formats can't be read by the model's web_fetch (binary) and
+ * have no server-side extractor either — e.g. legacy Hancom .hwp. A parser
+ * plugin runs IN THE BROWSER, turns the uploaded File into indexable text (or an
+ * HTML string), and the engine sends that content INLINE in the background
+ * indexing request — so the model indexes the parsed content directly, with no
+ * upload-side server extraction and no web_fetch for that file.
+ *
+ * Register a parser with `registerAttachmentParser()`, or via
+ * `configureChatEngine({ attachmentParsers: [...] })`. The BunnyQuery widget also
+ * exposes `BunnyQuery.registerAttachmentParser()` and an `attachmentParsers`
+ * init option. First matching parser wins.
+ */
+interface AttachmentParser {
+    /** Human-readable label — used only in logs. */
+    name?: string;
+    /**
+     * Return true if this parser handles the file. Receives the file name and
+     * (when known) its MIME type. Keep it cheap — it runs for every upload.
+     */
+    match: (file: {
+        name: string;
+        mime?: string;
+    }) => boolean;
+    /**
+     * Parse the File into indexable plain text OR an HTML string (the model reads
+     * either). Runs in the browser; may be async. Return a falsy/empty value to
+     * skip (the file then falls back to web_fetch / server extraction).
+     */
+    parse: (file: File) => string | null | undefined | Promise<string | null | undefined>;
+}
+declare const MAX_PARSED_CONTENT_CHARS = 200000;
+/** Register an attachment parser. Ignores duplicates (by reference) and invalid plugins. */
+declare function registerAttachmentParser(parser: AttachmentParser): void;
+/** Remove all registered parsers (mainly for tests / re-init). */
+declare function clearAttachmentParsers(): void;
+/** Snapshot of the registered parsers. */
+declare function getAttachmentParsers(): AttachmentParser[];
+/** First parser whose `match` returns true for the given file, if any. */
+declare function findAttachmentParser(name: string, mime?: string): AttachmentParser | undefined;
+/**
+ * Run the matching parser (if any) and return capped, trimmed content — or null
+ * when there is no parser, the parser throws, or it yields nothing. Never throws:
+ * a parser failure degrades to null so the upload still completes (the file then
+ * resolves via its normal path).
+ */
+declare function parseAttachmentContent(file: File, name: string, mime?: string): Promise<string | null>;
+
+/**
  * Engine configuration / dependency injection.
  *
  * The engine is framework- and transport-agnostic: it never imports a skapi
@@ -12,6 +62,7 @@
  * `poll: 0` to get the early ack + a manual `.poll()` handle (needed for queued-
  * send cancel). So the request builders include `poll` only when it is set.
  */
+
 interface ChatEngineConfig {
     /** skapi.clientSecretRequest, bound to the consumer's skapi instance. */
     clientSecretRequest: (opts: any) => Promise<any>;
@@ -24,6 +75,12 @@ interface ChatEngineConfig {
      * the `poll` key is omitted entirely (agent.vue). BunnyQuery sets `0`.
      */
     poll?: number;
+    /**
+     * Optional client-side attachment parsers (e.g. an .hwp parser). Each is
+     * registered at configure time; more can be added later via
+     * `registerAttachmentParser()`. See attachment_parsers.ts.
+     */
+    attachmentParsers?: AttachmentParser[];
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
@@ -153,6 +210,12 @@ type BuildIndexingUserMessageOptions = {
      * drops the temporary-URL line — there is nothing for the model to fetch).
      */
     inlineContentPlaceholder?: string;
+    /**
+     * Actual file content parsed CLIENT-SIDE by an attachment-parser plugin (e.g.
+     * an .hwp parser). Embedded inline verbatim — no server extraction and no
+     * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
+     */
+    inlineContent?: string;
 };
 declare function buildIndexingUserMessage(attachment: IndexingAttachmentInfo, options?: BuildIndexingUserMessageOptions): string;
 
@@ -293,6 +356,12 @@ type AttachmentSaveInfo = {
         size?: number;
         url: string;
     };
+    /**
+     * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
+     * parser). When set, it is inlined into the indexing message verbatim and
+     * takes precedence over server-side office extraction / web_fetch.
+     */
+    parsedContent?: string;
 };
 declare function notifyAgentSaveAttachment(info: AttachmentSaveInfo): Promise<any>;
 declare function extractClaudeText(response: any): any;
@@ -496,4 +565,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

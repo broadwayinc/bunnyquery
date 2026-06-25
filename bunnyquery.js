@@ -1,10 +1,52 @@
 (function () {
   'use strict';
 
+  // src/engine/attachment_parsers.ts
+  var MAX_PARSED_CONTENT_CHARS = 2e5;
+  var _parsers = [];
+  function registerAttachmentParser(parser) {
+    if (parser && typeof parser.match === "function" && typeof parser.parse === "function" && _parsers.indexOf(parser) === -1) {
+      _parsers.push(parser);
+    }
+  }
+  function findAttachmentParser(name, mime) {
+    for (let i = 0; i < _parsers.length; i++) {
+      try {
+        if (_parsers[i].match({ name, mime })) return _parsers[i];
+      } catch {
+      }
+    }
+    return void 0;
+  }
+  async function parseAttachmentContent(file, name, mime) {
+    const parser = findAttachmentParser(name, mime);
+    if (!parser) return null;
+    let raw;
+    try {
+      raw = await parser.parse(file);
+    } catch (err) {
+      console.error(
+        `[chat-engine] attachment parser ${parser.name || "(unnamed)"} failed for ${name}:`,
+        err
+      );
+      return null;
+    }
+    let text = (raw == null ? "" : String(raw)).trim();
+    if (!text) return null;
+    if (text.length > MAX_PARSED_CONTENT_CHARS) {
+      text = text.slice(0, MAX_PARSED_CONTENT_CHARS) + `
+...[truncated for length; original ${text.length} characters]`;
+    }
+    return text;
+  }
+
   // src/engine/config.ts
   var _config = null;
   function configureChatEngine(config) {
     _config = config;
+    if (config.attachmentParsers) {
+      for (const parser of config.attachmentParsers) registerAttachmentParser(parser);
+    }
   }
   function chatEngineConfig() {
     if (!_config) {
@@ -34,7 +76,8 @@
     "hwpx",
     "ods",
     "odt",
-    "odp"
+    "odp",
+    "epub"
   ]);
   var WEB_FETCHABLE_TEXT_EXTENSIONS = /* @__PURE__ */ new Set([
     "csv",
@@ -50,14 +93,21 @@
     "xml",
     "yaml",
     "yml",
-    "log"
+    "log",
+    // RTF is a TEXT format (not a binary zip), so web_fetch can read it and the
+    // model decodes its control words. Pin it here so a `.rtf` reported as
+    // `application/msword` isn't misrouted to server-side extraction (which has no
+    // .rtf extractor → "unsupported format" note).
+    "rtf",
+    "htm",
+    "html"
   ]);
   function isOfficeFile(name, mime) {
     const ext = (name || "").split(".").pop()?.toLowerCase() || "";
     if (OFFICE_FILE_EXTENSIONS.has(ext)) return true;
     if (WEB_FETCHABLE_TEXT_EXTENSIONS.has(ext)) return false;
     const m = (mime || "").toLowerCase();
-    return m.includes("officedocument") || m.includes("opendocument") || m.includes("hwp") || m === "application/msword" || m === "application/vnd.ms-excel" || m === "application/vnd.ms-powerpoint";
+    return m.includes("officedocument") || m.includes("opendocument") || m.includes("hwp") || m.includes("epub") || m === "application/msword" || m === "application/vnd.ms-excel" || m === "application/vnd.ms-powerpoint";
   }
   var _extractPlaceholderSeq = 0;
   function makeExtractPlaceholder(seed) {
@@ -178,6 +228,14 @@ File metadata:
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + (typeof attachment.size === "number" ? `- size (bytes): ${attachment.size}
 ` : "");
+    if (options?.inlineContent) {
+      return head + `
+The file's content was parsed by the client and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
+
+----- BEGIN FILE CONTENT -----
+${options.inlineContent}
+----- END FILE CONTENT -----`;
+    }
     if (options?.inlineContentPlaceholder) {
       return head + `
 The file's text content was extracted on the server and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
@@ -673,14 +731,14 @@ ${options.inlineContentPlaceholder}
     });
   }
   async function notifyAgentSaveAttachment(info) {
-    const { platform, service, owner, attachment } = info;
-    const office = isOfficeFile(attachment.name, attachment.mime);
+    const { platform, service, owner, attachment, parsedContent } = info;
+    const office = !parsedContent && isOfficeFile(attachment.name, attachment.mime);
     const placeholder = office ? makeExtractPlaceholder(attachment.storagePath) : void 0;
     const extractContent = office && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
     const skapiExtract = extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
     const userMessage = buildIndexingUserMessage(
       attachment,
-      placeholder ? { inlineContentPlaceholder: placeholder } : void 0
+      parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : void 0
     );
     const systemPrompt = buildIndexingSystemPrompt({
       service,
@@ -1857,44 +1915,49 @@ ${options.inlineContentPlaceholder}
               att.storagePath = member.storagePath;
             }
             var mime = member.file.type || self.host.getMimeType(member.file.name);
-            return notifyAgentSaveAttachment({
-              platform: id.platform,
-              model: id.model,
-              service: id.serviceId,
-              owner: id.owner,
-              userId: id.userId || id.serviceId,
-              serviceName: id.serviceName,
-              serviceDescription: id.serviceDescription,
-              attachment: {
-                name: member.file.name,
-                storagePath: member.storagePath,
-                mime: mime || void 0,
-                size: member.file.size,
-                url
-              }
-            }).then(function(ack) {
-              if (ack && typeof ack.id === "string") {
-                self.bgTaskQueue.push({
-                  serviceId: id.serviceId,
-                  platform: id.platform,
-                  id: ack.id,
-                  filename: member.file.name,
+            return Promise.resolve(
+              parseAttachmentContent(member.file, member.file.name, mime || void 0)
+            ).then(function(parsedContent) {
+              return notifyAgentSaveAttachment({
+                platform: id.platform,
+                model: id.model,
+                service: id.serviceId,
+                owner: id.owner,
+                userId: id.userId || id.serviceId,
+                serviceName: id.serviceName,
+                serviceDescription: id.serviceDescription,
+                attachment: {
+                  name: member.file.name,
                   storagePath: member.storagePath,
-                  isReindex: hadExists,
                   mime: mime || void 0,
                   size: member.file.size,
-                  status: ack.status === "running" ? "running" : "pending",
-                  poll: ack.poll
-                });
-                self.drainBgTaskQueue();
-              }
-            }, function(e) {
-              console.error("[chat-engine] indexing request failed", e);
-              anyIndexFailed = true;
-              if (!att.errorCode && !att.errorDetail) {
-                att.errorCode = e && (e.code || e.body && e.body.code) || "";
-                att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
-              }
+                  url
+                },
+                parsedContent: parsedContent || void 0
+              }).then(function(ack) {
+                if (ack && typeof ack.id === "string") {
+                  self.bgTaskQueue.push({
+                    serviceId: id.serviceId,
+                    platform: id.platform,
+                    id: ack.id,
+                    filename: member.file.name,
+                    storagePath: member.storagePath,
+                    isReindex: hadExists,
+                    mime: mime || void 0,
+                    size: member.file.size,
+                    status: ack.status === "running" ? "running" : "pending",
+                    poll: ack.poll
+                  });
+                  self.drainBgTaskQueue();
+                }
+              }, function(e) {
+                console.error("[chat-engine] indexing request failed", e);
+                anyIndexFailed = true;
+                if (!att.errorCode && !att.errorDetail) {
+                  att.errorCode = e && (e.code || e.body && e.body.code) || "";
+                  att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
+                }
+              });
             });
           });
         });
@@ -1978,6 +2041,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
+    var BQ_VERSION = "1.4.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -2199,7 +2263,7 @@ ${options.inlineContentPlaceholder}
         if (typeof S.skapi.getConnectionInfo === "function") return S.skapi.getConnectionInfo();
         return S.skapi.connection || null;
       }).then(function(conn) {
-        console.log("[bunnyquery] loadServiceInfo", conn);
+        if (S.opts && S.opts.dev) console.log("[bunnyquery] loadServiceInfo", conn);
         if (conn) {
           S.serviceId = conn.service || S.serviceId;
           S.owner = conn.owner || S.owner;
@@ -5021,8 +5085,10 @@ ${options.inlineContentPlaceholder}
         googleClientSecretName: "ggl",
         signupConfirmationUrl: null,
         // defaults to current host page
-        hostDomain: null
+        hostDomain: null,
         // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
+        attachmentParsers: null
+        // client-side attachment parsers, e.g. [createHwpParser()]
       }, opts || {});
       S.mountEl = mountEl;
       clear(mountEl);
@@ -5030,6 +5096,7 @@ ${options.inlineContentPlaceholder}
       mountEl.appendChild(S.root);
       applyTheme(loadTheme());
       S.booted = true;
+      console.log("[bunnyquery] v" + BQ_VERSION);
       configureChatEngine({
         clientSecretRequest: function(o) {
           return S.skapi.clientSecretRequest(o);
@@ -5038,7 +5105,9 @@ ${options.inlineContentPlaceholder}
           return S.skapi.clientSecretRequestHistory(p, f);
         },
         mcpBaseUrl: mcpBaseUrl(),
-        poll: 0
+        poll: 0,
+        // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
+        attachmentParsers: S.opts.attachmentParsers || void 0
       });
       if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
         S._resizeBound = true;
@@ -5051,12 +5120,16 @@ ${options.inlineContentPlaceholder}
     }
     var PUBLIC = {
       init,
+      // Register a client-side attachment parser (e.g. createHwpParser()) so the
+      // widget parses matching uploads in-browser and sends the text for indexing.
+      // Can be called before or after init(); also settable via init opts.attachmentParsers.
+      registerAttachmentParser,
       setTheme: function(t) {
         applyTheme(t);
       },
       toggleTheme,
       logout,
-      version: "0.1.0",
+      version: BQ_VERSION,
       _state: S
       // exposed for later-phase modules / debugging
     };

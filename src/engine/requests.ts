@@ -425,14 +425,22 @@ export type AttachmentSaveInfo = {
 		size?: number;
 		url: string;
 	};
+	/**
+	 * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
+	 * parser). When set, it is inlined into the indexing message verbatim and
+	 * takes precedence over server-side office extraction / web_fetch.
+	 */
+	parsedContent?: string;
 };
 
-// Background "save into knowledge" call (not a chat turn). Office files get the
-// _skapi_extract directive + an inline-content placeholder instead of a URL.
+// Background "save into knowledge" call (not a chat turn). A client-parsed file
+// (parser plugin) is inlined directly; otherwise office files get the
+// _skapi_extract directive + a placeholder, and everything else gets a URL.
 export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
-	const { platform, service, owner, attachment } = info;
+	const { platform, service, owner, attachment, parsedContent } = info;
 
-	const office = isOfficeFile(attachment.name, attachment.mime);
+	// Client-parsed content wins over server-side office extraction.
+	const office = !parsedContent && isOfficeFile(attachment.name, attachment.mime);
 	const placeholder = office ? makeExtractPlaceholder(attachment.storagePath) : undefined;
 	const extractContent: ExtractDirective[] | undefined =
 		office && placeholder
@@ -443,7 +451,11 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 
 	const userMessage = buildIndexingUserMessage(
 		attachment,
-		placeholder ? { inlineContentPlaceholder: placeholder } : undefined,
+		parsedContent
+			? { inlineContent: parsedContent }
+			: placeholder
+				? { inlineContentPlaceholder: placeholder }
+				: undefined,
 	);
 
 	const systemPrompt = buildIndexingSystemPrompt({

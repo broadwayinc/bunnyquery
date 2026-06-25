@@ -24,6 +24,9 @@ you can build your own chat UI on top of it. See
   first load and on scroll-up.
 - **Attachments** — drag-and-drop files and folders, per-file upload status
   (uploading / failed / indexed), and overflow collapsing for large batches.
+- **Attachment parser plugins** — register a client-side parser so the widget
+  extracts text in the browser from formats the model can't otherwise read, and
+  indexes it directly. See [Attachment parser plugins](#attachment-parser-plugins).
 - **Settings panel** — in-place inside the chat: light/dark theme, account details,
   newsletter subscription, clear history, and remove account.
 - **Theming** — light and dark modes via CSS custom properties; the choice is
@@ -110,17 +113,19 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `dev`                    | `boolean` | `false`  | Use the development MCP host and `skapi.app` db-CDN host instead of production.               |
 | `mcpBaseUrl`             | `string`  | `null`   | Override the MCP OAuth server base URL entirely (advanced).                                   |
 | `hostDomain`             | `string`  | `null`   | db-CDN host for temporary file URLs. Defaults to `skapi.app` (dev) / `skapi.com` (prod).     |
+| `attachmentParsers`      | `array`   | `null`   | Client-side attachment parsers. See [Attachment parser plugins](#attachment-parser-plugins). |
 
 ### Methods
 
 The `BunnyQuery` global also exposes:
 
-| Method               | Description                                                        |
-| -------------------- | ----------------------------------------------------------------- |
-| `setTheme(theme)`    | Apply `"light"` or `"dark"` and persist it.                       |
-| `toggleTheme()`      | Switch between light and dark.                                    |
-| `logout()`           | Sign the current user out and return to the login view.           |
-| `version`            | The widget version string.                                        |
+| Method                             | Description                                                                         |
+| ---------------------------------- | ----------------------------------------------------------------------------------- |
+| `setTheme(theme)`                  | Apply `"light"` or `"dark"` and persist it.                                          |
+| `toggleTheme()`                    | Switch between light and dark.                                                       |
+| `logout()`                         | Sign the current user out and return to the login view.                             |
+| `registerAttachmentParser(parser)` | Register a client-side attachment parser. May be called before or after `init()`. See [Attachment parser plugins](#attachment-parser-plugins). |
+| `version`                          | The widget's package version string. Also logged to the console on `init()`.        |
 
 ```js
 BunnyQuery.setTheme("dark");
@@ -129,7 +134,71 @@ BunnyQuery.logout();
 ```
 
 > `init()` is idempotent — calling it twice logs a warning and returns the existing
-> instance rather than re-mounting.
+> instance rather than re-mounting. On a successful mount it logs its version, e.g.
+> `[bunnyquery] v1.3.5`.
+
+## Attachment parser plugins
+
+By default the chat agent reads most uploads via the model's `web_fetch` tool
+(text, CSV, PDF, …), and Office/OpenDocument/EPUB files are extracted on the
+server. For any format that can be read by **neither** (e.g. a proprietary
+binary format), register a **parser plugin**: it runs in the browser, turns the
+uploaded file into text (or an HTML string), and the widget sends that content
+**inline** for indexing — no `web_fetch`, no server extraction for that file.
+
+BunnyQuery ships only the **mechanism**. You bring the parsing library (so the
+widget stays lean and you choose which formats and which library).
+
+A parser is a plain object:
+
+```ts
+interface AttachmentParser {
+  name?: string;                                   // label, used in logs
+  match: (file: { name: string; mime?: string }) => boolean;   // handle this file?
+  parse: (file: File) => string | null | undefined | Promise<string | null | undefined>; // text or HTML; falsy = skip
+}
+```
+
+The first parser whose `match` returns `true` wins. A parser that throws or
+returns nothing is ignored — the file falls back to its normal path. Output is
+capped (~200k chars) before it is inlined.
+
+### Example
+
+Load whatever parsing library reads your format, then register a parser that
+turns a `File` into text:
+
+```html
+<!-- bring your own parsing library, e.g. from a CDN -->
+<script src="https://cdn.example.com/my-format-parser.js"></script>
+<script>
+  BunnyQuery.registerAttachmentParser({
+    name: "my-format",
+    match: (file) => /\.myext$/i.test(file.name),
+    parse: async (file) => {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      return window.myFormatParser.toText(bytes); // return plain text OR an HTML string
+    },
+  });
+
+  BunnyQuery.init(skapi, "chatbox", { theme: "light" });
+</script>
+```
+
+Equivalent one-shot form via init options:
+
+```js
+BunnyQuery.init(skapi, "chatbox", {
+  attachmentParsers: [ myParser ],
+});
+```
+
+Bundler consumers can import the same registry from the engine:
+
+```js
+import { registerAttachmentParser } from "bunnyquery/engine";
+registerAttachmentParser(myParser);
+```
 
 ## Theming
 

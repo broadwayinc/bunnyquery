@@ -34,6 +34,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
+import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage } from './host';
 
 function sleep(ms: number): Promise<void> {
@@ -881,6 +882,12 @@ export class ChatSession {
 					urls.push({ name: member.relPath, url: url, storagePath: member.storagePath });
 					if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = member.storagePath; }
 					var mime = member.file.type || self.host.getMimeType(member.file.name);
+					// Run a client-side attachment parser (e.g. .hwp) if one matches; its
+					// output is inlined into the indexing request (falls back to office
+					// extraction / web_fetch when no parser matches or it yields nothing).
+					return Promise.resolve(
+						parseAttachmentContent(member.file, member.file.name, mime || undefined),
+					).then(function (parsedContent: string | null) {
 					return notifyAgentSaveAttachment({
 						platform: id.platform as 'claude' | 'openai',
 						model: id.model,
@@ -893,6 +900,7 @@ export class ChatSession {
 							name: member.file.name, storagePath: member.storagePath,
 							mime: mime || undefined, size: member.file.size, url: url,
 						},
+						parsedContent: parsedContent || undefined,
 					}).then(function (ack: any) {
 						if (ack && typeof ack.id === 'string') {
 							self.bgTaskQueue.push({
@@ -915,6 +923,7 @@ export class ChatSession {
 							att.errorCode = (e && (e.code || (e.body && e.body.code))) || '';
 							att.errorDetail = (e && (e.message || (e.body && e.body.message))) || (typeof e === 'string' ? e : '');
 						}
+					});
 					});
 				});
 			});

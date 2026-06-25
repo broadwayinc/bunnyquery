@@ -13,6 +13,8 @@
  * send cancel). So the request builders include `poll` only when it is set.
  */
 
+import { type AttachmentParser, registerAttachmentParser } from './attachment_parsers';
+
 export interface ChatEngineConfig {
     /** skapi.clientSecretRequest, bound to the consumer's skapi instance. */
     clientSecretRequest: (opts: any) => Promise<any>;
@@ -25,12 +27,21 @@ export interface ChatEngineConfig {
      * the `poll` key is omitted entirely (agent.vue). BunnyQuery sets `0`.
      */
     poll?: number;
+    /**
+     * Optional client-side attachment parsers (e.g. an .hwp parser). Each is
+     * registered at configure time; more can be added later via
+     * `registerAttachmentParser()`. See attachment_parsers.ts.
+     */
+    attachmentParsers?: AttachmentParser[];
 }
 
 let _config: ChatEngineConfig | null = null;
 
 export function configureChatEngine(config: ChatEngineConfig): void {
     _config = config;
+    if (config.attachmentParsers) {
+        for (const parser of config.attachmentParsers) registerAttachmentParser(parser);
+    }
 }
 
 export function chatEngineConfig(): ChatEngineConfig {

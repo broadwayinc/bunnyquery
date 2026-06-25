@@ -30,6 +30,12 @@ export type BuildIndexingUserMessageOptions = {
 	 * drops the temporary-URL line — there is nothing for the model to fetch).
 	 */
 	inlineContentPlaceholder?: string;
+	/**
+	 * Actual file content parsed CLIENT-SIDE by an attachment-parser plugin (e.g.
+	 * an .hwp parser). Embedded inline verbatim — no server extraction and no
+	 * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
+	 */
+	inlineContent?: string;
 };
 
 export function buildIndexingUserMessage(
@@ -43,6 +49,20 @@ export function buildIndexingUserMessage(
 		`- storage path: ${attachment.storagePath}\n` +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
 		(typeof attachment.size === 'number' ? `- size (bytes): ${attachment.size}\n` : '');
+
+	if (options?.inlineContent) {
+		// Parsed client-side (an attachment-parser plugin). The content is already
+		// inlined below — no server extraction, no URL to fetch.
+		return (
+			head +
+			`\nThe file's content was parsed by the client and is provided inline below. ` +
+			`Read it directly — do NOT fetch any URL for this file. ` +
+			`Use the storage path above (not this content) for the "src::" unique_id.\n\n` +
+			`----- BEGIN FILE CONTENT -----\n` +
+			`${options.inlineContent}\n` +
+			`----- END FILE CONTENT -----`
+		);
+	}
 
 	if (options?.inlineContentPlaceholder) {
 		// Office file: text was extracted on the server and is inlined below
