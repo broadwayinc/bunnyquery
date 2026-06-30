@@ -1116,13 +1116,38 @@ ${options.inlineContentPlaceholder}
       }).catch(function(err) {
         return { content: getErrorMessage(err), isError: true };
       }).then(function(result) {
-        var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
-        self.aiChatHistoryCache[params.key] = {
-          messages: existing.messages.concat([{ role: "assistant", content: result.content, isError: result.isError }]),
-          endOfList: existing.endOfList,
-          startKeyHistory: existing.startKeyHistory
-        };
         delete self.pendingAgentRequests[params.key];
+        var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
+        var reply = { role: "assistant", content: result.content, isError: result.isError };
+        var onThisVisibleChat = self.host.isViewMounted() && self.getHistoryCacheKey() === params.key;
+        if (onThisVisibleChat) {
+          self.aiChatHistoryCache[params.key] = {
+            messages: existing.messages.concat([reply]),
+            endOfList: existing.endOfList,
+            startKeyHistory: existing.startKeyHistory
+          };
+        } else {
+          var msgs = existing.messages.slice();
+          var idx = -1;
+          for (var i = msgs.length - 1; i >= 0; i--) {
+            var m = msgs[i];
+            if (m && m.isPending && m.role === "assistant" && !m.isBackgroundTask) {
+              idx = i;
+              break;
+            }
+          }
+          if (idx !== -1) {
+            reply._serverItemId = msgs[idx]._serverItemId;
+            msgs[idx] = reply;
+          } else {
+            msgs.push(reply);
+          }
+          self.aiChatHistoryCache[params.key] = {
+            messages: msgs,
+            endOfList: existing.endOfList,
+            startKeyHistory: existing.startKeyHistory
+          };
+        }
         return result;
       });
       this.pendingAgentRequests[params.key] = run;
@@ -1212,7 +1237,6 @@ ${options.inlineContentPlaceholder}
         serviceId: id.serviceId,
         history: historyForLlm
       });
-      var requestToken = this.state.gateRefreshToken;
       var run = this.dispatchAgentRequest({
         key,
         serviceId: id.serviceId,
@@ -1227,7 +1251,7 @@ ${options.inlineContentPlaceholder}
       });
       Promise.resolve(run).catch(function() {
       }).then(function() {
-        if (requestToken !== self.state.gateRefreshToken || self.getHistoryCacheKey() !== key) return;
+        if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
         self.state.sending = false;
         return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
           self.host.scrollToBottom(true);
@@ -1841,7 +1865,7 @@ ${options.inlineContentPlaceholder}
             if (item.status !== "running" && item.status !== "pending") return;
             if (!item.poll || !item.id) return;
             if (self.historyItemPolls.has(item.id)) return;
-            if (item.status === "running" && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
+            if ((item.status === "running" || item.status === "pending") && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
             self.historyItemPolls.set(item.id, true);
             var capturedId = item.id;
             var pp = item.poll({
@@ -2084,7 +2108,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.4.3" ;
+    var BQ_VERSION = "1.4.4" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

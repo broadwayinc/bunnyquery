@@ -138,19 +138,49 @@ export class ChatSession {
 			})
 			.catch(function (err: any) { return { content: getErrorMessage(err), isError: true }; })
 			.then(function (result: any) {
-				// Append the resolved reply to the shared history cache. This runs
-				// independently of the view lifecycle, so a reply lands in the cache
-				// even if the view unmounted mid-request; the view renders it from
-				// the cache via typewriteLatestReply (and resumePendingRequest on
-				// remount). The displayed bubble in state.messages is updated by the
-				// caller's typewriteLatestReply, not here.
-				var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
-				self.aiChatHistoryCache[params.key] = {
-					messages: existing.messages.concat([{ role: 'assistant', content: result.content, isError: result.isError }]),
-					endOfList: existing.endOfList,
-					startKeyHistory: existing.startKeyHistory,
-				};
+				// Land the resolved reply in the shared history cache. This runs
+				// independently of the view lifecycle, so a reply is captured even
+				// if the chatbox unmounted mid-request.
 				delete self.pendingAgentRequests[params.key];
+				var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
+				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
+
+				var onThisVisibleChat = self.host.isViewMounted() && self.getHistoryCacheKey() === params.key;
+				if (onThisVisibleChat) {
+					// The chatbox is showing THIS chat: its typewriteLatestReply will
+					// swap the "Thinking..." bubble in state.messages and re-snapshot
+					// the cache. Just append the reply for it to pick up.
+					self.aiChatHistoryCache[params.key] = {
+						messages: existing.messages.concat([reply]),
+						endOfList: existing.endOfList,
+						startKeyHistory: existing.startKeyHistory,
+					};
+				} else {
+					// Resolved while this chat is NOT the visible view (the chatbox
+					// unmounted, or the user moved to another project). No view
+					// typewriter will run, so REPLACE the trailing pending
+					// "Thinking..." bubble in the cache with the answer rather than
+					// appending a duplicate — otherwise a remount renders a stuck
+					// "Thinking..." (whose bubble was never resolved). The next
+					// fresh history fetch reconciles it either way.
+					var msgs = existing.messages.slice();
+					var idx = -1;
+					for (var i = msgs.length - 1; i >= 0; i--) {
+						var m = msgs[i];
+						if (m && m.isPending && m.role === 'assistant' && !m.isBackgroundTask) { idx = i; break; }
+					}
+					if (idx !== -1) {
+						reply._serverItemId = msgs[idx]._serverItemId;
+						msgs[idx] = reply;
+					} else {
+						msgs.push(reply);
+					}
+					self.aiChatHistoryCache[params.key] = {
+						messages: msgs,
+						endOfList: existing.endOfList,
+						startKeyHistory: existing.startKeyHistory,
+					};
+				}
 				return result;
 			});
 		this.pendingAgentRequests[params.key] = run;
@@ -238,14 +268,23 @@ export class ChatSession {
 			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
 			history: historyForLlm,
 		});
-		var requestToken = this.state.gateRefreshToken;
 		var run = this.dispatchAgentRequest({
 			key: key, serviceId: id.serviceId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 			systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,
 			extractContent: extractContent,
 		});
+		// Render the reply into the "Thinking..." bubble whenever the chatbox is
+		// CURRENTLY showing this chat — even after an unmount/remount. The old
+		// guard bailed on `requestToken !== gateRefreshToken`, but EVERY remount
+		// bumps gateRefreshToken (refreshGate), so a request that finished after
+		// the user navigated away and back left a stuck "Thinking..." (no view
+		// typewriter ever ran, and resumePendingRequest bails when a pending
+		// bubble is already present). Gate on "is this the visible chat" instead.
+		// When it ISN'T (unmounted / another project), dispatchAgentRequest has
+		// already replaced the pending bubble with the answer IN THE CACHE, so a
+		// later loadChatHistory renders it.
 		Promise.resolve(run).catch(function () { }).then(function () {
-			if (requestToken !== self.state.gateRefreshToken || self.getHistoryCacheKey() !== key) return;
+			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
 			self.state.sending = false;
 			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottom(true); });
 		});
@@ -789,7 +828,11 @@ export class ChatSession {
 					if (item.status !== 'running' && item.status !== 'pending') return;
 					if (!item.poll || !item.id) return;
 					if (self.historyItemPolls.has(item.id)) return;
-					if (item.status === 'running' && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
+					// running OR pending: a live dispatchAgentRequest already polls this
+					// item; attaching a second (history) poll would double the interval
+					// fetch on a remount (skapi item.poll() loops survive unmount —
+					// they're uncancellable, so the dispatch poll is still running).
+					if ((item.status === 'running' || item.status === 'pending') && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
 					self.historyItemPolls.set(item.id, true);
 					var capturedId = item.id;
 					var pp = item.poll({
