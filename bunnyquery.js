@@ -2084,7 +2084,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.4.2" ;
+    var BQ_VERSION = "1.4.3" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -2491,6 +2491,43 @@ ${options.inlineContentPlaceholder}
       var expired = !tok || typeof tok.expires_at === "number" && tok.expires_at < now + 6e4;
       var mismatched = !!tok && !!currentSub && !!tokenSub && tokenSub !== currentSub;
       return expired || mismatched;
+    }
+    function refreshMcpToken() {
+      var client = getStoredMcpClient();
+      var current = getStoredMcpToken();
+      if (!client || !current || !current.refresh_token) return Promise.resolve(null);
+      var body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: current.refresh_token,
+        client_id: client.client_id
+      });
+      var headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      if (client.client_secret) {
+        headers.Authorization = basicAuthHeader(client.client_id, client.client_secret);
+      }
+      return fetch(mcpBaseUrl() + "/oauth/token", {
+        method: "POST",
+        headers,
+        body: body.toString()
+      }).then(function(res) {
+        return res.ok ? res.json() : null;
+      }).then(function(json) {
+        if (!json || !json.access_token) return null;
+        var token = Object.assign({}, json, {
+          refresh_token: json.refresh_token || current.refresh_token,
+          expires_at: typeof json.expires_in === "number" ? Date.now() + json.expires_in * 1e3 : void 0
+        });
+        lsSet(skey(SK.mcpToken), JSON.stringify(token));
+        return token;
+      }).catch(function() {
+        return null;
+      });
+    }
+    function ensureMcpGrantFresh() {
+      if (!S.user || !mcpGrantNeedsRefresh(S.user)) return Promise.resolve(true);
+      return refreshMcpToken().then(function(tok) {
+        return !!(tok && !mcpGrantNeedsRefresh(S.user));
+      });
     }
     function googleEnabled() {
       return !!S.opts.googleClientId;
@@ -3759,6 +3796,8 @@ ${options.inlineContentPlaceholder}
     }
     function refreshSkapiSession() {
       return S.skapi.getProfile({ refreshToken: true }).then(function() {
+        return ensureMcpGrantFresh();
+      }).then(function() {
         return true;
       }).catch(function() {
         return false;
@@ -5099,9 +5138,12 @@ ${options.inlineContentPlaceholder}
           return;
         }
         if (mcpGrantNeedsRefresh(user)) {
-          return beginMcpOAuthOnLogin("chat").catch(function(err) {
-            console.error("[bunnyquery] MCP refresh failed", err);
-            return enterAfterLogin();
+          return refreshMcpToken().then(function(tok) {
+            if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+            return beginMcpOAuthOnLogin("chat").catch(function(err) {
+              console.error("[bunnyquery] MCP refresh failed", err);
+              return enterAfterLogin();
+            });
           });
         }
         return enterAfterLogin();
@@ -5156,6 +5198,12 @@ ${options.inlineContentPlaceholder}
         S._resizeBound = true;
         window.addEventListener("resize", function() {
           scheduleAttachmentOverflowRecompute();
+        });
+      }
+      if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
+        S._visBound = true;
+        document.addEventListener("visibilitychange", function() {
+          if (document.visibilityState === "visible" && S.user) ensureMcpGrantFresh();
         });
       }
       boot();

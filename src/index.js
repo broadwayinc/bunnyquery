@@ -550,6 +550,56 @@ import {
         return expired || mismatched;
     }
 
+    // Silently refresh the MCP grant via the OAuth refresh_token flow — NO
+    // browser redirect. Works while the stored refresh_token is valid and the
+    // server session still exists (~30d): the server re-reads + re-persists the
+    // user's session file on this call (skapi_admin.SkapiAdmin.load), which is
+    // exactly what reconnects a "disconnected" MCP user. Resolves to the new
+    // token, or null when there's nothing to refresh or the server rejected it.
+    function refreshMcpToken() {
+        var client = getStoredMcpClient();
+        var current = getStoredMcpToken();
+        if (!client || !current || !current.refresh_token) return Promise.resolve(null);
+
+        var body = new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: current.refresh_token,
+            client_id: client.client_id,
+        });
+        var headers = { "Content-Type": "application/x-www-form-urlencoded" };
+        if (client.client_secret) {
+            headers.Authorization = basicAuthHeader(client.client_id, client.client_secret);
+        }
+        return fetch(mcpBaseUrl() + "/oauth/token", {
+            method: "POST", headers: headers, body: body.toString(),
+        }).then(function (res) {
+            return res.ok ? res.json() : null;
+        }).then(function (json) {
+            if (!json || !json.access_token) return null;
+            var token = Object.assign({}, json, {
+                refresh_token: json.refresh_token || current.refresh_token,
+                expires_at: typeof json.expires_in === "number"
+                    ? Date.now() + json.expires_in * 1000 : undefined,
+            });
+            lsSet(skey(SK.mcpToken), JSON.stringify(token));
+            return token;
+        }).catch(function () { return null; });
+    }
+
+    // Keep the MCP grant live WITHOUT disrupting the embedded host page. When
+    // the stored grant is missing/expired/for-another-user, try the silent
+    // refresh_token exchange first (no redirect). Resolves true if the grant is
+    // now fresh (or already was), false if it could not be refreshed silently —
+    // callers that can afford a redirect (boot) then fall back to
+    // beginMcpOAuthOnLogin(); mid-chat callers stay silent so the host page
+    // isn't yanked away (the next boot re-establishes the hard case).
+    function ensureMcpGrantFresh() {
+        if (!S.user || !mcpGrantNeedsRefresh(S.user)) return Promise.resolve(true);
+        return refreshMcpToken().then(function (tok) {
+            return !!(tok && !mcpGrantNeedsRefresh(S.user));
+        });
+    }
+
     /* ---- Google OAuth (outbound) ----------------------------------------- */
 
     function googleEnabled() {
@@ -1596,7 +1646,16 @@ import {
     }
 
     function refreshSkapiSession() {
-        return S.skapi.getProfile({ refreshToken: true }).then(function () { return true; })
+        // Refresh BOTH credentials the chat depends on: (1) the skapi JWT (the
+        // $ACCESS_TOKEN bearer the MCP server decodes for the user's sub), and
+        // (2) the MCP grant / server-side session. The engine calls this on any
+        // auth-expired (401) before resending — and an MCP 401 (a stale/cleaned
+        // server session) is NOT fixed by a fresh JWT alone, so silently
+        // re-establish the grant here too. No redirect: a mid-chat reconnect
+        // stays transparent (the engine resends right after this resolves).
+        return S.skapi.getProfile({ refreshToken: true })
+            .then(function () { return ensureMcpGrantFresh(); })
+            .then(function () { return true; })
             .catch(function () { return false; });
     }
 
@@ -2847,9 +2906,16 @@ import {
                 return;
             }
             if (mcpGrantNeedsRefresh(user)) {
-                return beginMcpOAuthOnLogin("chat").catch(function (err) {
-                    console.error("[bunnyquery] MCP refresh failed", err);
-                    return enterAfterLogin();
+                // Prefer a SILENT refresh (no redirect): reconnects a returning
+                // user whose local grant aged out but whose server session +
+                // refresh_token are still valid (~30d). Only fall back to the
+                // full OAuth redirect when the silent path can't refresh.
+                return refreshMcpToken().then(function (tok) {
+                    if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+                    return beginMcpOAuthOnLogin("chat").catch(function (err) {
+                        console.error("[bunnyquery] MCP refresh failed", err);
+                        return enterAfterLogin();
+                    });
                 });
             }
             return enterAfterLogin();
@@ -2911,6 +2977,16 @@ import {
         if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
             S._resizeBound = true;
             window.addEventListener("resize", function () { scheduleAttachmentOverflowRecompute(); });
+        }
+
+        // Keep the MCP grant warm: returning to a backgrounded tab after the
+        // grant aged out would otherwise disconnect the next message. Silently
+        // refresh it (no redirect) when the tab becomes visible again.
+        if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
+            S._visBound = true;
+            document.addEventListener("visibilitychange", function () {
+                if (document.visibilityState === "visible" && S.user) ensureMcpGrantFresh();
+            });
         }
 
         boot();
