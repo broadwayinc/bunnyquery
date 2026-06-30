@@ -1122,11 +1122,17 @@ var ChatSession = class {
   }
   dispatchAgentRequest(params) {
     var self = this;
+    var dispatchItemId;
     var sendAndPoll = function() {
       return Promise.resolve(
         self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
+          if (initial.id) {
+            if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
+            dispatchItemId = initial.id;
+            self.historyItemPolls.set(initial.id, true);
+          }
           return initial.poll({ latency: POLL_INTERVAL });
         }
         return initial;
@@ -1149,6 +1155,7 @@ var ChatSession = class {
       return { content: getErrorMessage(err), isError: true };
     }).then(function(result) {
       delete self.pendingAgentRequests[params.key];
+      if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
       var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
       var reply = { role: "assistant", content: result.content, isError: result.isError };
       var onThisVisibleChat = self.host.isViewMounted() && self.getHistoryCacheKey() === params.key;
@@ -1232,6 +1239,7 @@ var ChatSession = class {
           self.host.notify();
         }
         if (result && result.poll && (result.status === "pending" || result.status === "running")) {
+          if (serverId) self.historyItemPolls.set(serverId, true);
           return result.poll({ latency: POLL_INTERVAL }).then(function(res) {
             return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId);
           }).catch(function(err) {
@@ -1371,6 +1379,7 @@ var ChatSession = class {
     else this.state.messages.push(msg);
   }
   onQueuedSendResponse(_composed, response, platform, serverId) {
+    if (serverId) this.historyItemPolls.delete(serverId);
     var targetIdx = this.resolveQueuedUserBubble(serverId);
     if (targetIdx === void 0) {
       this.host.notify();
@@ -1405,6 +1414,7 @@ var ChatSession = class {
     this.host.scrollToBottom(true);
   }
   onQueuedSendError(_composed, err, serverId) {
+    if (serverId) this.historyItemPolls.delete(serverId);
     var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
     if (isNotExists) {
       var userIdx = serverId ? this.state.messages.findIndex(function(m) {

@@ -105,11 +105,23 @@ export class ChatSession {
 
 	dispatchAgentRequest(params: any) {
 		var self = this;
+		// Id of the in-flight item this dispatch polls. Recorded in
+		// historyItemPolls (set below, deleted when the dispatch settles) so a
+		// remount / history refetch dedups against THIS poll instead of stacking
+		// a duplicate history poll on the same item. (The cacheKey guard alone
+		// stops covering an item once pendingAgentRequests clears — e.g. a queued
+		// message still in flight after the immediate one resolved.)
+		var dispatchItemId: string | undefined;
 		var sendAndPoll = function () {
 			return Promise.resolve(
 				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
 			).then(function (initial: any) {
 				if (initial && initial.poll && (initial.status === 'pending' || initial.status === 'running')) {
+					if (initial.id) {
+						if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
+						dispatchItemId = initial.id;
+						self.historyItemPolls.set(initial.id, true);
+					}
 					return initial.poll({ latency: POLL_INTERVAL });
 				}
 				return initial;
@@ -142,6 +154,7 @@ export class ChatSession {
 				// independently of the view lifecycle, so a reply is captured even
 				// if the chatbox unmounted mid-request.
 				delete self.pendingAgentRequests[params.key];
+				if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
 				var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
 
@@ -235,6 +248,9 @@ export class ChatSession {
 						self.state.messages[sendingIdx] = upd; self.host.notify();
 					}
 					if (result && result.poll && (result.status === 'pending' || result.status === 'running')) {
+						// Track this queued item's poll so a remount/refetch dedups
+						// against it instead of attaching a duplicate history poll.
+						if (serverId) self.historyItemPolls.set(serverId, true);
 						return result.poll({ latency: POLL_INTERVAL })
 							.then(function (res: any) { return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId); })
 							.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, serverId); });
@@ -372,6 +388,7 @@ export class ChatSession {
 	}
 
 	onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string): void {
+		if (serverId) this.historyItemPolls.delete(serverId);
 		var targetIdx = this.resolveQueuedUserBubble(serverId);
 		if (targetIdx === undefined) { this.host.notify(); this.updateHistoryCache(); return; }
 		if (isErrorResponseBody(response)) {
@@ -401,6 +418,7 @@ export class ChatSession {
 
 	onQueuedSendError(_composed: string, err: any, serverId?: string): void {
 		var self = this;
+		if (serverId) this.historyItemPolls.delete(serverId);
 		var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
 		if (isNotExists) {
 			var userIdx = serverId
