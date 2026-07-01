@@ -1036,10 +1036,18 @@ ${options.inlineContentPlaceholder}
   }
 
   // src/engine/session.ts
-  function sleep(ms) {
-    return new Promise(function(r) {
-      setTimeout(r, ms);
-    });
+  var _g = typeof globalThis !== "undefined" ? globalThis : {};
+  function nowMs() {
+    return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
+  }
+  function nextFrame(cb) {
+    if (typeof _g.requestAnimationFrame === "function") {
+      _g.requestAnimationFrame(cb);
+      return;
+    }
+    setTimeout(function() {
+      cb(nowMs());
+    }, 16);
   }
   var ChatSession = class {
     constructor(host) {
@@ -1126,35 +1134,26 @@ ${options.inlineContentPlaceholder}
         if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
         var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
         var reply = { role: "assistant", content: result.content, isError: result.isError };
-        var onThisVisibleChat = self.host.isViewMounted() && self.getHistoryCacheKey() === params.key;
-        if (onThisVisibleChat) {
-          self.aiChatHistoryCache[params.key] = {
-            messages: existing.messages.concat([reply]),
-            endOfList: existing.endOfList,
-            startKeyHistory: existing.startKeyHistory
-          };
-        } else {
-          var msgs = existing.messages.slice();
-          var idx = -1;
-          for (var i = msgs.length - 1; i >= 0; i--) {
-            var m = msgs[i];
-            if (m && m.isPending && m.role === "assistant" && !m.isBackgroundTask) {
-              idx = i;
-              break;
-            }
+        var msgs = existing.messages.slice();
+        var idx = -1;
+        for (var i = msgs.length - 1; i >= 0; i--) {
+          var m = msgs[i];
+          if (m && m.isPending && m.role === "assistant" && !m.isBackgroundTask) {
+            idx = i;
+            break;
           }
-          if (idx !== -1) {
-            reply._serverItemId = msgs[idx]._serverItemId;
-            msgs[idx] = reply;
-          } else {
-            msgs.push(reply);
-          }
-          self.aiChatHistoryCache[params.key] = {
-            messages: msgs,
-            endOfList: existing.endOfList,
-            startKeyHistory: existing.startKeyHistory
-          };
         }
+        if (idx !== -1) {
+          reply._serverItemId = msgs[idx]._serverItemId;
+          msgs[idx] = reply;
+        } else {
+          msgs.push(reply);
+        }
+        self.aiChatHistoryCache[params.key] = {
+          messages: msgs,
+          endOfList: existing.endOfList,
+          startKeyHistory: existing.startKeyHistory
+        };
         return result;
       });
       this.pendingAgentRequests[params.key] = run;
@@ -1297,7 +1296,9 @@ ${options.inlineContentPlaceholder}
       if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
       if (existing.isSendingToServer) promoted.isSendingToServer = true;
       this.state.messages[nextIdx] = promoted;
-      this.state.messages.splice(nextIdx + 1, 0, { role: "assistant", content: "", isPending: true });
+      var placeholder = { role: "assistant", content: "", isPending: true };
+      if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
+      this.state.messages.splice(nextIdx + 1, 0, placeholder);
       this.host.notify();
     }
     resolveQueuedUserBubble(serverId) {
@@ -1507,61 +1508,118 @@ ${options.inlineContentPlaceholder}
       });
     }
     // --- typewriter -------------------------------------------------------
+    // Reveal `fullText` into a message bubble at a constant wall-clock RATE
+    // (chars/second) driven by requestAnimationFrame, rather than a fixed number
+    // of characters per fixed-delay tick. This is what keeps typing smooth and
+    // cheap on slow machines:
+    //
+    //   * Each frame reveals `elapsed_ms * CHARS_PER_SEC` characters, so the
+    //     visual speed is the same regardless of how long a frame actually took.
+    //   * As the bubble's markdown grows, each re-render gets more expensive, so
+    //     frames get longer — which makes each frame reveal MORE characters and
+    //     therefore do FEWER, larger renders. That converts the old O(n^2)
+    //     "re-render the whole growing string once per 3 characters" (which got
+    //     slower and slower and pegged the CPU) into roughly O(n): the number of
+    //     renders self-throttles to what the machine can actually paint.
+    //   * rAF paces us to the browser's paint cycle and pauses in background
+    //     tabs, so we never queue work faster than it can be drawn.
     typewriteIntoIndex(idx, fullText, localId) {
       var self = this;
       if (!fullText) return Promise.resolve();
-      var TICK_MS = 16, charsPerTick = 3, FENCE_REVEAL_MS = 200;
-      var fenceTicks = Math.max(1, Math.floor(FENCE_REVEAL_MS / TICK_MS));
-      var fenceRegions = [], m;
+      var CHARS_PER_SEC = 300;
+      var MIN_STEP = 1;
+      var MAX_FRAME_MS = 1e3;
+      var regions = [], m;
       var fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
-      while ((m = fenceRegex.exec(fullText)) !== null) fenceRegions.push({ start: m.index, end: m.index + m[0].length });
-      var linkRegions = [], lm;
+      while ((m = fenceRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
       var linkRegex = createInlineLinkRegex();
-      while ((lm = linkRegex.exec(fullText)) !== null) linkRegions.push({ start: lm.index, end: lm.index + lm[0].length });
+      while ((m = linkRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
+      regions.sort(function(a, b) {
+        return a.start - b.start;
+      });
       this.state.typing = true;
       this.state.typingAbort = false;
       var i = 0;
-      return (function loop() {
-        if (self.state.typingAbort || i >= fullText.length) return Promise.resolve();
-        var step = charsPerTick;
-        var region = fenceRegions.find(function(r) {
-          return i >= r.start && i < r.end;
-        });
-        var linkRegion = linkRegions.find(function(r) {
-          return i >= r.start && i < r.end;
-        });
-        if (region) step = Math.max(charsPerTick, Math.ceil((region.end - i) / fenceTicks));
-        else if (linkRegion) step = Math.max(charsPerTick, linkRegion.end - i);
-        else {
-          var nextLink = linkRegions.find(function(r) {
-            return i < r.start && i + step > r.start;
-          });
-          if (nextLink) step = nextLink.end - i;
+      var last = nowMs();
+      return new Promise(function(resolve) {
+        var done = false;
+        var doc = _g.document;
+        function isHidden() {
+          return !!(doc && doc.hidden);
         }
-        i = Math.min(fullText.length, i + step);
-        var currentIdx = localId ? self.state.messages.findIndex(function(mm) {
-          return mm._localId === localId;
-        }) : idx;
-        if (currentIdx === -1) return Promise.resolve();
-        var target = self.state.messages[currentIdx];
-        if (!target) return Promise.resolve();
-        target.content = fullText.slice(0, i);
-        self.host.refreshMessageBubble(currentIdx);
-        return Promise.resolve(self.host.scrollToBottomIfSticky()).then(function() {
-          return sleep(TICK_MS);
-        }).then(loop);
-      })().then(function() {
-        if (!self.state.typingAbort) {
-          var fi = localId ? self.state.messages.findIndex(function(mm) {
+        function cleanup() {
+          if (doc && doc.removeEventListener) doc.removeEventListener("visibilitychange", onVisibility);
+        }
+        function finish() {
+          if (done) return;
+          done = true;
+          cleanup();
+          if (!self.state.typingAbort) {
+            var fi = localId ? self.state.messages.findIndex(function(mm) {
+              return mm._localId === localId;
+            }) : idx;
+            if (fi !== -1) {
+              var t = self.state.messages[fi];
+              if (t) {
+                t.content = fullText;
+                self.host.refreshMessageBubble(fi);
+              }
+            }
+          }
+          self.state.typing = false;
+          resolve();
+        }
+        function onVisibility() {
+          if (isHidden()) finish();
+        }
+        if (doc && doc.addEventListener) doc.addEventListener("visibilitychange", onVisibility);
+        function frame(t) {
+          if (done) return;
+          if (self.state.typingAbort || i >= fullText.length || isHidden()) {
+            finish();
+            return;
+          }
+          var dt = t - last;
+          last = t;
+          if (!(dt > 0)) dt = 16;
+          if (dt > MAX_FRAME_MS) dt = MAX_FRAME_MS;
+          var step = Math.round(dt * CHARS_PER_SEC / 1e3);
+          if (step < MIN_STEP) step = MIN_STEP;
+          var next = Math.min(fullText.length, i + step);
+          for (var changed = true; changed; ) {
+            changed = false;
+            for (var k = 0; k < regions.length; k++) {
+              var r = regions[k];
+              if (next > r.start && i < r.end && r.end > next) {
+                next = r.end;
+                changed = true;
+              }
+            }
+          }
+          if (next > fullText.length) next = fullText.length;
+          i = next;
+          var currentIdx = localId ? self.state.messages.findIndex(function(mm) {
             return mm._localId === localId;
           }) : idx;
-          var t = fi !== -1 ? self.state.messages[fi] : self.state.messages[idx];
-          if (t) {
-            t.content = fullText;
-            self.host.refreshMessageBubble(fi !== -1 ? fi : idx);
+          if (currentIdx === -1) {
+            finish();
+            return;
           }
+          var target = self.state.messages[currentIdx];
+          if (!target) {
+            finish();
+            return;
+          }
+          target.content = fullText.slice(0, i);
+          self.host.refreshMessageBubble(currentIdx);
+          self.host.scrollToBottomIfSticky();
+          nextFrame(frame);
         }
-        self.state.typing = false;
+        if (isHidden()) {
+          finish();
+          return;
+        }
+        nextFrame(frame);
       });
     }
     enqueueTypewrite(idx, fullText, localId) {
@@ -1875,7 +1933,7 @@ ${options.inlineContentPlaceholder}
             if (item.status !== "running" && item.status !== "pending") return;
             if (!item.poll || !item.id) return;
             if (self.historyItemPolls.has(item.id)) return;
-            if ((item.status === "running" || item.status === "pending") && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
+            if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
             self.historyItemPolls.set(item.id, true);
             var capturedId = item.id;
             var pp = item.poll({
@@ -4851,7 +4909,6 @@ ${options.inlineContentPlaceholder}
       CS.settingsBtnEl = null;
       CS.composerEl = null;
       CS.gateRefreshToken += 1;
-      historyItemPolls.clear();
       if (CS.pollTimer) {
         clearInterval(CS.pollTimer);
         CS.pollTimer = null;

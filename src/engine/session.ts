@@ -41,6 +41,18 @@ function sleep(ms: number): Promise<void> {
 	return new Promise(function (r) { setTimeout(r, ms); });
 }
 
+// requestAnimationFrame / high-res clock, reached through globalThis so the
+// engine stays DOM-free at the type level (and degrades gracefully in non-DOM
+// / test environments where these globals are absent).
+var _g: any = typeof globalThis !== 'undefined' ? globalThis : {};
+function nowMs(): number {
+	return (_g.performance && typeof _g.performance.now === 'function') ? _g.performance.now() : Date.now();
+}
+function nextFrame(cb: (t: number) => void): void {
+	if (typeof _g.requestAnimationFrame === 'function') { _g.requestAnimationFrame(cb); return; }
+	setTimeout(function () { cb(nowMs()); }, 16);
+}
+
 export class ChatSession {
 	host: ChatHost;
 	state: ChatState;
@@ -158,42 +170,35 @@ export class ChatSession {
 				var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
 
-				var onThisVisibleChat = self.host.isViewMounted() && self.getHistoryCacheKey() === params.key;
-				if (onThisVisibleChat) {
-					// The chatbox is showing THIS chat: its typewriteLatestReply will
-					// swap the "Thinking..." bubble in state.messages and re-snapshot
-					// the cache. Just append the reply for it to pick up.
-					self.aiChatHistoryCache[params.key] = {
-						messages: existing.messages.concat([reply]),
-						endOfList: existing.endOfList,
-						startKeyHistory: existing.startKeyHistory,
-					};
-				} else {
-					// Resolved while this chat is NOT the visible view (the chatbox
-					// unmounted, or the user moved to another project). No view
-					// typewriter will run, so REPLACE the trailing pending
-					// "Thinking..." bubble in the cache with the answer rather than
-					// appending a duplicate — otherwise a remount renders a stuck
-					// "Thinking..." (whose bubble was never resolved). The next
-					// fresh history fetch reconciles it either way.
-					var msgs = existing.messages.slice();
-					var idx = -1;
-					for (var i = msgs.length - 1; i >= 0; i--) {
-						var m = msgs[i];
-						if (m && m.isPending && m.role === 'assistant' && !m.isBackgroundTask) { idx = i; break; }
-					}
-					if (idx !== -1) {
-						reply._serverItemId = msgs[idx]._serverItemId;
-						msgs[idx] = reply;
-					} else {
-						msgs.push(reply);
-					}
-					self.aiChatHistoryCache[params.key] = {
-						messages: msgs,
-						endOfList: existing.endOfList,
-						startKeyHistory: existing.startKeyHistory,
-					};
+				// REPLACE the trailing pending "Thinking..." bubble in the cache with
+				// the answer (falling back to append when none is present), regardless
+				// of whether this chat is the currently-visible view. The cache must
+				// NEVER retain a pending "Thinking..." bubble: even when the chatbox is
+				// showing this chat, typewriteLatestReply swaps the bubble only in
+				// state.messages and NEVER re-snapshots the cache — so appending a
+				// duplicate here would leave the cached copy stuck pending, and a later
+				// cache-first remount (agent.vue's loadChatHistory) would re-render that
+				// "Thinking..." forever. typewriteLatestReply still finds this reply (it
+				// reads the latest non-pending assistant from the cache), so replacing is
+				// correct for the visible case too. The next fresh history fetch
+				// reconciles it either way.
+				var msgs = existing.messages.slice();
+				var idx = -1;
+				for (var i = msgs.length - 1; i >= 0; i--) {
+					var m = msgs[i];
+					if (m && m.isPending && m.role === 'assistant' && !m.isBackgroundTask) { idx = i; break; }
 				}
+				if (idx !== -1) {
+					reply._serverItemId = msgs[idx]._serverItemId;
+					msgs[idx] = reply;
+				} else {
+					msgs.push(reply);
+				}
+				self.aiChatHistoryCache[params.key] = {
+					messages: msgs,
+					endOfList: existing.endOfList,
+					startKeyHistory: existing.startKeyHistory,
+				};
 				return result;
 			});
 		this.pendingAgentRequests[params.key] = run;
@@ -334,7 +339,17 @@ export class ChatSession {
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
 		if (existing.isSendingToServer) promoted.isSendingToServer = true;
 		this.state.messages[nextIdx] = promoted;
-		this.state.messages.splice(nextIdx + 1, 0, { role: 'assistant', content: '', isPending: true });
+		// Carry the promoted turn's _serverItemId onto the "Thinking..." placeholder
+		// (mirrors promoteNextBgQueuedToRunning). Without it, when this promoted turn
+		// is resolved via the history-poll path — applyHistoryItemResolution, which
+		// matches the pending assistant by _serverItemId — the placeholder is not
+		// found, so the reply is spliced in BESIDE it and the "Thinking..." is
+		// stranded forever (e.g. after a reload, or when a cancel advances the queue).
+		// onQueuedSendResponse still finds it by position, so the queued-send path is
+		// unaffected.
+		var placeholder: ChatMessage = { role: 'assistant', content: '', isPending: true };
+		if (existing._serverItemId !== undefined) placeholder._serverItemId = existing._serverItemId;
+		this.state.messages.splice(nextIdx + 1, 0, placeholder);
 		this.host.notify();
 	}
 
@@ -506,46 +521,112 @@ export class ChatSession {
 	}
 
 	// --- typewriter -------------------------------------------------------
+	// Reveal `fullText` into a message bubble at a constant wall-clock RATE
+	// (chars/second) driven by requestAnimationFrame, rather than a fixed number
+	// of characters per fixed-delay tick. This is what keeps typing smooth and
+	// cheap on slow machines:
+	//
+	//   * Each frame reveals `elapsed_ms * CHARS_PER_SEC` characters, so the
+	//     visual speed is the same regardless of how long a frame actually took.
+	//   * As the bubble's markdown grows, each re-render gets more expensive, so
+	//     frames get longer — which makes each frame reveal MORE characters and
+	//     therefore do FEWER, larger renders. That converts the old O(n^2)
+	//     "re-render the whole growing string once per 3 characters" (which got
+	//     slower and slower and pegged the CPU) into roughly O(n): the number of
+	//     renders self-throttles to what the machine can actually paint.
+	//   * rAF paces us to the browser's paint cycle and pauses in background
+	//     tabs, so we never queue work faster than it can be drawn.
 	typewriteIntoIndex(idx: number, fullText: string, localId?: string): Promise<void> {
 		var self = this;
 		if (!fullText) return Promise.resolve();
-		var TICK_MS = 16, charsPerTick = 3, FENCE_REVEAL_MS = 200;
-		var fenceTicks = Math.max(1, Math.floor(FENCE_REVEAL_MS / TICK_MS));
-		var fenceRegions: Array<{ start: number; end: number }> = [], m;
+
+		var CHARS_PER_SEC = 300;   // reveal rate (was ~188 = 3 chars / 16ms) — a bit faster
+		var MIN_STEP = 1;          // always make progress, even on a sub-ms frame
+		var MAX_FRAME_MS = 1000;   // cap catch-up after a long stall / backgrounded tab
+
+		// Atomic regions that must never be left half-revealed: file fences
+		// (shown as a download chip / hidden as "[generating …]" while unclosed —
+		// and potentially huge, so revealed in one jump) and inline links
+		// (a partial link is broken markdown). If a frame's reveal boundary lands
+		// inside one, snap it to the region end so the chip/link appears whole.
+		var regions: Array<{ start: number; end: number }> = [], m;
 		var fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
-		while ((m = fenceRegex.exec(fullText)) !== null) fenceRegions.push({ start: m.index, end: m.index + m[0].length });
-		var linkRegions: Array<{ start: number; end: number }> = [], lm;
+		while ((m = fenceRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
 		var linkRegex = createInlineLinkRegex();
-		while ((lm = linkRegex.exec(fullText)) !== null) linkRegions.push({ start: lm.index, end: lm.index + lm[0].length });
+		while ((m = linkRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
+		regions.sort(function (a, b) { return a.start - b.start; });
 
 		this.state.typing = true; this.state.typingAbort = false;
 		var i = 0;
-		return (function loop(): Promise<void> {
-			if (self.state.typingAbort || i >= fullText.length) return Promise.resolve();
-			var step = charsPerTick;
-			var region = fenceRegions.find(function (r) { return i >= r.start && i < r.end; });
-			var linkRegion = linkRegions.find(function (r) { return i >= r.start && i < r.end; });
-			if (region) step = Math.max(charsPerTick, Math.ceil((region.end - i) / fenceTicks));
-			else if (linkRegion) step = Math.max(charsPerTick, linkRegion.end - i);
-			else {
-				var nextLink = linkRegions.find(function (r) { return i < r.start && i + step > r.start; });
-				if (nextLink) step = nextLink.end - i;
+		var last = nowMs();
+
+		return new Promise<void>(function (resolve) {
+			var done = false;
+			var doc: any = _g.document;
+			function isHidden(): boolean { return !!(doc && doc.hidden); }
+			function cleanup(): void {
+				if (doc && doc.removeEventListener) doc.removeEventListener('visibilitychange', onVisibility);
 			}
-			i = Math.min(fullText.length, i + step);
-			var currentIdx = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
-			if (currentIdx === -1) return Promise.resolve();
-			var target = self.state.messages[currentIdx];
-			if (!target) return Promise.resolve();
-			target.content = fullText.slice(0, i);
-			self.host.refreshMessageBubble(currentIdx);
-			return Promise.resolve(self.host.scrollToBottomIfSticky()).then(function () { return sleep(TICK_MS); }).then(loop);
-		})().then(function () {
-			if (!self.state.typingAbort) {
-				var fi = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
-				var t = fi !== -1 ? self.state.messages[fi] : self.state.messages[idx];
-				if (t) { t.content = fullText; self.host.refreshMessageBubble(fi !== -1 ? fi : idx); }
+			function finish(): void {
+				if (done) return;
+				done = true;
+				cleanup();
+				if (!self.state.typingAbort) {
+					// Re-find the bubble by localId and, if it's gone, bail WITHOUT
+					// writing — never fall back to the numeric idx, which a concurrent
+					// array mutation may have repurposed for an unrelated message
+					// (mirrors frame()'s currentIdx===-1 bail below).
+					var fi = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
+					if (fi !== -1) {
+						var t = self.state.messages[fi];
+						if (t) { t.content = fullText; self.host.refreshMessageBubble(fi); }
+					}
+				}
+				self.state.typing = false;
+				resolve();
 			}
-			self.state.typing = false;
+			// requestAnimationFrame is PAUSED in a backgrounded tab (setTimeout only
+			// throttles), so an rAF-driven reveal would freeze there — leaving a blank
+			// bubble and stalling the sequential enqueueTypewrite queue until refocus.
+			// When the page is (or becomes) hidden, skip the animation and show the
+			// full text immediately so the queue keeps draining.
+			function onVisibility(): void { if (isHidden()) finish(); }
+			if (doc && doc.addEventListener) doc.addEventListener('visibilitychange', onVisibility);
+			function frame(t: number): void {
+				if (done) return;
+				if (self.state.typingAbort || i >= fullText.length || isHidden()) { finish(); return; }
+
+				var dt = t - last; last = t;
+				if (!(dt > 0)) dt = 16;                       // first frame / clock glitch
+				if (dt > MAX_FRAME_MS) dt = MAX_FRAME_MS;
+				var step = Math.round(dt * CHARS_PER_SEC / 1000);
+				if (step < MIN_STEP) step = MIN_STEP;
+				var next = Math.min(fullText.length, i + step);
+
+				// Extend past any atomic region the newly-revealed span (i, next]
+				// cuts into. Iterate to convergence so back-to-back regions (e.g. a
+				// link right after a fence) are all revealed whole in one frame.
+				for (var changed = true; changed;) {
+					changed = false;
+					for (var k = 0; k < regions.length; k++) {
+						var r = regions[k];
+						if (next > r.start && i < r.end && r.end > next) { next = r.end; changed = true; }
+					}
+				}
+				if (next > fullText.length) next = fullText.length;
+				i = next;
+
+				var currentIdx = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
+				if (currentIdx === -1) { finish(); return; }
+				var target = self.state.messages[currentIdx];
+				if (!target) { finish(); return; }
+				target.content = fullText.slice(0, i);
+				self.host.refreshMessageBubble(currentIdx);
+				self.host.scrollToBottomIfSticky();
+				nextFrame(frame);
+			}
+			if (isHidden()) { finish(); return; }
+			nextFrame(frame);
 		});
 	}
 
@@ -845,12 +926,28 @@ export class ChatSession {
 				chatList.forEach(function (item: any) {
 					if (item.status !== 'running' && item.status !== 'pending') return;
 					if (!item.poll || !item.id) return;
+					// Every live poll registers its item id in historyItemPolls — an
+					// immediate dispatch (dispatchAgentRequest ~123), a queued send
+					// (~253), a bg task (drain), or an earlier history poll — so the
+					// has() check below already skips exactly the items a live poll
+					// covers (including the one the current dispatch is polling). Do NOT
+					// additionally skip every OTHER running/pending item just because
+					// some immediate dispatch is in flight: that dispatch polls only ITS
+					// item, so blanket-skipping stranded a concurrent "-bg" indexing item
+					// (a separate server queue runs in parallel) — or any item whose own
+					// poll had since died — with no live poller, leaving a "Thinking..."
+					// that never clears even after the server settled everything.
 					if (self.historyItemPolls.has(item.id)) return;
-					// running OR pending: a live dispatchAgentRequest already polls this
-					// item; attaching a second (history) poll would double the interval
-					// fetch on a remount (skapi item.poll() loops survive unmount —
-					// they're uncancellable, so the dispatch poll is still running).
-					if ((item.status === 'running' || item.status === 'pending') && self.pendingAgentRequests[self.getHistoryCacheKey()]) return;
+					// An in-flight immediate dispatch polls its own MAIN-QUEUE item but
+					// registers that id in historyItemPolls only AFTER its provider POST
+					// returns; in the sliver before that, a remount can surface the item
+					// here still unregistered. Skip re-polling MAIN-QUEUE items while a
+					// dispatch is in flight so we don't stack a 2nd poll on the item the
+					// dispatch is about to poll. Bg-queue items (_isBgTask indexing tasks
+					// and _isOnBgQueue chats) run on a SEPARATE queue the immediate
+					// dispatch never polls, so they MUST still get their poll — skipping
+					// them was the stranded-"Thinking" bug this guard must not revive.
+					if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
 					self.historyItemPolls.set(item.id, true);
 					var capturedId = item.id;
 					var pp = item.poll({

@@ -2613,7 +2613,15 @@ import {
         CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
         CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null;
         CS.gateRefreshToken += 1;
-        historyItemPolls.clear();
+        // Do NOT clear historyItemPolls here. Its entries track LIVE polls
+        // (immediate dispatch / queued send / bg task / history poll), and every
+        // poll deletes its own entry when it settles or errors — so a surviving
+        // entry always means a still-running poll that outlives this remount
+        // (skapi item.poll() loops are uncancellable). Wiping it made loadHistory
+        // re-attach a SECOND poll on top of the live one (double-poll → duplicate
+        // reply / stranded "Thinking"); keeping it lets loadHistory's has() dedup
+        // skip exactly the items already covered. A full page reload resets the
+        // Map anyway, so nothing leaks across sessions.
         if (CS.pollTimer) { clearInterval(CS.pollTimer); CS.pollTimer = null; }
 
         render("chat", function () {
