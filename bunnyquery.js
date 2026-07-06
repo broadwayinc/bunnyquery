@@ -2176,7 +2176,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.4.6" ;
+    var BQ_VERSION = "1.5.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -2431,13 +2431,40 @@ ${options.inlineContentPlaceholder}
         })
       );
     }
+    var BUNNY_FRAME_A = '  (\\(\\\n  ( - -)\n c(")(")';
+    var BUNNY_FRAME_B = '  /)/)\n ( . .)\nc(")(")';
+    function bunnyLoader(label, overlay) {
+      return h(
+        "div",
+        {
+          class: "bq-bunny-loader" + (""),
+          "aria-hidden": "true",
+          translate: "no"
+        },
+        h(
+          "div",
+          { class: "bq-bunny-stage" },
+          h(
+            "div",
+            { class: "bq-bunny-track" },
+            h(
+              "div",
+              { class: "bq-bunny-dir" },
+              h("pre", { class: "bq-frame bq-frame-a", translate: "no", text: BUNNY_FRAME_A }),
+              h("pre", { class: "bq-frame bq-frame-b", translate: "no", text: BUNNY_FRAME_B })
+            )
+          )
+        ),
+        label ? h("div", { class: "bq-bunny-loader__label", text: label }) : null
+      );
+    }
     function showLoading(label) {
       render("loading", function() {
         return pageRoot(
           h(
             "div",
             { class: "bq-disabled-inner", style: { marginTop: "3rem" } },
-            h("span", { class: "bq-loader", text: "Loading" })
+            bunnyLoader("Loading...")
           )
         );
       });
@@ -3323,7 +3350,7 @@ ${options.inlineContentPlaceholder}
       CS.messagesBox.appendChild(h(
         "div",
         { class: "bq-chat-settings" },
-        h("div", { class: "bq-chat-settings-loading" }, h("span", { class: "bq-loader", text: "Loading" }))
+        h("div", { class: "bq-chat-settings-loading" }, bunnyLoader("Loading..."))
       ));
       Promise.all([getProfile(), getNewsletterStatus()]).then(function(res) {
         if (res[0]) S.user = res[0];
@@ -4843,9 +4870,16 @@ ${options.inlineContentPlaceholder}
       return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
     }
     function historyLoadingEl(initial) {
+      if (initial) {
+        return h(
+          "div",
+          { class: "bq-history-loading is-initial" },
+          bunnyLoader("Fetching history...")
+        );
+      }
       return h(
         "div",
-        { class: "bq-history-loading" + (initial ? " is-initial" : "") },
+        { class: "bq-history-loading" },
         h("span", { text: "Fetching history" }),
         h("span", { class: "bq-loader" })
       );

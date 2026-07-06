@@ -162,6 +162,87 @@
     to { transform: rotate(360deg); }
 }
 
+/* jumping ASCII bunny — full-area "loading/fetching" indicator (page/gate loads,
+   initial history fetch, settings panel). Ported from www.bunnyquery.com
+   bunnyLoader.vue. Two <pre> frames toggle + hop across the track and flip. */
+.bq-bunny-loader {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+}
+.bq-bunny-loader--overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 4;
+}
+.bq-bunny-stage {
+    display: inline-block;
+    position: relative;
+    text-align: left;
+}
+.bq-bunny-track {
+    position: relative;
+    height: 3.6rem;
+    width: 100%;
+    animation: bq-bunny-move 9s steps(12) infinite;
+}
+.bq-bunny-dir {
+    display: inline-block;
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    animation: bq-bunny-flip 9s steps(1) infinite;
+}
+.bq-frame {
+    margin: 0;
+    /* Pin a Latin monospace font. Without it the <pre> falls back to the UA
+       `monospace` keyword, which on Korean/Japanese systems can resolve to a
+       CJK font that renders U+005C (backslash) as ₩ / ¥ — wrecking the art. */
+    font-family: var(--bq-mono);
+    font-size: 1rem;
+    line-height: 1.2;
+    white-space: pre;
+    color: var(--bq-ink);
+}
+.bq-frame-a {
+    animation: bq-bunny-toggle-a 1s steps(1) infinite;
+}
+.bq-frame-b {
+    animation: bq-bunny-toggle-b 1s steps(1) infinite;
+    opacity: 0;
+}
+.bq-bunny-loader__label {
+    color: var(--bq-ink);
+    font-family: var(--bq-mono);
+    font-size: 0.83rem;
+}
+@keyframes bq-bunny-move {
+    0%     { transform: translateX(-11ch); }
+    25%    { transform: translateX(4ch); }
+    37.5%  { transform: translateX(4ch); }
+    50%    { transform: translateX(4ch); }
+    75%    { transform: translateX(-11ch); }
+    87.5%  { transform: translateX(-11ch); }
+    100%   { transform: translateX(-11ch); }
+}
+@keyframes bq-bunny-flip {
+    0%   { transform: scaleX(1); }
+    50%  { transform: scaleX(-1); }
+}
+@keyframes bq-bunny-toggle-a {
+    0%   { opacity: 1; }
+    25%  { opacity: 0; }
+    100% { opacity: 1; }
+}
+@keyframes bq-bunny-toggle-b {
+    0%   { opacity: 0; }
+    25%  { opacity: 1; }
+    100% { opacity: 0; }
+}
+
 /* ============================================================================
  * AUTH VIEWS (login / signup / forgot / verify / settings)
  * ==========================================================================*/

@@ -379,11 +379,30 @@ import {
             h("a", { class: "bq-page-footer-link", href: "https://www.bunnyquery.com",
                 target: "_blank", rel: "noopener noreferrer", text: "www.bunnyquery.com" }));
     }
+    // Jumping ASCII bunny — the full-area "loading/fetching" indicator (page/gate
+    // loads, initial history fetch, settings panel). Ported from www.bunnyquery.com
+    // bunnyLoader.vue; small inline states (Thinking, older-history) keep .bq-loader.
+    // The two frames toggle + hop; an explicit Latin mono font (--bq-mono, applied
+    // in CSS) keeps CJK systems from drawing U+005C (backslash) as ₩/¥.
+    var BUNNY_FRAME_A = "  (\\(\\\n  ( - -)\n c(\")(\")";
+    var BUNNY_FRAME_B = "  /)/)\n ( . .)\nc(\")(\")";
+    function bunnyLoader(label, overlay) {
+        return h("div", {
+                class: "bq-bunny-loader" + (overlay ? " bq-bunny-loader--overlay" : ""),
+                "aria-hidden": "true", translate: "no",
+            },
+            h("div", { class: "bq-bunny-stage" },
+                h("div", { class: "bq-bunny-track" },
+                    h("div", { class: "bq-bunny-dir" },
+                        h("pre", { class: "bq-frame bq-frame-a", translate: "no", text: BUNNY_FRAME_A }),
+                        h("pre", { class: "bq-frame bq-frame-b", translate: "no", text: BUNNY_FRAME_B })))),
+            label ? h("div", { class: "bq-bunny-loader__label", text: label }) : null);
+    }
     function showLoading(label) {
         render("loading", function () {
             return pageRoot(
                 h("div", { class: "bq-disabled-inner", style: { marginTop: "3rem" } },
-                    h("span", { class: "bq-loader", text: label || "Loading" })
+                    bunnyLoader(label || "Loading...")
                 )
             );
         });
@@ -1251,7 +1270,7 @@ import {
         if (!CS.messagesBox) return;
         clear(CS.messagesBox);
         CS.messagesBox.appendChild(h("div", { class: "bq-chat-settings" },
-            h("div", { class: "bq-chat-settings-loading" }, h("span", { class: "bq-loader", text: "Loading" }))));
+            h("div", { class: "bq-chat-settings-loading" }, bunnyLoader("Loading..."))));
         Promise.all([getProfile(), getNewsletterStatus()]).then(function (res) {
             if (res[0]) S.user = res[0];
             S.newsletterSubscribed = res[1];
@@ -2565,7 +2584,14 @@ import {
     }
 
     function historyLoadingEl(initial) {
-        return h("div", { class: "bq-history-loading" + (initial ? " is-initial" : "") },
+        // Initial (empty messages area) load gets the jumping bunny, matching
+        // www.bunnyquery.com's .bq-gate-loading. Older-history pagination keeps the
+        // compact inline "Fetching history..." dot-trail so it stays a thin sticky bar.
+        if (initial) {
+            return h("div", { class: "bq-history-loading is-initial" },
+                bunnyLoader("Fetching history..."));
+        }
+        return h("div", { class: "bq-history-loading" },
             h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" }));
     }
     function renderMessages() {
