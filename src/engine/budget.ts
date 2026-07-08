@@ -33,7 +33,7 @@ export function getContextWindow(platform: string, model?: string): number {
 
 export function stripFileBlocksFromHistory(content: string): string {
 	if (!content) return content;
-	return content.replace(/```([\w.-]+\.[a-zA-Z0-9]+)\n[\s\S]*?```/g, '[file previously attached: $1]');
+	return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, '[file previously attached: $1]');
 }
 
 export type BoundedChatOptions = {

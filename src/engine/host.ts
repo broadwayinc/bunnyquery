@@ -99,8 +99,8 @@ export interface ChatHost {
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;
-	/** Non-dismissible "file exists" prompt → keep+reindex vs overwrite. */
-	promptOverwrite(filename: string): Promise<'overwrite' | 'reindex'>;
+	/** Non-dismissible "file exists" prompt → skip, keep+reindex, or overwrite. */
+	promptOverwrite(filename: string): Promise<'overwrite' | 'reindex' | 'skip'>;
 	/** Clear the "apply to all" overwrite choice at the start of a batch. */
 	resetOverwriteBatch(): void;
 	/** Re-render the attachment chip row (progress / status). */

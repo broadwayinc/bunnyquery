@@ -473,7 +473,7 @@ ${options.inlineContentPlaceholder}
   }
   function stripFileBlocksFromHistory(content) {
     if (!content) return content;
-    return content.replace(/```([\w.-]+\.[a-zA-Z0-9]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
+    return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
   }
   function buildBoundedChatMessages(options) {
     var contextWindow = getContextWindow(options.platform, options.model);
@@ -1530,7 +1530,7 @@ ${options.inlineContentPlaceholder}
       var MIN_STEP = 1;
       var MAX_FRAME_MS = 1e3;
       var regions = [], m;
-      var fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
+      var fenceRegex = /```[^\n`]+?\.[^\s.`]+\n[\s\S]*?```/g;
       while ((m = fenceRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
       var linkRegex = createInlineLinkRegex();
       while ((m = linkRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
@@ -2015,6 +2015,7 @@ ${options.inlineContentPlaceholder}
       members.forEach(function(member, idx) {
         chain = chain.then(function() {
           var hadExists = false;
+          var skipped = false;
           var onProg = function(p) {
             if (p && p.total) {
               att.progress = Math.floor((idx + p.loaded / p.total) / total * 100);
@@ -2039,11 +2040,17 @@ ${options.inlineContentPlaceholder}
             if (!isExists) throw err;
             return self.host.promptOverwrite(member.file.name).then(function(choice) {
               if (choice === "overwrite") return doMemberUpload(false);
+              if (choice === "skip") {
+                skipped = true;
+                return;
+              }
               hadExists = true;
             });
           }).then(function() {
+            if (skipped) return;
             return self.host.getTemporaryUrl(member.storagePath);
           }).then(function(url) {
+            if (skipped) return;
             urls.push({ name: member.relPath, url, storagePath: member.storagePath });
             if (att.kind !== "folder") {
               att.uploadedUrl = url;
@@ -2176,7 +2183,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.5.0" ;
+    var BQ_VERSION = "1.5.1" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -4018,13 +4025,18 @@ ${options.inlineContentPlaceholder}
       var existing = fileBlobCache.get(key);
       if (existing) return existing;
       var contentType = mimeGetType(filename) || "text/plain";
-      var href = URL.createObjectURL(new Blob([body], { type: contentType }));
+      var ext = (String(filename || "").split(".").pop() || "").toLowerCase();
+      var isText = /^text\//i.test(contentType) || /application\/(json|xml|csv|yaml|x-yaml|javascript)/i.test(contentType);
+      var needsBom = ext === "csv" || ext === "tsv" || ext === "tab";
+      var type = isText ? contentType + "; charset=utf-8" : contentType;
+      var data = needsBom ? "\uFEFF" + body : body;
+      var href = URL.createObjectURL(new Blob([data], { type }));
       fileBlobCache.set(key, href);
       return href;
     }
     function fileToAnchorHtml(filename, href) {
       var text = "\u2197 " + filename;
-      return '<a class="bq-file-download" href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
+      return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
     }
     function linkToAnchorHtml(link) {
       var refreshing = !!refreshingLinkMap[link.expiredHref || link.href];
@@ -4095,13 +4107,13 @@ ${options.inlineContentPlaceholder}
         return PH(idx);
       };
       var working = String(content == null ? "" : content).replace(
-        /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g,
+        /```([^\n`]+?\.[^\s.`]+)\n([\s\S]*?)```/g,
         function(_full, filename, body) {
           return pushPlaceholder(fileToAnchorHtml(filename, getOrCreateFileHref(filename, body)));
         }
       );
       if (CS.typing) {
-        var openFence = working.match(/```([\w.-]+\.[a-zA-Z0-9]+)\n?/);
+        var openFence = working.match(/```([^\n`]+?\.[^\s.`]+)\n?/);
         if (openFence && typeof openFence.index === "number") {
           working = working.slice(0, openFence.index) + "\n[generating " + openFence[1] + "\u2026]";
         }
@@ -5107,12 +5119,15 @@ ${options.inlineContentPlaceholder}
             h(
               "p",
               { class: "bq-modal-desc" },
-              "A file named \u201C" + filename + "\u201D already exists. Keep the existing file and just reindex it, or overwrite it completely?"
+              "A file named \u201C" + filename + "\u201D already exists. Skip it, keep the existing file and just reindex it, or overwrite it completely?"
             ),
             applyLabel,
             h(
               "div",
               { class: "bq-modal-btns" },
+              h("button", { class: "btn btn--outline", type: "button", onclick: function() {
+                chooseOverwrite("skip");
+              } }, "Skip"),
               h("button", { class: "btn btn--outline", type: "button", onclick: function() {
                 chooseOverwrite("reindex");
               } }, "Reindex only"),

@@ -478,7 +478,7 @@ function getContextWindow(platform, model) {
 }
 function stripFileBlocksFromHistory(content) {
   if (!content) return content;
-  return content.replace(/```([\w.-]+\.[a-zA-Z0-9]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
+  return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
 }
 function buildBoundedChatMessages(options) {
   var contextWindow = getContextWindow(options.platform, options.model);
@@ -1562,7 +1562,7 @@ var ChatSession = class {
     var MIN_STEP = 1;
     var MAX_FRAME_MS = 1e3;
     var regions = [], m;
-    var fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
+    var fenceRegex = /```[^\n`]+?\.[^\s.`]+\n[\s\S]*?```/g;
     while ((m = fenceRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
     var linkRegex = createInlineLinkRegex();
     while ((m = linkRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
@@ -2047,6 +2047,7 @@ var ChatSession = class {
     members.forEach(function(member, idx) {
       chain = chain.then(function() {
         var hadExists = false;
+        var skipped = false;
         var onProg = function(p) {
           if (p && p.total) {
             att.progress = Math.floor((idx + p.loaded / p.total) / total * 100);
@@ -2071,11 +2072,17 @@ var ChatSession = class {
           if (!isExists) throw err;
           return self.host.promptOverwrite(member.file.name).then(function(choice) {
             if (choice === "overwrite") return doMemberUpload(false);
+            if (choice === "skip") {
+              skipped = true;
+              return;
+            }
             hadExists = true;
           });
         }).then(function() {
+          if (skipped) return;
           return self.host.getTemporaryUrl(member.storagePath);
         }).then(function(url) {
+          if (skipped) return;
           urls.push({ name: member.relPath, url, storagePath: member.storagePath });
           if (att.kind !== "folder") {
             att.uploadedUrl = url;

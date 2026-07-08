@@ -1797,13 +1797,20 @@ import {
         var existing = fileBlobCache.get(key);
         if (existing) return existing;
         var contentType = mimeGetType(filename) || "text/plain";
-        var href = URL.createObjectURL(new Blob([body], { type: contentType }));
+        var ext = (String(filename || "").split(".").pop() || "").toLowerCase();
+        var isText = /^text\//i.test(contentType) || /application\/(json|xml|csv|yaml|x-yaml|javascript)/i.test(contentType);
+        // Prepend a UTF-8 BOM for spreadsheet-family text: Korean-Windows Excel
+        // otherwise decodes a BOM-less CSV as CP949 and mojibakes every column.
+        var needsBom = ext === "csv" || ext === "tsv" || ext === "tab";
+        var type = isText ? contentType + "; charset=utf-8" : contentType;
+        var data = needsBom ? "﻿" + body : body;
+        var href = URL.createObjectURL(new Blob([data], { type: type }));
         fileBlobCache.set(key, href);
         return href;
     }
     function fileToAnchorHtml(filename, href) {
         var text = "↗ " + filename;
-        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
+        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
     }
     function linkToAnchorHtml(link) {
         var refreshing = !!refreshingLinkMap[link.expiredHref || link.href];
@@ -1865,11 +1872,11 @@ import {
         var PH = function (idx) { return "BQ" + idx + ""; };
         var pushPlaceholder = function (anchorHtml) { var idx = placeholderHtml.length; placeholderHtml.push(anchorHtml); return PH(idx); };
         var working = String(content == null ? "" : content).replace(
-            /```([\w.-]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/g,
+            /```([^\n`]+?\.[^\s.`]+)\n([\s\S]*?)```/g,
             function (_full, filename, body) { return pushPlaceholder(fileToAnchorHtml(filename, getOrCreateFileHref(filename, body))); }
         );
         if (CS.typing) {
-            var openFence = working.match(/```([\w.-]+\.[a-zA-Z0-9]+)\n?/);
+            var openFence = working.match(/```([^\n`]+?\.[^\s.`]+)\n?/);
             if (openFence && typeof openFence.index === "number") {
                 working = working.slice(0, openFence.index) + "\n[generating " + openFence[1] + "…]";
             }
@@ -2745,11 +2752,12 @@ import {
 
     /* ---- overwrite / reindex prompt (agent.vue useOverwritePrompt) -------- *
      * When an upload hits an existing file, promptOverwrite(filename) surfaces a
-     * NON-DISMISSIBLE modal (no backdrop/×): "Reindex only" keeps the existing
-     * file and just re-indexes it; "Overwrite" replaces it. "Apply to all
-     * remaining" makes the chosen outcome sticky for the rest of the current
-     * upload batch; resetOverwriteBatch() clears it at the start of each batch.
-     * Uploads run sequentially, so only one prompt is ever open at a time. */
+     * NON-DISMISSIBLE modal (no backdrop/×): "Skip" leaves the existing file
+     * untouched (no upload/index); "Reindex only" keeps the existing file and
+     * just re-indexes it; "Overwrite" replaces it. "Apply to all remaining"
+     * makes the chosen outcome sticky for the rest of the current upload batch;
+     * resetOverwriteBatch() clears it at the start of each batch. Uploads run
+     * sequentially, so only one prompt is ever open at a time. */
     var overwriteState = { resolver: null, sticky: null, handle: null, applyToAll: false };
     function resetOverwriteBatch() { overwriteState.sticky = null; overwriteState.applyToAll = false; }
     function chooseOverwrite(choice) {
@@ -2772,9 +2780,10 @@ import {
                 return h("div", { class: "bq-modal" },
                     h("div", { class: "bq-modal-delete-header" }, h("span", { text: "File already exists" })),
                     h("p", { class: "bq-modal-desc" },
-                        "A file named “" + filename + "” already exists. Keep the existing file and just reindex it, or overwrite it completely?"),
+                        "A file named “" + filename + "” already exists. Skip it, keep the existing file and just reindex it, or overwrite it completely?"),
                     applyLabel,
                     h("div", { class: "bq-modal-btns" },
+                        h("button", { class: "btn btn--outline", type: "button", onclick: function () { chooseOverwrite("skip"); } }, "Skip"),
                         h("button", { class: "btn btn--outline", type: "button", onclick: function () { chooseOverwrite("reindex"); } }, "Reindex only"),
                         h("button", { class: "btn btn--danger", type: "button", onclick: function () { chooseOverwrite("overwrite"); } }, "Overwrite"))
                 );

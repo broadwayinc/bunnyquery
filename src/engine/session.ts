@@ -550,7 +550,7 @@ export class ChatSession {
 		// (a partial link is broken markdown). If a frame's reveal boundary lands
 		// inside one, snap it to the region end so the chip/link appears whole.
 		var regions: Array<{ start: number; end: number }> = [], m;
-		var fenceRegex = /```[\w.-]+\.[a-zA-Z0-9]+\n[\s\S]*?```/g;
+		var fenceRegex = /```[^\n`]+?\.[^\s.`]+\n[\s\S]*?```/g;
 		while ((m = fenceRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
 		var linkRegex = createInlineLinkRegex();
 		while ((m = linkRegex.exec(fullText)) !== null) regions.push({ start: m.index, end: m.index + m[0].length });
@@ -1013,6 +1013,7 @@ export class ChatSession {
 		members.forEach(function (member: any, idx: number) {
 			chain = chain.then(function () {
 				var hadExists = false;
+				var skipped = false;
 				var onProg = function (p: any) {
 					if (p && p.total) {
 						att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
@@ -1032,11 +1033,14 @@ export class ChatSession {
 					if (!isExists) throw err; // a member upload failed → whole attachment fails (red)
 					return self.host.promptOverwrite(member.file.name).then(function (choice) {
 						if (choice === 'overwrite') return doMemberUpload(false); // replace the existing file
-						hadExists = true; // keep it; reindex only
+						if (choice === 'skip') { skipped = true; return; } // leave it untouched; no upload/index
+						hadExists = true; // keep it; Reindex
 					});
 				}).then(function () {
+					if (skipped) return; // user skipped this member — no url, no index request
 					return self.host.getTemporaryUrl(member.storagePath);
 				}).then(function (url: string) {
+					if (skipped) return; // guard the indexing branch for a skipped member
 					urls.push({ name: member.relPath, url: url, storagePath: member.storagePath });
 					if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = member.storagePath; }
 					var mime = member.file.type || self.host.getMimeType(member.file.name);
