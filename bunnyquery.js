@@ -2213,7 +2213,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.5.1" ;
+    var BQ_VERSION = "1.5.3" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -4201,7 +4201,7 @@ ${options.inlineContentPlaceholder}
       return (reindex ? "Reindexing: " : "Indexing: ") + nameLabel + (extras.length ? " \xB7 " + extras.join(" \xB7 ") : "");
     }
     function sanitizeStorageSegment(name) {
-      var n = String(name == null ? "file" : name).trim().replace(/[^A-Za-z0-9._-]+/g, "_").replace(/_{2,}/g, "_").replace(/^[_]+/, "");
+      var n = String(name == null ? "file" : name).normalize("NFC").trim().replace(/[^\p{L}\p{N}._ -]+/gu, "_").replace(/ {2,}/g, " ").replace(/_{2,}/g, "_").replace(/^[_ ]+/, "");
       return n || "file";
     }
     function attachmentStoragePath(relPath) {
@@ -4646,6 +4646,12 @@ ${options.inlineContentPlaceholder}
         row.appendChild(removeAll);
       }
     }
+    function uploadsFrozenForUser() {
+      var conf = S.service && S.service.conf || {};
+      if (!conf.freeze_database) return false;
+      var ag = S.user && typeof S.user.access_group === "number" ? S.user.access_group : 0;
+      return ag < 99;
+    }
     function updateComposerControls() {
       var uploading = CS.uploadingAttachments;
       if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
@@ -5069,15 +5075,19 @@ ${options.inlineContentPlaceholder}
         requestAnimationFrame(function() {
           autoGrowInput(input);
         });
-        var attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
-        attachFileInput.addEventListener("change", function() {
-          onAttachInputChange(attachFileInput);
-        });
-        var attachBtn = h("button", { class: "bq-attach-btn", type: "button", title: "Attach files", html: ATTACH_ICON_SVG });
-        attachBtn.addEventListener("click", function() {
-          attachFileInput.click();
-        });
-        CS.attachBtnEl = attachBtn;
+        var attachDisabled = uploadsFrozenForUser();
+        var attachFileInput = null, attachBtn = null;
+        if (!attachDisabled) {
+          attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
+          attachFileInput.addEventListener("change", function() {
+            onAttachInputChange(attachFileInput);
+          });
+          attachBtn = h("button", { class: "bq-attach-btn", type: "button", title: "Attach files", html: ATTACH_ICON_SVG });
+          attachBtn.addEventListener("click", function() {
+            attachFileInput.click();
+          });
+          CS.attachBtnEl = attachBtn;
+        }
         var attachmentsRow = h("div", { class: "bq-attachments" });
         attachmentsRow.style.display = "none";
         CS.attachmentsRow = attachmentsRow;
@@ -5096,7 +5106,7 @@ ${options.inlineContentPlaceholder}
         chatArea = h("div", { class: "bq-chat" }, box, composer);
         CS.chatEl = chatArea;
         CS.composerEl = composer;
-        setupDragAndDrop(chatArea);
+        if (!attachDisabled) setupDragAndDrop(chatArea);
         return h("div", { class: "bq-meta" }, header, chatArea);
       });
       if (S.aiPlatform === "none") return;

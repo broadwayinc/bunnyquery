@@ -1945,15 +1945,25 @@ import {
         return (reindex ? "Reindexing: " : "Indexing: ") + nameLabel + (extras.length ? " · " + extras.join(" · ") : "");
     }
     function sanitizeStorageSegment(name) {
-        // The db CDN serves files through a %-encoded path; object keys that
-        // contain spaces (or other chars that round-trip badly through
-        // encodeURIComponent) are stored raw but requested encoded, so they
-        // 404 at CloudFront/S3. Normalize the stored key so it ALWAYS matches
-        // the served path. The original name is kept separately for display.
-        var n = String(name == null ? "file" : name).trim()
-            .replace(/[^A-Za-z0-9._-]+/g, "_")
+        // Keep the stored object key human-readable while ensuring it round-trips
+        // through retrieval. Both retrieval paths encode the key per-segment:
+        // the agent/preview URL comes from the backend's generate_temporary_cdn_url
+        // (quote(unquote(seg), safe="")) and the download URL is signed by boto3 —
+        // so spaces and Unicode become %20 / %XX and match the raw S3 key on the
+        // way back. The key is also reused verbatim as the "src::<key>" record
+        // unique_id, which skapi does NOT char-restrict.
+        //
+        // So PRESERVE Unicode letters/digits (Korean, Japanese, accented Latin, …)
+        // AND spaces, and only replace genuinely unsafe chars (other punctuation/
+        // symbols/control) with "_". NFC-normalize first so composed/decomposed
+        // forms (macOS NFD filenames) yield a stable, matchable key. (An old
+        // ASCII-only allowlist erased whole non-Latin names, e.g.
+        // "외국인 고용보험.pdf" → ".pdf".) The original name is kept for display.
+        var n = String(name == null ? "file" : name).normalize("NFC").trim()
+            .replace(/[^\p{L}\p{N}._ -]+/gu, "_")
+            .replace(/ {2,}/g, " ")
             .replace(/_{2,}/g, "_")
-            .replace(/^[_]+/, "");
+            .replace(/^[_ ]+/, "");
         return n || "file";
     }
     function attachmentStoragePath(relPath) {
@@ -2348,6 +2358,17 @@ import {
             row.appendChild(removeAll);
         }
     }
+    // Uploads are blocked for non-admin users when the service database is
+    // frozen: this mirrors the backend get_signed_url gate
+    // (freeze_database && not is_master). access_group 99 == admin/master, so we
+    // hide the attach affordances (clip button + drag-drop) below that. The flag
+    // lives under ConnectionInfo.conf (S.service = getConnectionInfo() result).
+    function uploadsFrozenForUser() {
+        var conf = (S.service && S.service.conf) || {};
+        if (!conf.freeze_database) return false;
+        var ag = (S.user && typeof S.user.access_group === "number") ? S.user.access_group : 0;
+        return ag < 99;
+    }
     function updateComposerControls() {
         var uploading = CS.uploadingAttachments;
         if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
@@ -2716,11 +2737,18 @@ import {
             // first-keystroke height jump / bottom clip from the CSS min-height)
             requestAnimationFrame(function () { autoGrowInput(input); });
 
-            var attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
-            attachFileInput.addEventListener("change", function () { onAttachInputChange(attachFileInput); });
-            var attachBtn = h("button", { class: "bq-attach-btn", type: "button", title: "Attach files", html: ATTACH_ICON_SVG });
-            attachBtn.addEventListener("click", function () { attachFileInput.click(); });
-            CS.attachBtnEl = attachBtn;
+            // When the DB is frozen for a non-admin user, omit the attach clip
+            // button + file input entirely (null children are skipped by h()).
+            // Drag-drop is likewise gated below so there's no upload path at all.
+            var attachDisabled = uploadsFrozenForUser();
+            var attachFileInput = null, attachBtn = null;
+            if (!attachDisabled) {
+                attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
+                attachFileInput.addEventListener("change", function () { onAttachInputChange(attachFileInput); });
+                attachBtn = h("button", { class: "bq-attach-btn", type: "button", title: "Attach files", html: ATTACH_ICON_SVG });
+                attachBtn.addEventListener("click", function () { attachFileInput.click(); });
+                CS.attachBtnEl = attachBtn;
+            }
 
             var attachmentsRow = h("div", { class: "bq-attachments" });
             attachmentsRow.style.display = "none";
@@ -2734,7 +2762,7 @@ import {
 
             chatArea = h("div", { class: "bq-chat" }, box, composer);
             CS.chatEl = chatArea; CS.composerEl = composer;
-            setupDragAndDrop(chatArea);
+            if (!attachDisabled) setupDragAndDrop(chatArea);
             return h("div", { class: "bq-meta" }, header, chatArea);
         });
 
