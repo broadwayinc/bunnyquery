@@ -489,6 +489,13 @@ interface ChatHost {
     }): Promise<any>;
     /** Mint a temporary CDN URL for a stored file. */
     getTemporaryUrl(storagePath: string): Promise<string>;
+    /** Delete a file's AI-index record ("src::<storagePath>") ahead of a
+     *  reindex/overwrite so the agent re-creates it fresh instead of colliding/
+     *  duplicating. The skapi backend cascades a src:: delete to the record's
+     *  reference-linked children. OPTIONAL — hosts that don't implement it fall
+     *  through to a plain re-index. Implementations must be best-effort (swallow
+     *  "not found" / permission errors so indexing still proceeds). */
+    deleteExistingFileRecord?(storagePath: string): Promise<any>;
     /** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
     storagePathFor(relPath: string): string;
     getMimeType(name: string): string | null;

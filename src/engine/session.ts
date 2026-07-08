@@ -1014,6 +1014,12 @@ export class ChatSession {
 			chain = chain.then(function () {
 				var hadExists = false;
 				var skipped = false;
+				// True when the file already existed and we are re-indexing over it
+				// (user chose Reindex, OR Overwrite replaced the bytes). Drives the
+				// delete-then-repost of the stale "src::" record below. Kept separate
+				// from hadExists, which must keep driving ONLY the Reindexing/Indexing
+				// label (isReindex) — overwrite still labels as "Indexing:".
+				var existedBefore = false;
 				var onProg = function (p: any) {
 					if (p && p.total) {
 						att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
@@ -1032,9 +1038,9 @@ export class ChatSession {
 					var isExists = code === 'EXISTS' || (msg && /exist/i.test(msg));
 					if (!isExists) throw err; // a member upload failed → whole attachment fails (red)
 					return self.host.promptOverwrite(member.file.name).then(function (choice) {
-						if (choice === 'overwrite') return doMemberUpload(false); // replace the existing file
+						if (choice === 'overwrite') { existedBefore = true; return doMemberUpload(false); } // replace the existing file
 						if (choice === 'skip') { skipped = true; return; } // leave it untouched; no upload/index
-						hadExists = true; // keep it; Reindex
+						hadExists = true; existedBefore = true; // keep it; Reindex
 					});
 				}).then(function () {
 					if (skipped) return; // user skipped this member — no url, no index request
@@ -1044,12 +1050,23 @@ export class ChatSession {
 					urls.push({ name: member.relPath, url: url, storagePath: member.storagePath });
 					if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = member.storagePath; }
 					var mime = member.file.type || self.host.getMimeType(member.file.name);
+					// Delete-then-repost: when the file already existed (Reindex or
+					// Overwrite), delete the stale "src::<storagePath>" index record
+					// first — the skapi backend cascades the delete to its
+					// reference-linked children — so re-indexing REPLACES rather than
+					// colliding/duplicating. Awaited before the index request is
+					// enqueued. Best-effort + optional-hook guarded: a missing record,
+					// a permission error, or a host without the hook must not block
+					// indexing.
+					var preIndex = (existedBefore && typeof self.host.deleteExistingFileRecord === 'function')
+						? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { })
+						: Promise.resolve();
 					// Run a client-side attachment parser (e.g. .hwp) if one matches; its
 					// output is inlined into the indexing request (falls back to office
 					// extraction / web_fetch when no parser matches or it yields nothing).
-					return Promise.resolve(
-						parseAttachmentContent(member.file, member.file.name, mime || undefined),
-					).then(function (parsedContent: string | null) {
+					return preIndex.then(function () {
+						return parseAttachmentContent(member.file, member.file.name, mime || undefined);
+					}).then(function (parsedContent: string | null) {
 					return notifyAgentSaveAttachment({
 						platform: id.platform as 'claude' | 'openai',
 						model: id.model,

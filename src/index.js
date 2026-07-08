@@ -1586,6 +1586,7 @@ import {
         // attachment upload I/O (bunnyquery: get-signed-url + db CDN)
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
+        deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
@@ -2005,6 +2006,17 @@ import {
             form.append("file", file);
             return xhrUploadForm(signed.url, form, onProgress, setAbort);
         });
+    }
+    // Delete a file's AI-index record ("src::<storagePath>") ahead of a
+    // reindex/overwrite so the agent re-creates it fresh instead of colliding/
+    // duplicating. The skapi backend cascades a src:: record delete to every
+    // record that references it (its reference-linked children). Best-effort: a
+    // missing record (file never indexed, or an anon upload that can't carry a
+    // unique_id) or a permission error must not block indexing.
+    function deleteFileIndexRecordDb(storagePath) {
+        if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
+        return S.skapi.deleteRecords({ service: S.serviceId, unique_id: "src::" + storagePath })
+            .catch(function () { });
     }
     // Mint a temporary CDN url for a db file (request:'get-db'), matching
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
@@ -2568,7 +2580,7 @@ import {
 
         var bubble;
         if (msg.isPending) {
-            bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader", text: "Thinking" }));
+            bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
         } else {
             bubble = h("div", { class: "bq-bubble" });
             if (msg.role === "user" && msg.isPendingQueued) {
