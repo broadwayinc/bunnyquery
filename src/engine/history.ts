@@ -107,7 +107,9 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			mapped.push(em);
 		} else if (assistantText) {
-			var okm: any = { role: 'assistant', content: assistantText };
+			// Safe db-only sanitize (forAssistant) so a volatile db url the model
+			// emitted renders as a re-mintable `_expired_.url` link, not a dead one.
+			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			mapped.push(okm);

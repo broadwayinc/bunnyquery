@@ -56,13 +56,35 @@ export function buildDisplayExpiredAttachmentHref(remotePath: string, fallback?:
 	return EXPIRED_ATTACHMENT_URL_ORIGIN + '/' + encodePathSegments(getExpiredAttachmentVisiblePath(remotePath, fallback));
 }
 
-export function sanitizeAttachmentLinksForHistory(content: string, serviceId: string): string {
-	if (!content || content.indexOf('Attached files:') === -1) return content;
+// Does `href` point at THIS service's db attachment storage? A db attachment URL's
+// path always begins with the serviceId segment (…/<serviceId>/<hash>/<path>). Used
+// to SAFELY sanitize assistant messages — where an arbitrary external citation URL
+// must never be rewritten, only the service's own volatile db links.
+export function isServiceDbAttachmentHref(href: string, serviceId: string): boolean {
+	if (!serviceId) return false;
+	try {
+		var parsed = new URL(href);
+		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+		var segs = normalizeAttachmentPathCandidate(parsed.pathname || '').split('/').filter(Boolean);
+		return segs.length > 0 && segs[0] === serviceId;
+	} catch (e) { return false; }
+}
+
+// Replace volatile attachment URLs with their durable `_expired_.url/<path>`
+// placeholder so a stored/replayed copy re-mints on demand instead of going stale.
+// USER turns: the "Attached files:" block gates the (broad) rewrite — every url
+// there is a db link. ASSISTANT turns (forAssistant=true): no marker exists and the
+// text may contain external citation urls, so restrict the rewrite to THIS
+// service's db attachment urls and leave every other link untouched.
+export function sanitizeAttachmentLinksForHistory(content: string, serviceId: string, forAssistant?: boolean): string {
+	if (!content) return content;
+	if (!forAssistant && content.indexOf('Attached files:') === -1) return content;
 	return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function (_m: string, label: string, href: string) {
+		if (forAssistant && !isServiceDbAttachmentHref(href, serviceId)) return _m;
 		var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
 		var labelPath = normalizeAttachmentPathCandidate(label);
 		var fullPath = remotePath || labelPath;
-		if (!fullPath) return '[' + label + '](' + EXPIRED_ATTACHMENT_URL_ORIGIN + '/file)';
+		if (!fullPath) return forAssistant ? _m : '[' + label + '](' + EXPIRED_ATTACHMENT_URL_ORIGIN + '/file)';
 		return '[' + label + '](' + buildDisplayExpiredAttachmentHref(fullPath, label) + ')';
 	});
 }

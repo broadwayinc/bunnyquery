@@ -1718,7 +1718,7 @@ import {
                 // vs-immediate decision, the cache+resume immediate-send model, the
                 // office extractContent, and the "-bg" queue routing).
                 var c = composeUserMessage(text, attachmentUrls);
-                session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+                session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent, c.fileUrls);
             }
             // After the uploads + indexing-queue requests are all made, surface a
             // single report of everything that failed (grouped by error).
@@ -2696,8 +2696,7 @@ import {
             box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
             CS.messagesBox = box;
 
-            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
-                        "." });
+            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Ask anything about: " + (S.serviceName || "your project") });
             CS.inputEl = input;
             var composing = false;
             input.addEventListener("compositionstart", function () { composing = true; });

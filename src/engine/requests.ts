@@ -11,7 +11,7 @@
  *                                    only the BgTaskEntry TYPE lives here)
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage } from './prompts';
-import { isServerExtractable, makeExtractPlaceholder, type ExtractDirective } from './office';
+import { isServerExtractable, makeExtractPlaceholder, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, pollOpt } from './config';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -206,6 +206,7 @@ export type CallClaudeWithMcpParams = {
 	system?: string;
 	mcpServer: ClaudeMcpServerRequest;
 	extractContent?: ExtractDirective[];
+	fileUrls?: FileUrlDirective[];
 	onResponse?: (res: any) => void;
 	onError?: (err: any) => void;
 };
@@ -221,6 +222,7 @@ export async function callClaudeWithMcp({
 	system,
 	mcpServer,
 	extractContent,
+	fileUrls,
 }: CallClaudeWithMcpParams) {
 	const mcpServerDefinition: Record<string, any> = {
 		type: 'url',
@@ -251,6 +253,9 @@ export async function callClaudeWithMcp({
 			max_tokens: maxTokens,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
+				: {}),
+			...(fileUrls && fileUrls.length
+				? { _skapi_file_urls: fileUrls }
 				: {}),
 			...(system
 				? {
@@ -306,6 +311,7 @@ export async function callClaudeWithPublicMcp(
 	model?: string,
 	userId?: string,
 	extractContent?: ExtractDirective[],
+	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
 ) {
@@ -319,6 +325,7 @@ export async function callClaudeWithPublicMcp(
 		maxTokens: MAX_TOKENS,
 		system,
 		extractContent,
+		fileUrls,
 		mcpServer: {
 			name: MCP_NAME,
 			url: mcpUrl(),
@@ -338,6 +345,7 @@ export async function callOpenAIWithPublicMcp(
 	model?: string,
 	userId?: string,
 	extractContent?: ExtractDirective[],
+	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
 ) {
@@ -385,6 +393,9 @@ export async function callOpenAIWithPublicMcp(
 			max_output_tokens: MAX_TOKENS,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
+				: {}),
+			...(fileUrls && fileUrls.length
+				? { _skapi_file_urls: fileUrls }
 				: {}),
 			input: responseInput,
 			tools: [

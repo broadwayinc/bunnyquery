@@ -21,6 +21,18 @@ export type ExtractDirective = {
 	mime?: string;
 };
 
+// A directive telling the proxy worker to re-mint a fresh, short-lived URL for a
+// file the model fetches by url (PDFs, images — anything NOT server-extractable)
+// right before the upstream call, so a queued request never hands the model a
+// stale link. The worker mints from `path` and swaps `url` (the exact baked url
+// string) everywhere it appears in the request body.
+export type FileUrlDirective = {
+	/** db storage path of the file, e.g. "folder/report.pdf" (also the src:: value). */
+	path: string;
+	/** The exact baked url string in the request body to replace with a fresh one. */
+	url: string;
+};
+
 // Files whose text the worker extracts SERVER-SIDE and inlines for indexing,
 // instead of handing the agent a URL to fetch. Two groups:
 //   (1) BINARY document formats the model can't read at all (OOXML, Hancom
@@ -106,6 +118,8 @@ export interface ComposedUserMessage {
 	composedForLlm: string;
 	/** Office-extraction directives for the proxy worker (undefined if no office files). */
 	extractContent?: ExtractDirective[];
+	/** JIT url re-mint directives for the worker (non-extractable files: PDFs, images). */
+	fileUrls?: FileUrlDirective[];
 }
 
 // Compose the user's chat message from the typed text + uploaded attachment URLs.
@@ -128,6 +142,7 @@ export function composeUserMessage(
 	}
 	let composedForLlm = composed;
 	let extractContent: ExtractDirective[] | undefined;
+	let fileUrls: FileUrlDirective[] | undefined;
 	if (attachmentUrls.length > 0) {
 		const extractFiles = attachmentUrls.filter((u) => isServerExtractable(u.name));
 		if (extractFiles.length > 0) {
@@ -144,6 +159,15 @@ export function composeUserMessage(
 				`(read inline below; do NOT fetch their URLs):\n\n` +
 				sections.join('\n\n');
 		}
+		// Files the model fetches by url (NOT server-extractable: PDFs, images) get
+		// a re-mint directive so the worker swaps the baked long-lived CDN url for a
+		// fresh short-lived one at send time. Extractable files are inlined as text,
+		// so their url is never fetched — no directive needed. A blank url (nothing
+		// to match/replace) is skipped.
+		const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name));
+		if (urlFiles.length > 0) {
+			fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
+		}
 	}
-	return { composed, composedForLlm, extractContent };
+	return { composed, composedForLlm, extractContent, fileUrls };
 }

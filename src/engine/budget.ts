@@ -58,7 +58,10 @@ export function buildBoundedChatMessages(options: BoundedChatOptions) {
 	var trimmed = windowed.map(function (m, i) {
 		if (i === latestIndex) return m;
 		var stripped = stripFileBlocksFromHistory(m.content);
-		var sanitized = m.role === 'user' ? sanitizeAttachmentLinksForHistory(stripped, options.serviceId) : stripped;
+		// Sanitize BOTH roles: user turns via the "Attached files:" block, assistant
+		// turns via the safe db-only path (forAssistant=true) so a volatile db url the
+		// model emitted doesn't get replayed into the LLM context as a dead link.
+		var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== 'user');
 		return Object.assign({}, m, { content: sanitized });
 	});
 	var bounded: Array<{ role: string; content: string }> = [], used = 0;

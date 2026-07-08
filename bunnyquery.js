@@ -166,6 +166,7 @@ ${lines.join("\n")}`;
     }
     let composedForLlm = composed;
     let extractContent;
+    let fileUrls;
     if (attachmentUrls.length > 0) {
       const extractFiles = attachmentUrls.filter((u) => isServerExtractable(u.name));
       if (extractFiles.length > 0) {
@@ -186,8 +187,12 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 
 ` + sections.join("\n\n");
       }
+      const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name));
+      if (urlFiles.length > 0) {
+        fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
+      }
     }
-    return { composed, composedForLlm, extractContent };
+    return { composed, composedForLlm, extractContent, fileUrls };
   }
 
   // src/engine/attachments.ts
@@ -432,13 +437,26 @@ ${options.inlineContentPlaceholder}
   function buildDisplayExpiredAttachmentHref(remotePath, fallback) {
     return EXPIRED_ATTACHMENT_URL_ORIGIN + "/" + encodePathSegments(getExpiredAttachmentVisiblePath(remotePath, fallback));
   }
-  function sanitizeAttachmentLinksForHistory(content, serviceId) {
-    if (!content || content.indexOf("Attached files:") === -1) return content;
+  function isServiceDbAttachmentHref(href, serviceId) {
+    if (!serviceId) return false;
+    try {
+      var parsed = new URL(href);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+      var segs = normalizeAttachmentPathCandidate(parsed.pathname || "").split("/").filter(Boolean);
+      return segs.length > 0 && segs[0] === serviceId;
+    } catch (e) {
+      return false;
+    }
+  }
+  function sanitizeAttachmentLinksForHistory(content, serviceId, forAssistant) {
+    if (!content) return content;
+    if (!forAssistant && content.indexOf("Attached files:") === -1) return content;
     return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_m, label, href) {
+      if (forAssistant && !isServiceDbAttachmentHref(href, serviceId)) return _m;
       var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
       var labelPath = normalizeAttachmentPathCandidate(label);
       var fullPath = remotePath || labelPath;
-      if (!fullPath) return "[" + label + "](" + EXPIRED_ATTACHMENT_URL_ORIGIN + "/file)";
+      if (!fullPath) return forAssistant ? _m : "[" + label + "](" + EXPIRED_ATTACHMENT_URL_ORIGIN + "/file)";
       return "[" + label + "](" + buildDisplayExpiredAttachmentHref(fullPath, label) + ")";
     });
   }
@@ -489,7 +507,7 @@ ${options.inlineContentPlaceholder}
     var trimmed = windowed.map(function(m, i2) {
       if (i2 === latestIndex) return m;
       var stripped = stripFileBlocksFromHistory(m.content);
-      var sanitized = m.role === "user" ? sanitizeAttachmentLinksForHistory(stripped, options.serviceId) : stripped;
+      var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== "user");
       return Object.assign({}, m, { content: sanitized });
     });
     var bounded = [], used = 0;
@@ -633,7 +651,8 @@ ${options.inlineContentPlaceholder}
     maxTokens = 1e3,
     system,
     mcpServer,
-    extractContent
+    extractContent,
+    fileUrls
   }) {
     const mcpServerDefinition = {
       type: "url",
@@ -661,6 +680,7 @@ ${options.inlineContentPlaceholder}
         model,
         max_tokens: maxTokens,
         ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
         ...system ? {
           system: [
             {
@@ -698,7 +718,7 @@ ${options.inlineContentPlaceholder}
       }
     });
   }
-  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, onResponse, onError) {
+  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
     return callClaudeWithMcp({
       prompt,
       messages,
@@ -709,13 +729,14 @@ ${options.inlineContentPlaceholder}
       maxTokens: MAX_TOKENS,
       system,
       extractContent,
+      fileUrls,
       mcpServer: {
         name: MCP_NAME,
         url: mcpUrl(),
         authorizationToken: "$ACCESS_TOKEN"
       }});
   }
-  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, onResponse, onError) {
+  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
     const resolvedModel = model || DEFAULT_OPENAI_MODEL;
     const imageDetail = getOpenAIImageDetail(resolvedModel);
     const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
@@ -752,6 +773,7 @@ ${options.inlineContentPlaceholder}
         model: resolvedModel,
         max_output_tokens: MAX_TOKENS,
         ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
         input: responseInput,
         tools: [
           {
@@ -1026,7 +1048,7 @@ ${options.inlineContentPlaceholder}
         if (serverItemId !== void 0) em._serverItemId = serverItemId;
         mapped.push(em);
       } else if (assistantText) {
-        var okm = { role: "assistant", content: assistantText };
+        var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
         if (item._isBgTask) okm.isBackgroundTask = true;
         if (serverItemId !== void 0) okm._serverItemId = serverItemId;
         mapped.push(okm);
@@ -1092,16 +1114,16 @@ ${options.inlineContentPlaceholder}
         startKeyHistory: this.state.historyStartKeyHistory.slice()
       };
     }
-    _callProviderFor(platform, prompt, messages, system, model, userId, extractContent) {
+    _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls) {
       var id = this.host.getIdentity();
-      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent) : callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent);
+      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls);
     }
     dispatchAgentRequest(params) {
       var self = this;
       var dispatchItemId;
       var sendAndPoll = function() {
         return Promise.resolve(
-          self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
+          self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls)
         ).then(function(initial) {
           if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
             if (initial.id) {
@@ -1162,7 +1184,7 @@ ${options.inlineContentPlaceholder}
     // composed = clean display text; composedForLlm carries office-extraction
     // placeholders for the provider only. useBgQueue routes a post-attachment turn
     // onto the "-bg" queue so it runs after indexing.
-    dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent) {
+    dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent, fileUrls) {
       var self = this;
       if (!composed) return;
       var id = this.host.getIdentity();
@@ -1194,7 +1216,7 @@ ${options.inlineContentPlaceholder}
         this.updateHistoryCache();
         this.host.scrollToBottom(true);
         var capturedComposed = composed, capturedPlatform = aiPlatform;
-        Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent)).then(function(result) {
+        Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls)).then(function(result) {
           var sendingIdx = self.state.messages.findIndex(function(m) {
             return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user";
           });
@@ -1254,7 +1276,8 @@ ${options.inlineContentPlaceholder}
         text: composed,
         boundedMessages: bounded.messages,
         userId: chatQueue,
-        extractContent
+        extractContent,
+        fileUrls
       });
       Promise.resolve(run).catch(function() {
       }).then(function() {
@@ -3967,7 +3990,7 @@ ${options.inlineContentPlaceholder}
         clearSuccessfulAttachments();
         if (text) {
           var c = composeUserMessage(text, attachmentUrls);
-          session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent);
+          session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent, c.fileUrls);
         }
         if (failureGroups.length) showUploadErrorReport(failureGroups);
       }).catch(function(err) {
@@ -5018,7 +5041,7 @@ ${options.inlineContentPlaceholder}
         box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
         box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
         CS.messagesBox = box;
-        var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") + "." });
+        var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Ask anything about: " + (S.serviceName || "your project") });
         CS.inputEl = input;
         var composing = false;
         input.addEventListener("compositionstart", function() {

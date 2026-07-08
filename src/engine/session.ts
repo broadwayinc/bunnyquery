@@ -108,11 +108,11 @@ export class ChatSession {
 		};
 	}
 
-	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any) {
+	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any) {
 		var id = this.host.getIdentity();
 		return platform === 'openai'
-			? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent)
-			: callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent);
+			? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls)
+			: callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls);
 	}
 
 	dispatchAgentRequest(params: any) {
@@ -126,7 +126,7 @@ export class ChatSession {
 		var dispatchItemId: string | undefined;
 		var sendAndPoll = function () {
 			return Promise.resolve(
-				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
+				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls)
 			).then(function (initial: any) {
 				if (initial && initial.poll && (initial.status === 'pending' || initial.status === 'running')) {
 					if (initial.id) {
@@ -208,7 +208,7 @@ export class ChatSession {
 	// composed = clean display text; composedForLlm carries office-extraction
 	// placeholders for the provider only. useBgQueue routes a post-attachment turn
 	// onto the "-bg" queue so it runs after indexing.
-	dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any): void {
+	dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any): void {
 		var self = this;
 		if (!composed) return;
 		var id = this.host.getIdentity();
@@ -241,7 +241,7 @@ export class ChatSession {
 			this.host.notify(); this.updateHistoryCache(); this.host.scrollToBottom(true);
 
 			var capturedComposed = composed, capturedPlatform = aiPlatform;
-			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent))
+			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls))
 				.then(function (result: any) {
 					var sendingIdx = self.state.messages.findIndex(function (m) {
 						return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === 'user';
@@ -292,7 +292,7 @@ export class ChatSession {
 		var run = this.dispatchAgentRequest({
 			key: key, serviceId: id.serviceId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 			systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,
-			extractContent: extractContent,
+			extractContent: extractContent, fileUrls: fileUrls,
 		});
 		// Render the reply into the "Thinking..." bubble whenever the chatbox is
 		// CURRENTLY showing this chat — even after an unmount/remount. The old

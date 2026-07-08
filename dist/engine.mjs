@@ -170,6 +170,7 @@ ${lines.join("\n")}`;
   }
   let composedForLlm = composed;
   let extractContent;
+  let fileUrls;
   if (attachmentUrls.length > 0) {
     const extractFiles = attachmentUrls.filter((u) => isServerExtractable(u.name));
     if (extractFiles.length > 0) {
@@ -190,8 +191,12 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 
 ` + sections.join("\n\n");
     }
+    const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name));
+    if (urlFiles.length > 0) {
+      fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
+    }
   }
-  return { composed, composedForLlm, extractContent };
+  return { composed, composedForLlm, extractContent, fileUrls };
 }
 
 // src/engine/attachments.ts
@@ -436,13 +441,26 @@ function getExpiredAttachmentVisiblePath(remotePath, fallback) {
 function buildDisplayExpiredAttachmentHref(remotePath, fallback) {
   return EXPIRED_ATTACHMENT_URL_ORIGIN + "/" + encodePathSegments(getExpiredAttachmentVisiblePath(remotePath, fallback));
 }
-function sanitizeAttachmentLinksForHistory(content, serviceId) {
-  if (!content || content.indexOf("Attached files:") === -1) return content;
+function isServiceDbAttachmentHref(href, serviceId) {
+  if (!serviceId) return false;
+  try {
+    var parsed = new URL(href);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    var segs = normalizeAttachmentPathCandidate(parsed.pathname || "").split("/").filter(Boolean);
+    return segs.length > 0 && segs[0] === serviceId;
+  } catch (e) {
+    return false;
+  }
+}
+function sanitizeAttachmentLinksForHistory(content, serviceId, forAssistant) {
+  if (!content) return content;
+  if (!forAssistant && content.indexOf("Attached files:") === -1) return content;
   return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_m, label, href) {
+    if (forAssistant && !isServiceDbAttachmentHref(href, serviceId)) return _m;
     var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
     var labelPath = normalizeAttachmentPathCandidate(label);
     var fullPath = remotePath || labelPath;
-    if (!fullPath) return "[" + label + "](" + EXPIRED_ATTACHMENT_URL_ORIGIN + "/file)";
+    if (!fullPath) return forAssistant ? _m : "[" + label + "](" + EXPIRED_ATTACHMENT_URL_ORIGIN + "/file)";
     return "[" + label + "](" + buildDisplayExpiredAttachmentHref(fullPath, label) + ")";
   });
 }
@@ -494,7 +512,7 @@ function buildBoundedChatMessages(options) {
   var trimmed = windowed.map(function(m, i2) {
     if (i2 === latestIndex) return m;
     var stripped = stripFileBlocksFromHistory(m.content);
-    var sanitized = m.role === "user" ? sanitizeAttachmentLinksForHistory(stripped, options.serviceId) : stripped;
+    var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== "user");
     return Object.assign({}, m, { content: sanitized });
   });
   var bounded = [], used = 0;
@@ -640,7 +658,8 @@ async function callClaudeWithMcp({
   maxTokens = 1e3,
   system,
   mcpServer,
-  extractContent
+  extractContent,
+  fileUrls
 }) {
   const mcpServerDefinition = {
     type: "url",
@@ -668,6 +687,7 @@ async function callClaudeWithMcp({
       model,
       max_tokens: maxTokens,
       ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+      ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
       ...system ? {
         system: [
           {
@@ -705,7 +725,7 @@ async function callClaudeWithMcp({
     }
   });
 }
-async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, onResponse, onError) {
+async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
   return callClaudeWithMcp({
     prompt,
     messages,
@@ -716,13 +736,14 @@ async function callClaudeWithPublicMcp(prompt, service, owner, messages, system,
     maxTokens: MAX_TOKENS,
     system,
     extractContent,
+    fileUrls,
     mcpServer: {
       name: MCP_NAME,
       url: mcpUrl(),
       authorizationToken: "$ACCESS_TOKEN"
     }});
 }
-async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, onResponse, onError) {
+async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
   const resolvedModel = model || DEFAULT_OPENAI_MODEL;
   const imageDetail = getOpenAIImageDetail(resolvedModel);
   const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
@@ -759,6 +780,7 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
       model: resolvedModel,
       max_output_tokens: MAX_TOKENS,
       ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+      ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
       input: responseInput,
       tools: [
         {
@@ -1058,7 +1080,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
       mapped.push(em);
     } else if (assistantText) {
-      var okm = { role: "assistant", content: assistantText };
+      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       mapped.push(okm);
@@ -1124,16 +1146,16 @@ var ChatSession = class {
       startKeyHistory: this.state.historyStartKeyHistory.slice()
     };
   }
-  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent) {
+  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls) {
     var id = this.host.getIdentity();
-    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent) : callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent);
+    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls);
   }
   dispatchAgentRequest(params) {
     var self = this;
     var dispatchItemId;
     var sendAndPoll = function() {
       return Promise.resolve(
-        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent)
+        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
           if (initial.id) {
@@ -1194,7 +1216,7 @@ var ChatSession = class {
   // composed = clean display text; composedForLlm carries office-extraction
   // placeholders for the provider only. useBgQueue routes a post-attachment turn
   // onto the "-bg" queue so it runs after indexing.
-  dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent) {
+  dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent, fileUrls) {
     var self = this;
     if (!composed) return;
     var id = this.host.getIdentity();
@@ -1226,7 +1248,7 @@ var ChatSession = class {
       this.updateHistoryCache();
       this.host.scrollToBottom(true);
       var capturedComposed = composed, capturedPlatform = aiPlatform;
-      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent)).then(function(result) {
+      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls)).then(function(result) {
         var sendingIdx = self.state.messages.findIndex(function(m) {
           return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user";
         });
@@ -1286,7 +1308,8 @@ var ChatSession = class {
       text: composed,
       boundedMessages: bounded.messages,
       userId: chatQueue,
-      extractContent
+      extractContent,
+      fileUrls
     });
     Promise.resolve(run).catch(function() {
     }).then(function() {
@@ -2218,6 +2241,6 @@ var ChatSession = class {
   }
 };
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map
