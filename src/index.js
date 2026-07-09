@@ -1558,7 +1558,7 @@ import {
         attachments: [],          // [{ id, name, file, status, progress, uploadedUrl, storagePath, errorMessage }]
         uploadingAttachments: false,
         attachmentWarning: "",
-        attachmentCapHit: false,  // true once an add hit MAX_ATTACHMENT_FILE_COUNT; blocks the composer
+        attachmentCapNotice: "",  // informational "N files not added" when an add hit MAX_ATTACHMENT_FILE_COUNT
         attachmentsRow: null,     // .bq-attachments DOM node
         attachBtnEl: null,
         sendBtnEl: null,
@@ -2091,7 +2091,7 @@ import {
     // Unlike MAX_CHATBOX_FILE_COUNT (an advisory warning), this is enforced in
     // appendAttachments so a 10k-file drop/select can't freeze the tab. Bulk
     // uploads belong on the Upload Files page (bounded worker pool + paging).
-    var MAX_ATTACHMENT_FILE_COUNT = 100;
+    var MAX_ATTACHMENT_FILE_COUNT = 20;
     // Never materialize more than this many attachment chips as DOM nodes; the
     // "...(n) more" pill absorbs the rest. Bounds renderAttachmentChips and the
     // overflow-shrink loop to O(cap) regardless of attachment count.
@@ -2142,13 +2142,6 @@ import {
         return el ? (el.value || "").trim() : "";
     }
     function recomputeAttachmentWarning() {
-        // Hard cap hit (user tried to attach past MAX_ATTACHMENT_FILE_COUNT): show
-        // the cap message regardless of chat text, and keep the composer blocked
-        // (updateComposerControls disables input + send while this is set).
-        if (CS.attachmentCapHit) {
-            CS.attachmentWarning = "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message.";
-            return;
-        }
         // The per-request overload only happens when a chat message bundles all
         // the file URLs into one prompt. Attachment-only sends index the files
         // one-by-one (no aggregate per-request cost), so the limit — and the
@@ -2209,14 +2202,15 @@ import {
             remaining -= count;
             changed = true;
         });
-        // Attempting to attach past the ceiling puts the composer in a blocked
-        // state: show the cap message and disable the input + send button (see
-        // recomputeAttachmentWarning / updateComposerControls). It clears when the
-        // user removes attachments back under the ceiling. Attaching exactly up to
-        // the ceiling without overshooting does NOT block (that count is sendable).
-        if (dropped > 0) CS.attachmentCapHit = true;
+        // Over-cap adds are truncated (not rejected) and reported informationally:
+        // show how many files were left out, but do NOT block the composer. The
+        // user can still send with the files that were attached.
+        CS.attachmentCapNotice = dropped > 0
+            ? "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message. " +
+              dropped + " file" + (dropped === 1 ? " was" : "s were") + " not added."
+            : "";
         if (changed) { recomputeAttachmentWarning(); renderAttachmentChips(); scheduleAttachmentOverflowRecompute(); }
-        else if (dropped > 0) { recomputeAttachmentWarning(); renderAttachmentChips(); }
+        else if (dropped > 0) { renderAttachmentChips(); }
         updateComposerControls();
     }
     function addFilesToAttachments(files) {
@@ -2296,7 +2290,7 @@ import {
             return true;
         });
         CS.visibleAttachmentCount = Infinity;
-        CS.attachmentCapHit = false; // removing files clears the over-cap block
+        CS.attachmentCapNotice = ""; // removing files clears the "N not added" notice
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2308,7 +2302,7 @@ import {
         var att = CS.attachments[i];
         if (att._abort) { try { att._abort(); } catch (e) {} }
         CS.attachments.splice(i, 1);
-        CS.attachmentCapHit = false; // removing files clears the over-cap block
+        CS.attachmentCapNotice = ""; // removing files clears the "N not added" notice
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2318,7 +2312,7 @@ import {
         CS.attachments.forEach(function (a) { if (a._abort) { try { a._abort(); } catch (e) {} } });
         CS.attachments = [];
         CS.attachmentWarning = "";
-        CS.attachmentCapHit = false;
+        CS.attachmentCapNotice = "";
         renderAttachmentChips();
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
@@ -2330,7 +2324,7 @@ import {
             return a.status === "error" || a.status === "indexError";
         });
         CS.attachments.forEach(function (a) { a._abort = null; });
-        CS.attachmentCapHit = false;
+        CS.attachmentCapNotice = "";
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2363,8 +2357,12 @@ import {
         var row = CS.attachmentsRow;
         if (!row) return;
         row.innerHTML = "";
-        if (!CS.attachments.length && !CS.attachmentWarning) { row.style.display = "none"; return; }
+        if (!CS.attachments.length && !CS.attachmentWarning && !CS.attachmentCapNotice) { row.style.display = "none"; return; }
         row.style.display = "";
+        // Informational cap notice ("N files not added"): shown but non-blocking.
+        if (CS.attachmentCapNotice) {
+            row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentCapNotice })));
+        }
         if (CS.attachmentWarning) {
             row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentWarning })));
         }
@@ -2447,16 +2445,14 @@ import {
     }
     function updateComposerControls() {
         var uploading = CS.uploadingAttachments;
-        // When the attachment ceiling has been hit, block the composer entirely
-        // (input + attach + send) until the user removes files back under it.
-        var blocked = uploading || CS.attachmentCapHit;
-        if (CS.attachBtnEl) CS.attachBtnEl.disabled = blocked;
-        // #3: lock the chat input while the upload batch runs, or while over the cap.
-        if (CS.inputEl) CS.inputEl.disabled = blocked;
-        // Block sending while uploading, over the cap, or while an attachment
-        // warning is shown (too many files / over budget together with a chat
-        // message; the warning is only set when there is chat input text).
-        if (CS.sendBtnEl) CS.sendBtnEl.disabled = blocked || !!CS.attachmentWarning;
+        if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
+        // #3: lock the chat input while the upload batch runs.
+        if (CS.inputEl) CS.inputEl.disabled = uploading;
+        // Block sending while uploading, or while an attachment warning is shown
+        // (too many files / over budget together with a chat message). The
+        // warning is only set when there is chat input text (recomputeAttachmentWarning).
+        // The cap notice (attachmentCapNotice) is informational and does NOT block.
+        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading || !!CS.attachmentWarning;
     }
     function onAttachInputChange(inputEl) {
         if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -2753,7 +2749,7 @@ import {
         // reset transient chat state on (re)entry
         CS.messages = []; CS.messageEls = []; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
-        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapHit = false;
+        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
         CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
         CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null;

@@ -2214,7 +2214,7 @@ ${options.inlineContentPlaceholder}
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.5.4" ;
+    var BQ_VERSION = "1.5.5" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -3814,8 +3814,8 @@ ${options.inlineContentPlaceholder}
       // [{ id, name, file, status, progress, uploadedUrl, storagePath, errorMessage }]
       uploadingAttachments: false,
       attachmentWarning: "",
-      attachmentCapHit: false,
-      // true once an add hit MAX_ATTACHMENT_FILE_COUNT; blocks the composer
+      attachmentCapNotice: "",
+      // informational "N files not added" when an add hit MAX_ATTACHMENT_FILE_COUNT
       attachmentsRow: null,
       // .bq-attachments DOM node
       attachBtnEl: null,
@@ -4333,7 +4333,7 @@ ${options.inlineContentPlaceholder}
     var FILE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
     var FOLDER_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
     var MAX_CHATBOX_FILE_COUNT = 20;
-    var MAX_ATTACHMENT_FILE_COUNT = 100;
+    var MAX_ATTACHMENT_FILE_COUNT = 20;
     var VISIBLE_CHIP_CAP = 30;
     var ESTIMATED_BYTES_PER_TOKEN = 3;
     var ESTIMATED_PDF_BYTES_PER_TOKEN = 5e3;
@@ -4387,10 +4387,6 @@ ${options.inlineContentPlaceholder}
       return el ? (el.value || "").trim() : "";
     }
     function recomputeAttachmentWarning() {
-      if (CS.attachmentCapHit) {
-        CS.attachmentWarning = "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message.";
-        return;
-      }
       if (!currentChatInputText()) {
         CS.attachmentWarning = "";
         return;
@@ -4455,13 +4451,12 @@ ${options.inlineContentPlaceholder}
         remaining -= count;
         changed = true;
       });
-      if (dropped > 0) CS.attachmentCapHit = true;
+      CS.attachmentCapNotice = dropped > 0 ? "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message. " + dropped + " file" + (dropped === 1 ? " was" : "s were") + " not added." : "";
       if (changed) {
         recomputeAttachmentWarning();
         renderAttachmentChips();
         scheduleAttachmentOverflowRecompute();
       } else if (dropped > 0) {
-        recomputeAttachmentWarning();
         renderAttachmentChips();
       }
       updateComposerControls();
@@ -4566,7 +4561,7 @@ ${options.inlineContentPlaceholder}
         return true;
       });
       CS.visibleAttachmentCount = Infinity;
-      CS.attachmentCapHit = false;
+      CS.attachmentCapNotice = "";
       recomputeAttachmentWarning();
       renderAttachmentChips();
       updateComposerControls();
@@ -4585,7 +4580,7 @@ ${options.inlineContentPlaceholder}
         }
       }
       CS.attachments.splice(i, 1);
-      CS.attachmentCapHit = false;
+      CS.attachmentCapNotice = "";
       recomputeAttachmentWarning();
       renderAttachmentChips();
       updateComposerControls();
@@ -4602,7 +4597,7 @@ ${options.inlineContentPlaceholder}
       });
       CS.attachments = [];
       CS.attachmentWarning = "";
-      CS.attachmentCapHit = false;
+      CS.attachmentCapNotice = "";
       renderAttachmentChips();
       updateComposerControls();
       scheduleAttachmentOverflowRecompute();
@@ -4614,7 +4609,7 @@ ${options.inlineContentPlaceholder}
       CS.attachments.forEach(function(a) {
         a._abort = null;
       });
-      CS.attachmentCapHit = false;
+      CS.attachmentCapNotice = "";
       recomputeAttachmentWarning();
       renderAttachmentChips();
       updateComposerControls();
@@ -4642,11 +4637,14 @@ ${options.inlineContentPlaceholder}
       var row = CS.attachmentsRow;
       if (!row) return;
       row.innerHTML = "";
-      if (!CS.attachments.length && !CS.attachmentWarning) {
+      if (!CS.attachments.length && !CS.attachmentWarning && !CS.attachmentCapNotice) {
         row.style.display = "none";
         return;
       }
       row.style.display = "";
+      if (CS.attachmentCapNotice) {
+        row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentCapNotice })));
+      }
       if (CS.attachmentWarning) {
         row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentWarning })));
       }
@@ -4731,10 +4729,9 @@ ${options.inlineContentPlaceholder}
     }
     function updateComposerControls() {
       var uploading = CS.uploadingAttachments;
-      var blocked = uploading || CS.attachmentCapHit;
-      if (CS.attachBtnEl) CS.attachBtnEl.disabled = blocked;
-      if (CS.inputEl) CS.inputEl.disabled = blocked;
-      if (CS.sendBtnEl) CS.sendBtnEl.disabled = blocked || !!CS.attachmentWarning;
+      if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
+      if (CS.inputEl) CS.inputEl.disabled = uploading;
+      if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading || !!CS.attachmentWarning;
     }
     function onAttachInputChange(inputEl) {
       if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -5067,7 +5064,7 @@ ${options.inlineContentPlaceholder}
       CS.attachments = [];
       CS.uploadingAttachments = false;
       CS.attachmentWarning = "";
-      CS.attachmentCapHit = false;
+      CS.attachmentCapNotice = "";
       CS.attachmentsRow = null;
       CS.attachBtnEl = null;
       CS.sendBtnEl = null;
