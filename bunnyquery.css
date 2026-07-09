@@ -246,14 +246,16 @@
 /* ============================================================================
  * AUTH VIEWS (login / signup / forgot / verify / settings)
  * ==========================================================================*/
-/* padded parent that nests a standalone page (login / signup / verify / …) */
+/* padded parent that nests a standalone page (login / signup / verify / …).
+   Sits below the shared .bq-section-title header (the top-left service badge),
+   so the top padding is small — the header supplies the top spacing. */
 .bq-page {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    padding: 2.5rem 1.5rem;
+    padding: 1rem 1.5rem 2.5rem;
 }
 .bq-settings {
     flex: 1;
@@ -262,6 +264,15 @@
     margin: 0 auto;
     font-family: var(--bq-mono);
     color: var(--bq-ink);
+}
+
+/* full-box loading view: fill the space above the footer and center the bunny */
+.bq-page-loading {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .bq-page-footer {
@@ -276,6 +287,12 @@
     text-decoration: none;
 }
 .bq-page-footer-link:hover { text-decoration: underline; }
+.bq-page-footer-version {
+    font-family: var(--bq-mono);
+    font-size: 0.7rem;
+    color: var(--bq-muted);
+    margin-top: 0.25rem;
+}
 
 .bq-settings-title {
     font-size: 1.5rem;
@@ -559,11 +576,11 @@
     align-items: center;
     gap: 0.45rem;
     padding: 0.3rem 0.6rem;
-    border: 1px solid var(--bq-line);
-    background: var(--bq-paper);
+    border: 1px solid var(--bq-main);
+    background: var(--bq-main-bg);
     font-size: 0.75rem;
     font-family: var(--bq-mono);
-    color: var(--bq-ink);
+    color: var(--bq-main);
     max-width: 100%;
     overflow: hidden;
 }
@@ -608,7 +625,16 @@
     margin: 0 auto;
     padding: 1.25rem 0 2rem;
 }
-.bq-chat-settings-loading { text-align: center; padding: 2.5rem 0; color: var(--bq-muted); }
+/* fill the messages box and center the bunny (matches .bq-history-loading.is-initial).
+   Resolves against .bq-messages (position: relative), not the max-width settings wrap. */
+.bq-chat-settings-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--bq-muted);
+}
 
 /* chat container + scroll area */
 .bq-chat {
@@ -756,6 +782,8 @@
 .bq-input::placeholder { color: var(--bq-placeholder); }
 .bq-input:focus { outline: none; border-color: var(--bq-ink); }
 .bq-input:disabled { opacity: 0.5; cursor: default; }
+/* Attach button hidden (frozen DB): reclaim the reserved left gutter. */
+.bq-input.bq-input--noattach { padding-left: 0.7rem; }
 .bq-input-row .btn {
     align-self: flex-end;
     min-width: 5.5rem;

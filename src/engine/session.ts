@@ -774,18 +774,26 @@ export class ChatSession {
 		var id = this.host.getIdentity();
 		var svcId = id.serviceId, plat = id.platform;
 		if (!svcId || plat === 'none' || !this.host.isViewMounted()) return;
+		// Index messages by _serverItemId ONCE, so the per-entry presence/pending
+		// checks below are O(1) instead of a full messages.some() scan each. With a
+		// large bg queue (bulk uploads) the old nested scan was O(queue x messages)
+		// per drain, and the drain runs once per uploaded file (O(n^3) overall).
+		var presentIds: { [id: string]: boolean } = {};
+		var pendingIds: { [id: string]: boolean } = {};
+		this.state.messages.forEach(function (m) {
+			var sid = m._serverItemId;
+			if (sid == null) return;
+			presentIds[sid] = true;
+			if (m.isPending || m.isPendingInProcess || m.isPendingQueued) pendingIds[sid] = true;
+		});
 		for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
 			var e = this.bgTaskQueue[i];
 			if (e.serviceId !== svcId || e.platform !== plat) continue;
-			var present = this.state.messages.some(function (m) { return m._serverItemId === e.id; });
-			var stillPending = this.state.messages.some(function (m) {
-				return m._serverItemId === e.id && (m.isPending || m.isPendingInProcess || m.isPendingQueued);
-			});
-			if (present && !stillPending) this.bgTaskQueue.splice(i, 1);
+			if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
 		}
 		this.bgTaskQueue.forEach(function (entry) {
 			if (entry.serviceId !== svcId || entry.platform !== plat) return;
-			if (self.state.messages.some(function (m) { return m._serverItemId === entry.id; })) return;
+			if (presentIds[entry.id]) return;
 			var isRunning = entry.status === 'running';
 			var userBubble: ChatMessage = { role: 'user', content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
 			if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
@@ -793,6 +801,7 @@ export class ChatSession {
 			if (isRunning) {
 				self.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
 			}
+			presentIds[entry.id] = true; // keep the index consistent with the pushed bubbles
 			self.host.notify(); self.updateHistoryCache(); self.host.scrollToBottom(false);
 			if (!self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
 				self.historyItemPolls.set(entry.id, true);

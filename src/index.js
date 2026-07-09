@@ -371,13 +371,26 @@ import {
     // .bq-settings content. (The chat view supplies its own padding on
     // .bq-messages / .bq-input-row, so page padding lives here.)
     function pageRoot(content) {
-        return h("div", { class: "bq-page" }, h("div", { class: "bq-settings" }, content), pageFooter());
+        // Same top-left header the chat/settings views use (.bq-section-title >
+        // .bq-title-row > .bq-title-left), so the service badge sits flush at the
+        // widget's top-left instead of being indented into the centered content
+        // column. The scrollable .bq-page below holds the centered form + footer.
+        return h("div", { class: "bq-meta" },
+            h("div", { class: "bq-section-title" },
+                h("div", { class: "bq-title-row" },
+                    h("div", { class: "bq-title-left" },
+                        h("span", { class: "bq-agent-badge", text: agentBadgeText() })))),
+            h("div", { class: "bq-page" },
+                h("div", { class: "bq-settings" }, content),
+                pageFooter()));
     }
-    // Gray "www.bunnyquery.com" link, centered at the bottom of standalone pages.
+    // Gray "www.bunnyquery.com" link + current widget version, centered at the
+    // bottom of standalone pages.
     function pageFooter() {
         return h("div", { class: "bq-page-footer" },
             h("a", { class: "bq-page-footer-link", href: "https://www.bunnyquery.com",
-                target: "_blank", rel: "noopener noreferrer", text: "www.bunnyquery.com" }));
+                target: "_blank", rel: "noopener noreferrer", text: "www.bunnyquery.com" }),
+            h("div", { class: "bq-page-footer-version", text: "v" + BQ_VERSION }));
     }
     // Jumping ASCII bunny — the full-area "loading/fetching" indicator (page/gate
     // loads, initial history fetch, settings panel). Ported from www.bunnyquery.com
@@ -400,11 +413,13 @@ import {
     }
     function showLoading(label) {
         render("loading", function () {
-            return pageRoot(
-                h("div", { class: "bq-disabled-inner", style: { marginTop: "3rem" } },
-                    bunnyLoader(label || "Loading...")
-                )
-            );
+            // Fill the page and center the bunny (matching the "Fetching history..."
+            // initial loader), rather than top-anchoring it. The footer stays pinned
+            // at the bottom via .bq-page's column flex.
+            return h("div", { class: "bq-page" },
+                h("div", { class: "bq-page-loading" },
+                    bunnyLoader(label || "Loading...")),
+                pageFooter());
         });
     }
 
@@ -912,11 +927,21 @@ import {
         });
     }
 
-    // Shared settings-view shell: header + optional "back to login" link.
+    // Shared settings-view shell: header + optional back link. By default a
+    // "← Back to login" link is appended at the bottom. Pass opts.topBack =
+    // { label, onClick } to instead place a back link ABOVE the title (the
+    // settings-page layout, e.g. the verify-email page's "← Back to settings").
     function authShell(title, children, opts) {
         opts = opts || {};
-        var kids = authHeader(title).concat(children);
-        if (opts.back !== false) {
+        var kids = [];
+        if (opts.topBack) {
+            kids.push(h("div", { class: "bq-settings-top" },
+                h("button", { class: "bq-link", type: "button",
+                    onclick: opts.topBack.onClick,
+                    text: opts.topBack.label || "← Back" })));
+        }
+        kids = kids.concat(authHeader(title)).concat(children);
+        if (opts.back !== false && !opts.topBack) {
             kids.push(h("div", { class: "bq-actions", style: { marginTop: "1.5rem" } },
                 h("button", { class: "bq-link", type: "button",
                     onclick: function () { renderLogin(opts.backPrefill); },
@@ -1200,7 +1225,8 @@ import {
                     h("div", { class: "bq-actions" }, resend),
                     note,
                     h("div", { class: "bq-form-bottom" }, btn))
-            ], { back: false });
+            ], { topBack: { label: "← Back to settings",
+                onClick: function () { renderChat(); openChatSettings(); } } });
             // auto-send the first code on entry
             sendCode(note);
             return shell;
@@ -1532,6 +1558,7 @@ import {
         attachments: [],          // [{ id, name, file, status, progress, uploadedUrl, storagePath, errorMessage }]
         uploadingAttachments: false,
         attachmentWarning: "",
+        attachmentCapHit: false,  // true once an add hit MAX_ATTACHMENT_FILE_COUNT; blocks the composer
         attachmentsRow: null,     // .bq-attachments DOM node
         attachBtnEl: null,
         sendBtnEl: null,
@@ -2060,6 +2087,15 @@ import {
      * — they are all attached and the warning is informational.
      * ---------------------------------------------------------------------- */
     var MAX_CHATBOX_FILE_COUNT = 20;
+    // Hard ceiling on how many files can be attached to a single chat message.
+    // Unlike MAX_CHATBOX_FILE_COUNT (an advisory warning), this is enforced in
+    // appendAttachments so a 10k-file drop/select can't freeze the tab. Bulk
+    // uploads belong on the Upload Files page (bounded worker pool + paging).
+    var MAX_ATTACHMENT_FILE_COUNT = 100;
+    // Never materialize more than this many attachment chips as DOM nodes; the
+    // "...(n) more" pill absorbs the rest. Bounds renderAttachmentChips and the
+    // overflow-shrink loop to O(cap) regardless of attachment count.
+    var VISIBLE_CHIP_CAP = 30;
     var ESTIMATED_BYTES_PER_TOKEN = 3;
     var ESTIMATED_PDF_BYTES_PER_TOKEN = 5000;
     var ESTIMATED_IMAGE_TOKENS = 800;
@@ -2106,6 +2142,13 @@ import {
         return el ? (el.value || "").trim() : "";
     }
     function recomputeAttachmentWarning() {
+        // Hard cap hit (user tried to attach past MAX_ATTACHMENT_FILE_COUNT): show
+        // the cap message regardless of chat text, and keep the composer blocked
+        // (updateComposerControls disables input + send while this is set).
+        if (CS.attachmentCapHit) {
+            CS.attachmentWarning = "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message.";
+            return;
+        }
         // The per-request overload only happens when a chat message bundles all
         // the file URLs into one prompt. Attachment-only sends index the files
         // one-by-one (no aggregate per-request cost), so the limit — and the
@@ -2140,20 +2183,40 @@ import {
         return Object.assign({ id: "att_" + randomLowerString(10), status: "pending", progress: 0,
             uploadedUrl: "", storagePath: "", errorMessage: "" }, props);
     }
-    // Append pre-built attachment objects (kind:"file" | "folder"), de-duped.
+    // Append pre-built attachment objects (kind:"file" | "folder"), de-duped and
+    // hard-capped at MAX_ATTACHMENT_FILE_COUNT total files (folders count as their
+    // file count). Excess files are dropped (the boundary folder is truncated) so
+    // a mass drop/select can never balloon the attachment set past the ceiling.
     function appendAttachments(attObjs) {
         var seen = {};
         CS.attachments.forEach(function (a) { seen[attachmentKey(a)] = true; });
+        var remaining = MAX_ATTACHMENT_FILE_COUNT - attachmentFileCount();
+        var dropped = 0;
         var changed = false;
         (attObjs || []).forEach(function (a) {
             if (!a) return;
             var k = attachmentKey(a);
             if (seen[k]) return;
+            var count = (a.kind === "folder") ? (a.files ? a.files.length : 0) : 1;
+            if (remaining <= 0) { dropped += count; return; }
+            if (a.kind === "folder" && count > remaining) {
+                dropped += count - remaining;
+                a.files = a.files.slice(0, remaining);
+                count = remaining;
+            }
             seen[k] = true;
             CS.attachments.push(a);
+            remaining -= count;
             changed = true;
         });
+        // Attempting to attach past the ceiling puts the composer in a blocked
+        // state: show the cap message and disable the input + send button (see
+        // recomputeAttachmentWarning / updateComposerControls). It clears when the
+        // user removes attachments back under the ceiling. Attaching exactly up to
+        // the ceiling without overshooting does NOT block (that count is sendable).
+        if (dropped > 0) CS.attachmentCapHit = true;
         if (changed) { recomputeAttachmentWarning(); renderAttachmentChips(); scheduleAttachmentOverflowRecompute(); }
+        else if (dropped > 0) { recomputeAttachmentWarning(); renderAttachmentChips(); }
         updateComposerControls();
     }
     function addFilesToAttachments(files) {
@@ -2208,11 +2271,15 @@ import {
         var total = CS.attachments.length;
         if (!row || !chat) return;
         if (!total) { CS.visibleAttachmentCount = Infinity; return; }
-        CS.visibleAttachmentCount = total; // start by showing all, then shrink to fit
+        // Start from the render cap (not `total`): renderAttachmentChips never
+        // materializes more than VISIBLE_CHIP_CAP chips, so measuring/shrinking
+        // from a higher count would spin uselessly. This bounds the loop to
+        // O(cap) iterations instead of O(n).
+        var count = Math.min(total, VISIBLE_CHIP_CAP);
+        CS.visibleAttachmentCount = count; // start at the cap, then shrink to fit
         renderAttachmentChips();
         var maxHeight = chat.clientHeight * ATTACHMENTS_MAX_HEIGHT_RATIO;
         if (maxHeight <= 0) return;
-        var count = total;
         while (count > 0 && row.scrollHeight > maxHeight) {
             count--;
             CS.visibleAttachmentCount = count;
@@ -2229,6 +2296,7 @@ import {
             return true;
         });
         CS.visibleAttachmentCount = Infinity;
+        CS.attachmentCapHit = false; // removing files clears the over-cap block
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2240,6 +2308,7 @@ import {
         var att = CS.attachments[i];
         if (att._abort) { try { att._abort(); } catch (e) {} }
         CS.attachments.splice(i, 1);
+        CS.attachmentCapHit = false; // removing files clears the over-cap block
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2249,6 +2318,7 @@ import {
         CS.attachments.forEach(function (a) { if (a._abort) { try { a._abort(); } catch (e) {} } });
         CS.attachments = [];
         CS.attachmentWarning = "";
+        CS.attachmentCapHit = false;
         renderAttachmentChips();
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
@@ -2260,6 +2330,7 @@ import {
             return a.status === "error" || a.status === "indexError";
         });
         CS.attachments.forEach(function (a) { a._abort = null; });
+        CS.attachmentCapHit = false;
         recomputeAttachmentWarning();
         renderAttachmentChips();
         updateComposerControls();
@@ -2298,7 +2369,10 @@ import {
             row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentWarning })));
         }
         var sorted = sortedAttachments();
-        var vis = CS.visibleAttachmentCount;
+        // Hard cap the number of chips ever built as DOM nodes, independent of
+        // visibleAttachmentCount (which the overflow loop may leave high). Excess
+        // attachments collapse into the "...(n) more" pill below.
+        var vis = Math.min(CS.visibleAttachmentCount, VISIBLE_CHIP_CAP);
         var shown = (vis >= sorted.length) ? sorted : sorted.slice(0, Math.max(0, vis));
         var hidden = sorted.slice(shown.length);
         shown.forEach(function (att) {
@@ -2341,8 +2415,10 @@ import {
         // #10: when chips overflow, a "...(x) more" pill whose × drops the hidden
         // files; when nothing is hidden, a single "Remove all" button instead.
         if (hidden.length > 0) {
+            var moreNames = hidden.slice(0, 50).map(function (a) { return a.kind === "folder" ? a.name + "/" : a.name; });
+            if (hidden.length > moreNames.length) moreNames.push("...and " + (hidden.length - moreNames.length) + " more");
             var moreChip = h("div", { class: "bq-attachment bq-attachment-more",
-                title: hidden.map(function (a) { return a.kind === "folder" ? a.name + "/" : a.name; }).join("\n") });
+                title: moreNames.join("\n") });
             moreChip.appendChild(h("span", { class: "bq-attachment-name", text: "…(" + hidden.length + ") more" }));
             if (!CS.uploadingAttachments) {
                 var moreRm = h("button", { class: "bq-attachment-remove", type: "button",
@@ -2371,13 +2447,16 @@ import {
     }
     function updateComposerControls() {
         var uploading = CS.uploadingAttachments;
-        if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
-        // #3: lock the chat input while the upload batch runs.
-        if (CS.inputEl) CS.inputEl.disabled = uploading;
-        // Block sending while uploading, or while an attachment warning is shown
-        // (too many files / over budget together with a chat message). The
-        // warning is only set when there is chat input text (recomputeAttachmentWarning).
-        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading || !!CS.attachmentWarning;
+        // When the attachment ceiling has been hit, block the composer entirely
+        // (input + attach + send) until the user removes files back under it.
+        var blocked = uploading || CS.attachmentCapHit;
+        if (CS.attachBtnEl) CS.attachBtnEl.disabled = blocked;
+        // #3: lock the chat input while the upload batch runs, or while over the cap.
+        if (CS.inputEl) CS.inputEl.disabled = blocked;
+        // Block sending while uploading, over the cap, or while an attachment
+        // warning is shown (too many files / over budget together with a chat
+        // message; the warning is only set when there is chat input text).
+        if (CS.sendBtnEl) CS.sendBtnEl.disabled = blocked || !!CS.attachmentWarning;
     }
     function onAttachInputChange(inputEl) {
         if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -2674,7 +2753,7 @@ import {
         // reset transient chat state on (re)entry
         CS.messages = []; CS.messageEls = []; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
-        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = "";
+        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapHit = false;
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
         CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
         CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null;
@@ -2741,6 +2820,9 @@ import {
             // button + file input entirely (null children are skipped by h()).
             // Drag-drop is likewise gated below so there's no upload path at all.
             var attachDisabled = uploadsFrozenForUser();
+            // No clip button means no absolutely-positioned control in the left
+            // gutter, so drop the reserved left padding on the textarea.
+            if (attachDisabled) input.classList.add("bq-input--noattach");
             var attachFileInput = null, attachBtn = null;
             if (!attachDisabled) {
                 attachFileInput = h("input", { class: "bq-attach-input", type: "file", multiple: "multiple" });
@@ -2859,7 +2941,7 @@ import {
 
     function agentBadgeText() {
         if (S.aiPlatform === "none") return "No agent configured";
-        return S.serviceName ? "BunnyQuery · " + S.serviceName : "BunnyQuery";
+        return S.serviceName || "BunnyQuery";
     }
 
     /* ========================================================================
@@ -2932,7 +3014,16 @@ import {
 
     function boot() {
         showLoading("");
+        // Load connection info up-front (needs no auth) so the service-name badge
+        // is populated before the login/signup/verify pages render. enterAfterLogin
+        // re-loads it post-auth, so a miss here (offline, etc.) is non-fatal.
+        return loadServiceInfo()
+            .then(function (conn) { if (conn) { S.service = conn; applyAgentConfig(); } })
+            .catch(function () {})
+            .then(bootFlow);
+    }
 
+    function bootFlow() {
         // 0. INBOUND IdP: the MCP authorize step (or another platform) sent the
         // user here to authenticate against skapi. Bounce back with a session
         // code if logged in; otherwise show login (the submit handler bounces

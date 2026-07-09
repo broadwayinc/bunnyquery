@@ -1826,22 +1826,22 @@ var ChatSession = class {
     var id = this.host.getIdentity();
     var svcId = id.serviceId, plat = id.platform;
     if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
+    var presentIds = {};
+    var pendingIds = {};
+    this.state.messages.forEach(function(m) {
+      var sid = m._serverItemId;
+      if (sid == null) return;
+      presentIds[sid] = true;
+      if (m.isPending || m.isPendingInProcess || m.isPendingQueued) pendingIds[sid] = true;
+    });
     for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
       var e = this.bgTaskQueue[i];
       if (e.serviceId !== svcId || e.platform !== plat) continue;
-      var present = this.state.messages.some(function(m) {
-        return m._serverItemId === e.id;
-      });
-      var stillPending = this.state.messages.some(function(m) {
-        return m._serverItemId === e.id && (m.isPending || m.isPendingInProcess || m.isPendingQueued);
-      });
-      if (present && !stillPending) this.bgTaskQueue.splice(i, 1);
+      if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
     }
     this.bgTaskQueue.forEach(function(entry) {
       if (entry.serviceId !== svcId || entry.platform !== plat) return;
-      if (self.state.messages.some(function(m) {
-        return m._serverItemId === entry.id;
-      })) return;
+      if (presentIds[entry.id]) return;
       var isRunning = entry.status === "running";
       var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
       if (isRunning) userBubble.isPendingInProcess = true;
@@ -1850,6 +1850,7 @@ var ChatSession = class {
       if (isRunning) {
         self.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
       }
+      presentIds[entry.id] = true;
       self.host.notify();
       self.updateHistoryCache();
       self.host.scrollToBottom(false);

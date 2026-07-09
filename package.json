@@ -1,6 +1,6 @@
 {
   "name": "bunnyquery",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Embeddable BunnyQuery AI chat widget + its framework-agnostic chat engine",
   "main": "bunnyquery.js",
   "exports": {
