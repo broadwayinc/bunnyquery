@@ -101,6 +101,30 @@ export function isServerExtractable(name?: string, mime?: string): boolean {
 /** @deprecated renamed to {@link isServerExtractable} (now also covers text files). */
 export const isOfficeFile = isServerExtractable;
 
+// Extensions that are best read WINDOW-BY-WINDOW via the readFileContent tool instead of
+// inlined once: spreadsheets (grid rows + embedded photos, and can be huge) and PDFs
+// (scanned page images). For these the indexing agent is told to page through the whole
+// file with readFileContent rather than reading a capped inline dump or web_fetching a URL.
+const PAGED_READ_EXTENSIONS = new Set(['xls', 'xlsx', 'xlsm', 'ods', 'pdf']);
+
+/**
+ * True when a file should be indexed by PAGING through readFileContent (spreadsheets and
+ * PDFs), rather than inline extraction or a web_fetch URL. This is what lets a huge sheet
+ * be read row-window by row-window and a scanned PDF be read page-image by page-image,
+ * with embedded photos delivered to the vision model.
+ */
+export function isPagedReadFile(name?: string, mime?: string): boolean {
+	const ext = (name || '').split('.').pop()?.toLowerCase() || '';
+	if (PAGED_READ_EXTENSIONS.has(ext)) return true;
+	const m = (mime || '').toLowerCase();
+	return (
+		m === 'application/pdf' ||
+		m === 'application/vnd.ms-excel' ||
+		m.includes('spreadsheetml') ||
+		m.includes('opendocument.spreadsheet')
+	);
+}
+
 // Monotonic counter so placeholders are unique even for same-named files in one
 // request. Token shape must match the worker's _EXTRACT_PLACEHOLDER_RE:
 // {{SKAPI_FILE_CONTENT::<id>}}.

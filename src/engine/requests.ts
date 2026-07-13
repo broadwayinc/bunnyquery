@@ -11,7 +11,7 @@
  *                                    only the BgTaskEntry TYPE lives here)
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage } from './prompts';
-import { isServerExtractable, makeExtractPlaceholder, type ExtractDirective, type FileUrlDirective } from './office';
+import { isServerExtractable, isPagedReadFile, makeExtractPlaceholder, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, pollOpt } from './config';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -450,8 +450,13 @@ export type AttachmentSaveInfo = {
 export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const { platform, service, owner, attachment, parsedContent } = info;
 
+	// Spreadsheets and PDFs are read by PAGING through readFileContent (grid rows +
+	// embedded photos / scanned page images), NOT inlined once - so they skip the inline
+	// server-extract and the agent is told to page the whole file (see pagedRead below).
+	const pagedRead = !parsedContent && isPagedReadFile(attachment.name, attachment.mime);
+
 	// Client-parsed content wins over server-side extraction.
-	const serverExtract = !parsedContent && isServerExtractable(attachment.name, attachment.mime);
+	const serverExtract = !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
 	const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : undefined;
 	const extractContent: ExtractDirective[] | undefined =
 		serverExtract && placeholder
@@ -466,7 +471,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			? { inlineContent: parsedContent }
 			: placeholder
 				? { inlineContentPlaceholder: placeholder }
-				: undefined,
+				: pagedRead
+					? { pagedRead: true }
+					: undefined,
 	);
 
 	const systemPrompt = buildIndexingSystemPrompt({

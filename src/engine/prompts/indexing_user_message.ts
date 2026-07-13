@@ -36,6 +36,12 @@ export type BuildIndexingUserMessageOptions = {
 	 * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
 	 */
 	inlineContent?: string;
+	/**
+	 * Spreadsheet or PDF: read by PAGING through the readFileContent tool (grid rows +
+	 * embedded photos / rendered scanned pages), not inline and not by web_fetch. The
+	 * message instructs the agent to page through EVERY window and datafy each.
+	 */
+	pagedRead?: boolean;
 };
 
 export function buildIndexingUserMessage(
@@ -75,6 +81,20 @@ export function buildIndexingUserMessage(
 			`----- BEGIN FILE CONTENT -----\n` +
 			`${options.inlineContentPlaceholder}\n` +
 			`----- END FILE CONTENT -----`
+		);
+	}
+
+	if (options?.pagedRead) {
+		// Spreadsheet / PDF: force the paging path. The agent MUST read this with the
+		// readFileContent tool (which returns the file window by window, with grid rows,
+		// embedded photos, and rendered scanned pages), NOT by fetching the URL.
+		return (
+			head +
+			`\nRead this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. ` +
+			`readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. ` +
+			`Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. ` +
+			`Do NOT stop after the first window and do NOT just write a summary. Use the storage path above for the "src::" unique_id.` +
+			(attachment.url ? `\n(A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : '')
 		);
 	}
 

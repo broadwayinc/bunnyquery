@@ -233,6 +233,12 @@ type BuildIndexingUserMessageOptions = {
      * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
      */
     inlineContent?: string;
+    /**
+     * Spreadsheet or PDF: read by PAGING through the readFileContent tool (grid rows +
+     * embedded photos / rendered scanned pages), not inline and not by web_fetch. The
+     * message instructs the agent to page through EVERY window and datafy each.
+     */
+    pagedRead?: boolean;
 };
 declare function buildIndexingUserMessage(attachment: IndexingAttachmentInfo, options?: BuildIndexingUserMessageOptions): string;
 
