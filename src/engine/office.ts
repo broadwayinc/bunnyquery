@@ -125,6 +125,18 @@ export function isPagedReadFile(name?: string, mime?: string): boolean {
 	);
 }
 
+/**
+ * True for files whose content is VISUAL and must be delivered to the model as IMAGE
+ * BLOCKS in the message (rendered pages), because tool-result images render on neither
+ * provider. The worker renders a page window to image URLs and injects them (`_skapi_render`
+ * directive). Currently PDFs (scanned or not); indexed page-window by page-window with
+ * resume advancing the window.
+ */
+export function isImageVisionFile(name?: string, mime?: string): boolean {
+	const ext = (name || '').split('.').pop()?.toLowerCase() || '';
+	return ext === 'pdf' || (mime || '').toLowerCase() === 'application/pdf';
+}
+
 // Monotonic counter so placeholders are unique even for same-named files in one
 // request. Token shape must match the worker's _EXTRACT_PLACEHOLDER_RE:
 // {{SKAPI_FILE_CONTENT::<id>}}.
@@ -134,6 +146,19 @@ export function makeExtractPlaceholder(seed: string): string {
 	const slug = (seed || 'file').replace(/[^a-zA-Z0-9]+/g, '_').slice(-48);
 	return `{{SKAPI_FILE_CONTENT::${slug}-${_extractPlaceholderSeq}}}`;
 }
+
+// Placeholder marking WHERE the worker injects a window of rendered page/photo IMAGE blocks
+// (the `_skapi_render` directive). Distinct token from the text-extraction placeholder.
+let _renderPlaceholderSeq = 0;
+export function makeRenderPlaceholder(seed: string): string {
+	_renderPlaceholderSeq += 1;
+	const slug = (seed || 'file').replace(/[^a-zA-Z0-9]+/g, '_').slice(-48);
+	return `{{SKAPI_RENDER::${slug}-${_renderPlaceholderSeq}}}`;
+}
+
+// Page/photo images per render window. Must match the server default so the client's
+// resume window (from = pass * PAGES) lines up with what the worker renders.
+export const RENDER_PAGES_PER_WINDOW = 5;
 
 export interface ComposedUserMessage {
 	/** Clean display/history copy (attachment links, NO extraction placeholders). */

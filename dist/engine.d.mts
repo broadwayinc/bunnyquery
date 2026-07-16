@@ -241,6 +241,23 @@ type BuildIndexingUserMessageOptions = {
     pagedRead?: boolean;
 };
 declare function buildIndexingUserMessage(attachment: IndexingAttachmentInfo, options?: BuildIndexingUserMessageOptions): string;
+/**
+ * User message for a VISION file (PDF): its pages are delivered as RENDERED PAGE IMAGES that
+ * the proxy worker injects into THIS message at the `placeholder` token (tool-result images
+ * render on neither provider, so the pages must be image blocks in the message itself). Each
+ * pass shows one WINDOW of pages starting at `renderFrom` (0-based); the resume loop advances
+ * the window a pass at a time until the injected note says the last window was reached.
+ *
+ * renderFrom === 0 is the FIRST pass (leads with "A new file has just been uploaded." so the
+ * client builds the "Indexing: <name>" bubble); renderFrom > 0 is a RESUME pass (leads with
+ * "CONTINUE indexing" like the paged continue message, so it is not a duplicate primary bubble).
+ */
+declare function buildIndexingRenderMessage(attachment: IndexingAttachmentInfo, placeholder: string, renderFrom: number): string;
+/**
+ * User message for a RESUME pass: a previous indexing pass could not finish this large
+ * file, so continue it from where the already-saved records leave off (never restart).
+ */
+declare function buildIndexingContinueMessage(attachment: IndexingAttachmentInfo): string;
 
 /**
  * Error detection + message extraction (pure). Moved verbatim from the
@@ -387,6 +404,18 @@ type AttachmentSaveInfo = {
      * takes precedence over server-side office extraction / web_fetch.
      */
     parsedContent?: string;
+    /**
+     * True for a RESUME pass: a previous indexing pass could not finish this (large)
+     * file, so continue it - always via readFileContent paging, with a "continue"
+     * message telling the agent to resume from where the saved records leave off.
+     */
+    continueIndexing?: boolean;
+    /**
+     * For an image-vision file (PDF), the 0-based PAGE the render window should start at.
+     * The worker renders [renderFrom, renderFrom+RENDER_PAGES_PER_WINDOW) and injects them
+     * as image blocks; the resume loop advances this by a window each pass.
+     */
+    renderFrom?: number;
 };
 declare function notifyAgentSaveAttachment(info: AttachmentSaveInfo): Promise<any>;
 declare function extractClaudeText(response: any): any;
@@ -407,6 +436,8 @@ type BgTaskEntry = {
     poll: ((opts: {
         latency: number;
     }) => Promise<any>) | undefined;
+    /** How many CONTINUE passes have already run for this file (resume-across-passes). */
+    resumePass?: number;
 };
 declare function getChatHistory(params: {
     service?: string;
@@ -582,6 +613,7 @@ declare class ChatSession {
     handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
     applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
     drainBgTaskQueue(): void;
+    maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void;
     loadHistory(fetchMore?: boolean, token?: number): Promise<void>;
     uploadSingleAttachment(att: any): Promise<Array<{
         name: string;
@@ -597,4 +629,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

@@ -162,12 +162,23 @@ function isPagedReadFile(name, mime) {
   const m = (mime || "").toLowerCase();
   return m === "application/pdf" || m === "application/vnd.ms-excel" || m.includes("spreadsheetml") || m.includes("opendocument.spreadsheet");
 }
+function isImageVisionFile(name, mime) {
+  const ext = (name || "").split(".").pop()?.toLowerCase() || "";
+  return ext === "pdf" || (mime || "").toLowerCase() === "application/pdf";
+}
 var _extractPlaceholderSeq = 0;
 function makeExtractPlaceholder(seed) {
   _extractPlaceholderSeq += 1;
   const slug = (seed || "file").replace(/[^a-zA-Z0-9]+/g, "_").slice(-48);
   return `{{SKAPI_FILE_CONTENT::${slug}-${_extractPlaceholderSeq}}}`;
 }
+var _renderPlaceholderSeq = 0;
+function makeRenderPlaceholder(seed) {
+  _renderPlaceholderSeq += 1;
+  const slug = (seed || "file").replace(/[^a-zA-Z0-9]+/g, "_").slice(-48);
+  return `{{SKAPI_RENDER::${slug}-${_renderPlaceholderSeq}}}`;
+}
+var RENDER_PAGES_PER_WINDOW = 5;
 function composeUserMessage(text, attachmentUrls) {
   let composed = text;
   if (attachmentUrls.length > 0) {
@@ -265,12 +276,14 @@ function buildIndexingSystemPrompt(params) {
   let systemPrompt = `You are a background indexing agent for project ${service}.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY been extracted on the server and included inline in the user message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read that directly. If the inline content is a "[skapi: ...]" note, the file could not be extracted - index it from its metadata only.
-- BIG or SCANNED files: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note), and scanned PDFs / files with embedded photos are not fully captured inline. In those cases READ THE FILE WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, scanned/large PDFs as rendered PAGE IMAGES, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window.
-- VISION: when a readFileContent window (or an inline attachment) includes IMAGES - scanned PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
+- BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). For big spreadsheets and big text/data files READ THE FILE WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
+- PDFs (scanned or not): you do NOT read a PDF with a tool or a URL. Its pages are RENDERED and embedded directly in the user message as IMAGE blocks, a WINDOW of pages at a time. LOOK at the embedded page images and datafy every one. The note beside them tells you whether MORE pages remain: if so, save this window's records and stop (a follow-up pass shows the next window automatically); only when the note says it was the LAST window is the PDF fully seen. Do NOT call readFileContent or web_fetch for a PDF.
+- VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
 - Whatever the file type, use the file's storage path (the "storage path" metadata line) as the "src::" unique_id - never the inline content or a temporary URL.
 - TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a dedicated table (e.g. "spreadsheet_rows"). Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, paging through it with readFileContent when it is large. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. ALSO save one file-level summary record (file name, sheet name(s), column headers, total row count, overall summary) - this is the record that carries the file's "src::" unique_id - and link EVERY per-row record to it via reference (set each row record's reference to that src:: file record; the row records themselves do NOT carry a src:: unique_id). The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed.
 - EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in a dedicated table (e.g. "book_chapters") - never collapse the whole book into a single record. Each chapter record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO save one book-level record (title, author, language, overall summary, chapter list / table of contents, genre/subjects) and link each chapter record to it via reference. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
-- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Always use the MCP tools to save what you learn - be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far and note the last cursor/page you reached; a follow-up will continue from there. Never store raw or binary bytes (base64, blobs); describe them in human-readable text instead.
+- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Always use the MCP tools to save what you learn - be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. Never store raw or binary bytes (base64, blobs); describe them in human-readable text instead.
+- COMPLETION SIGNAL: only when you have fully read and saved the ENTIRE file (for readFileContent files: reached "END OF FILE"; for PDFs: the embedded page-image note said it was the LAST window - with all rows/pages/items saved), end your final message with the token INDEXING_COMPLETE on its own line. If you did NOT finish the whole file (more rows/pages remain), do NOT write that token - leaving it out is how the system knows to run another pass to continue.
 - Only AFTER every save is done, send exactly ONE final message summarizing what you indexed - never just "Indexing complete", and never a raw/base64/binary value or a large pasted dump. Keep it to a few factual sentences or a short markdown bullet list covering: the file name, its content type, each table you wrote to with its record/row count and the key columns/fields or topics captured, and anything that could not be extracted. Follow this shape - Indexed <file name> (<content type>): saved <N> records to <table(s)> capturing <key columns/fields or topics>; could not extract: <gaps, or none>.`;
   if (serviceDescription) {
     systemPrompt += `
@@ -312,6 +325,48 @@ Read this file with the readFileContent tool, using the storage path above - do 
 (A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : "");
   }
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
+}
+function buildIndexingRenderMessage(attachment, placeholder, renderFrom) {
+  const from = Math.max(0, renderFrom || 0);
+  const src = `src::${attachment.storagePath}`;
+  const meta = `File metadata:
+- name: ${attachment.name}
+- storage path: ${attachment.storagePath}
+` + (attachment.mime ? `- mime type: ${attachment.mime}
+` : "");
+  const datafy = `
+${placeholder}
+
+LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
+
+The note next to the images tells you whether MORE pages remain after this window. If MORE remain: save this window's records and STOP - do NOT write INDEXING_COMPLETE; another pass shows the next window automatically. Only when the note says this is the LAST window (you have seen the whole file) AND everything is saved, end your message with the token INDEXING_COMPLETE.`;
+  if (from === 0) {
+    return `A new file has just been uploaded. Index it now.
+
+` + meta + `
+This is a PDF. Its pages are delivered to you as RENDERED PAGE IMAGES embedded directly in this message (you do NOT need any tool, URL, or web_fetch to see them). You are shown a WINDOW of pages at a time, starting at page ${from + 1}.
+` + datafy;
+  }
+  return `CONTINUE indexing a PDF whose previous pass did not finish.
+
+` + meta + `
+Records for the earlier pages are ALREADY saved (they reference "${src}"). The NEXT window of rendered page images (starting at page ${from + 1}) is embedded in this message. Datafy each page as before and do NOT re-save pages that are already saved.
+` + datafy;
+}
+function buildIndexingContinueMessage(attachment) {
+  const src = `src::${attachment.storagePath}`;
+  return `CONTINUE indexing a file whose previous pass did not finish.
+
+File metadata:
+- name: ${attachment.name}
+- storage path: ${attachment.storagePath}
+` + (attachment.mime ? `- mime type: ${attachment.mime}
+` : "") + `
+Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest page/row/window already saved). Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
+  - PDF: the cursor is the NUMBER OF PAGES already read (0-based next page). If you saved up to page N, call readFileContent with cursor="N" to get page N+1 onward.
+  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
+  - Text: the cursor is the character offset already read.
+Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. Do NOT re-save windows that are already saved. Use the storage path above for the "src::" unique_id. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
 }
 
 // src/engine/errors.ts
@@ -817,14 +872,26 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
     }
   });
 }
+async function notifyAgentContinueIndexing(info) {
+  return notifyAgentSaveAttachment({ ...info, continueIndexing: true });
+}
 async function notifyAgentSaveAttachment(info) {
   const { platform, service, owner, attachment, parsedContent } = info;
-  const pagedRead = !parsedContent && isPagedReadFile(attachment.name, attachment.mime);
-  const serverExtract = !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
+  const continuing = !!info.continueIndexing;
+  const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
+  const renderFrom = Math.max(0, info.renderFrom || 0);
+  const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
+  const skapiRender = visionFile && renderPlaceholder ? {
+    _skapi_render: [
+      { path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW, placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime }
+    ]
+  } : {};
+  const pagedRead = !visionFile && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
+  const serverExtract = !visionFile && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
   const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
   const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
   const skapiExtract = extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
-  const userMessage = buildIndexingUserMessage(
+  const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
   );
@@ -852,6 +919,7 @@ async function notifyAgentSaveAttachment(info) {
         model: resolvedModel2,
         max_output_tokens: MAX_TOKENS,
         ...skapiExtract,
+        ...skapiRender,
         input: [
           { role: "system", content: systemPrompt },
           {
@@ -896,6 +964,7 @@ async function notifyAgentSaveAttachment(info) {
       model: resolvedModel,
       max_tokens: MAX_TOKENS,
       ...skapiExtract,
+      ...skapiRender,
       system: [
         {
           type: "text",
@@ -992,6 +1061,9 @@ async function listOpenAIModels(service, owner) {
   });
 }
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+var MAX_INDEXING_RESUME_PASSES = 6;
+var MAX_VISION_RESUME_PASSES = 40;
 async function getChatHistory(params, fetchOptions) {
   const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
   const p = Object.assign(
@@ -1800,6 +1872,7 @@ var ChatSession = class {
     this.historyItemPolls.delete(itemId);
     var isErr = isErrorResponseBody(response);
     var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
+    if (!isErr && answer) answer = answer.split(INDEXING_COMPLETE_MARKER).join("").trim();
     var idx = this.state.messages.findIndex(function(m) {
       return m.isPending && m._serverItemId === itemId;
     });
@@ -1873,8 +1946,10 @@ var ChatSession = class {
       if (!self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
         self.historyItemPolls.set(entry.id, true);
         var capturedId = entry.id, capturedPlat = plat;
+        var capturedEntry = entry;
         entry.poll({ latency: POLL_INTERVAL }).then(function(response) {
           self.handleHistoryItemResolution(capturedId, response, capturedPlat);
+          self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
         }).catch(function(err) {
           self.historyItemPolls.delete(capturedId);
           var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
@@ -1896,6 +1971,65 @@ var ChatSession = class {
       }
     });
     this.promoteNextBgQueuedToRunning();
+  }
+  // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
+  // PDF) finished WITHOUT the completion marker, the agent ran out of room before reading
+  // the whole file - dispatch a CONTINUE pass (up to a cap) that resumes from where the
+  // already-saved records leave off. Additive + guarded so it never loops forever and
+  // never breaks the resolution path.
+  maybeResumeIndexing(entry, response, platform) {
+    var self = this;
+    try {
+      if (!entry || !entry.storagePath) return;
+      if (!isPagedReadFile(entry.filename, entry.mime)) return;
+      if (isErrorResponseBody(response)) return;
+      var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
+      if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
+      var pass = (entry.resumePass || 0) + 1;
+      var isVision = isImageVisionFile(entry.filename, entry.mime);
+      var maxPasses = isVision ? MAX_VISION_RESUME_PASSES : MAX_INDEXING_RESUME_PASSES;
+      if (pass > maxPasses) return;
+      var id = this.host.getIdentity();
+      if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
+      var renderFrom = isVision ? pass * RENDER_PAGES_PER_WINDOW : void 0;
+      notifyAgentContinueIndexing({
+        platform: id.platform,
+        model: id.model,
+        service: id.serviceId,
+        owner: id.owner,
+        userId: id.userId || id.serviceId,
+        serviceName: id.serviceName,
+        serviceDescription: id.serviceDescription,
+        renderFrom,
+        attachment: {
+          name: entry.filename,
+          storagePath: entry.storagePath,
+          mime: entry.mime,
+          size: entry.size,
+          url: ""
+        }
+      }).then(function(ack) {
+        if (ack && typeof ack.id === "string") {
+          self.bgTaskQueue.push({
+            serviceId: id.serviceId,
+            platform: id.platform,
+            id: ack.id,
+            filename: entry.filename,
+            storagePath: entry.storagePath,
+            isReindex: entry.isReindex,
+            mime: entry.mime,
+            size: entry.size,
+            status: ack.status === "running" ? "running" : "pending",
+            poll: ack.poll,
+            resumePass: pass
+          });
+          self.drainBgTaskQueue();
+        }
+      }, function(e) {
+        console.error("[chat-engine] resume-indexing dispatch failed", e);
+      });
+    } catch (e) {
+    }
   }
   // --- history fetch + pagination --------------------------------------
   // Initial load (fetchMore=false) replaces the list (with in-flight rescue +
@@ -2279,6 +2413,8 @@ exports.TOOL_AND_RESPONSE_BUFFER = TOOL_AND_RESPONSE_BUFFER;
 exports.buildBoundedChatMessages = buildBoundedChatMessages;
 exports.buildChatSystemPrompt = buildChatSystemPrompt;
 exports.buildDisplayExpiredAttachmentHref = buildDisplayExpiredAttachmentHref;
+exports.buildIndexingContinueMessage = buildIndexingContinueMessage;
+exports.buildIndexingRenderMessage = buildIndexingRenderMessage;
 exports.buildIndexingSystemPrompt = buildIndexingSystemPrompt;
 exports.buildIndexingUserMessage = buildIndexingUserMessage;
 exports.callClaudeWithMcp = callClaudeWithMcp;

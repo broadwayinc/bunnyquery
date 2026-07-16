@@ -21,6 +21,10 @@ import {
 	callClaudeWithPublicMcp,
 	callOpenAIWithPublicMcp,
 	notifyAgentSaveAttachment,
+	notifyAgentContinueIndexing,
+	INDEXING_COMPLETE_MARKER,
+	MAX_INDEXING_RESUME_PASSES,
+	MAX_VISION_RESUME_PASSES,
 	extractClaudeText,
 	extractOpenAIText,
 	getChatHistory,
@@ -30,6 +34,7 @@ import {
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
 } from './requests';
+import { isPagedReadFile, isImageVisionFile, RENDER_PAGES_PER_WINDOW } from './office';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
@@ -736,6 +741,8 @@ export class ChatSession {
 		var isErr = isErrorResponseBody(response);
 		var answer = isErr ? getErrorMessage(response)
 			: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim();
+		// Hide the internal indexing-completion marker from the displayed summary.
+		if (!isErr && answer) answer = answer.split(INDEXING_COMPLETE_MARKER).join('').trim();
 		var idx = this.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === itemId; });
 		if (idx !== -1) {
 			// A bg "Indexing:" turn pushes a user bubble (isPendingInProcess) ALONGSIDE
@@ -806,8 +813,10 @@ export class ChatSession {
 			if (!self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
 				self.historyItemPolls.set(entry.id, true);
 				var capturedId = entry.id, capturedPlat = plat;
+				var capturedEntry = entry;
 				entry.poll({ latency: POLL_INTERVAL }).then(function (response: any) {
 					self.handleHistoryItemResolution(capturedId, response, capturedPlat);
+					self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
 				}).catch(function (err: any) {
 					self.historyItemPolls.delete(capturedId);
 					var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
@@ -824,6 +833,62 @@ export class ChatSession {
 			}
 		});
 		this.promoteNextBgQueuedToRunning();
+	}
+
+	// Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
+	// PDF) finished WITHOUT the completion marker, the agent ran out of room before reading
+	// the whole file - dispatch a CONTINUE pass (up to a cap) that resumes from where the
+	// already-saved records leave off. Additive + guarded so it never loops forever and
+	// never breaks the resolution path.
+	maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void {
+		var self = this;
+		try {
+			if (!entry || !entry.storagePath) return;
+			if (!isPagedReadFile(entry.filename, entry.mime)) return;
+			if (isErrorResponseBody(response)) return; // a failed pass is not "incomplete"
+			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '';
+			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return; // fully indexed
+			var pass = (entry.resumePass || 0) + 1;
+			// Vision (rendered PDF pages) advances one window per pass, so it needs a much
+			// higher cap than the text/grid path (which reads many windows per pass).
+			var isVision = isImageVisionFile(entry.filename, entry.mime);
+			var maxPasses = isVision ? MAX_VISION_RESUME_PASSES : MAX_INDEXING_RESUME_PASSES;
+			if (pass > maxPasses) return; // give up after the cap
+			var id = this.host.getIdentity();
+			if (!id || id.platform === 'none' || id.serviceId !== entry.serviceId) return;
+			// VISION files (PDFs) resume by ADVANCING the rendered page window: pass N reads
+			// pages [N*WINDOW, (N+1)*WINDOW). Other paged files resume via a derived cursor
+			// (the continue message tells the agent to resume from the furthest saved record).
+			var renderFrom = isVision ? pass * RENDER_PAGES_PER_WINDOW : undefined;
+			notifyAgentContinueIndexing({
+				platform: id.platform as 'claude' | 'openai',
+				model: id.model,
+				service: id.serviceId,
+				owner: id.owner,
+				userId: id.userId || id.serviceId,
+				serviceName: id.serviceName,
+				serviceDescription: id.serviceDescription,
+				renderFrom: renderFrom,
+				attachment: {
+					name: entry.filename,
+					storagePath: entry.storagePath,
+					mime: entry.mime,
+					size: entry.size,
+					url: '',
+				},
+			}).then(function (ack: any) {
+				if (ack && typeof ack.id === 'string') {
+					self.bgTaskQueue.push({
+						serviceId: id.serviceId, platform: id.platform as 'claude' | 'openai', id: ack.id,
+						filename: entry.filename, storagePath: entry.storagePath,
+						isReindex: entry.isReindex, mime: entry.mime, size: entry.size,
+						status: ack.status === 'running' ? 'running' : 'pending',
+						poll: ack.poll, resumePass: pass,
+					});
+					self.drainBgTaskQueue();
+				}
+			}, function (e: any) { console.error('[chat-engine] resume-indexing dispatch failed', e); });
+		} catch (e) { /* best-effort: resume must never break bg-task resolution */ }
 	}
 
 	// --- history fetch + pagination --------------------------------------

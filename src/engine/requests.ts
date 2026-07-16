@@ -10,8 +10,8 @@
  *                                    state that stays in the consumer, not here;
  *                                    only the BgTaskEntry TYPE lives here)
  */
-import { buildIndexingSystemPrompt, buildIndexingUserMessage } from './prompts';
-import { isServerExtractable, isPagedReadFile, makeExtractPlaceholder, type ExtractDirective, type FileUrlDirective } from './office';
+import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage } from './prompts';
+import { isServerExtractable, isPagedReadFile, isImageVisionFile, makeExtractPlaceholder, makeRenderPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, pollOpt } from './config';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -442,7 +442,26 @@ export type AttachmentSaveInfo = {
 	 * takes precedence over server-side office extraction / web_fetch.
 	 */
 	parsedContent?: string;
+	/**
+	 * True for a RESUME pass: a previous indexing pass could not finish this (large)
+	 * file, so continue it - always via readFileContent paging, with a "continue"
+	 * message telling the agent to resume from where the saved records leave off.
+	 */
+	continueIndexing?: boolean;
+	/**
+	 * For an image-vision file (PDF), the 0-based PAGE the render window should start at.
+	 * The worker renders [renderFrom, renderFrom+RENDER_PAGES_PER_WINDOW) and injects them
+	 * as image blocks; the resume loop advances this by a window each pass.
+	 */
+	renderFrom?: number;
 };
+
+// RESUME pass: continue indexing a large file a previous pass could not finish. Same
+// dispatch as notifyAgentSaveAttachment, but forced onto the paging path with a
+// "continue from where the saved records leave off" message.
+export async function notifyAgentContinueIndexing(info: AttachmentSaveInfo) {
+	return notifyAgentSaveAttachment({ ...info, continueIndexing: true });
+}
 
 // Background "save into knowledge" call (not a chat turn). A client-parsed file
 // (parser plugin) is inlined directly; otherwise office files get the
@@ -450,13 +469,29 @@ export type AttachmentSaveInfo = {
 export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const { platform, service, owner, attachment, parsedContent } = info;
 
-	// Spreadsheets and PDFs are read by PAGING through readFileContent (grid rows +
-	// embedded photos / scanned page images), NOT inlined once - so they skip the inline
-	// server-extract and the agent is told to page the whole file (see pagedRead below).
-	const pagedRead = !parsedContent && isPagedReadFile(attachment.name, attachment.mime);
+	// A CONTINUE pass resumes a large file that a previous pass could not finish.
+	const continuing = !!info.continueIndexing;
+
+	// VISION files (PDFs) are delivered as rendered page IMAGES injected into the message by
+	// the worker (`_skapi_render`), because tool-result images render on neither provider.
+	// Both the first pass and every resume pass use this; renderFrom advances the page window.
+	const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
+	const renderFrom = Math.max(0, info.renderFrom || 0);
+	const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : undefined;
+	const skapiRender = visionFile && renderPlaceholder
+		? {
+			_skapi_render: [
+				{ path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW, placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime },
+			],
+		}
+		: {};
+
+	// Spreadsheets are read by PAGING through readFileContent (grid rows), NOT inlined - so
+	// they skip the inline server-extract and the agent is told to page the whole file.
+	const pagedRead = !visionFile && (continuing || (!parsedContent && isPagedReadFile(attachment.name, attachment.mime)));
 
 	// Client-parsed content wins over server-side extraction.
-	const serverExtract = !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
+	const serverExtract = !visionFile && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
 	const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : undefined;
 	const extractContent: ExtractDirective[] | undefined =
 		serverExtract && placeholder
@@ -465,16 +500,20 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const skapiExtract =
 		extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
 
-	const userMessage = buildIndexingUserMessage(
-		attachment,
-		parsedContent
-			? { inlineContent: parsedContent }
-			: placeholder
-				? { inlineContentPlaceholder: placeholder }
-				: pagedRead
-					? { pagedRead: true }
-					: undefined,
-	);
+	const userMessage = (visionFile && renderPlaceholder)
+		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
+		: continuing
+			? buildIndexingContinueMessage(attachment)
+			: buildIndexingUserMessage(
+				attachment,
+				parsedContent
+					? { inlineContent: parsedContent }
+					: placeholder
+						? { inlineContentPlaceholder: placeholder }
+						: pagedRead
+							? { pagedRead: true }
+							: undefined,
+			);
 
 	const systemPrompt = buildIndexingSystemPrompt({
 		service,
@@ -501,6 +540,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				model: resolvedModel,
 				max_output_tokens: MAX_TOKENS,
 				...skapiExtract,
+				...skapiRender,
 				input: [
 					{ role: 'system', content: systemPrompt },
 					{
@@ -548,6 +588,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			model: resolvedModel,
 			max_tokens: MAX_TOKENS,
 			...skapiExtract,
+			...skapiRender,
 			system: [
 				{
 					type: 'text',
@@ -686,7 +727,24 @@ export type BgTaskEntry = {
 	size?: number;
 	status: 'running' | 'pending';
 	poll: ((opts: { latency: number }) => Promise<any>) | undefined;
+	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
+	resumePass?: number;
 };
+
+// Token the indexing agent appends to its final message ONLY when it has fully read and
+// saved the whole file. Its ABSENCE is what tells the client to run another CONTINUE pass.
+export const INDEXING_COMPLETE_MARKER = 'INDEXING_COMPLETE';
+// Cap on CONTINUE passes per file, so a file the agent can never mark complete (or a
+// pathological loop) stops instead of re-dispatching forever. The text/grid paging path
+// reads MANY windows within a single pass (the agent loops readFileContent in one turn), so
+// a small cap suffices.
+export const MAX_INDEXING_RESUME_PASSES = 6;
+// The VISION path (rendered PDF pages) can only advance ONE page-window per pass, because the
+// worker injects a single window of images into each request. A big scanned PDF therefore
+// needs one pass PER window (pages / RENDER_PAGES_PER_WINDOW), so it gets a much higher cap.
+// The loop still terminates naturally when the agent reaches the last window (it appends
+// INDEXING_COMPLETE); this cap is only the backstop for a doc larger than it covers.
+export const MAX_VISION_RESUME_PASSES = 40;
 
 export async function getChatHistory(
 	params: { service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string },
