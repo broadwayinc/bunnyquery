@@ -18,6 +18,18 @@ export interface ChatIdentity {
 	serviceDescription?: string;
 }
 
+/**
+ * Project context captured at the moment the user hit Send, so a turn whose
+ * dispatch is delayed (attachment uploads are awaited first) still reaches the
+ * project the question was asked of rather than whichever project the user has
+ * navigated to by then. Both fields are identity-derived and must be snapshotted
+ * together — the system prompt embeds the service name/description/id.
+ */
+export interface PinnedDispatchContext {
+	identity: ChatIdentity;
+	systemPrompt: string;
+}
+
 export interface ChatMessage {
 	role: 'user' | 'assistant';
 	content: string; // raw markdown — never HTML (the view parses for display)
@@ -34,6 +46,13 @@ export interface ChatMessage {
 	_localId?: string;
 	_cancelling?: boolean;
 	_cancelError?: string;
+	// History cache key (`serviceId#platform`) this bubble was created under.
+	// Stamped on LOCALLY-created bubbles only (the optimistic user message and
+	// its "Thinking..." placeholder); server-mapped bubbles are identified by
+	// _serverItemId instead. The dashboard renders every project through ONE
+	// ChatSession singleton, so without this a bubble is unattributable and an
+	// in-flight turn from project A gets rescued/cached into project B.
+	_ownerKey?: string;
 }
 
 export interface ChatState {

@@ -24,7 +24,6 @@ import {
 	notifyAgentContinueIndexing,
 	INDEXING_COMPLETE_MARKER,
 	MAX_INDEXING_RESUME_PASSES,
-	MAX_VISION_RESUME_PASSES,
 	extractClaudeText,
 	extractOpenAIText,
 	getChatHistory,
@@ -34,13 +33,13 @@ import {
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
 } from './requests';
-import { isPagedReadFile, isImageVisionFile, RENDER_PAGES_PER_WINDOW } from './office';
+import { isPagedReadFile, isImageVisionFile } from './office';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
 import { parseAttachmentContent } from './attachment_parsers';
-import type { ChatHost, ChatState, ChatMessage } from './host';
+import type { ChatHost, ChatState, ChatMessage, PinnedDispatchContext } from './host';
 
 function sleep(ms: number): Promise<void> {
 	return new Promise(function (r) { setTimeout(r, ms); });
@@ -106,18 +105,87 @@ export class ChatSession {
 	updateHistoryCache(): void {
 		var key = this.getHistoryCacheKey();
 		if (!key) return;
+		// Never persist another chat's in-flight bubbles under THIS key. The
+		// dashboard shares one ChatSession across projects, so a turn dispatched
+		// in project A can still be sitting in state.messages while the identity
+		// (and therefore `key`) already points at project B — without this filter
+		// A's user + "Thinking..." bubbles get written into B's cache entry and
+		// replay on every later visit to B. Bubbles with no _ownerKey (server
+		// history, bg tasks) are always kept. Single pass: this runs on the
+		// typewriter hot path.
 		this.aiChatHistoryCache[key] = {
-			messages: this.state.messages.slice(),
+			messages: this.state.messages.filter(function (m) {
+				return m._ownerKey === undefined || m._ownerKey === key;
+			}),
 			endOfList: this.state.historyEndOfList,
 			startKeyHistory: this.state.historyStartKeyHistory.slice(),
 		};
 	}
 
-	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any) {
-		var id = this.host.getIdentity();
+	/**
+	 * Land a resolved reply in the history cache of a chat that is NOT currently
+	 * visible, without touching state.messages. Mirrors the cache-only path in
+	 * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
+	 * (append only when there is none), and settle the matching pending user
+	 * bubble, so the cached copy never keeps a stuck "Thinking..." that a later
+	 * cache-first load would re-render forever.
+	 */
+	private _applyReplyToCache(key: string, reply: ChatMessage, serverId?: string): void {
+		if (!key) return;
+		var existing = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+		var msgs = existing.messages.slice();
+
+		var thIdx = -1;
+		for (var i = msgs.length - 1; i >= 0; i--) {
+			var m = msgs[i];
+			if (!m || !m.isPending || m.role !== 'assistant' || m.isBackgroundTask) continue;
+			if (serverId && m._serverItemId && m._serverItemId !== serverId) continue;
+			thIdx = i; break;
+		}
+		if (thIdx !== -1) {
+			if (reply._serverItemId === undefined && msgs[thIdx]._serverItemId !== undefined) reply._serverItemId = msgs[thIdx]._serverItemId;
+			msgs[thIdx] = reply;
+		} else {
+			msgs.push(reply);
+		}
+
+		// Settle the user bubble this turn belongs to (first pending one, or the
+		// one carrying serverId) so it stops rendering as still in flight.
+		for (var j = 0; j < msgs.length; j++) {
+			var u = msgs[j];
+			if (!u || u.role !== 'user' || u.isBackgroundTask) continue;
+			if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
+			if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
+			var settled: ChatMessage = { role: 'user', content: u.content };
+			if (u._serverItemId !== undefined) settled._serverItemId = u._serverItemId;
+			if (u._ownerKey !== undefined) settled._ownerKey = u._ownerKey;
+			msgs[j] = settled;
+			break;
+		}
+
+		this.aiChatHistoryCache[key] = {
+			messages: msgs,
+			endOfList: existing.endOfList,
+			startKeyHistory: existing.startKeyHistory,
+		};
+	}
+
+	/**
+	 * serviceId/owner are passed explicitly by every caller: a request can be
+	 * dispatched after the user moved to another project, and re-reading the live
+	 * identity here would silently send the turn to THAT project instead of the
+	 * one it was composed for. Falls back to the live read only when a caller
+	 * omits them.
+	 */
+	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any, serviceId?: string, owner?: string) {
+		if (serviceId === undefined || owner === undefined) {
+			var id = this.host.getIdentity();
+			if (serviceId === undefined) serviceId = id.serviceId;
+			if (owner === undefined) owner = id.owner;
+		}
 		return platform === 'openai'
-			? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls)
-			: callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls);
+			? callOpenAIWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls)
+			: callClaudeWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls);
 	}
 
 	dispatchAgentRequest(params: any) {
@@ -131,7 +199,7 @@ export class ChatSession {
 		var dispatchItemId: string | undefined;
 		var sendAndPoll = function () {
 			return Promise.resolve(
-				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls)
+				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.serviceId, params.owner)
 			).then(function (initial: any) {
 				if (initial && initial.poll && (initial.status === 'pending' || initial.status === 'running')) {
 					if (initial.id) {
@@ -213,23 +281,72 @@ export class ChatSession {
 	// composed = clean display text; composedForLlm carries office-extraction
 	// placeholders for the provider only. useBgQueue routes a post-attachment turn
 	// onto the "-bg" queue so it runs after indexing.
-	dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any): void {
+	dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void {
 		var self = this;
 		if (!composed) return;
-		var id = this.host.getIdentity();
+		// A send can be dispatched LONG after the user hit Send (attachment
+		// uploads are awaited first), by which time the live identity may have
+		// moved to another project. The caller pins the identity + system prompt
+		// it captured at Send time so the request still goes to the project the
+		// question was actually asked of. Falls back to the live read when the
+		// caller doesn't pin (the widget, which has only one project anyway).
+		var id = pinned ? pinned.identity : this.host.getIdentity();
 		if (id.platform === 'none') return;
 
 		var llmComposed = composedForLlm || composed;
 
-		var isQueuedSend = useBgQueue || this.state.sending || this.state.messages.some(function (m) {
+		// Cache key of the chat this turn belongs to. Every locally-created
+		// bubble is stamped with it so a project switch (which flips
+		// getIdentity()/getHistoryCacheKey() to the new project) can't
+		// misattribute this turn's bubbles to that project.
+		// (platform === 'none' already returned above, so serviceId is the only gate)
+		var key = !id.serviceId ? '' : id.serviceId + '#' + id.platform;
+		// True when the pinned chat is NOT the one currently on screen. Then
+		// state.messages belongs to a different project and MUST NOT be touched:
+		// the turn is staged in the pinned chat's cache instead and shows up when
+		// the user navigates back to it.
+		var offChat = !!key && key !== this.getHistoryCacheKey();
+
+		var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function (m) {
 			return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
-		});
+		}));
 
 		var aiPlatform = id.platform;
 		var aiModel = id.model || undefined;
-		var systemPrompt = this.host.buildSystemPrompt();
+		var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
 		var userId = id.userId || id.serviceId;
 		var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
+
+		if (offChat) {
+			// Stage the turn in the pinned chat's cache and dispatch. The
+			// client-side queue can't be consulted (its state is the other
+			// project's), but the SERVER serializes per queue name, so ordering
+			// within the pinned chat still holds. dispatchAgentRequest replaces
+			// the pending bubble in this same cache entry when the reply lands.
+			var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function (m) {
+				return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
+					!m.isCancelled && !m.isBackgroundTask;
+			});
+			var offBounded = buildBoundedChatMessages({
+				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
+				history: offHistory.concat([{ role: 'user', content: llmComposed }]),
+			});
+			var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+			this.aiChatHistoryCache[key] = {
+				messages: offExisting.messages.concat([
+					{ role: 'user', content: composed, _ownerKey: key },
+					{ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, _ownerKey: key },
+				]),
+				endOfList: offExisting.endOfList,
+				startKeyHistory: offExisting.startKeyHistory,
+			};
+			this.dispatchAgentRequest({
+				key: key, serviceId: id.serviceId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
+				systemPrompt: systemPrompt, text: composed, boundedMessages: offBounded.messages, userId: chatQueue,
+				extractContent: extractContent, fileUrls: fileUrls,
+			});
+			return;
+		}
 
 		if (isQueuedSend) {
 			var resolvedHistory = this.state.messages.filter(function (m) {
@@ -241,15 +358,20 @@ export class ChatSession {
 				history: resolvedHistory.concat([{ role: 'user', content: llmComposed }]),
 			});
 			var queuedBubble: ChatMessage = { role: 'user', content: composed, isPendingQueued: true, isSendingToServer: true };
+			if (key) queuedBubble._ownerKey = key;
 			if (useBgQueue) queuedBubble._useBgQueue = true;
 			this.state.messages.push(queuedBubble);
 			this.host.notify(); this.updateHistoryCache(); this.host.scrollToBottom(true);
 
-			var capturedComposed = composed, capturedPlatform = aiPlatform;
-			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls))
+			var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
+			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner))
 				.then(function (result: any) {
-					var sendingIdx = self.state.messages.findIndex(function (m) {
-						return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === 'user';
+					// Only ack a bubble that belongs to THIS chat — the search is
+					// positional, so on another project it would stamp this turn's
+					// _serverItemId onto that project's unrelated in-flight bubble.
+					var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function (m) {
+						return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === 'user' &&
+							(m._ownerKey === undefined || m._ownerKey === capturedKey);
 					});
 					var serverId = result && typeof result.id === 'string' ? result.id : undefined;
 					if (sendingIdx >= 0) {
@@ -262,12 +384,12 @@ export class ChatSession {
 						// against it instead of attaching a duplicate history poll.
 						if (serverId) self.historyItemPolls.set(serverId, true);
 						return result.poll({ latency: POLL_INTERVAL })
-							.then(function (res: any) { return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId); })
-							.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, serverId); });
+							.then(function (res: any) { return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
+							.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey); });
 					}
-					return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId);
+					return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
 				})
-				.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, undefined); });
+				.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, undefined, capturedKey); });
 			return;
 		}
 
@@ -276,11 +398,10 @@ export class ChatSession {
 		// view unmount), then rendered from the cache via typewriteLatestReply. A
 		// later resumePendingRequest() re-renders it if the view remounted while the
 		// request was still in flight.
-		this.state.messages.push({ role: 'user', content: composed });
-		this.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true });
+		this.state.messages.push({ role: 'user', content: composed, ...(key ? { _ownerKey: key } : {}) });
+		this.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) });
 		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.host.scrollToBottom(true);
 
-		var key = this.getHistoryCacheKey();
 		var historyForLlm = this.state.messages.filter(function (m) { return !m.isCancelled && !m.isBackgroundTask; });
 		if (llmComposed !== composed) {
 			for (var li = historyForLlm.length - 1; li >= 0; li--) {
@@ -310,8 +431,16 @@ export class ChatSession {
 		// already replaced the pending bubble with the answer IN THE CACHE, so a
 		// later loadChatHistory renders it.
 		Promise.resolve(run).catch(function () { }).then(function () {
-			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
+			// Clear `sending` UNCONDITIONALLY. It is session-global (it gates
+			// isQueuedSend above, plus the platform/model pickers in the view), so
+			// leaving it set when the user navigated to another project wedged
+			// every subsequent send in EVERY project onto the queued path and kept
+			// the view's user-bubble rescue arm armed forever. Only the RENDER of
+			// the reply stays gated on still showing this chat — when it isn't,
+			// dispatchAgentRequest has already written the answer into the cache
+			// under `key`, so a later loadChatHistory renders it.
 			self.state.sending = false;
+			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
 			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottom(true); });
 		});
 	}
@@ -325,9 +454,11 @@ export class ChatSession {
 		var existing = this.state.messages[nextIdx];
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
+		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		this.state.messages[nextIdx] = promoted;
 		var placeholder: ChatMessage = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true, isBackgroundTask: true };
 		if (existing._serverItemId !== undefined) placeholder._serverItemId = existing._serverItemId;
+		if (existing._ownerKey !== undefined) placeholder._ownerKey = existing._ownerKey;
 		this.state.messages.splice(nextIdx + 1, 0, placeholder);
 		this.host.notify();
 	}
@@ -342,6 +473,7 @@ export class ChatSession {
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true };
 		if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
+		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		if (existing.isSendingToServer) promoted.isSendingToServer = true;
 		this.state.messages[nextIdx] = promoted;
 		// Carry the promoted turn's _serverItemId onto the "Thinking..." placeholder
@@ -354,11 +486,16 @@ export class ChatSession {
 		// unaffected.
 		var placeholder: ChatMessage = { role: 'assistant', content: '', isPending: true };
 		if (existing._serverItemId !== undefined) placeholder._serverItemId = existing._serverItemId;
+		if (existing._ownerKey !== undefined) placeholder._ownerKey = existing._ownerKey;
 		this.state.messages.splice(nextIdx + 1, 0, placeholder);
 		this.host.notify();
 	}
 
 	resolveQueuedUserBubble(serverId?: string): number | undefined {
+		// The two fallbacks below match by POSITION, not identity, so they must
+		// never consider a bubble stamped for a different chat.
+		var liveKey = this.getHistoryCacheKey();
+		var isLocal = function (m: ChatMessage) { return m._ownerKey === undefined || m._ownerKey === liveKey; };
 		var userIdx = -1;
 		if (serverId) {
 			userIdx = this.state.messages.findIndex(function (m) {
@@ -368,19 +505,19 @@ export class ChatSession {
 		}
 		if (userIdx === -1) {
 			userIdx = this.state.messages.findIndex(function (m) {
-				return m.isPendingInProcess && m.role === 'user' && !m.isBackgroundTask && !m._useBgQueue;
+				return m.isPendingInProcess && m.role === 'user' && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
 			});
 		}
 		if (userIdx === -1) {
 			userIdx = this.state.messages.findIndex(function (m) {
-				return m.isPendingQueued && m.role === 'user' && !m.isBackgroundTask && !m._useBgQueue;
+				return m.isPendingQueued && m.role === 'user' && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
 			});
 		}
 		if (serverId && this.cancelledServerIds.has(serverId)) {
 			this.cancelledServerIds.delete(serverId);
 			if (userIdx >= 0) {
 				var ex = this.state.messages[userIdx];
-				this.state.messages[userIdx] = { role: 'user', content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId };
+				this.state.messages[userIdx] = { role: 'user', content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId, ...(ex._ownerKey !== undefined ? { _ownerKey: ex._ownerKey } : {}) };
 				var thIdx = this.state.messages.findIndex(function (m, i) {
 					return i > userIdx && m.isPending && m.role === 'assistant' && !m.isBackgroundTask;
 				});
@@ -393,6 +530,7 @@ export class ChatSession {
 			var exist = this.state.messages[userIdx];
 			var repl: ChatMessage = { role: 'user', content: exist.content };
 			if (exist._serverItemId !== undefined) repl._serverItemId = exist._serverItemId;
+			if (exist._ownerKey !== undefined) repl._ownerKey = exist._ownerKey;
 			this.state.messages[userIdx] = repl;
 		}
 		var thinkingIdx = userIdx >= 0
@@ -407,8 +545,21 @@ export class ChatSession {
 		else this.state.messages.push(msg);
 	}
 
-	onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string): void {
+	onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void {
 		if (serverId) this.historyItemPolls.delete(serverId);
+		// This turn resolved while a DIFFERENT chat is on screen (the user moved to
+		// another project mid-flight). state.messages now belongs to that chat, and
+		// resolveQueuedUserBubble's positional fallbacks would happily hijack ITS
+		// pending bubble — or, finding nothing, push this answer onto its list.
+		// Settle in the owning chat's cache instead and leave the view untouched.
+		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+			var offReply: ChatMessage = isErrorResponseBody(response)
+				? { role: 'assistant', content: getErrorMessage(response), isError: true }
+				: { role: 'assistant', content: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim() || 'No text response received from AI provider.' };
+			this._applyReplyToCache(ownerKey, offReply, serverId);
+			if (serverId) this.cancelledServerIds.delete(serverId);
+			return;
+		}
 		var targetIdx = this.resolveQueuedUserBubble(serverId);
 		if (targetIdx === undefined) { this.host.notify(); this.updateHistoryCache(); return; }
 		if (isErrorResponseBody(response)) {
@@ -436,9 +587,19 @@ export class ChatSession {
 		this.host.scrollToBottom(true);
 	}
 
-	onQueuedSendError(_composed: string, err: any, serverId?: string): void {
+	onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void {
 		var self = this;
 		if (serverId) this.historyItemPolls.delete(serverId);
+		// Off-chat resolution — see onQueuedSendResponse. Settle in the owning
+		// chat's cache rather than mutating whatever chat is on screen now.
+		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+			var isGone = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
+			this._applyReplyToCache(ownerKey, isGone
+				? { role: 'assistant', content: 'Request was cancelled.', isError: true }
+				: { role: 'assistant', content: getErrorMessage(err), isError: true }, serverId);
+			if (serverId) this.cancelledServerIds.delete(serverId);
+			return;
+		}
 		var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
 		if (isNotExists) {
 			var userIdx = serverId
@@ -836,30 +997,30 @@ export class ChatSession {
 	}
 
 	// Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
-	// PDF) finished WITHOUT the completion marker, the agent ran out of room before reading
+	// text) finished WITHOUT the completion marker, the agent ran out of room before reading
 	// the whole file - dispatch a CONTINUE pass (up to a cap) that resumes from where the
 	// already-saved records leave off. Additive + guarded so it never loops forever and
 	// never breaks the resolution path.
+	//
+	// VISION files (PDFs rendered to page images) are NOT resumed here: the proxy worker
+	// advances their page window itself, off the renderer's true page count. Driving them
+	// from the browser is what used to lose pages on long documents - the chain lived in tab
+	// memory (a reload or a closed tab ended it), and it stopped whenever the model claimed
+	// completion, which on an 88-page file happened at page 15. Continuing to dispatch here
+	// as well would now double-index every window.
 	maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void {
 		var self = this;
 		try {
 			if (!entry || !entry.storagePath) return;
 			if (!isPagedReadFile(entry.filename, entry.mime)) return;
+			if (isImageVisionFile(entry.filename, entry.mime)) return; // worker owns this loop
 			if (isErrorResponseBody(response)) return; // a failed pass is not "incomplete"
 			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '';
 			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return; // fully indexed
 			var pass = (entry.resumePass || 0) + 1;
-			// Vision (rendered PDF pages) advances one window per pass, so it needs a much
-			// higher cap than the text/grid path (which reads many windows per pass).
-			var isVision = isImageVisionFile(entry.filename, entry.mime);
-			var maxPasses = isVision ? MAX_VISION_RESUME_PASSES : MAX_INDEXING_RESUME_PASSES;
-			if (pass > maxPasses) return; // give up after the cap
+			if (pass > MAX_INDEXING_RESUME_PASSES) return; // give up after the cap
 			var id = this.host.getIdentity();
 			if (!id || id.platform === 'none' || id.serviceId !== entry.serviceId) return;
-			// VISION files (PDFs) resume by ADVANCING the rendered page window: pass N reads
-			// pages [N*WINDOW, (N+1)*WINDOW). Other paged files resume via a derived cursor
-			// (the continue message tells the agent to resume from the furthest saved record).
-			var renderFrom = isVision ? pass * RENDER_PAGES_PER_WINDOW : undefined;
 			notifyAgentContinueIndexing({
 				platform: id.platform as 'claude' | 'openai',
 				model: id.model,
@@ -868,7 +1029,6 @@ export class ChatSession {
 				userId: id.userId || id.serviceId,
 				serviceName: id.serviceName,
 				serviceDescription: id.serviceDescription,
-				renderFrom: renderFrom,
 				attachment: {
 					name: entry.filename,
 					storagePath: entry.storagePath,
@@ -900,6 +1060,11 @@ export class ChatSession {
 	loadHistory(fetchMore?: boolean, token?: number): Promise<void> {
 		var self = this;
 		var id = this.host.getIdentity();
+		// Key this fetch is FOR, snapshotted from the same identity read the
+		// request is built from. The rescue below compares against this rather
+		// than a live getHistoryCacheKey(), so a project switch mid-fetch can't
+		// make another chat's in-flight bubbles look local.
+		var loadKey = (!id.serviceId || id.platform === 'none') ? '' : id.serviceId + '#' + id.platform;
 		if (token === undefined) token = this.state.gateRefreshToken;
 		if ((this.state.loadingHistory && this.state.historyRequestToken === token) || id.platform === 'none' || !id.serviceId) {
 			return Promise.resolve();
@@ -960,6 +1125,10 @@ export class ChatSession {
 				for (var ri = 0; ri < self.state.messages.length; ri++) {
 					var mm = self.state.messages[ri];
 					if (mm.isBackgroundTask) continue;
+					// Belongs to a different chat (another project, or another
+					// platform on this one) — it must not be carried onto THIS
+					// chat's freshly-fetched history.
+					if (mm._ownerKey !== undefined && mm._ownerKey !== loadKey) continue;
 					if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
 					if (!mm._serverItemId) {
 						if (mappedHasPendingAssistant) continue;

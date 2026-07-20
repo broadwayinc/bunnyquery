@@ -242,17 +242,34 @@ type BuildIndexingUserMessageOptions = {
 };
 declare function buildIndexingUserMessage(attachment: IndexingAttachmentInfo, options?: BuildIndexingUserMessageOptions): string;
 /**
+ * Token the WORKER substitutes with the 1-based first page of the window it is about to
+ * render, when it builds the next pass of a document from `RENDER_CONTINUE_TEMPLATE`.
+ * Must match the worker's RENDER_FROM_TOKEN.
+ */
+declare const RENDER_FROM_TOKEN = "{{RENDER_FROM}}";
+/**
  * User message for a VISION file (PDF): its pages are delivered as RENDERED PAGE IMAGES that
  * the proxy worker injects into THIS message at the `placeholder` token (tool-result images
  * render on neither provider, so the pages must be image blocks in the message itself). Each
- * pass shows one WINDOW of pages starting at `renderFrom` (0-based); the resume loop advances
- * the window a pass at a time until the injected note says the last window was reached.
+ * pass shows one WINDOW of pages starting at `renderFrom` (0-based).
+ *
+ * The WORKER advances the window: when its renderer reports pages remaining it enqueues the
+ * next pass itself, off the true page count, so a document indexes end-to-end with no browser
+ * involved. This message therefore only ever describes ONE window, and the model is never
+ * asked to decide whether the document is finished.
  *
  * renderFrom === 0 is the FIRST pass (leads with "A new file has just been uploaded." so the
- * client builds the "Indexing: <name>" bubble); renderFrom > 0 is a RESUME pass (leads with
- * "CONTINUE indexing" like the paged continue message, so it is not a duplicate primary bubble).
+ * client builds the "Indexing: <name>" bubble); a continue pass (built by the worker from
+ * buildIndexingRenderContinueTemplate) leads with "CONTINUE indexing" so it is not a duplicate
+ * primary bubble.
  */
 declare function buildIndexingRenderMessage(attachment: IndexingAttachmentInfo, placeholder: string, renderFrom: number): string;
+/**
+ * The CONTINUE pass, as a template the worker fills in. `pageLabel` defaults to the
+ * RENDER_FROM_TOKEN placeholder, which the worker replaces with the real 1-based start page
+ * of the window it is rendering; passing an explicit label produces a ready-to-send message.
+ */
+declare function buildIndexingRenderContinueTemplate(attachment: IndexingAttachmentInfo, placeholder: string, pageLabel?: string): string;
 /**
  * User message for a RESUME pass: a previous indexing pass could not finish this large
  * file, so continue it from where the already-saved records leave off (never restart).
@@ -464,6 +481,17 @@ interface ChatIdentity {
     serviceName?: string;
     serviceDescription?: string;
 }
+/**
+ * Project context captured at the moment the user hit Send, so a turn whose
+ * dispatch is delayed (attachment uploads are awaited first) still reaches the
+ * project the question was asked of rather than whichever project the user has
+ * navigated to by then. Both fields are identity-derived and must be snapshotted
+ * together — the system prompt embeds the service name/description/id.
+ */
+interface PinnedDispatchContext {
+    identity: ChatIdentity;
+    systemPrompt: string;
+}
 interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
@@ -480,6 +508,7 @@ interface ChatMessage {
     _localId?: string;
     _cancelling?: boolean;
     _cancelError?: string;
+    _ownerKey?: string;
 }
 interface ChatState {
     messages: ChatMessage[];
@@ -593,15 +622,31 @@ declare class ChatSession {
     private _newLocalId;
     getHistoryCacheKey(): string;
     updateHistoryCache(): void;
+    /**
+     * Land a resolved reply in the history cache of a chat that is NOT currently
+     * visible, without touching state.messages. Mirrors the cache-only path in
+     * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
+     * (append only when there is none), and settle the matching pending user
+     * bubble, so the cached copy never keeps a stuck "Thinking..." that a later
+     * cache-first load would re-render forever.
+     */
+    private _applyReplyToCache;
+    /**
+     * serviceId/owner are passed explicitly by every caller: a request can be
+     * dispatched after the user moved to another project, and re-reading the live
+     * identity here would silently send the turn to THAT project instead of the
+     * one it was composed for. Falls back to the live read only when a caller
+     * omits them.
+     */
     private _callProviderFor;
     dispatchAgentRequest(params: any): Promise<any>;
-    dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any): void;
+    dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void;
     promoteNextBgQueuedToRunning(): void;
     promoteNextQueuedToRunning(): void;
     resolveQueuedUserBubble(serverId?: string): number | undefined;
     insertAtTarget(msg: ChatMessage, targetIdx: number): void;
-    onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string): void;
-    onQueuedSendError(_composed: string, err: any, serverId?: string): void;
+    onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
+    onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
     typewriteIntoIndex(idx: number, fullText: string, localId?: string): Promise<void>;
     private typewriterQueue;
@@ -629,4 +674,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

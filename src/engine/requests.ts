@@ -10,7 +10,7 @@
  *                                    state that stays in the consumer, not here;
  *                                    only the BgTaskEntry TYPE lives here)
  */
-import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage } from './prompts';
+import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, makeExtractPlaceholder, makeRenderPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, pollOpt } from './config';
 
@@ -38,25 +38,47 @@ export const DEFAULT_OPENAI_MODEL = 'gpt-5.4';
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretRequest(opts);
 
+// Resolve the per-image `detail` for OpenAI. The version match tolerates a
+// trailing variant/date suffix (`gpt-5.4-nano`, `-mini`, `-2026-01-01`, …):
+// previously the pattern was anchored with no suffix allowed, so EVERY suffixed
+// model silently fell through to 'auto' — i.e. the cheap tiers that most need
+// resolution were the ones getting downsampled images.
+//
+// Base models keep their exact previous behavior ('original'). A suffixed
+// variant resolves to 'high' rather than 'original': 'high' is the universally
+// supported value, and we have no way to confirm a given variant accepts
+// 'original' — sending an unsupported value would fail the whole request, which
+// is far worse than a slightly less detailed image.
 const getOpenAIImageDetail = (model?: string) => {
 	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
-	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?$/);
+	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
 	if (!match) {
 		return DEFAULT_OPENAI_IMAGE_DETAIL;
 	}
 
 	const major = Number(match[1]);
 	const minor = match[2] === undefined ? null : Number(match[2]);
+	const isVariant = !!match[3];
 
-	if (major > 5) {
-		return 'original';
+	const supportsOriginal = major > 5 || (major === 5 && minor !== null && minor >= 4);
+	if (!supportsOriginal) {
+		return DEFAULT_OPENAI_IMAGE_DETAIL;
 	}
 
-	if (major === 5 && minor !== null && minor >= 4) {
-		return 'original';
-	}
+	return isVariant ? 'high' : 'original';
+};
 
-	return DEFAULT_OPENAI_IMAGE_DETAIL;
+// Per-image `detail` for WORKER-RENDERED document pages (the `_skapi_render`
+// path). Same resolution as above with one difference: these are dense scans
+// whose entire purpose is to be read, so 'auto' is never acceptable — it lets
+// the API downsample exactly the pixels the model needs to OCR. Floor it at
+// 'high'; models that support full-resolution 'original' still get it.
+//
+// Without this the worker falls back to its own model-blind default ('high'),
+// which silently denies the strongest models the 'original' detail they support.
+const getRenderImageDetail = (model?: string) => {
+	const detail = getOpenAIImageDetail(model);
+	return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? 'high' : detail;
 };
 
 export type ClaudeRole = 'user' | 'assistant';
@@ -478,10 +500,28 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
 	const renderFrom = Math.max(0, info.renderFrom || 0);
 	const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : undefined;
+	// Tell the worker what image `detail` to stamp on the injected page blocks.
+	// The worker is model-blind, so without this it applies a one-size default and
+	// the strongest models never get the 'original' detail they support. Only
+	// meaningful for OpenAI — Claude has no per-image detail knob and the worker
+	// ignores the field for it.
+	const renderDetail = platform === 'openai'
+		? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL)
+		: undefined;
+	// `auto_continue` + `continue_text` hand the page loop to the WORKER: when its renderer
+	// reports pages left after this window, it builds the next pass from this template
+	// (substituting the window's 1-based start page for RENDER_FROM_TOKEN) and enqueues it
+	// itself. That is what makes a 500-page document index end-to-end — the loop no longer
+	// depends on the tab staying open, nor on the model correctly declaring itself unfinished.
 	const skapiRender = visionFile && renderPlaceholder
 		? {
 			_skapi_render: [
-				{ path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW, placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime },
+				{
+					path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW,
+					placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime, detail: renderDetail,
+					auto_continue: true,
+					continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder),
+				},
 			],
 		}
 		: {};
@@ -733,18 +773,16 @@ export type BgTaskEntry = {
 
 // Token the indexing agent appends to its final message ONLY when it has fully read and
 // saved the whole file. Its ABSENCE is what tells the client to run another CONTINUE pass.
+//
+// Applies to the TEXT/GRID paging path only. The vision path (rendered PDF pages) no longer
+// asks the model whether it is finished — the worker advances that loop off the renderer's
+// page count — so this marker has no say in whether a PDF keeps going.
 export const INDEXING_COMPLETE_MARKER = 'INDEXING_COMPLETE';
 // Cap on CONTINUE passes per file, so a file the agent can never mark complete (or a
 // pathological loop) stops instead of re-dispatching forever. The text/grid paging path
 // reads MANY windows within a single pass (the agent loops readFileContent in one turn), so
 // a small cap suffices.
 export const MAX_INDEXING_RESUME_PASSES = 6;
-// The VISION path (rendered PDF pages) can only advance ONE page-window per pass, because the
-// worker injects a single window of images into each request. A big scanned PDF therefore
-// needs one pass PER window (pages / RENDER_PAGES_PER_WINDOW), so it gets a much higher cap.
-// The loop still terminates naturally when the agent reaches the last window (it appends
-// INDEXING_COMPLETE); this cap is only the backstop for a doc larger than it covers.
-export const MAX_VISION_RESUME_PASSES = 40;
 
 export async function getChatHistory(
 	params: { service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string },

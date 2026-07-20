@@ -102,15 +102,27 @@ export function buildIndexingUserMessage(
 }
 
 /**
+ * Token the WORKER substitutes with the 1-based first page of the window it is about to
+ * render, when it builds the next pass of a document from `RENDER_CONTINUE_TEMPLATE`.
+ * Must match the worker's RENDER_FROM_TOKEN.
+ */
+export const RENDER_FROM_TOKEN = '{{RENDER_FROM}}';
+
+/**
  * User message for a VISION file (PDF): its pages are delivered as RENDERED PAGE IMAGES that
  * the proxy worker injects into THIS message at the `placeholder` token (tool-result images
  * render on neither provider, so the pages must be image blocks in the message itself). Each
- * pass shows one WINDOW of pages starting at `renderFrom` (0-based); the resume loop advances
- * the window a pass at a time until the injected note says the last window was reached.
+ * pass shows one WINDOW of pages starting at `renderFrom` (0-based).
+ *
+ * The WORKER advances the window: when its renderer reports pages remaining it enqueues the
+ * next pass itself, off the true page count, so a document indexes end-to-end with no browser
+ * involved. This message therefore only ever describes ONE window, and the model is never
+ * asked to decide whether the document is finished.
  *
  * renderFrom === 0 is the FIRST pass (leads with "A new file has just been uploaded." so the
- * client builds the "Indexing: <name>" bubble); renderFrom > 0 is a RESUME pass (leads with
- * "CONTINUE indexing" like the paged continue message, so it is not a duplicate primary bubble).
+ * client builds the "Indexing: <name>" bubble); a continue pass (built by the worker from
+ * buildIndexingRenderContinueTemplate) leads with "CONTINUE indexing" so it is not a duplicate
+ * primary bubble.
  */
 export function buildIndexingRenderMessage(
 	attachment: IndexingAttachmentInfo,
@@ -118,44 +130,66 @@ export function buildIndexingRenderMessage(
 	renderFrom: number,
 ): string {
 	const from = Math.max(0, renderFrom || 0);
+	if (from > 0) return buildIndexingRenderContinueTemplate(attachment, placeholder, String(from + 1));
+
+	return (
+		`A new file has just been uploaded. Index it now.\n\n` +
+		buildRenderMeta(attachment) +
+		`\nThis is a PDF. Its pages are delivered to you as RENDERED PAGE IMAGES embedded directly in this ` +
+		`message (you do NOT need any tool, URL, or web_fetch to see them). You are shown a WINDOW of pages ` +
+		`at a time, starting at page ${from + 1}.\n` +
+		buildRenderDatafy(placeholder)
+	);
+}
+
+/**
+ * The CONTINUE pass, as a template the worker fills in. `pageLabel` defaults to the
+ * RENDER_FROM_TOKEN placeholder, which the worker replaces with the real 1-based start page
+ * of the window it is rendering; passing an explicit label produces a ready-to-send message.
+ */
+export function buildIndexingRenderContinueTemplate(
+	attachment: IndexingAttachmentInfo,
+	placeholder: string,
+	pageLabel: string = RENDER_FROM_TOKEN,
+): string {
 	const src = `src::${attachment.storagePath}`;
-	const meta =
+	return (
+		`CONTINUE indexing a PDF whose previous pass did not finish.\n\n` +
+		buildRenderMeta(attachment) +
+		`\nRecords for the earlier pages are ALREADY saved (they reference "${src}"). The NEXT window of ` +
+		`rendered page images (starting at page ${pageLabel}) is embedded in this message. Datafy each page as ` +
+		`before and do NOT re-save pages that are already saved.\n` +
+		buildRenderDatafy(placeholder)
+	);
+}
+
+function buildRenderMeta(attachment: IndexingAttachmentInfo): string {
+	return (
 		`File metadata:\n` +
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
-		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '');
+		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '')
+	);
+}
 
-	// Shared datafy + completion guidance. The placeholder is where the worker splices the
-	// note + rendered page images; instructions reference "the page images in this message"
-	// so they read correctly whether the images land before or after this text.
-	const datafy =
+// Shared datafy guidance. The placeholder is where the worker splices the note + rendered
+// page images; instructions reference "the page images in this message" so they read
+// correctly whether the images land before or after this text.
+//
+// Deliberately says nothing about INDEXING_COMPLETE or about whether the document is
+// finished: the worker decides that from the renderer's page count. Asking the model was
+// what used to end an 88-page file at page 15.
+function buildRenderDatafy(placeholder: string): string {
+	return (
 		`\n${placeholder}\n\n` +
 		`LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page ` +
 		`call postRecords and save records - one record per row / table entry / line item visible on the page ` +
 		`(or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables ` +
 		`cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.\n\n` +
-		`The note next to the images tells you whether MORE pages remain after this window. ` +
-		`If MORE remain: save this window's records and STOP - do NOT write INDEXING_COMPLETE; another pass shows the next window automatically. ` +
-		`Only when the note says this is the LAST window (you have seen the whole file) AND everything is saved, end your message with the token INDEXING_COMPLETE.`;
-
-	if (from === 0) {
-		return (
-			`A new file has just been uploaded. Index it now.\n\n` +
-			meta +
-			`\nThis is a PDF. Its pages are delivered to you as RENDERED PAGE IMAGES embedded directly in this ` +
-			`message (you do NOT need any tool, URL, or web_fetch to see them). You are shown a WINDOW of pages ` +
-			`at a time, starting at page ${from + 1}.\n` +
-			datafy
-		);
-	}
-
-	return (
-		`CONTINUE indexing a PDF whose previous pass did not finish.\n\n` +
-		meta +
-		`\nRecords for the earlier pages are ALREADY saved (they reference "${src}"). The NEXT window of ` +
-		`rendered page images (starting at page ${from + 1}) is embedded in this message. Datafy each page as ` +
-		`before and do NOT re-save pages that are already saved.\n` +
-		datafy
+		`Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read ` +
+		`the rest of the file and do NOT worry about the pages after this window: if any remain, the next window ` +
+		`is rendered and sent to you automatically. Report only the pages you were actually shown - never imply ` +
+		`you have seen the whole document.`
 	);
 }
 

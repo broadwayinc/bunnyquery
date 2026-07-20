@@ -326,32 +326,38 @@ Read this file with the readFileContent tool, using the storage path above - do 
   }
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
 }
+var RENDER_FROM_TOKEN = "{{RENDER_FROM}}";
 function buildIndexingRenderMessage(attachment, placeholder, renderFrom) {
   const from = Math.max(0, renderFrom || 0);
+  if (from > 0) return buildIndexingRenderContinueTemplate(attachment, placeholder, String(from + 1));
+  return `A new file has just been uploaded. Index it now.
+
+` + buildRenderMeta(attachment) + `
+This is a PDF. Its pages are delivered to you as RENDERED PAGE IMAGES embedded directly in this message (you do NOT need any tool, URL, or web_fetch to see them). You are shown a WINDOW of pages at a time, starting at page ${from + 1}.
+` + buildRenderDatafy(placeholder);
+}
+function buildIndexingRenderContinueTemplate(attachment, placeholder, pageLabel = RENDER_FROM_TOKEN) {
   const src = `src::${attachment.storagePath}`;
-  const meta = `File metadata:
+  return `CONTINUE indexing a PDF whose previous pass did not finish.
+
+` + buildRenderMeta(attachment) + `
+Records for the earlier pages are ALREADY saved (they reference "${src}"). The NEXT window of rendered page images (starting at page ${pageLabel}) is embedded in this message. Datafy each page as before and do NOT re-save pages that are already saved.
+` + buildRenderDatafy(placeholder);
+}
+function buildRenderMeta(attachment) {
+  return `File metadata:
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "");
-  const datafy = `
+}
+function buildRenderDatafy(placeholder) {
+  return `
 ${placeholder}
 
 LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
 
-The note next to the images tells you whether MORE pages remain after this window. If MORE remain: save this window's records and STOP - do NOT write INDEXING_COMPLETE; another pass shows the next window automatically. Only when the note says this is the LAST window (you have seen the whole file) AND everything is saved, end your message with the token INDEXING_COMPLETE.`;
-  if (from === 0) {
-    return `A new file has just been uploaded. Index it now.
-
-` + meta + `
-This is a PDF. Its pages are delivered to you as RENDERED PAGE IMAGES embedded directly in this message (you do NOT need any tool, URL, or web_fetch to see them). You are shown a WINDOW of pages at a time, starting at page ${from + 1}.
-` + datafy;
-  }
-  return `CONTINUE indexing a PDF whose previous pass did not finish.
-
-` + meta + `
-Records for the earlier pages are ALREADY saved (they reference "${src}"). The NEXT window of rendered page images (starting at page ${from + 1}) is embedded in this message. Datafy each page as before and do NOT re-save pages that are already saved.
-` + datafy;
+Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
 }
 function buildIndexingContinueMessage(attachment) {
   const src = `src::${attachment.storagePath}`;
@@ -624,19 +630,22 @@ var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
 var getOpenAIImageDetail = (model) => {
   const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
-  const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?$/);
+  const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
   if (!match) {
     return DEFAULT_OPENAI_IMAGE_DETAIL;
   }
   const major = Number(match[1]);
   const minor = match[2] === void 0 ? null : Number(match[2]);
-  if (major > 5) {
-    return "original";
+  const isVariant = !!match[3];
+  const supportsOriginal = major > 5 || major === 5 && minor !== null && minor >= 4;
+  if (!supportsOriginal) {
+    return DEFAULT_OPENAI_IMAGE_DETAIL;
   }
-  if (major === 5 && minor !== null && minor >= 4) {
-    return "original";
-  }
-  return DEFAULT_OPENAI_IMAGE_DETAIL;
+  return isVariant ? "high" : "original";
+};
+var getRenderImageDetail = (model) => {
+  const detail = getOpenAIImageDetail(model);
+  return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? "high" : detail;
 };
 var IMAGE_URL_REGEX = /\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
 function transformContentWithImages(content) {
@@ -881,9 +890,20 @@ async function notifyAgentSaveAttachment(info) {
   const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
   const renderFrom = Math.max(0, info.renderFrom || 0);
   const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
+  const renderDetail = platform === "openai" ? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
   const skapiRender = visionFile && renderPlaceholder ? {
     _skapi_render: [
-      { path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW, placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime }
+      {
+        path: attachment.storagePath,
+        from: renderFrom,
+        count: RENDER_PAGES_PER_WINDOW,
+        placeholder: renderPlaceholder,
+        name: attachment.name,
+        mime: attachment.mime,
+        detail: renderDetail,
+        auto_continue: true,
+        continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder)
+      }
     ]
   } : {};
   const pagedRead = !visionFile && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
@@ -1063,7 +1083,6 @@ async function listOpenAIModels(service, owner) {
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
 var MAX_INDEXING_RESUME_PASSES = 6;
-var MAX_VISION_RESUME_PASSES = 40;
 async function getChatHistory(params, fetchOptions) {
   const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
   const p = Object.assign(
@@ -1229,21 +1248,77 @@ var ChatSession = class {
     var key = this.getHistoryCacheKey();
     if (!key) return;
     this.aiChatHistoryCache[key] = {
-      messages: this.state.messages.slice(),
+      messages: this.state.messages.filter(function(m) {
+        return m._ownerKey === void 0 || m._ownerKey === key;
+      }),
       endOfList: this.state.historyEndOfList,
       startKeyHistory: this.state.historyStartKeyHistory.slice()
     };
   }
-  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls) {
-    var id = this.host.getIdentity();
-    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, id.serviceId, id.owner, messages, system, model, userId, extractContent, fileUrls);
+  /**
+   * Land a resolved reply in the history cache of a chat that is NOT currently
+   * visible, without touching state.messages. Mirrors the cache-only path in
+   * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
+   * (append only when there is none), and settle the matching pending user
+   * bubble, so the cached copy never keeps a stuck "Thinking..." that a later
+   * cache-first load would re-render forever.
+   */
+  _applyReplyToCache(key, reply, serverId) {
+    if (!key) return;
+    var existing = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+    var msgs = existing.messages.slice();
+    var thIdx = -1;
+    for (var i = msgs.length - 1; i >= 0; i--) {
+      var m = msgs[i];
+      if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
+      if (serverId && m._serverItemId && m._serverItemId !== serverId) continue;
+      thIdx = i;
+      break;
+    }
+    if (thIdx !== -1) {
+      if (reply._serverItemId === void 0 && msgs[thIdx]._serverItemId !== void 0) reply._serverItemId = msgs[thIdx]._serverItemId;
+      msgs[thIdx] = reply;
+    } else {
+      msgs.push(reply);
+    }
+    for (var j = 0; j < msgs.length; j++) {
+      var u = msgs[j];
+      if (!u || u.role !== "user" || u.isBackgroundTask) continue;
+      if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
+      if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
+      var settled = { role: "user", content: u.content };
+      if (u._serverItemId !== void 0) settled._serverItemId = u._serverItemId;
+      if (u._ownerKey !== void 0) settled._ownerKey = u._ownerKey;
+      msgs[j] = settled;
+      break;
+    }
+    this.aiChatHistoryCache[key] = {
+      messages: msgs,
+      endOfList: existing.endOfList,
+      startKeyHistory: existing.startKeyHistory
+    };
+  }
+  /**
+   * serviceId/owner are passed explicitly by every caller: a request can be
+   * dispatched after the user moved to another project, and re-reading the live
+   * identity here would silently send the turn to THAT project instead of the
+   * one it was composed for. Falls back to the live read only when a caller
+   * omits them.
+   */
+  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, serviceId, owner) {
+    if (serviceId === void 0 || owner === void 0) {
+      var id = this.host.getIdentity();
+      if (serviceId === void 0) serviceId = id.serviceId;
+      if (owner === void 0) owner = id.owner;
+    }
+    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls);
   }
   dispatchAgentRequest(params) {
     var self = this;
     var dispatchItemId;
     var sendAndPoll = function() {
       return Promise.resolve(
-        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls)
+        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.serviceId, params.owner)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
           if (initial.id) {
@@ -1304,20 +1379,57 @@ var ChatSession = class {
   // composed = clean display text; composedForLlm carries office-extraction
   // placeholders for the provider only. useBgQueue routes a post-attachment turn
   // onto the "-bg" queue so it runs after indexing.
-  dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent, fileUrls) {
+  dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent, fileUrls, pinned) {
     var self = this;
     if (!composed) return;
-    var id = this.host.getIdentity();
+    var id = pinned ? pinned.identity : this.host.getIdentity();
     if (id.platform === "none") return;
     var llmComposed = composedForLlm || composed;
-    var isQueuedSend = useBgQueue || this.state.sending || this.state.messages.some(function(m) {
+    var key = !id.serviceId ? "" : id.serviceId + "#" + id.platform;
+    var offChat = !!key && key !== this.getHistoryCacheKey();
+    var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function(m) {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
-    });
+    }));
     var aiPlatform = id.platform;
     var aiModel = id.model || void 0;
-    var systemPrompt = this.host.buildSystemPrompt();
+    var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
     var userId = id.userId || id.serviceId;
     var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
+    if (offChat) {
+      var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function(m) {
+        return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask;
+      });
+      var offBounded = buildBoundedChatMessages({
+        platform: aiPlatform,
+        model: aiModel,
+        systemPrompt,
+        serviceId: id.serviceId,
+        history: offHistory.concat([{ role: "user", content: llmComposed }])
+      });
+      var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+      this.aiChatHistoryCache[key] = {
+        messages: offExisting.messages.concat([
+          { role: "user", content: composed, _ownerKey: key },
+          { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
+        ]),
+        endOfList: offExisting.endOfList,
+        startKeyHistory: offExisting.startKeyHistory
+      };
+      this.dispatchAgentRequest({
+        key,
+        serviceId: id.serviceId,
+        owner: id.owner,
+        aiPlatform,
+        aiModel,
+        systemPrompt,
+        text: composed,
+        boundedMessages: offBounded.messages,
+        userId: chatQueue,
+        extractContent,
+        fileUrls
+      });
+      return;
+    }
     if (isQueuedSend) {
       var resolvedHistory = this.state.messages.filter(function(m) {
         return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask;
@@ -1330,15 +1442,16 @@ var ChatSession = class {
         history: resolvedHistory.concat([{ role: "user", content: llmComposed }])
       });
       var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true };
+      if (key) queuedBubble._ownerKey = key;
       if (useBgQueue) queuedBubble._useBgQueue = true;
       this.state.messages.push(queuedBubble);
       this.host.notify();
       this.updateHistoryCache();
       this.host.scrollToBottom(true);
-      var capturedComposed = composed, capturedPlatform = aiPlatform;
-      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls)).then(function(result) {
-        var sendingIdx = self.state.messages.findIndex(function(m) {
-          return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user";
+      var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
+      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner)).then(function(result) {
+        var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
+          return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
         });
         var serverId = result && typeof result.id === "string" ? result.id : void 0;
         if (sendingIdx >= 0) {
@@ -1350,24 +1463,23 @@ var ChatSession = class {
         if (result && result.poll && (result.status === "pending" || result.status === "running")) {
           if (serverId) self.historyItemPolls.set(serverId, true);
           return result.poll({ latency: POLL_INTERVAL }).then(function(res) {
-            return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId);
+            return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey);
           }).catch(function(err) {
-            return self.onQueuedSendError(capturedComposed, err, serverId);
+            return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey);
           });
         }
-        return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId);
+        return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
       }).catch(function(err) {
-        return self.onQueuedSendError(capturedComposed, err, void 0);
+        return self.onQueuedSendError(capturedComposed, err, void 0, capturedKey);
       });
       return;
     }
-    this.state.messages.push({ role: "user", content: composed });
-    this.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true });
+    this.state.messages.push({ role: "user", content: composed, ...key ? { _ownerKey: key } : {} });
+    this.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} });
     this.host.notify();
     this.updateHistoryCache();
     this.state.sending = true;
     this.host.scrollToBottom(true);
-    var key = this.getHistoryCacheKey();
     var historyForLlm = this.state.messages.filter(function(m) {
       return !m.isCancelled && !m.isBackgroundTask;
     });
@@ -1401,8 +1513,8 @@ var ChatSession = class {
     });
     Promise.resolve(run).catch(function() {
     }).then(function() {
-      if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
       self.state.sending = false;
+      if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
       return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
         self.host.scrollToBottom(true);
       });
@@ -1419,9 +1531,11 @@ var ChatSession = class {
     var existing = this.state.messages[nextIdx];
     var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
     if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
+    if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
     this.state.messages[nextIdx] = promoted;
     var placeholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true };
     if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
+    if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
     this.state.messages.splice(nextIdx + 1, 0, placeholder);
     this.host.notify();
   }
@@ -1437,14 +1551,20 @@ var ChatSession = class {
     var promoted = { role: "user", content: existing.content, isPendingInProcess: true };
     if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
     if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
+    if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
     if (existing.isSendingToServer) promoted.isSendingToServer = true;
     this.state.messages[nextIdx] = promoted;
     var placeholder = { role: "assistant", content: "", isPending: true };
     if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
+    if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
     this.state.messages.splice(nextIdx + 1, 0, placeholder);
     this.host.notify();
   }
   resolveQueuedUserBubble(serverId) {
+    var liveKey = this.getHistoryCacheKey();
+    var isLocal = function(m) {
+      return m._ownerKey === void 0 || m._ownerKey === liveKey;
+    };
     var userIdx = -1;
     if (serverId) {
       userIdx = this.state.messages.findIndex(function(m) {
@@ -1453,19 +1573,19 @@ var ChatSession = class {
     }
     if (userIdx === -1) {
       userIdx = this.state.messages.findIndex(function(m) {
-        return m.isPendingInProcess && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue;
+        return m.isPendingInProcess && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
       });
     }
     if (userIdx === -1) {
       userIdx = this.state.messages.findIndex(function(m) {
-        return m.isPendingQueued && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue;
+        return m.isPendingQueued && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
       });
     }
     if (serverId && this.cancelledServerIds.has(serverId)) {
       this.cancelledServerIds.delete(serverId);
       if (userIdx >= 0) {
         var ex = this.state.messages[userIdx];
-        this.state.messages[userIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId };
+        this.state.messages[userIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId, ...ex._ownerKey !== void 0 ? { _ownerKey: ex._ownerKey } : {} };
         var thIdx = this.state.messages.findIndex(function(m, i) {
           return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
         });
@@ -1478,6 +1598,7 @@ var ChatSession = class {
       var exist = this.state.messages[userIdx];
       var repl = { role: "user", content: exist.content };
       if (exist._serverItemId !== void 0) repl._serverItemId = exist._serverItemId;
+      if (exist._ownerKey !== void 0) repl._ownerKey = exist._ownerKey;
       this.state.messages[userIdx] = repl;
     }
     var thinkingIdx = userIdx >= 0 ? this.state.messages.findIndex(function(m, i) {
@@ -1490,8 +1611,14 @@ var ChatSession = class {
     else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
     else this.state.messages.push(msg);
   }
-  onQueuedSendResponse(_composed, response, platform, serverId) {
+  onQueuedSendResponse(_composed, response, platform, serverId, ownerKey) {
     if (serverId) this.historyItemPolls.delete(serverId);
+    if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+      var offReply = isErrorResponseBody(response) ? { role: "assistant", content: getErrorMessage(response), isError: true } : { role: "assistant", content: ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim() || "No text response received from AI provider." };
+      this._applyReplyToCache(ownerKey, offReply, serverId);
+      if (serverId) this.cancelledServerIds.delete(serverId);
+      return;
+    }
     var targetIdx = this.resolveQueuedUserBubble(serverId);
     if (targetIdx === void 0) {
       this.host.notify();
@@ -1525,8 +1652,14 @@ var ChatSession = class {
     this.host.notify();
     this.host.scrollToBottom(true);
   }
-  onQueuedSendError(_composed, err, serverId) {
+  onQueuedSendError(_composed, err, serverId, ownerKey) {
     if (serverId) this.historyItemPolls.delete(serverId);
+    if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+      var isGone = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
+      this._applyReplyToCache(ownerKey, isGone ? { role: "assistant", content: "Request was cancelled.", isError: true } : { role: "assistant", content: getErrorMessage(err), isError: true }, serverId);
+      if (serverId) this.cancelledServerIds.delete(serverId);
+      return;
+    }
     var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
     if (isNotExists) {
       var userIdx = serverId ? this.state.messages.findIndex(function(m) {
@@ -1973,25 +2106,30 @@ var ChatSession = class {
     this.promoteNextBgQueuedToRunning();
   }
   // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
-  // PDF) finished WITHOUT the completion marker, the agent ran out of room before reading
+  // text) finished WITHOUT the completion marker, the agent ran out of room before reading
   // the whole file - dispatch a CONTINUE pass (up to a cap) that resumes from where the
   // already-saved records leave off. Additive + guarded so it never loops forever and
   // never breaks the resolution path.
+  //
+  // VISION files (PDFs rendered to page images) are NOT resumed here: the proxy worker
+  // advances their page window itself, off the renderer's true page count. Driving them
+  // from the browser is what used to lose pages on long documents - the chain lived in tab
+  // memory (a reload or a closed tab ended it), and it stopped whenever the model claimed
+  // completion, which on an 88-page file happened at page 15. Continuing to dispatch here
+  // as well would now double-index every window.
   maybeResumeIndexing(entry, response, platform) {
     var self = this;
     try {
       if (!entry || !entry.storagePath) return;
       if (!isPagedReadFile(entry.filename, entry.mime)) return;
+      if (isImageVisionFile(entry.filename, entry.mime)) return;
       if (isErrorResponseBody(response)) return;
       var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
       if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
       var pass = (entry.resumePass || 0) + 1;
-      var isVision = isImageVisionFile(entry.filename, entry.mime);
-      var maxPasses = isVision ? MAX_VISION_RESUME_PASSES : MAX_INDEXING_RESUME_PASSES;
-      if (pass > maxPasses) return;
+      if (pass > MAX_INDEXING_RESUME_PASSES) return;
       var id = this.host.getIdentity();
       if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
-      var renderFrom = isVision ? pass * RENDER_PAGES_PER_WINDOW : void 0;
       notifyAgentContinueIndexing({
         platform: id.platform,
         model: id.model,
@@ -2000,7 +2138,6 @@ var ChatSession = class {
         userId: id.userId || id.serviceId,
         serviceName: id.serviceName,
         serviceDescription: id.serviceDescription,
-        renderFrom,
         attachment: {
           name: entry.filename,
           storagePath: entry.storagePath,
@@ -2040,6 +2177,7 @@ var ChatSession = class {
   loadHistory(fetchMore, token) {
     var self = this;
     var id = this.host.getIdentity();
+    var loadKey = !id.serviceId || id.platform === "none" ? "" : id.serviceId + "#" + id.platform;
     if (token === void 0) token = this.state.gateRefreshToken;
     if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.serviceId) {
       return Promise.resolve();
@@ -2096,6 +2234,7 @@ var ChatSession = class {
         for (var ri = 0; ri < self.state.messages.length; ri++) {
           var mm = self.state.messages[ri];
           if (mm.isBackgroundTask) continue;
+          if (mm._ownerKey !== void 0 && mm._ownerKey !== loadKey) continue;
           if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
           if (!mm._serverItemId) {
             if (mappedHasPendingAssistant) continue;
@@ -2409,11 +2548,13 @@ exports.MCP_NAME = MCP_NAME;
 exports.MIN_INPUT_TOKEN_BUDGET = MIN_INPUT_TOKEN_BUDGET;
 exports.OUTPUT_TOKEN_RESERVE = OUTPUT_TOKEN_RESERVE;
 exports.POLL_INTERVAL = POLL_INTERVAL;
+exports.RENDER_FROM_TOKEN = RENDER_FROM_TOKEN;
 exports.TOOL_AND_RESPONSE_BUFFER = TOOL_AND_RESPONSE_BUFFER;
 exports.buildBoundedChatMessages = buildBoundedChatMessages;
 exports.buildChatSystemPrompt = buildChatSystemPrompt;
 exports.buildDisplayExpiredAttachmentHref = buildDisplayExpiredAttachmentHref;
 exports.buildIndexingContinueMessage = buildIndexingContinueMessage;
+exports.buildIndexingRenderContinueTemplate = buildIndexingRenderContinueTemplate;
 exports.buildIndexingRenderMessage = buildIndexingRenderMessage;
 exports.buildIndexingSystemPrompt = buildIndexingSystemPrompt;
 exports.buildIndexingUserMessage = buildIndexingUserMessage;

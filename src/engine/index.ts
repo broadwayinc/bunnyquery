@@ -57,7 +57,7 @@ export {
 // Tier-2: the stateful chat orchestration (queue/poll/cancel, typewriter,
 // bg-task drain, resolution). DOM-free; the consumer implements ChatHost.
 export { ChatSession } from './session';
-export type { ChatHost, ChatIdentity, ChatState, ChatMessage } from './host';
+export type { ChatHost, ChatIdentity, ChatState, ChatMessage, PinnedDispatchContext } from './host';
 
 export {
 	// constants

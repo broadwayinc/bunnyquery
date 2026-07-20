@@ -11,6 +11,8 @@ export {
 	buildIndexingUserMessage,
 	buildIndexingContinueMessage,
 	buildIndexingRenderMessage,
+	buildIndexingRenderContinueTemplate,
+	RENDER_FROM_TOKEN,
 	type IndexingAttachmentInfo,
 	type BuildIndexingUserMessageOptions,
 } from './indexing_user_message';
