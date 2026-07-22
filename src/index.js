@@ -56,6 +56,7 @@ import {
     truncateLabelForDisplay,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
+    buildChatDisplayList,
 } from "./engine";
 
 (function () {
@@ -1540,7 +1541,11 @@ import {
     // ---- chat state ------------------------------------------------------
     var CS = {
         messages: [],
-        messageEls: [],          // parallel rendered .bq-message nodes
+        // Rendered .bq-message nodes, indexed BY MESSAGE INDEX (sparse: a message
+        // folded into a collapsed indexing row has no node of its own).
+        messageEls: [],
+        // Expanded background-indexing rows, keyed by group key (storage path).
+        indexGroupsOpen: {},
         messagesBox: null,       // .bq-messages element
         sending: false,
         typing: false,
@@ -2701,6 +2706,96 @@ import {
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
     }
 
+    /* ---- collapsed background-indexing rows ------------------------------
+     * One file's indexing turns (first pass + every CONTINUE pass, request AND
+     * response) render as a SINGLE status row wherever they sit in the
+     * conversation. Grouping is the shared engine's (buildChatDisplayList) so
+     * agent.vue collapses identically; only this markup is widget-side.
+     */
+    // Inlined SVG, never an icon font (the widget ships none). The active one is
+    // spun by CSS (.bq-index-group.is-active .bq-index-icon svg).
+    var INDEX_ICON_ACTIVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 0 1-8.5 8.5 8.5 8.5 0 0 1-7.6-4.7"/><path d="M3.5 12A8.5 8.5 0 0 1 12 3.5a8.5 8.5 0 0 1 7.6 4.7"/><path d="M20 3.6v4.8h-4.8"/><path d="M4 20.4v-4.8h4.8"/></svg>';
+    var INDEX_ICON_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>';
+    var INDEX_ICON_ERROR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><path d="M12 16.6h.01"/></svg>';
+    var INDEX_ICON_CANCELLED = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.2 8.2l7.6 7.6"/></svg>';
+
+    function indexGroupIcon(group) {
+        if (group.status === "active") return INDEX_ICON_ACTIVE;
+        if (group.status === "error") return INDEX_ICON_ERROR;
+        if (group.status === "cancelled") return INDEX_ICON_CANCELLED;
+        return INDEX_ICON_DONE;
+    }
+
+    function indexGroupVerb(group) {
+        if (group.status === "active") return group.isReindex ? "Reindexing" : "Indexing";
+        if (group.status === "error") return "Indexing failed:";
+        if (group.status === "cancelled") return "Indexing cancelled:";
+        return group.isReindex ? "Reindexed" : "Indexed";
+    }
+
+    // The file renders as a BARE storage-path markdown link, the same form the
+    // uncollapsed bubble used, so a click mints a fresh temporary URL.
+    function indexGroupLabel(group) {
+        var nameLabel = group.path ? "[" + group.name + "](" + group.path + ")" : group.name;
+        return indexGroupVerb(group) + " " + nameLabel;
+    }
+
+    // Passes LOADED, never a server-side total: history pages newest-first, so a
+    // scroll-up can always reveal more. "+" marks a run whose start is unpaged.
+    function indexGroupCount(group) {
+        if (group.passCount <= 1 && !group.mayHaveOlder) return "";
+        return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+    }
+
+    function toggleIndexGroup(key) {
+        if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
+        else CS.indexGroupsOpen[key] = true;
+        renderMessages();
+    }
+
+    function buildIndexGroupEl(group, isOpen) {
+        var cls = ["bq-index-group"];
+        if (group.status === "active") cls.push("is-active");
+        if (group.status === "error") cls.push("is-error");
+        if (isOpen) cls.push("is-open");
+
+        var label = h("span", { class: "bq-index-label", html: parseMsgPartsHtml(indexGroupLabel(group)) });
+        label.addEventListener("click", function (e) {
+            // A click on the file name is a download, not a collapse toggle.
+            if (e.target && e.target.closest && e.target.closest("a")) e.stopPropagation();
+            onBubbleLinkClick(e);
+        });
+
+        // A div, not a button: the file name inside is a real anchor, and an
+        // anchor nested in a button is invalid and swallows its own activation.
+        var head = h("div", {
+            class: "bq-index-head",
+            role: "button",
+            tabindex: "0",
+            "aria-expanded": isOpen ? "true" : "false",
+            title: isOpen ? "Hide indexing steps" : "Show indexing steps",
+            onclick: function () { toggleIndexGroup(group.key); },
+            onkeydown: function (e) {
+                if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+                e.preventDefault();
+                toggleIndexGroup(group.key);
+            },
+        },
+            h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
+            label,
+            indexGroupCount(group) ? h("span", { class: "bq-index-count", text: indexGroupCount(group) }) : null,
+            h("span", { class: "bq-index-chevron", text: "▶" }));
+
+        var el = h("div", { class: cls.join(" ") }, head);
+        if (isOpen && group.mayHaveOlder) {
+            el.appendChild(h("div", {
+                class: "bq-index-note",
+                text: "Earlier passes of this file are further back in the conversation. Scroll up to load them.",
+            }));
+        }
+        return el;
+    }
+
     function historyLoadingEl(initial) {
         // Initial (empty messages area) load gets the jumping bunny, matching
         // www.bunnyquery.com's .bq-gate-loading. Older-history pagination keeps the
@@ -2732,9 +2827,25 @@ import {
             CS.messagesBox.appendChild(greet);
             return;
         }
-        CS.messages.forEach(function (msg, idx) {
-            var el = buildMessageEl(msg, idx);
-            CS.messageEls.push(el);
+        // Rows, not raw messages: a file's many background-indexing turns collapse
+        // into one status row. An expanded row's own turns are emitted as ordinary
+        // message rows right after it, so buildMessageEl stays the single source.
+        var rows = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+        rows.forEach(function (row) {
+            if (row.kind === "indexing") {
+                var isOpen = !!CS.indexGroupsOpen[row.group.key];
+                CS.messagesBox.appendChild(buildIndexGroupEl(row.group, isOpen));
+                if (!isOpen) return;
+                row.group.members.forEach(function (member) {
+                    var pass = buildMessageEl(member.msg, member.index);
+                    pass.classList.add("bq-index-pass");
+                    CS.messageEls[member.index] = pass;
+                    CS.messagesBox.appendChild(pass);
+                });
+                return;
+            }
+            var el = buildMessageEl(row.msg, row.index);
+            CS.messageEls[row.index] = el;
             CS.messagesBox.appendChild(el);
         });
     }
@@ -2742,15 +2853,18 @@ import {
     function refreshMessageBubble(idx) {
         if (idx < 0 || idx >= CS.messages.length) return;
         var oldEl = CS.messageEls[idx];
+        // No node means the message is folded into a collapsed indexing row; its
+        // text is not on screen, so there is nothing to patch.
         if (!oldEl || !oldEl.parentNode) return;
         var newEl = buildMessageEl(CS.messages[idx], idx);
+        if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
         oldEl.parentNode.replaceChild(newEl, oldEl);
         CS.messageEls[idx] = newEl;
     }
 
     function renderChat() {
         // reset transient chat state on (re)entry
-        CS.messages = []; CS.messageEls = []; CS.sending = false; CS.typing = false; CS.typingAbort = true;
+        CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;

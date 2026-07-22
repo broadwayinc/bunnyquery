@@ -674,7 +674,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
   var MCP_NAME = "BunnyQuery";
   var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
-  var DEFAULT_OPENAI_MODEL = "gpt-5.4";
+  var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
   var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
   var getOpenAIImageDetail = (model) => {
@@ -1195,6 +1195,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
       if (userText) {
         var displayContent;
+        var indexFile = void 0;
         if (item._isBgTask) {
           var nameMatch = userText.match(/^- name: (.+)$/m);
           if (nameMatch) {
@@ -1210,6 +1211,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               false,
               isContinuePass
             );
+            indexFile = {
+              name: nameMatch[1].trim(),
+              path: pathMatch ? pathMatch[1].trim() : void 0,
+              mime: mimeMatch ? mimeMatch[1].trim() : void 0,
+              size: sizeMatch ? Number(sizeMatch[1]) : void 0,
+              continued: isContinuePass
+            };
           } else {
             displayContent = userText;
           }
@@ -1221,6 +1229,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isQueued) userMsg.isPendingQueued = true;
         if (isCancelledItem) userMsg.isCancelled = true;
         if (item._isBgTask) userMsg.isBackgroundTask = true;
+        if (indexFile) userMsg._indexFile = indexFile;
         if (item._isOnBgQueue) userMsg._useBgQueue = true;
         if (serverItemId !== void 0) userMsg._serverItemId = serverItemId;
         mapped.push(userMsg);
@@ -1409,7 +1418,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (reply._serverItemId === void 0 && msgs[thIdx]._serverItemId !== void 0) reply._serverItemId = msgs[thIdx]._serverItemId;
         msgs[thIdx] = reply;
       } else {
-        msgs.push(reply);
+        var dupIdx = -1;
+        if (serverId) {
+          for (var d = msgs.length - 1; d >= 0; d--) {
+            var dm = msgs[d];
+            if (dm && dm.role === "assistant" && dm._serverItemId === serverId) {
+              dupIdx = d;
+              break;
+            }
+          }
+        }
+        if (dupIdx !== -1) msgs[dupIdx] = reply;
+        else msgs.push(reply);
       }
       for (var j = 0; j < msgs.length; j++) {
         var u = msgs[j];
@@ -1663,6 +1683,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (nextIdx === -1) return;
       var existing = this.state.messages[nextIdx];
       var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
+      if (existing._indexFile) promoted._indexFile = existing._indexFile;
       if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
       if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
       this.state.messages[nextIdx] = promoted;
@@ -1683,6 +1704,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var existing = this.state.messages[nextIdx];
       var promoted = { role: "user", content: existing.content, isPendingInProcess: true };
       if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
+      if (existing._indexFile) promoted._indexFile = existing._indexFile;
       if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
       if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
       if (existing.isSendingToServer) promoted.isSendingToServer = true;
@@ -2102,6 +2124,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var u = this.state.messages[uIdx];
       var cleaned = { role: "user", content: u.content, _serverItemId: itemId };
       if (u.isBackgroundTask) cleaned.isBackgroundTask = true;
+      if (u._indexFile) cleaned._indexFile = u._indexFile;
       this.state.messages[uIdx] = cleaned;
     }
     // If an immediate-send request for the current cache key is still in flight
@@ -2144,14 +2167,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       if (idx !== -1) {
         this._clearPendingUserBubble(itemId);
+        var wasBgTask = !!this.state.messages[idx].isBackgroundTask;
         if (isErr) {
           this.state.messages[idx] = { role: "assistant", content: answer, isError: true, _serverItemId: itemId };
+          if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
           this.host.notify();
           this.updateHistoryCache();
           return;
         }
         var lid = this._newLocalId();
         this.state.messages[idx] = { role: "assistant", content: "", _localId: lid, _serverItemId: itemId };
+        if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
         this.host.notify();
         this.enqueueTypewrite(idx, answer || "No text response received from AI provider.", lid);
         this.updateHistoryCache();
@@ -2162,15 +2188,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       if (userIdx === -1) return;
       var ex = this.state.messages[userIdx];
-      this.state.messages[userIdx] = { role: "user", content: ex.content, _serverItemId: itemId };
+      var settledUser = { role: "user", content: ex.content, _serverItemId: itemId };
+      if (ex.isBackgroundTask) settledUser.isBackgroundTask = true;
+      if (ex._indexFile) settledUser._indexFile = ex._indexFile;
+      if (ex._useBgQueue) settledUser._useBgQueue = true;
+      this.state.messages[userIdx] = settledUser;
       if (isErr) {
-        this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: answer, isError: true, _serverItemId: itemId });
+        var errReply = { role: "assistant", content: answer, isError: true, _serverItemId: itemId };
+        if (ex.isBackgroundTask) errReply.isBackgroundTask = true;
+        this.state.messages.splice(userIdx + 1, 0, errReply);
         this.host.notify();
         this.updateHistoryCache();
         return;
       }
       var lid2 = this._newLocalId();
-      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: "", _localId: lid2, _serverItemId: itemId });
+      var reply = { role: "assistant", content: "", _localId: lid2, _serverItemId: itemId };
+      if (ex.isBackgroundTask) reply.isBackgroundTask = true;
+      this.state.messages.splice(userIdx + 1, 0, reply);
       this.host.notify();
       this.enqueueTypewrite(userIdx + 1, answer || "No text response received from AI provider.", lid2);
       this.updateHistoryCache();
@@ -2198,7 +2232,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (entry.serviceId !== svcId || entry.platform !== plat) return;
         if (!presentIds[entry.id]) {
           var isRunning = entry.status === "running";
-          var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass), isBackgroundTask: true, _serverItemId: entry.id };
+          var userBubble = {
+            role: "user",
+            content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass),
+            isBackgroundTask: true,
+            _serverItemId: entry.id,
+            // Structured ref so this live pass groups with the same file's passes
+            // rebuilt from history (see indexing_groups.buildChatDisplayList).
+            _indexFile: {
+              name: entry.filename,
+              path: entry.storagePath,
+              mime: entry.mime,
+              size: entry.size,
+              isReindex: !!entry.isReindex,
+              continued: !!entry.resumePass
+            }
+          };
           if (isRunning) userBubble.isPendingInProcess = true;
           else userBubble.isPendingQueued = true;
           self.state.messages.push(userBubble);
@@ -2357,6 +2406,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           serviceId: id.serviceId,
           formatIndexingLabel: self.host.formatIndexingLabel
         }).messages;
+        var keptOlderPages = false;
         if (fetchMore) {
           self.state.messages = mapped.concat(self.state.messages);
         } else {
@@ -2387,7 +2437,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               }
             }
           }
-          self.state.messages = mapped;
+          var oldestInPage1 = void 0;
+          mapped.forEach(function(m) {
+            var sid = m._serverItemId;
+            if (typeof sid !== "string") return;
+            if (oldestInPage1 === void 0 || sid < oldestInPage1) oldestInPage1 = sid;
+          });
+          var sharesPage1 = self.state.messages.some(function(m) {
+            return typeof m._serverItemId === "string" && !!serverIds[m._serverItemId];
+          });
+          var retainedOlder = !sharesPage1 || oldestInPage1 === void 0 ? [] : self.state.messages.filter(function(m) {
+            if (typeof m._serverItemId !== "string") return false;
+            if (m._ownerKey !== void 0 && m._ownerKey !== loadKey) return false;
+            return m._serverItemId < oldestInPage1;
+          });
+          keptOlderPages = retainedOlder.length > 0;
+          self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
           rescued.forEach(function(m) {
             self.state.messages.push(m);
           });
@@ -2402,12 +2467,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }
           }
         }
-        self.state.historyEndOfList = !!(history && history.endOfList);
-        self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
-        var clearedAt = self.host.getClearedAt();
-        if (clearedAt && chatList.length > 0) {
-          var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
-          if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+        if (!keptOlderPages) {
+          self.state.historyEndOfList = !!(history && history.endOfList);
+          self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
+          var clearedAt = self.host.getClearedAt();
+          if (clearedAt && chatList.length > 0) {
+            var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
+            if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+          }
         }
         if (self.state.historyRequestToken === token) {
           self.state.loadingHistory = false;
@@ -2468,7 +2535,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
           self.drainBgTaskQueue();
         }
-        if (!fetchMore) return self.host.scrollToBottom();
+        if (!fetchMore) return self.host.scrollToBottomIfSticky();
       }).catch(function(err) {
         console.warn("[chat-engine] getChatHistory failed", err);
       }).then(function() {
@@ -2675,11 +2742,146 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
   };
 
+  // src/engine/indexing_groups.ts
+  var INDEXING_LABEL_RE = /^(Re)?[Ii]ndexing(\s*\(continuing\))?\s*:?\s+(.+)$/;
+  var LEADING_MD_LINK_RE = /^\[([^\]]+)\]\(([^)]+)\)/;
+  function parseIndexingLabel(content) {
+    if (typeof content !== "string" || !content) return null;
+    var firstLine = content.split("\n")[0].trim();
+    var m = firstLine.match(INDEXING_LABEL_RE);
+    if (!m) return null;
+    var head = m[3].split(" \xB7 ")[0].trim();
+    var link = head.match(LEADING_MD_LINK_RE);
+    var name = link ? link[1].trim() : head;
+    if (!name) return null;
+    return {
+      name,
+      path: link ? link[2].trim() : void 0,
+      continued: !!m[2],
+      isReindex: !!m[1]
+    };
+  }
+  function readFileRef(msg) {
+    var ref = msg && msg._indexFile;
+    if (ref && (ref.path || ref.name)) {
+      return {
+        name: ref.name || ref.path || "",
+        path: ref.path,
+        mime: ref.mime,
+        size: ref.size,
+        isReindex: ref.isReindex,
+        continued: !!ref.continued
+      };
+    }
+    var parsed = parseIndexingLabel(msg && msg.content);
+    if (!parsed) return null;
+    return {
+      name: parsed.name,
+      path: parsed.path,
+      isReindex: parsed.isReindex,
+      continued: parsed.continued
+    };
+  }
+  function isPendingMsg(m) {
+    return !!(m.isPending || m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
+  }
+  function buildChatDisplayList(messages, opts) {
+    var list = Array.isArray(messages) ? messages : [];
+    var hasMoreHistory = !!(opts && opts.hasMoreHistory);
+    var groups = {};
+    var order = [];
+    var keyOfIndex = new Array(list.length);
+    var keyByItemId = {};
+    var lastKey;
+    for (var i = 0; i < list.length; i++) {
+      var msg = list[i];
+      if (!msg || !msg.isBackgroundTask) continue;
+      var key;
+      var ref = msg.role === "user" ? readFileRef(msg) : null;
+      if (ref) {
+        key = ref.path || ref.name;
+      } else if (msg._serverItemId && keyByItemId[msg._serverItemId]) {
+        key = keyByItemId[msg._serverItemId];
+      } else if (msg.role !== "user") {
+        key = lastKey;
+      }
+      if (!key) continue;
+      var g = groups[key];
+      if (!g) {
+        g = groups[key] = {
+          key,
+          name: ref ? ref.name : key,
+          path: ref ? ref.path : void 0,
+          mime: ref ? ref.mime : void 0,
+          size: ref ? ref.size : void 0,
+          isReindex: !!(ref && ref.isReindex),
+          members: [],
+          passCount: 0,
+          status: "done",
+          mayHaveOlder: false,
+          anchorIndex: i
+        };
+        order.push(key);
+      }
+      if (ref) {
+        if (ref.name) g.name = ref.name;
+        if (ref.path) g.path = ref.path;
+        if (ref.mime) g.mime = ref.mime;
+        if (typeof ref.size === "number") g.size = ref.size;
+        if (ref.isReindex) g.isReindex = true;
+        if (!ref.continued) g.mayHaveOlder = false;
+        g.passCount++;
+      }
+      g.members.push({ msg, index: i });
+      g.anchorIndex = i;
+      keyOfIndex[i] = key;
+      if (msg._serverItemId) keyByItemId[msg._serverItemId] = key;
+      lastKey = key;
+    }
+    for (var oi = 0; oi < order.length; oi++) {
+      var grp = groups[order[oi]];
+      var active = false;
+      for (var mi = 0; mi < grp.members.length; mi++) {
+        if (isPendingMsg(grp.members[mi].msg)) {
+          active = true;
+          break;
+        }
+      }
+      if (active) {
+        grp.status = "active";
+      } else {
+        var last = grp.members[grp.members.length - 1].msg;
+        grp.status = last.isError ? "error" : last.isCancelled ? "cancelled" : "done";
+      }
+      var sawFirstPass = false;
+      for (var pi = 0; pi < grp.members.length; pi++) {
+        var pm = grp.members[pi].msg;
+        if (pm.role !== "user") continue;
+        var pref = readFileRef(pm);
+        if (pref && !pref.continued) {
+          sawFirstPass = true;
+          break;
+        }
+      }
+      grp.mayHaveOlder = !sawFirstPass && hasMoreHistory;
+    }
+    var out = [];
+    for (var j = 0; j < list.length; j++) {
+      var k = keyOfIndex[j];
+      if (k === void 0) {
+        out.push({ kind: "message", msg: list[j], index: j });
+        continue;
+      }
+      if (groups[k].anchorIndex === j) out.push({ kind: "indexing", group: groups[k], index: j });
+    }
+    return out;
+  }
+
   // src/index.js
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.6.3" ;
+    var BQ_VERSION = "1.6.4" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -4258,8 +4460,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     var CS = {
       messages: [],
+      // Rendered .bq-message nodes, indexed BY MESSAGE INDEX (sparse: a message
+      // folded into a collapsed indexing row has no node of its own).
       messageEls: [],
-      // parallel rendered .bq-message nodes
+      // Expanded background-indexing rows, keyed by group key (storage path).
+      indexGroupsOpen: {},
       messagesBox: null,
       // .bq-messages element
       sending: false,
@@ -5466,6 +5671,76 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
     }
+    var INDEX_ICON_ACTIVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 0 1-8.5 8.5 8.5 8.5 0 0 1-7.6-4.7"/><path d="M3.5 12A8.5 8.5 0 0 1 12 3.5a8.5 8.5 0 0 1 7.6 4.7"/><path d="M20 3.6v4.8h-4.8"/><path d="M4 20.4v-4.8h4.8"/></svg>';
+    var INDEX_ICON_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>';
+    var INDEX_ICON_ERROR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><path d="M12 16.6h.01"/></svg>';
+    var INDEX_ICON_CANCELLED = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.2 8.2l7.6 7.6"/></svg>';
+    function indexGroupIcon(group) {
+      if (group.status === "active") return INDEX_ICON_ACTIVE;
+      if (group.status === "error") return INDEX_ICON_ERROR;
+      if (group.status === "cancelled") return INDEX_ICON_CANCELLED;
+      return INDEX_ICON_DONE;
+    }
+    function indexGroupVerb(group) {
+      if (group.status === "active") return group.isReindex ? "Reindexing" : "Indexing";
+      if (group.status === "error") return "Indexing failed:";
+      if (group.status === "cancelled") return "Indexing cancelled:";
+      return group.isReindex ? "Reindexed" : "Indexed";
+    }
+    function indexGroupLabel(group) {
+      var nameLabel = group.path ? "[" + group.name + "](" + group.path + ")" : group.name;
+      return indexGroupVerb(group) + " " + nameLabel;
+    }
+    function indexGroupCount(group) {
+      if (group.passCount <= 1 && !group.mayHaveOlder) return "";
+      return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+    }
+    function toggleIndexGroup(key) {
+      if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
+      else CS.indexGroupsOpen[key] = true;
+      renderMessages();
+    }
+    function buildIndexGroupEl(group, isOpen) {
+      var cls = ["bq-index-group"];
+      if (group.status === "active") cls.push("is-active");
+      if (group.status === "error") cls.push("is-error");
+      if (isOpen) cls.push("is-open");
+      var label = h("span", { class: "bq-index-label", html: parseMsgPartsHtml(indexGroupLabel(group)) });
+      label.addEventListener("click", function(e) {
+        if (e.target && e.target.closest && e.target.closest("a")) e.stopPropagation();
+        onBubbleLinkClick(e);
+      });
+      var head = h(
+        "div",
+        {
+          class: "bq-index-head",
+          role: "button",
+          tabindex: "0",
+          "aria-expanded": isOpen ? "true" : "false",
+          title: isOpen ? "Hide indexing steps" : "Show indexing steps",
+          onclick: function() {
+            toggleIndexGroup(group.key);
+          },
+          onkeydown: function(e) {
+            if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+            e.preventDefault();
+            toggleIndexGroup(group.key);
+          }
+        },
+        h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
+        label,
+        indexGroupCount(group) ? h("span", { class: "bq-index-count", text: indexGroupCount(group) }) : null,
+        h("span", { class: "bq-index-chevron", text: "\u25B6" })
+      );
+      var el = h("div", { class: cls.join(" ") }, head);
+      if (isOpen && group.mayHaveOlder) {
+        el.appendChild(h("div", {
+          class: "bq-index-note",
+          text: "Earlier passes of this file are further back in the conversation. Scroll up to load them."
+        }));
+      }
+      return el;
+    }
     function historyLoadingEl(initial) {
       if (initial) {
         return h(
@@ -5504,9 +5779,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.messagesBox.appendChild(greet);
         return;
       }
-      CS.messages.forEach(function(msg, idx) {
-        var el = buildMessageEl(msg, idx);
-        CS.messageEls.push(el);
+      var rows = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+      rows.forEach(function(row) {
+        if (row.kind === "indexing") {
+          var isOpen = !!CS.indexGroupsOpen[row.group.key];
+          CS.messagesBox.appendChild(buildIndexGroupEl(row.group, isOpen));
+          if (!isOpen) return;
+          row.group.members.forEach(function(member) {
+            var pass = buildMessageEl(member.msg, member.index);
+            pass.classList.add("bq-index-pass");
+            CS.messageEls[member.index] = pass;
+            CS.messagesBox.appendChild(pass);
+          });
+          return;
+        }
+        var el = buildMessageEl(row.msg, row.index);
+        CS.messageEls[row.index] = el;
         CS.messagesBox.appendChild(el);
       });
     }
@@ -5515,12 +5803,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var oldEl = CS.messageEls[idx];
       if (!oldEl || !oldEl.parentNode) return;
       var newEl = buildMessageEl(CS.messages[idx], idx);
+      if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
       oldEl.parentNode.replaceChild(newEl, oldEl);
       CS.messageEls[idx] = newEl;
     }
     function renderChat() {
       CS.messages = [];
       CS.messageEls = [];
+      CS.indexGroupsOpen = {};
       CS.sending = false;
       CS.typing = false;
       CS.typingAbort = true;

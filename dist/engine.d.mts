@@ -383,7 +383,7 @@ declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'ope
 
 declare const MCP_NAME = "BunnyQuery";
 declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
-declare const DEFAULT_OPENAI_MODEL = "gpt-5.4";
+declare const DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 type ClaudeRole = 'user' | 'assistant';
 type ClaudeMessage = {
     role: ClaudeRole;
@@ -527,6 +527,24 @@ interface PinnedDispatchContext {
     identity: ChatIdentity;
     systemPrompt: string;
 }
+/**
+ * The file a background-indexing bubble belongs to. Stamped on the REQUEST
+ * bubble (both the live one and the one rebuilt from history) so the display
+ * layer can group a file's many passes without reverse-parsing the view's
+ * formatted label. See indexing_groups.buildChatDisplayList.
+ */
+interface IndexingFileRef {
+    name: string;
+    /** Storage path, when known. Preferred group identity: a file can be
+     *  re-uploaded under a name that already exists elsewhere. */
+    path?: string;
+    mime?: string;
+    size?: number;
+    isReindex?: boolean;
+    /** A CONTINUE pass. Its absence across every loaded pass is what tells the
+     *  display layer that earlier passes are still unpaged. */
+    continued?: boolean;
+}
 interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
@@ -538,6 +556,8 @@ interface ChatMessage {
     isCancelled?: boolean;
     isError?: boolean;
     isBackgroundTask?: boolean;
+    /** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
+    _indexFile?: IndexingFileRef;
     _useBgQueue?: boolean;
     _serverItemId?: string;
     _localId?: string;
@@ -752,4 +772,84 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+/**
+ * Background file-indexing turns, collapsed into ONE row per file.
+ *
+ * A single upload can produce many chat turns: the first "Indexing: <file>" pass
+ * plus up to MAX_INDEXING_RESUME_PASSES CONTINUE passes, each with its own
+ * request AND response bubble. Rendered flat, that reads as the same task
+ * repeating forever, and any real question the user asks in between gets buried.
+ *
+ * buildChatDisplayList turns the flat message array into a DISPLAY list in which
+ * every message belonging to one file (however far apart they sit, and whatever
+ * else is interleaved between them) is represented by a single group entry,
+ * rendered at the position of that file's NEWEST turn. Newest, not oldest, so:
+ *   - a running index sits at the bottom, where the activity is, and
+ *   - paging older history in never moves a row that is already on screen
+ *     (older passes simply join the group they already belong to).
+ *
+ * The group deliberately reports no authoritative pass TOTAL. History is paged
+ * newest-first, so any total computed from loaded messages is a lower bound that
+ * a later scroll-up would contradict. It reports STATE (indexing / indexed /
+ * failed), how many passes are currently loaded, and `mayHaveOlder` when the
+ * file's first pass is not among them.
+ *
+ * Pure and view-agnostic: agent.vue and the BunnyQuery widget both render from
+ * this, so the two stay identical.
+ */
+
+type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
+type IndexingGroup = {
+    /** Stable identity across re-renders and across history pages: storage path
+     *  when known (a file can be re-uploaded under the same name), else name. */
+    key: string;
+    name: string;
+    path?: string;
+    mime?: string;
+    size?: number;
+    /** True when any loaded pass was a re-index of an already-stored file. */
+    isReindex: boolean;
+    /** Every message of this file, in chat order, with its index in the source
+     *  array (so cancel/typewriter paths keep addressing the real message). */
+    members: {
+        msg: ChatMessage;
+        index: number;
+    }[];
+    /** Indexing passes LOADED (request bubbles), never a server-side total. */
+    passCount: number;
+    status: IndexingGroupStatus;
+    /** The file's first pass is not among the loaded messages, so earlier passes
+     *  exist in history that has not been paged in yet. */
+    mayHaveOlder: boolean;
+    /** Position in the source array this collapsed row renders at. */
+    anchorIndex: number;
+};
+type DisplayEntry = {
+    kind: 'message';
+    msg: ChatMessage;
+    index: number;
+} | {
+    kind: 'indexing';
+    group: IndexingGroup;
+    index: number;
+};
+type BuildDisplayListOptions = {
+    /** True while older history remains unpaged, which is what makes a group
+     *  with no first pass genuinely incomplete rather than merely odd. */
+    hasMoreHistory?: boolean;
+};
+declare function parseIndexingLabel(content: string): {
+    name: string;
+    path?: string;
+    continued: boolean;
+    isReindex: boolean;
+} | null;
+/**
+ * Collapse background-indexing turns into per-file groups.
+ *
+ * Messages that are not background-indexing pass through untouched, at their
+ * original positions and with their original indices.
+ */
+declare function buildChatDisplayList(messages: ChatMessage[], opts?: BuildDisplayListOptions): DisplayEntry[];
+
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

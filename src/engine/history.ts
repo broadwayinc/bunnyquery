@@ -67,6 +67,9 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 
 		if (userText) {
 			var displayContent;
+			// Structured file ref for the display layer's per-file collapsing, kept
+			// alongside the formatted label so grouping never has to parse it back.
+			var indexFile: any = undefined;
 			if (item._isBgTask) {
 				var nameMatch = userText.match(/^- name: (.+)$/m);
 				if (nameMatch) {
@@ -86,6 +89,13 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 						false,
 						isContinuePass
 					);
+					indexFile = {
+						name: nameMatch[1].trim(),
+						path: pathMatch ? pathMatch[1].trim() : undefined,
+						mime: mimeMatch ? mimeMatch[1].trim() : undefined,
+						size: sizeMatch ? Number(sizeMatch[1]) : undefined,
+						continued: isContinuePass,
+					};
 				} else {
 					displayContent = userText;
 				}
@@ -97,6 +107,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (isQueued) userMsg.isPendingQueued = true;
 			if (isCancelledItem) userMsg.isCancelled = true;
 			if (item._isBgTask) userMsg.isBackgroundTask = true;
+			if (indexFile) userMsg._indexFile = indexFile;
 			if (item._isOnBgQueue) userMsg._useBgQueue = true;
 			if (serverItemId !== undefined) userMsg._serverItemId = serverItemId;
 			mapped.push(userMsg);

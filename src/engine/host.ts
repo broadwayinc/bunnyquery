@@ -30,6 +30,25 @@ export interface PinnedDispatchContext {
 	systemPrompt: string;
 }
 
+/**
+ * The file a background-indexing bubble belongs to. Stamped on the REQUEST
+ * bubble (both the live one and the one rebuilt from history) so the display
+ * layer can group a file's many passes without reverse-parsing the view's
+ * formatted label. See indexing_groups.buildChatDisplayList.
+ */
+export interface IndexingFileRef {
+	name: string;
+	/** Storage path, when known. Preferred group identity: a file can be
+	 *  re-uploaded under a name that already exists elsewhere. */
+	path?: string;
+	mime?: string;
+	size?: number;
+	isReindex?: boolean;
+	/** A CONTINUE pass. Its absence across every loaded pass is what tells the
+	 *  display layer that earlier passes are still unpaged. */
+	continued?: boolean;
+}
+
 export interface ChatMessage {
 	role: 'user' | 'assistant';
 	content: string; // raw markdown — never HTML (the view parses for display)
@@ -41,6 +60,8 @@ export interface ChatMessage {
 	isCancelled?: boolean;
 	isError?: boolean;
 	isBackgroundTask?: boolean;
+	/** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
+	_indexFile?: IndexingFileRef;
 	_useBgQueue?: boolean;
 	_serverItemId?: string;
 	_localId?: string;

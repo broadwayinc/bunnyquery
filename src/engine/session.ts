@@ -250,7 +250,21 @@ export class ChatSession {
 			if (reply._serverItemId === undefined && msgs[thIdx]._serverItemId !== undefined) reply._serverItemId = msgs[thIdx]._serverItemId;
 			msgs[thIdx] = reply;
 		} else {
-			msgs.push(reply);
+			// No pending placeholder left to replace. Before appending, check whether
+			// this turn is ALREADY in the cache — a history fetch may have mapped the
+			// resolved turn in while the reply was in flight. Appending blindly is how
+			// one turn ended up rendered twice (the duplicated question+answer): the
+			// cache is restored verbatim on the next mount, so a duplicate written
+			// here survives every later visit.
+			var dupIdx = -1;
+			if (serverId) {
+				for (var d = msgs.length - 1; d >= 0; d--) {
+					var dm = msgs[d];
+					if (dm && dm.role === 'assistant' && dm._serverItemId === serverId) { dupIdx = d; break; }
+				}
+			}
+			if (dupIdx !== -1) msgs[dupIdx] = reply;
+			else msgs.push(reply);
 		}
 
 		// Settle the user bubble this turn belongs to (first pending one, or the
@@ -559,6 +573,7 @@ export class ChatSession {
 		if (nextIdx === -1) return;
 		var existing = this.state.messages[nextIdx];
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
+		if (existing._indexFile) promoted._indexFile = existing._indexFile;
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
 		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		this.state.messages[nextIdx] = promoted;
@@ -578,6 +593,7 @@ export class ChatSession {
 		var existing = this.state.messages[nextIdx];
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true };
 		if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
+		if (existing._indexFile) promoted._indexFile = existing._indexFile;
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
 		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		if (existing.isSendingToServer) promoted.isSendingToServer = true;
@@ -975,6 +991,9 @@ export class ChatSession {
 		var u = this.state.messages[uIdx];
 		var cleaned: ChatMessage = { role: 'user', content: u.content, _serverItemId: itemId };
 		if (u.isBackgroundTask) cleaned.isBackgroundTask = true;
+		// Carry the file ref: it is what keeps this pass in its file's collapsed
+		// row (the label parser is only a fallback for older cached bubbles).
+		if (u._indexFile) cleaned._indexFile = u._indexFile;
 		this.state.messages[uIdx] = cleaned;
 	}
 
@@ -1019,12 +1038,21 @@ export class ChatSession {
 			// bubble stuck pending — and drainBgTaskQueue then never clears its queue
 			// entry (its stillPending check stays true). Un-pend it here too.
 			this._clearPendingUserBubble(itemId);
+			// Carry isBackgroundTask onto the REPLACEMENT. These rebuilds are fresh
+			// object literals, so anything not copied is lost — and dropping this flag
+			// made a pass that resolved LIVE fall out of its file's collapsed row
+			// (buildChatDisplayList only considers isBackgroundTask messages), while
+			// the same pass rebuilt from history stayed grouped. That mismatch is the
+			// "new indexing response renders outside the group" bug.
+			var wasBgTask = !!this.state.messages[idx].isBackgroundTask;
 			if (isErr) {
 				this.state.messages[idx] = { role: 'assistant', content: answer, isError: true, _serverItemId: itemId };
+				if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
 				this.host.notify(); this.updateHistoryCache(); return;
 			}
 			var lid = this._newLocalId();
 			this.state.messages[idx] = { role: 'assistant', content: '', _localId: lid, _serverItemId: itemId };
+			if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
 			this.host.notify(); this.enqueueTypewrite(idx, answer || 'No text response received from AI provider.', lid);
 			this.updateHistoryCache(); return;
 		}
@@ -1033,13 +1061,24 @@ export class ChatSession {
 		});
 		if (userIdx === -1) return;
 		var ex = this.state.messages[userIdx];
-		this.state.messages[userIdx] = { role: 'user', content: ex.content, _serverItemId: itemId };
+		// Same carry-over as above, plus _indexFile / _useBgQueue: this rebuild is
+		// what keeps an indexing REQUEST bubble in its file's collapsed row (and a
+		// bg-queued chat cancelling against the right queue) once the pass settles.
+		var settledUser: ChatMessage = { role: 'user', content: ex.content, _serverItemId: itemId };
+		if (ex.isBackgroundTask) settledUser.isBackgroundTask = true;
+		if (ex._indexFile) settledUser._indexFile = ex._indexFile;
+		if (ex._useBgQueue) settledUser._useBgQueue = true;
+		this.state.messages[userIdx] = settledUser;
 		if (isErr) {
-			this.state.messages.splice(userIdx + 1, 0, { role: 'assistant', content: answer, isError: true, _serverItemId: itemId });
+			var errReply: ChatMessage = { role: 'assistant', content: answer, isError: true, _serverItemId: itemId };
+			if (ex.isBackgroundTask) errReply.isBackgroundTask = true;
+			this.state.messages.splice(userIdx + 1, 0, errReply);
 			this.host.notify(); this.updateHistoryCache(); return;
 		}
 		var lid2 = this._newLocalId();
-		this.state.messages.splice(userIdx + 1, 0, { role: 'assistant', content: '', _localId: lid2, _serverItemId: itemId });
+		var reply: ChatMessage = { role: 'assistant', content: '', _localId: lid2, _serverItemId: itemId };
+		if (ex.isBackgroundTask) reply.isBackgroundTask = true;
+		this.state.messages.splice(userIdx + 1, 0, reply);
 		this.host.notify(); this.enqueueTypewrite(userIdx + 1, answer || 'No text response received from AI provider.', lid2);
 		this.updateHistoryCache();
 	}
@@ -1075,7 +1114,22 @@ export class ChatSession {
 			// "Thinking..." once polling resumed.
 			if (!presentIds[entry.id]) {
 			var isRunning = entry.status === 'running';
-			var userBubble: ChatMessage = { role: 'user', content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass), isBackgroundTask: true, _serverItemId: entry.id };
+			var userBubble: ChatMessage = {
+				role: 'user',
+				content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass),
+				isBackgroundTask: true,
+				_serverItemId: entry.id,
+				// Structured ref so this live pass groups with the same file's passes
+				// rebuilt from history (see indexing_groups.buildChatDisplayList).
+				_indexFile: {
+					name: entry.filename,
+					path: entry.storagePath,
+					mime: entry.mime,
+					size: entry.size,
+					isReindex: !!entry.isReindex,
+					continued: !!entry.resumePass,
+				},
+			};
 			if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
 			self.state.messages.push(userBubble);
 			if (isRunning) {
@@ -1230,6 +1284,10 @@ export class ChatSession {
 				formatIndexingLabel: self.host.formatIndexingLabel,
 			}).messages;
 
+			// Set when a first-page refresh re-prepended already-loaded older pages,
+			// so the cursor reset below knows not to rewind to page 1's boundary.
+			var keptOlderPages = false;
+
 			if (fetchMore) {
 				self.state.messages = mapped.concat(self.state.messages);
 			} else {
@@ -1266,7 +1324,40 @@ export class ChatSession {
 						}
 					}
 				}
-				self.state.messages = mapped;
+				// PRESERVE already-loaded older pages. `mapped` is only page 1, so a
+				// blind replace threw away every page the user had scrolled in. This
+				// path runs from resumePolling (visibilitychange), so merely leaving
+				// the tab and coming back wiped the whole scrolled-in history.
+				//
+				// The list is oldest-first (fetchMore PREPENDS), and ids sort with
+				// newest largest, so anything already in the list whose _serverItemId
+				// sorts BELOW page 1's oldest id is an older page. Those are disjoint
+				// from `mapped` (strict <), so re-prepending cannot duplicate.
+				var oldestInPage1: string | undefined = undefined;
+				mapped.forEach(function (m: any) {
+					var sid = m._serverItemId;
+					if (typeof sid !== 'string') return;
+					if (oldestInPage1 === undefined || sid < (oldestInPage1 as string)) oldestInPage1 = sid;
+				});
+				// Only merge when the current list is genuinely a continuation of THIS
+				// page 1 (shares at least one id with it). A project switch, a cleared
+				// horizon, or a wholly-new page means the head is unrelated history and
+				// must be replaced, not spliced.
+				var sharesPage1 = self.state.messages.some(function (m) {
+					return typeof m._serverItemId === 'string' && !!serverIds[m._serverItemId as string];
+				});
+				var retainedOlder: ChatMessage[] = (!sharesPage1 || oldestInPage1 === undefined) ? [] : self.state.messages.filter(function (m) {
+					// Settled server history only; in-flight bubbles are the rescue
+					// loop's job below and would otherwise be kept twice.
+					if (typeof m._serverItemId !== 'string') return false;
+					// Same ownership predicate as the rescue loop: never carry another
+					// project's bubbles onto this chat (the cross-project leak fix).
+					// Compare against the snapshotted loadKey, never a live read.
+					if (m._ownerKey !== undefined && m._ownerKey !== loadKey) return false;
+					return (m._serverItemId as string) < (oldestInPage1 as string);
+				});
+				keptOlderPages = retainedOlder.length > 0;
+				self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
 				rescued.forEach(function (m) { self.state.messages.push(m); });
 				if (Object.keys(locallyCancelled).length) {
 					for (var ci = 0; ci < self.state.messages.length; ci++) {
@@ -1279,12 +1370,17 @@ export class ChatSession {
 					}
 				}
 			}
-			self.state.historyEndOfList = !!(history && history.endOfList);
-			self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
-			var clearedAt = self.host.getClearedAt();
-			if (clearedAt && chatList.length > 0) {
-				var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
-				if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+			// Only adopt page 1's cursor when page 1 IS the whole list. If older pages
+			// survived the merge, rewinding here would make the next scroll-up
+			// re-fetch page 2 (already on screen) and duplicate it.
+			if (!keptOlderPages) {
+				self.state.historyEndOfList = !!(history && history.endOfList);
+				self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
+				var clearedAt = self.host.getClearedAt();
+				if (clearedAt && chatList.length > 0) {
+					var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
+					if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+				}
 			}
 			// Clear loading flags BEFORE this render so the final paint is
 			// indicator-free (and the view's scroll-restore math sees matching heights).
@@ -1358,7 +1454,11 @@ export class ChatSession {
 				self.drainBgTaskQueue();
 			}
 
-			if (!fetchMore) return self.host.scrollToBottom();
+			// Sticky, NOT forcing: this runs after every first-page load, including
+			// the one resumePolling fires on visibilitychange. Forcing yanked a
+			// reader who had scrolled up back to the bottom. On a genuine mount the
+			// user is still pinned, so this behaves identically there.
+			if (!fetchMore) return self.host.scrollToBottomIfSticky();
 		}).catch(function (err: any) {
 			console.warn('[chat-engine] getChatHistory failed', err);
 		}).then(function () {

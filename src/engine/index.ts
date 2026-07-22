@@ -57,7 +57,18 @@ export {
 // Tier-2: the stateful chat orchestration (queue/poll/cancel, typewriter,
 // bg-task drain, resolution). DOM-free; the consumer implements ChatHost.
 export { ChatSession } from './session';
-export type { ChatHost, ChatIdentity, ChatState, ChatMessage, PinnedDispatchContext } from './host';
+export type { ChatHost, ChatIdentity, ChatState, ChatMessage, IndexingFileRef, PinnedDispatchContext } from './host';
+
+// Display transform: collapse a file's many background-indexing turns into one
+// row, wherever they sit in the conversation. Shared so both chatboxes match.
+export {
+	buildChatDisplayList,
+	parseIndexingLabel,
+	type DisplayEntry,
+	type IndexingGroup,
+	type IndexingGroupStatus,
+	type BuildDisplayListOptions,
+} from './indexing_groups';
 
 export {
 	// constants
