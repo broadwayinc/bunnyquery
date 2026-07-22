@@ -81,6 +81,20 @@ interface ChatEngineConfig {
      * `registerAttachmentParser()`. See attachment_parsers.ts.
      */
     attachmentParsers?: AttachmentParser[];
+    /**
+     * Opt in to SERVER-DRIVEN windowed indexing for text/grid files.
+     *
+     * Off by default, and deliberately so. When on, the client emits a
+     * `_skapi_window` directive and the WORKER reads the file one window at a time,
+     * continuing until the reader says it is exhausted. When off, the agent pages the
+     * file itself with readFileContent, exactly as before.
+     *
+     * The flag exists because the backend must ship FIRST: a client emitting the
+     * directive against a worker that does not strip it leaves an unknown field in the
+     * request body, and the provider rejects the whole call with no retry. Keep it off
+     * until the worker is deployed, then flip it per environment.
+     */
+    windowedIndexing?: boolean;
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
@@ -271,6 +285,17 @@ declare function buildIndexingRenderMessage(attachment: IndexingAttachmentInfo, 
  */
 declare function buildIndexingRenderContinueTemplate(attachment: IndexingAttachmentInfo, placeholder: string, pageLabel?: string): string;
 /**
+ * User message for a WINDOWED file: the worker splices ONE window of the file's rows or
+ * text into this message at `placeholder`, then continues from the reader's own cursor
+ * until the file is exhausted.
+ *
+ * The agent is deliberately NOT asked to page the file itself, and is NOT asked to judge
+ * whether it is finished. Both used to be its job, and both failed the same way: the
+ * traversal lived inside a single turn's budget, so a large file simply stopped partway
+ * with a confident summary of the part it had seen.
+ */
+declare function buildIndexingWindowMessage(attachment: IndexingAttachmentInfo, placeholder: string, isContinuation: boolean, positionLabel?: string): string;
+/**
  * User message for a RESUME pass: a previous indexing pass could not finish this large
  * file, so continue it from where the already-saved records leave off (never restart).
  */
@@ -440,6 +465,16 @@ declare function extractOpenAIText(response: any): any;
 declare function listClaudeModels(service: string, owner: string): Promise<any>;
 declare function listOpenAIModels(service: string, owner: string): Promise<any>;
 declare const BG_INDEXING_QUEUE_SUFFIX = "-bg";
+/**
+ * True when a request belongs to the background-indexing queue.
+ *
+ * Accepts BOTH shapes this value arrives in: the bare queue name the client sends
+ * ("<userId>-bg"), and the server qid that comes back on history/poll responses
+ * ("<service>:<queue>|<seq>"). Testing the tail of the raw value only works for the
+ * first: a qid ends in "|<seq>", so `endsWith('-bg')` is always false for it — which
+ * silently meant history items were NEVER recognised as background tasks.
+ */
+declare function isBgIndexingQueue(queueName?: string): boolean;
 type BgTaskEntry = {
     serviceId: string;
     platform: 'claude' | 'openai';
@@ -605,6 +640,13 @@ interface ChatHost {
  * session via the public methods and re-renders in host.notify().
  */
 
+/** A live poll registered in ChatSession.historyItemPolls. */
+type PollHandle = {
+    /** 'bg' = background indexing, pausable. 'fg' = a reply the user is waiting on. */
+    kind: 'fg' | 'bg';
+    /** Absent on an older skapi-js that cannot stop an attached poll. */
+    stop?: () => void;
+};
 declare class ChatSession {
     host: ChatHost;
     state: ChatState;
@@ -616,9 +658,45 @@ declare class ChatSession {
         endOfList: boolean;
         startKeyHistory: string[];
     }>;
-    historyItemPolls: Map<string, boolean>;
+    historyItemPolls: Map<string, PollHandle>;
+    /** Non-empty while polling is paused; keyed by reason so overlapping causes
+     * (view detached AND tab hidden) do not resume each other prematurely. */
+    private _pauseReasons;
+    private _resuming;
     private _lidSeq;
     constructor(host: ChatHost);
+    /**
+     * Register a live poll so (a) a remount dedupes against it instead of stacking a
+     * SECOND poll on the same item, and (b) pausePolling can stop it.
+     *
+     * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
+     * poll simply cannot be stopped and is left running — see pausePolling.
+     */
+    private _trackPoll;
+    /** True while any pause reason is active. */
+    isPollingPaused(): boolean;
+    /**
+     * Stop BACKGROUND polling until resumePolling. Foreground polls (a reply the user is
+     * waiting on) keep running deliberately: their results must still land in the history
+     * cache so resumePendingRequest can render them on return, otherwise a user who sends
+     * a message then navigates away comes back to a permanently stuck "Thinking...".
+     *
+     * Server-side work is untouched; this only stops asking about it. That is safe for
+     * document indexing because the worker drives that loop itself.
+     */
+    pausePolling(reason: string): void;
+    /**
+     * Lift a pause reason WITHOUT running the reconcile. For a caller that is about to
+     * reload history anyway (a view remounting), letting resumePolling also reconcile
+     * would race that load and can double-attach.
+     */
+    clearPauseReason(reason: string): void;
+    /**
+     * Clear a pause reason and, once none remain, re-attach polling and reconcile.
+     * Deliberately does NOT touch gateRefreshToken: bumping it would silently discard
+     * the results of anything still in flight across the pause.
+     */
+    resumePolling(reason: string): Promise<void>;
     private _newLocalId;
     getHistoryCacheKey(): string;
     updateHistoryCache(): void;
@@ -674,4 +752,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

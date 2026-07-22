@@ -33,6 +33,20 @@ export interface ChatEngineConfig {
      * `registerAttachmentParser()`. See attachment_parsers.ts.
      */
     attachmentParsers?: AttachmentParser[];
+    /**
+     * Opt in to SERVER-DRIVEN windowed indexing for text/grid files.
+     *
+     * Off by default, and deliberately so. When on, the client emits a
+     * `_skapi_window` directive and the WORKER reads the file one window at a time,
+     * continuing until the reader says it is exhausted. When off, the agent pages the
+     * file itself with readFileContent, exactly as before.
+     *
+     * The flag exists because the backend must ship FIRST: a client emitting the
+     * directive against a worker that does not strip it leaves an unknown field in the
+     * request body, and the provider rejects the whole call with no retry. Keep it off
+     * until the worker is deployed, then flip it per environment.
+     */
+    windowedIndexing?: boolean;
 }
 
 let _config: ChatEngineConfig | null = null;
@@ -51,6 +65,11 @@ export function chatEngineConfig(): ChatEngineConfig {
         );
     }
     return _config;
+}
+
+/** True when the consumer has opted in to server-driven windowed indexing. */
+export function windowedIndexingEnabled(): boolean {
+    return _config?.windowedIndexing === true;
 }
 
 /** Spread helper: `{ ...pollOpt() }` adds `poll` only when configured. */

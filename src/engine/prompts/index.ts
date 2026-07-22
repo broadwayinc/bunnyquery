@@ -12,6 +12,7 @@ export {
 	buildIndexingContinueMessage,
 	buildIndexingRenderMessage,
 	buildIndexingRenderContinueTemplate,
+	buildIndexingWindowMessage,
 	RENDER_FROM_TOKEN,
 	type IndexingAttachmentInfo,
 	type BuildIndexingUserMessageOptions,

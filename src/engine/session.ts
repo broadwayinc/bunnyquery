@@ -29,6 +29,7 @@ import {
 	getChatHistory,
 	POLL_INTERVAL,
 	BG_INDEXING_QUEUE_SUFFIX,
+	isBgIndexingQueue,
 	ANTHROPIC_MESSAGES_API_URL,
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
@@ -57,6 +58,22 @@ function nextFrame(cb: (t: number) => void): void {
 	setTimeout(function () { cb(nowMs()); }, 16);
 }
 
+/** A live poll registered in ChatSession.historyItemPolls. */
+export type PollHandle = {
+	/** 'bg' = background indexing, pausable. 'fg' = a reply the user is waiting on. */
+	kind: 'fg' | 'bg';
+	/** Absent on an older skapi-js that cannot stop an attached poll. */
+	stop?: () => void;
+};
+
+/**
+ * True when a poll result came from stopPolling rather than the server. Duck-typed on
+ * purpose — see the note above about not importing skapi-js here.
+ */
+function isPollStopped(res: any): boolean {
+	return !!res && typeof res === 'object' && res.status === 'stopped';
+}
+
 export class ChatSession {
 	host: ChatHost;
 	state: ChatState;
@@ -64,7 +81,11 @@ export class ChatSession {
 	cancelledServerIds: Set<string>;
 	pendingAgentRequests: Record<string, Promise<any>>;
 	aiChatHistoryCache: Record<string, { messages: ChatMessage[]; endOfList: boolean; startKeyHistory: string[] }>;
-	historyItemPolls: Map<string, boolean>;
+	historyItemPolls: Map<string, PollHandle>;
+	/** Non-empty while polling is paused; keyed by reason so overlapping causes
+	 * (view detached AND tab hidden) do not resume each other prematurely. */
+	private _pauseReasons: Set<string>;
+	private _resuming: boolean;
 	private _lidSeq: number;
 
 	constructor(host: ChatHost) {
@@ -88,7 +109,89 @@ export class ChatSession {
 		this.pendingAgentRequests = {};
 		this.aiChatHistoryCache = {};
 		this.historyItemPolls = new Map();
+		this._pauseReasons = new Set();
+		this._resuming = false;
 		this._lidSeq = 0;
+	}
+
+	/**
+	 * Register a live poll so (a) a remount dedupes against it instead of stacking a
+	 * SECOND poll on the same item, and (b) pausePolling can stop it.
+	 *
+	 * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
+	 * poll simply cannot be stopped and is left running — see pausePolling.
+	 */
+	private _trackPoll(id: string, kind: 'fg' | 'bg', p: any): any {
+		var stop = p && typeof p.stop === 'function' ? p.stop.bind(p) : undefined;
+		if (!stop) {
+			// The SDK could not give us a handle. Almost always means an older skapi-js
+			// is loaded (or a stale bundler dep cache) — the poll will be unstoppable.
+			console.debug('[chat-engine] poll has no stop handle', { id: id, kind: kind });
+		}
+		this.historyItemPolls.set(id, { kind: kind, stop: stop });
+		return p;
+	}
+
+	/** True while any pause reason is active. */
+	isPollingPaused(): boolean {
+		return this._pauseReasons.size > 0;
+	}
+
+	/**
+	 * Stop BACKGROUND polling until resumePolling. Foreground polls (a reply the user is
+	 * waiting on) keep running deliberately: their results must still land in the history
+	 * cache so resumePendingRequest can render them on return, otherwise a user who sends
+	 * a message then navigates away comes back to a permanently stuck "Thinking...".
+	 *
+	 * Server-side work is untouched; this only stops asking about it. That is safe for
+	 * document indexing because the worker drives that loop itself.
+	 */
+	pausePolling(reason: string): void {
+		this._pauseReasons.add(reason || 'paused');
+		var self = this;
+		var stopped: string[] = [];
+		this.historyItemPolls.forEach(function (handle, id) {
+			if (!handle || handle.kind !== 'bg') return;
+			// No stop available (older SDK): LEAVE the entry in place. Deleting it would
+			// let a later drain attach a second, uncancellable poll on the same item.
+			if (typeof handle.stop !== 'function') return;
+			try { handle.stop(); } catch (e) { /* best effort */ }
+			stopped.push(id);
+		});
+		// Delete only what we actually stopped, one at a time. NEVER clear() the map:
+		// wholesale clearing is what previously let loadHistory attach a duplicate poll
+		// on a live item, producing duplicate replies and stranded "Thinking" bubbles.
+		stopped.forEach(function (id) { self.historyItemPolls.delete(id); });
+
+	}
+
+	/**
+	 * Lift a pause reason WITHOUT running the reconcile. For a caller that is about to
+	 * reload history anyway (a view remounting), letting resumePolling also reconcile
+	 * would race that load and can double-attach.
+	 */
+	clearPauseReason(reason: string): void {
+		this._pauseReasons.delete(reason || 'paused');
+	}
+
+	/**
+	 * Clear a pause reason and, once none remain, re-attach polling and reconcile.
+	 * Deliberately does NOT touch gateRefreshToken: bumping it would silently discard
+	 * the results of anything still in flight across the pause.
+	 */
+	resumePolling(reason: string): Promise<void> {
+		this._pauseReasons.delete(reason || 'paused');
+		if (this._pauseReasons.size > 0 || this._resuming) return Promise.resolve();
+		if (!this.host.isViewMounted || !this.host.isViewMounted()) return Promise.resolve();
+		var self = this;
+		this._resuming = true;
+		return Promise.resolve()
+			.then(function () {
+				self.drainBgTaskQueue();
+				return self.loadHistory(false, self.state.gateRefreshToken);
+			})
+			.catch(function (e: any) { console.error('[chat-engine] resume polling failed', e); })
+			.then(function () { self._resuming = false; });
 	}
 
 	private _newLocalId(): string {
@@ -205,9 +308,10 @@ export class ChatSession {
 					if (initial.id) {
 						if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
 						dispatchItemId = initial.id;
-						self.historyItemPolls.set(initial.id, true);
 					}
-					return initial.poll({ latency: POLL_INTERVAL });
+					var dp = initial.poll({ latency: POLL_INTERVAL });
+					if (initial.id) self._trackPoll(initial.id, 'fg', dp);
+					return dp;
 				}
 				return initial;
 			});
@@ -382,9 +486,10 @@ export class ChatSession {
 					if (result && result.poll && (result.status === 'pending' || result.status === 'running')) {
 						// Track this queued item's poll so a remount/refetch dedups
 						// against it instead of attaching a duplicate history poll.
-						if (serverId) self.historyItemPolls.set(serverId, true);
-						return result.poll({ latency: POLL_INTERVAL })
-							.then(function (res: any) { return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
+						var qp = result.poll({ latency: POLL_INTERVAL });
+						if (serverId) self._trackPoll(serverId, 'fg', qp);
+						return qp
+							.then(function (res: any) { if (isPollStopped(res)) return; return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
 							.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey); });
 					}
 					return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
@@ -961,7 +1066,11 @@ export class ChatSession {
 		}
 		this.bgTaskQueue.forEach(function (entry) {
 			if (entry.serviceId !== svcId || entry.platform !== plat) return;
-			if (presentIds[entry.id]) return;
+			// Bubble injection and poll attachment are INDEPENDENT. An entry whose bubble
+			// already exists may still need a poll — that is exactly the state a paused
+			// drain leaves behind, and returning early here stranded it as a permanent
+			// "Thinking..." once polling resumed.
+			if (!presentIds[entry.id]) {
 			var isRunning = entry.status === 'running';
 			var userBubble: ChatMessage = { role: 'user', content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
 			if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
@@ -971,11 +1080,17 @@ export class ChatSession {
 			}
 			presentIds[entry.id] = true; // keep the index consistent with the pushed bubbles
 			self.host.notify(); self.updateHistoryCache(); self.host.scrollToBottom(false);
-			if (!self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
-				self.historyItemPolls.set(entry.id, true);
+			}
+			if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
 				var capturedId = entry.id, capturedPlat = plat;
 				var capturedEntry = entry;
-				entry.poll({ latency: POLL_INTERVAL }).then(function (response: any) {
+				var wasStopped = false;
+				var bp = entry.poll({ latency: POLL_INTERVAL });
+				self._trackPoll(entry.id, 'bg', bp);
+				bp.then(function (response: any) {
+					// A stopped poll is not a result: leave the bubble and the queue entry
+					// exactly as they were so resumePolling can re-attach.
+					if (isPollStopped(response)) { wasStopped = true; return; }
 					self.handleHistoryItemResolution(capturedId, response, capturedPlat);
 					self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
 				}).catch(function (err: any) {
@@ -988,6 +1103,9 @@ export class ChatSession {
 						self.host.notify(); self.updateHistoryCache();
 					}
 				}).then(function () {
+					// Keep the queue entry when the poll was merely stopped, or resuming
+					// would have nothing left to re-attach to.
+					if (wasStopped) return;
 					var qi = self.bgTaskQueue.findIndex(function (q) { return q.id === capturedId; });
 					if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
 				});
@@ -1087,9 +1205,9 @@ export class ChatSession {
 			if (token !== self.state.gateRefreshToken) return;
 			var chatList = history && Array.isArray(history.list) ? history.list : [];
 			chatList.forEach(function (item: any) {
-				if (typeof item.queue_name === 'string' && item.queue_name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX) {
+				if (isBgIndexingQueue(item.queue_name)) {
 					var userText = extractLastUserTextFromRequest(item.request_body);
-					if (typeof userText === 'string' && userText.indexOf('A new file has just been uploaded') === 0) item._isBgTask = true;
+					if (typeof userText === 'string' && (userText.indexOf('A new file has just been uploaded') === 0 || userText.indexOf('CONTINUE indexing') === 0)) item._isBgTask = true;
 					else item._isOnBgQueue = true;
 				}
 			});
@@ -1191,11 +1309,13 @@ export class ChatSession {
 					// dispatch never polls, so they MUST still get their poll — skipping
 					// them was the stranded-"Thinking" bug this guard must not revive.
 					if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
-					self.historyItemPolls.set(item.id, true);
+					// Background indexing polls are suppressed while paused; foreground
+					// replies the user is waiting on are not.
+					if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
 					var capturedId = item.id;
 					var pp = item.poll({
 						latency: POLL_INTERVAL,
-						onResponse: function (response: any) { self.handleHistoryItemResolution(capturedId, response, platform); },
+						onResponse: function (response: any) { if (isPollStopped(response)) return; self.handleHistoryItemResolution(capturedId, response, platform); },
 						onError: function (err: any) {
 							self.historyItemPolls.delete(capturedId);
 							var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
@@ -1218,6 +1338,12 @@ export class ChatSession {
 							}
 						},
 					});
+					// Anything on the BACKGROUND queue is pausable, not just items whose
+					// prompt text we recognise as an indexing task. _isBgTask vs
+					// _isOnBgQueue is a DISPLAY distinction ("Indexing: file" vs a normal
+					// chat bubble); keying the pause off _isBgTask alone left every
+					// bg-queue item we could not text-match polling forever.
+					self._trackPoll(capturedId, (item._isBgTask || item._isOnBgQueue) ? 'bg' : 'fg', pp);
 					if (pp && pp.catch) pp.catch(function () { });
 				});
 				self.drainBgTaskQueue();

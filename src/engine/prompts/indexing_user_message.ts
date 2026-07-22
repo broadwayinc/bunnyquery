@@ -107,6 +107,7 @@ export function buildIndexingUserMessage(
  * Must match the worker's RENDER_FROM_TOKEN.
  */
 export const RENDER_FROM_TOKEN = '{{RENDER_FROM}}';
+const WINDOW_CURSOR_TOKEN = RENDER_FROM_TOKEN;
 
 /**
  * User message for a VISION file (PDF): its pages are delivered as RENDERED PAGE IMAGES that
@@ -190,6 +191,48 @@ function buildRenderDatafy(placeholder: string): string {
 		`the rest of the file and do NOT worry about the pages after this window: if any remain, the next window ` +
 		`is rendered and sent to you automatically. Report only the pages you were actually shown - never imply ` +
 		`you have seen the whole document.`
+	);
+}
+
+/**
+ * User message for a WINDOWED file: the worker splices ONE window of the file's rows or
+ * text into this message at `placeholder`, then continues from the reader's own cursor
+ * until the file is exhausted.
+ *
+ * The agent is deliberately NOT asked to page the file itself, and is NOT asked to judge
+ * whether it is finished. Both used to be its job, and both failed the same way: the
+ * traversal lived inside a single turn's budget, so a large file simply stopped partway
+ * with a confident summary of the part it had seen.
+ */
+export function buildIndexingWindowMessage(
+	attachment: IndexingAttachmentInfo,
+	placeholder: string,
+	isContinuation: boolean,
+	positionLabel?: string,
+): string {
+	const src = `src::${attachment.storagePath}`;
+	const head = isContinuation
+		? `CONTINUE indexing a file whose previous pass did not finish.\n\n`
+		: `A new file has just been uploaded. Index it now.\n\n`;
+	const where = isContinuation
+		? `\nRecords for the earlier windows are ALREADY saved (they reference "${src}"). The NEXT window ` +
+		  `(starting at ${positionLabel || WINDOW_CURSOR_TOKEN}) is embedded below. Do NOT re-save windows that are already saved.\n`
+		: `\nThis file is delivered to you ONE WINDOW at a time, embedded directly in this message. ` +
+		  `You do NOT need any tool, URL, or web_fetch to read it.\n`;
+
+	return (
+		head +
+		buildRenderMeta(attachment) +
+		where +
+		`\n${placeholder}\n\n` +
+		`DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW ` +
+		`for tabular data (keyed by the column headers), or one record per section for prose. Capture every ` +
+		`value you can read. Use the storage path above for the "src::" unique_id on the file-level record, ` +
+		`and link every row/section record to it by reference.\n\n` +
+		`Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest ` +
+		`of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to ` +
+		`you automatically. Report only what you were actually shown, and never imply you have seen the whole ` +
+		`file when the note beside the window says more remains.`
 	);
 }
 

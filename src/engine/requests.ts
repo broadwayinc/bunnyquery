@@ -10,9 +10,9 @@
  *                                    state that stays in the consumer, not here;
  *                                    only the BgTaskEntry TYPE lives here)
  */
-import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate } from './prompts';
-import { isServerExtractable, isPagedReadFile, isImageVisionFile, makeExtractPlaceholder, makeRenderPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, pollOpt } from './config';
+import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
+import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
+import { chatEngineConfig, pollOpt, windowedIndexingEnabled } from './config';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODELS_API_URL = 'https://api.anthropic.com/v1/models';
@@ -526,12 +526,40 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		}
 		: {};
 
+	// SERVER-DRIVEN windowed read. When enabled, the worker reads one window of the file
+	// per request and continues from the reader's own cursor until the file is exhausted,
+	// so the traversal no longer lives inside the model's turn budget.
+	//
+	// Flag-gated because the BACKEND MUST SHIP FIRST: against a worker that does not strip
+	// `_skapi_window`, the directive reaches the provider as an unknown body field and the
+	// call fails terminally with no retry.
+	const windowedRead =
+		!visionFile && !parsedContent && windowedIndexingEnabled() &&
+		isWindowedReadFile(attachment.name, attachment.mime);
+	const windowPlaceholder = windowedRead ? makeWindowPlaceholder(attachment.storagePath) : undefined;
+	const skapiWindow = windowedRead && windowPlaceholder
+		? {
+			_skapi_window: [
+				{
+					path: attachment.storagePath,
+					cursor: null,
+					placeholder: windowPlaceholder,
+					name: attachment.name,
+					mime: attachment.mime,
+					kind: 'window',
+					auto_continue: true,
+					continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true),
+				},
+			],
+		}
+		: {};
+
 	// Spreadsheets are read by PAGING through readFileContent (grid rows), NOT inlined - so
 	// they skip the inline server-extract and the agent is told to page the whole file.
-	const pagedRead = !visionFile && (continuing || (!parsedContent && isPagedReadFile(attachment.name, attachment.mime)));
+	const pagedRead = !visionFile && !windowedRead && (continuing || (!parsedContent && isPagedReadFile(attachment.name, attachment.mime)));
 
 	// Client-parsed content wins over server-side extraction.
-	const serverExtract = !visionFile && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
+	const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
 	const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : undefined;
 	const extractContent: ExtractDirective[] | undefined =
 		serverExtract && placeholder
@@ -542,6 +570,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 
 	const userMessage = (visionFile && renderPlaceholder)
 		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
+		: (windowedRead && windowPlaceholder)
+		? buildIndexingWindowMessage(attachment, windowPlaceholder, false)
 		: continuing
 			? buildIndexingContinueMessage(attachment)
 			: buildIndexingUserMessage(
@@ -581,6 +611,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				max_output_tokens: MAX_TOKENS,
 				...skapiExtract,
 				...skapiRender,
+				...skapiWindow,
 				input: [
 					{ role: 'system', content: systemPrompt },
 					{
@@ -629,6 +660,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			max_tokens: MAX_TOKENS,
 			...skapiExtract,
 			...skapiRender,
+			...skapiWindow,
 			system: [
 				{
 					type: 'text',
@@ -752,6 +784,23 @@ export async function listOpenAIModels(service: string, owner: string) {
 // Suffix for the background-indexing queue. Must sort *before* ':' (ASCII 58)
 // so the chat-history BETWEEN query never includes bg-queue items. '-' (45) works.
 export const BG_INDEXING_QUEUE_SUFFIX = '-bg';
+
+/**
+ * True when a request belongs to the background-indexing queue.
+ *
+ * Accepts BOTH shapes this value arrives in: the bare queue name the client sends
+ * ("<userId>-bg"), and the server qid that comes back on history/poll responses
+ * ("<service>:<queue>|<seq>"). Testing the tail of the raw value only works for the
+ * first: a qid ends in "|<seq>", so `endsWith('-bg')` is always false for it — which
+ * silently meant history items were NEVER recognised as background tasks.
+ */
+export function isBgIndexingQueue(queueName?: string): boolean {
+	if (typeof queueName !== 'string' || !queueName) return false;
+	const prefix = queueName.split('|')[0];
+	const idx = prefix.lastIndexOf(':');
+	const name = idx === -1 ? prefix : prefix.slice(idx + 1);
+	return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
+}
 
 // Pending background-indexing task descriptor. NOTE: the live mutable queue
 // (a Vue `reactive([])` in agent.vue, a plain array in bunnyquery) is app-level

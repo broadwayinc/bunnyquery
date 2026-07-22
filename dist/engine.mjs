@@ -59,6 +59,9 @@ function chatEngineConfig() {
   }
   return _config;
 }
+function windowedIndexingEnabled() {
+  return _config?.windowedIndexing === true;
+}
 function pollOpt() {
   const p = _config?.poll;
   return p === void 0 ? {} : { poll: p };
@@ -153,7 +156,32 @@ function isServerExtractable(name, mime) {
   return m.includes("officedocument") || m.includes("opendocument") || m.includes("hwp") || m.includes("epub") || m === "application/msword" || m === "application/vnd.ms-excel" || m === "application/vnd.ms-powerpoint";
 }
 var isOfficeFile = isServerExtractable;
-var PAGED_READ_EXTENSIONS = /* @__PURE__ */ new Set(["xls", "xlsx", "xlsm", "ods", "pdf"]);
+var PAGED_READ_EXTENSIONS = /* @__PURE__ */ new Set([
+  // grids
+  "xls",
+  "xlsx",
+  "xlsm",
+  "ods",
+  // delimited text (row-windowed by the layer)
+  "csv",
+  "tsv",
+  "tab",
+  // documents
+  "pdf",
+  "docx",
+  "pptx",
+  // plain text / data / markup
+  "txt",
+  "md",
+  "markdown",
+  "log",
+  "json",
+  "jsonl",
+  "ndjson",
+  "xml",
+  "yaml",
+  "yml"
+]);
 function isPagedReadFile(name, mime) {
   const ext = (name || "").split(".").pop()?.toLowerCase() || "";
   if (PAGED_READ_EXTENSIONS.has(ext)) return true;
@@ -177,6 +205,16 @@ function makeRenderPlaceholder(seed) {
   return `{{SKAPI_RENDER::${slug}-${_renderPlaceholderSeq}}}`;
 }
 var RENDER_PAGES_PER_WINDOW = 5;
+var _windowPlaceholderSeq = 0;
+function makeWindowPlaceholder(seed) {
+  _windowPlaceholderSeq += 1;
+  const slug = (seed || "file").replace(/[^a-zA-Z0-9]+/g, "_").slice(-48);
+  return `{{SKAPI_WINDOW::${slug}-${_windowPlaceholderSeq}}}`;
+}
+function isWindowedReadFile(name, mime) {
+  if (isImageVisionFile(name, mime)) return false;
+  return isPagedReadFile(name, mime);
+}
 function composeUserMessage(text, attachmentUrls) {
   let composed = text;
   if (attachmentUrls.length > 0) {
@@ -325,6 +363,7 @@ Read this file with the readFileContent tool, using the storage path above - do 
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
 }
 var RENDER_FROM_TOKEN = "{{RENDER_FROM}}";
+var WINDOW_CURSOR_TOKEN = RENDER_FROM_TOKEN;
 function buildIndexingRenderMessage(attachment, placeholder, renderFrom) {
   const from = Math.max(0, renderFrom || 0);
   if (from > 0) return buildIndexingRenderContinueTemplate(attachment, placeholder, String(from + 1));
@@ -356,6 +395,25 @@ ${placeholder}
 LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
 
 Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
+}
+function buildIndexingWindowMessage(attachment, placeholder, isContinuation, positionLabel) {
+  const src = `src::${attachment.storagePath}`;
+  const head = isContinuation ? `CONTINUE indexing a file whose previous pass did not finish.
+
+` : `A new file has just been uploaded. Index it now.
+
+`;
+  const where = isContinuation ? `
+Records for the earlier windows are ALREADY saved (they reference "${src}"). The NEXT window (starting at ${positionLabel || WINDOW_CURSOR_TOKEN}) is embedded below. Do NOT re-save windows that are already saved.
+` : `
+This file is delivered to you ONE WINDOW at a time, embedded directly in this message. You do NOT need any tool, URL, or web_fetch to read it.
+`;
+  return head + buildRenderMeta(attachment) + where + `
+${placeholder}
+
+DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. Use the storage path above for the "src::" unique_id on the file-level record, and link every row/section record to it by reference.
+
+Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to you automatically. Report only what you were actually shown, and never imply you have seen the whole file when the note beside the window says more remains.`;
 }
 function buildIndexingContinueMessage(attachment) {
   const src = `src::${attachment.storagePath}`;
@@ -904,12 +962,28 @@ async function notifyAgentSaveAttachment(info) {
       }
     ]
   } : {};
-  const pagedRead = !visionFile && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
-  const serverExtract = !visionFile && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
+  const windowedRead = !visionFile && !parsedContent && windowedIndexingEnabled() && isWindowedReadFile(attachment.name, attachment.mime);
+  const windowPlaceholder = windowedRead ? makeWindowPlaceholder(attachment.storagePath) : void 0;
+  const skapiWindow = windowedRead && windowPlaceholder ? {
+    _skapi_window: [
+      {
+        path: attachment.storagePath,
+        cursor: null,
+        placeholder: windowPlaceholder,
+        name: attachment.name,
+        mime: attachment.mime,
+        kind: "window",
+        auto_continue: true,
+        continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true)
+      }
+    ]
+  } : {};
+  const pagedRead = !visionFile && !windowedRead && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
+  const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
   const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
   const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
   const skapiExtract = extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
-  const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
+  const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
   );
@@ -938,6 +1012,7 @@ async function notifyAgentSaveAttachment(info) {
         max_output_tokens: MAX_TOKENS,
         ...skapiExtract,
         ...skapiRender,
+        ...skapiWindow,
         input: [
           { role: "system", content: systemPrompt },
           {
@@ -983,6 +1058,7 @@ async function notifyAgentSaveAttachment(info) {
       max_tokens: MAX_TOKENS,
       ...skapiExtract,
       ...skapiRender,
+      ...skapiWindow,
       system: [
         {
           type: "text",
@@ -1079,6 +1155,13 @@ async function listOpenAIModels(service, owner) {
   });
 }
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+function isBgIndexingQueue(queueName) {
+  if (typeof queueName !== "string" || !queueName) return false;
+  const prefix = queueName.split("|")[0];
+  const idx = prefix.lastIndexOf(":");
+  const name = idx === -1 ? prefix : prefix.slice(idx + 1);
+  return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
+}
 var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
 var MAX_INDEXING_RESUME_PASSES = 6;
 async function getChatHistory(params, fetchOptions) {
@@ -1208,6 +1291,9 @@ function nextFrame(cb) {
     cb(nowMs());
   }, 16);
 }
+function isPollStopped(res) {
+  return !!res && typeof res === "object" && res.status === "stopped";
+}
 var ChatSession = class {
   constructor(host) {
     this.typewriterQueue = Promise.resolve();
@@ -1231,7 +1317,82 @@ var ChatSession = class {
     this.pendingAgentRequests = {};
     this.aiChatHistoryCache = {};
     this.historyItemPolls = /* @__PURE__ */ new Map();
+    this._pauseReasons = /* @__PURE__ */ new Set();
+    this._resuming = false;
     this._lidSeq = 0;
+  }
+  /**
+   * Register a live poll so (a) a remount dedupes against it instead of stacking a
+   * SECOND poll on the same item, and (b) pausePolling can stop it.
+   *
+   * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
+   * poll simply cannot be stopped and is left running — see pausePolling.
+   */
+  _trackPoll(id, kind, p) {
+    var stop = p && typeof p.stop === "function" ? p.stop.bind(p) : void 0;
+    if (!stop) {
+      console.debug("[chat-engine] poll has no stop handle", { id, kind });
+    }
+    this.historyItemPolls.set(id, { kind, stop });
+    return p;
+  }
+  /** True while any pause reason is active. */
+  isPollingPaused() {
+    return this._pauseReasons.size > 0;
+  }
+  /**
+   * Stop BACKGROUND polling until resumePolling. Foreground polls (a reply the user is
+   * waiting on) keep running deliberately: their results must still land in the history
+   * cache so resumePendingRequest can render them on return, otherwise a user who sends
+   * a message then navigates away comes back to a permanently stuck "Thinking...".
+   *
+   * Server-side work is untouched; this only stops asking about it. That is safe for
+   * document indexing because the worker drives that loop itself.
+   */
+  pausePolling(reason) {
+    this._pauseReasons.add(reason || "paused");
+    var self = this;
+    var stopped = [];
+    this.historyItemPolls.forEach(function(handle, id) {
+      if (!handle || handle.kind !== "bg") return;
+      if (typeof handle.stop !== "function") return;
+      try {
+        handle.stop();
+      } catch (e) {
+      }
+      stopped.push(id);
+    });
+    stopped.forEach(function(id) {
+      self.historyItemPolls.delete(id);
+    });
+  }
+  /**
+   * Lift a pause reason WITHOUT running the reconcile. For a caller that is about to
+   * reload history anyway (a view remounting), letting resumePolling also reconcile
+   * would race that load and can double-attach.
+   */
+  clearPauseReason(reason) {
+    this._pauseReasons.delete(reason || "paused");
+  }
+  /**
+   * Clear a pause reason and, once none remain, re-attach polling and reconcile.
+   * Deliberately does NOT touch gateRefreshToken: bumping it would silently discard
+   * the results of anything still in flight across the pause.
+   */
+  resumePolling(reason) {
+    this._pauseReasons.delete(reason || "paused");
+    if (this._pauseReasons.size > 0 || this._resuming) return Promise.resolve();
+    if (!this.host.isViewMounted || !this.host.isViewMounted()) return Promise.resolve();
+    var self = this;
+    this._resuming = true;
+    return Promise.resolve().then(function() {
+      self.drainBgTaskQueue();
+      return self.loadHistory(false, self.state.gateRefreshToken);
+    }).catch(function(e) {
+      console.error("[chat-engine] resume polling failed", e);
+    }).then(function() {
+      self._resuming = false;
+    });
   }
   _newLocalId() {
     this._lidSeq += 1;
@@ -1322,9 +1483,10 @@ var ChatSession = class {
           if (initial.id) {
             if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
             dispatchItemId = initial.id;
-            self.historyItemPolls.set(initial.id, true);
           }
-          return initial.poll({ latency: POLL_INTERVAL });
+          var dp = initial.poll({ latency: POLL_INTERVAL });
+          if (initial.id) self._trackPoll(initial.id, "fg", dp);
+          return dp;
         }
         return initial;
       });
@@ -1459,8 +1621,10 @@ var ChatSession = class {
           self.host.notify();
         }
         if (result && result.poll && (result.status === "pending" || result.status === "running")) {
-          if (serverId) self.historyItemPolls.set(serverId, true);
-          return result.poll({ latency: POLL_INTERVAL }).then(function(res) {
+          var qp = result.poll({ latency: POLL_INTERVAL });
+          if (serverId) self._trackPoll(serverId, "fg", qp);
+          return qp.then(function(res) {
+            if (isPollStopped(res)) return;
             return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey);
           }).catch(function(err) {
             return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey);
@@ -2061,24 +2225,31 @@ var ChatSession = class {
     }
     this.bgTaskQueue.forEach(function(entry) {
       if (entry.serviceId !== svcId || entry.platform !== plat) return;
-      if (presentIds[entry.id]) return;
-      var isRunning = entry.status === "running";
-      var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
-      if (isRunning) userBubble.isPendingInProcess = true;
-      else userBubble.isPendingQueued = true;
-      self.state.messages.push(userBubble);
-      if (isRunning) {
-        self.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
+      if (!presentIds[entry.id]) {
+        var isRunning = entry.status === "running";
+        var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
+        if (isRunning) userBubble.isPendingInProcess = true;
+        else userBubble.isPendingQueued = true;
+        self.state.messages.push(userBubble);
+        if (isRunning) {
+          self.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
+        }
+        presentIds[entry.id] = true;
+        self.host.notify();
+        self.updateHistoryCache();
+        self.host.scrollToBottom(false);
       }
-      presentIds[entry.id] = true;
-      self.host.notify();
-      self.updateHistoryCache();
-      self.host.scrollToBottom(false);
-      if (!self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
-        self.historyItemPolls.set(entry.id, true);
+      if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
         var capturedId = entry.id, capturedPlat = plat;
         var capturedEntry = entry;
-        entry.poll({ latency: POLL_INTERVAL }).then(function(response) {
+        var wasStopped = false;
+        var bp = entry.poll({ latency: POLL_INTERVAL });
+        self._trackPoll(entry.id, "bg", bp);
+        bp.then(function(response) {
+          if (isPollStopped(response)) {
+            wasStopped = true;
+            return;
+          }
           self.handleHistoryItemResolution(capturedId, response, capturedPlat);
           self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
         }).catch(function(err) {
@@ -2094,6 +2265,7 @@ var ChatSession = class {
             self.updateHistoryCache();
           }
         }).then(function() {
+          if (wasStopped) return;
           var qi = self.bgTaskQueue.findIndex(function(q) {
             return q.id === capturedId;
           });
@@ -2198,9 +2370,9 @@ var ChatSession = class {
       if (token !== self.state.gateRefreshToken) return;
       var chatList = history && Array.isArray(history.list) ? history.list : [];
       chatList.forEach(function(item) {
-        if (typeof item.queue_name === "string" && item.queue_name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX) {
+        if (isBgIndexingQueue(item.queue_name)) {
           var userText = extractLastUserTextFromRequest(item.request_body);
-          if (typeof userText === "string" && userText.indexOf("A new file has just been uploaded") === 0) item._isBgTask = true;
+          if (typeof userText === "string" && (userText.indexOf("A new file has just been uploaded") === 0 || userText.indexOf("CONTINUE indexing") === 0)) item._isBgTask = true;
           else item._isOnBgQueue = true;
         }
       });
@@ -2277,11 +2449,12 @@ var ChatSession = class {
           if (!item.poll || !item.id) return;
           if (self.historyItemPolls.has(item.id)) return;
           if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
-          self.historyItemPolls.set(item.id, true);
+          if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
           var capturedId = item.id;
           var pp = item.poll({
             latency: POLL_INTERVAL,
             onResponse: function(response) {
+              if (isPollStopped(response)) return;
               self.handleHistoryItemResolution(capturedId, response, platform);
             },
             onError: function(err) {
@@ -2317,6 +2490,7 @@ var ChatSession = class {
               }
             }
           });
+          self._trackPoll(capturedId, item._isBgTask || item._isOnBgQueue ? "bg" : "fg", pp);
           if (pp && pp.catch) pp.catch(function() {
           });
         });
@@ -2529,6 +2703,6 @@ var ChatSession = class {
   }
 };
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

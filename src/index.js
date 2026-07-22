@@ -3154,7 +3154,21 @@ import {
         if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
             S._visBound = true;
             document.addEventListener("visibilitychange", function () {
-                if (document.visibilityState === "visible" && S.user) ensureMcpGrantFresh();
+                if (document.visibilityState === "hidden") {
+                    // Nobody is looking: stop background indexing polls. The server keeps
+                    // working (the worker drives the document loop itself), so this only
+                    // drops traffic, never progress.
+                    if (session && session.pausePolling) session.pausePolling("hidden");
+                    return;
+                }
+                if (document.visibilityState === "visible") {
+                    // Refresh the MCP grant BEFORE resuming, or the first poll after a long
+                    // hidden stretch 401s on an aged-out grant.
+                    var refreshed = S.user ? ensureMcpGrantFresh() : null;
+                    Promise.resolve(refreshed).catch(function () { }).then(function () {
+                        if (session && session.resumePolling) session.resumePolling("hidden");
+                    });
+                }
             });
         }
 

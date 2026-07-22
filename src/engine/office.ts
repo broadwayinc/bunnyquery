@@ -101,11 +101,32 @@ export function isServerExtractable(name?: string, mime?: string): boolean {
 /** @deprecated renamed to {@link isServerExtractable} (now also covers text files). */
 export const isOfficeFile = isServerExtractable;
 
-// Extensions that are best read WINDOW-BY-WINDOW via the readFileContent tool instead of
-// inlined once: spreadsheets (grid rows + embedded photos, and can be huge) and PDFs
-// (scanned page images). For these the indexing agent is told to page through the whole
-// file with readFileContent rather than reading a capped inline dump or web_fetching a URL.
-const PAGED_READ_EXTENSIONS = new Set(['xls', 'xlsx', 'xlsm', 'ods', 'pdf']);
+// Extensions read WINDOW-BY-WINDOW via the readFileContent tool instead of inlined once.
+//
+// Anything NOT in this set falls back to one-shot server extraction, which is capped at
+// MAX_EXTRACTED_CHARS (200k). Measured against real files, that cap was discarding the
+// overwhelming majority of every large non-spreadsheet upload:
+//   5MB .txt   -> 4.0% indexed (4.8M characters silently dropped)
+//   4.8MB .json-> 4.2%
+//   1.9M-char Korean .txt -> 10.5%
+//   .docx      -> 70.6%
+// The truncation was invisible: the agent received a plausible-looking document and had
+// no way to know most of it was missing. Windowing these types is what makes "index the
+// whole file" true rather than aspirational.
+//
+// CSV/TSV specifically must be here rather than in the inline path: the layer now gives
+// them ROW-bounded windows with absolute row numbers, where the character windower used
+// to split rows across boundaries and emit no row numbers at all.
+const PAGED_READ_EXTENSIONS = new Set([
+	// grids
+	'xls', 'xlsx', 'xlsm', 'ods',
+	// delimited text (row-windowed by the layer)
+	'csv', 'tsv', 'tab',
+	// documents
+	'pdf', 'docx', 'pptx',
+	// plain text / data / markup
+	'txt', 'md', 'markdown', 'log', 'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml',
+]);
 
 /**
  * True when a file should be indexed by PAGING through readFileContent (spreadsheets and
@@ -159,6 +180,33 @@ export function makeRenderPlaceholder(seed: string): string {
 // Page/photo images per render window. Must match the server default so the client's
 // resume window (from = pass * PAGES) lines up with what the worker renders.
 export const RENDER_PAGES_PER_WINDOW = 5;
+
+// Token the WORKER substitutes with a human description of the next window's position.
+// Shared with the render loop so one substitution path serves both.
+export const WINDOW_CURSOR_TOKEN = '{{RENDER_FROM}}';
+
+let _windowPlaceholderSeq = 0;
+
+/**
+ * Placeholder the worker replaces with ONE window of a file's text/grid content.
+ * Distinct token from the render (page-image) and extract (whole-file) placeholders so
+ * a stale token from either can never be mistaken for this one.
+ */
+export function makeWindowPlaceholder(seed: string): string {
+	_windowPlaceholderSeq += 1;
+	const slug = (seed || 'file').replace(/[^a-zA-Z0-9]+/g, '_').slice(-48);
+	return `{{SKAPI_WINDOW::${slug}-${_windowPlaceholderSeq}}}`;
+}
+
+/**
+ * True when a file should be read server-side, one window at a time, by the worker.
+ * PDFs are excluded: they go through the VISION path, where pages are rendered to
+ * images because their text layer is often absent or unreliable.
+ */
+export function isWindowedReadFile(name?: string, mime?: string): boolean {
+	if (isImageVisionFile(name, mime)) return false;
+	return isPagedReadFile(name, mime);
+}
 
 export interface ComposedUserMessage {
 	/** Clean display/history copy (attachment links, NO extraction placeholders). */
