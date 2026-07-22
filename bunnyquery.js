@@ -1201,11 +1201,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             var mimeMatch = userText.match(/^- mime type: (.+)$/m);
             var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
             var pathMatch = userText.match(/^- storage path: (.+)$/m);
+            var isContinuePass = userText.indexOf("CONTINUE indexing") === 0;
             displayContent = opts.formatIndexingLabel(
               nameMatch[1].trim(),
               mimeMatch ? mimeMatch[1].trim() : "",
               sizeMatch ? Number(sizeMatch[1]) : null,
-              pathMatch ? pathMatch[1].trim() : void 0
+              pathMatch ? pathMatch[1].trim() : void 0,
+              false,
+              isContinuePass
             );
           } else {
             displayContent = userText;
@@ -2195,7 +2198,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (entry.serviceId !== svcId || entry.platform !== plat) return;
         if (!presentIds[entry.id]) {
           var isRunning = entry.status === "running";
-          var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
+          var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass), isBackgroundTask: true, _serverItemId: entry.id };
           if (isRunning) userBubble.isPendingInProcess = true;
           else userBubble.isPendingQueued = true;
           self.state.messages.push(userBubble);
@@ -2261,6 +2264,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (!entry || !entry.storagePath) return;
         if (!isPagedReadFile(entry.filename, entry.mime)) return;
         if (isImageVisionFile(entry.filename, entry.mime)) return;
+        if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
         if (isErrorResponseBody(response)) return;
         var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
         if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
@@ -2675,7 +2679,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.6.1" ;
+    var BQ_VERSION = "1.6.3" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -4331,8 +4335,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       refreshSession: function() {
         return refreshSkapiSession();
       },
-      formatIndexingLabel: function(name, mime, size, storagePath, reindex) {
-        return buildIndexingLabel(name, mime, size, storagePath, reindex);
+      formatIndexingLabel: function(name, mime, size, storagePath, reindex, continued) {
+        return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
       },
       isViewMounted: function() {
         return !!CS.messagesBox;
@@ -4702,9 +4706,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
       return (n / (1024 * 1024)).toFixed(1) + " MB";
     }
-    function buildIndexingLabel(name, mime, size, storagePath, reindex) {
-      var extras = [];
+    function buildIndexingLabel(name, mime, size, storagePath, reindex, continued) {
       var nameLabel = storagePath ? "[" + name + "](" + storagePath + ")" : name;
+      if (continued) return "Indexing (continuing) " + nameLabel;
+      var extras = [];
       if (mime) extras.push(mime);
       if (size != null && size !== "" && !isNaN(Number(size))) extras.push(formatBytes(size));
       return (reindex ? "Reindexing: " : "Indexing: ") + nameLabel + (extras.length ? " \xB7 " + extras.join(" \xB7 ") : "");

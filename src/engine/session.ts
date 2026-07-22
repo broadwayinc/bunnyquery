@@ -34,7 +34,8 @@ import {
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
 } from './requests';
-import { isPagedReadFile, isImageVisionFile } from './office';
+import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
+import { windowedIndexingEnabled } from './config';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
@@ -1072,7 +1073,7 @@ export class ChatSession {
 			// "Thinking..." once polling resumed.
 			if (!presentIds[entry.id]) {
 			var isRunning = entry.status === 'running';
-			var userBubble: ChatMessage = { role: 'user', content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
+			var userBubble: ChatMessage = { role: 'user', content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass), isBackgroundTask: true, _serverItemId: entry.id };
 			if (isRunning) userBubble.isPendingInProcess = true; else userBubble.isPendingQueued = true;
 			self.state.messages.push(userBubble);
 			if (isRunning) {
@@ -1131,7 +1132,13 @@ export class ChatSession {
 		try {
 			if (!entry || !entry.storagePath) return;
 			if (!isPagedReadFile(entry.filename, entry.mime)) return;
-			if (isImageVisionFile(entry.filename, entry.mime)) return; // worker owns this loop
+			if (isImageVisionFile(entry.filename, entry.mime)) return; // worker owns this loop (PDF vision)
+			// When windowed indexing is on, the WORKER drives the text/grid loop too. The
+			// client MUST NOT also resume, or two drivers each enqueue a continuation per
+			// pass and the chain FORKS - duplicate records, runaway passes. Same reason
+			// PDFs early-return above. Gated on the flag so the old client-driven path is
+			// untouched when windowing is off.
+			if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
 			if (isErrorResponseBody(response)) return; // a failed pass is not "incomplete"
 			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '';
 			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return; // fully indexed

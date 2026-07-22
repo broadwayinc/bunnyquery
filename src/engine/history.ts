@@ -44,7 +44,7 @@ export type MapHistoryOptions = {
 	clearedAt: number;
 	serviceId: string;
 	/** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
-	formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string) => string;
+	formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
 
 export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions) {
@@ -73,11 +73,18 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 					var mimeMatch = userText.match(/^- mime type: (.+)$/m);
 					var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
 					var pathMatch = userText.match(/^- storage path: (.+)$/m);
+					// A CONTINUE pass ("CONTINUE indexing …") gets the compact
+					// continuation label; a first pass ("A new file …") gets the full
+					// one. Mirrors agent.vue's mapHistoryListToMessages so a big file's
+					// windows read as progress, not the same task repeating.
+					var isContinuePass = userText.indexOf('CONTINUE indexing') === 0;
 					displayContent = opts.formatIndexingLabel(
 						nameMatch[1].trim(),
 						mimeMatch ? mimeMatch[1].trim() : '',
 						sizeMatch ? Number(sizeMatch[1]) : null,
-						pathMatch ? pathMatch[1].trim() : undefined
+						pathMatch ? pathMatch[1].trim() : undefined,
+						false,
+						isContinuePass
 					);
 				} else {
 					displayContent = userText;

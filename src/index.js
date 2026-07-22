@@ -1605,8 +1605,8 @@ import {
         scrollToBottomIfSticky: function (smooth) { return scrollToBottomIfSticky(smooth); },
         cancelRequest: function (opts) { return S.skapi.cancelClientSecretRequest(opts); },
         refreshSession: function () { return refreshSkapiSession(); },
-        formatIndexingLabel: function (name, mime, size, storagePath, reindex) {
-            return buildIndexingLabel(name, mime, size, storagePath, reindex);
+        formatIndexingLabel: function (name, mime, size, storagePath, reindex, continued) {
+            return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
         },
         isViewMounted: function () { return !!CS.messagesBox; },
         getClearedAt: function () { return getClearedAt(); },
@@ -1964,9 +1964,12 @@ import {
     // marking it expired so a click fetches a fresh temporary URL. A full
     // https://_expired_.url/… href must NOT be used here (it would render as a
     // plain external link that never refreshes). reindex=true shows "Reindexing:".
-    function buildIndexingLabel(name, mime, size, storagePath, reindex) {
-        var extras = [];
+    function buildIndexingLabel(name, mime, size, storagePath, reindex, continued) {
         var nameLabel = storagePath ? "[" + name + "](" + storagePath + ")" : name;
+        // A CONTINUE pass of a big file gets a compact, visibly different label so a
+        // long multi-window run reads as progress, not the same task repeating.
+        if (continued) return "Indexing (continuing) " + nameLabel;
+        var extras = [];
         if (mime) extras.push(mime);
         if (size != null && size !== "" && !isNaN(Number(size))) extras.push(formatBytes(size));
         return (reindex ? "Reindexing: " : "Indexing: ") + nameLabel + (extras.length ? " · " + extras.join(" · ") : "");

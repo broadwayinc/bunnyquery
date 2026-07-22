@@ -374,7 +374,7 @@ type MapHistoryOptions = {
     clearedAt: number;
     serviceId: string;
     /** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
-    formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string) => string;
+    formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
 declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions): {
     messages: any[];
@@ -586,7 +586,7 @@ interface ChatHost {
     } | any>;
     refreshSession(): Promise<boolean>;
     /** Build the "Indexing:/Reindexing: …" label (view-side display formatting). */
-    formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean): string;
+    formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean): string;
     /** drainBgTaskQueue is a no-op until the chat view is mounted. */
     isViewMounted(): boolean;
     /** Clear-horizon timestamp (localStorage, per service#platform) — view-owned. */

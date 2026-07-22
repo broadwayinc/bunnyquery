@@ -95,7 +95,7 @@ export interface ChatHost {
 
 	// --- bg-indexing display ---
 	/** Build the "Indexing:/Reindexing: …" label (view-side display formatting). */
-	formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean): string;
+	formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean): string;
 	/** drainBgTaskQueue is a no-op until the chat view is mounted. */
 	isViewMounted(): boolean;
 

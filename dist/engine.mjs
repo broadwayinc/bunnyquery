@@ -1233,11 +1233,14 @@ function mapHistoryListToMessages(list, platform, opts) {
           var mimeMatch = userText.match(/^- mime type: (.+)$/m);
           var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
           var pathMatch = userText.match(/^- storage path: (.+)$/m);
+          var isContinuePass = userText.indexOf("CONTINUE indexing") === 0;
           displayContent = opts.formatIndexingLabel(
             nameMatch[1].trim(),
             mimeMatch ? mimeMatch[1].trim() : "",
             sizeMatch ? Number(sizeMatch[1]) : null,
-            pathMatch ? pathMatch[1].trim() : void 0
+            pathMatch ? pathMatch[1].trim() : void 0,
+            false,
+            isContinuePass
           );
         } else {
           displayContent = userText;
@@ -2227,7 +2230,7 @@ var ChatSession = class {
       if (entry.serviceId !== svcId || entry.platform !== plat) return;
       if (!presentIds[entry.id]) {
         var isRunning = entry.status === "running";
-        var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex), isBackgroundTask: true, _serverItemId: entry.id };
+        var userBubble = { role: "user", content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass), isBackgroundTask: true, _serverItemId: entry.id };
         if (isRunning) userBubble.isPendingInProcess = true;
         else userBubble.isPendingQueued = true;
         self.state.messages.push(userBubble);
@@ -2293,6 +2296,7 @@ var ChatSession = class {
       if (!entry || !entry.storagePath) return;
       if (!isPagedReadFile(entry.filename, entry.mime)) return;
       if (isImageVisionFile(entry.filename, entry.mime)) return;
+      if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
       if (isErrorResponseBody(response)) return;
       var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
       if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
