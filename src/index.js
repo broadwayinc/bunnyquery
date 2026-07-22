@@ -2766,6 +2766,26 @@ import {
             onBubbleLinkClick(e);
         });
 
+        // Stop indexing this file: cancels every queued/running pass and keeps the
+        // client from dispatching the next one. Sits in the head so it is reachable
+        // without expanding the row; its click must not toggle that row.
+        var cancelBtn = null;
+        if (group.cancellableIds.length || group.cancelling) {
+            cancelBtn = h("button", {
+                class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
+                type: "button",
+                title: group.cancelling ? "Stopping..." : "Stop indexing this file",
+                "aria-label": "Stop indexing " + group.name,
+                text: group.cancelling ? "Stopping..." : "Stop",
+            });
+            if (group.cancelling) cancelBtn.disabled = true;
+            else cancelBtn.addEventListener("click", function (e) {
+                e.stopPropagation();
+                session.cancelIndexingGroup(group);
+            });
+            cancelBtn.addEventListener("keydown", function (e) { e.stopPropagation(); });
+        }
+
         // A div, not a button: the file name inside is a real anchor, and an
         // anchor nested in a button is invalid and swallows its own activation.
         var head = h("div", {
@@ -2784,9 +2804,16 @@ import {
             h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
             label,
             indexGroupCount(group) ? h("span", { class: "bq-index-count", text: indexGroupCount(group) }) : null,
+            cancelBtn,
             h("span", { class: "bq-index-chevron", text: "▶" }));
 
         var el = h("div", { class: cls.join(" ") }, head);
+        if (group.cancelError) {
+            el.appendChild(h("div", {
+                class: "bq-index-note is-error",
+                text: "Could not stop this file: " + group.cancelError,
+            }));
+        }
         if (isOpen && group.mayHaveOlder) {
             el.appendChild(h("div", {
                 class: "bq-index-note",

@@ -42,6 +42,7 @@ import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, PinnedDispatchContext } from './host';
+import type { IndexingGroup } from './indexing_groups';
 
 function sleep(ms: number): Promise<void> {
 	return new Promise(function (r) { setTimeout(r, ms); });
@@ -80,6 +81,13 @@ export class ChatSession {
 	state: ChatState;
 	bgTaskQueue: BgTaskEntry[];
 	cancelledServerIds: Set<string>;
+	/** Files whose indexing the user stopped, keyed exactly as buildChatDisplayList
+	 *  keys a group (storage path, else filename). Cancelling one pass is not
+	 *  enough on its own: the client dispatches CONTINUE passes for paged files, so
+	 *  without this the next pass is enqueued the moment the cancelled one settles.
+	 *  Cleared when a FIRST pass for the same file is queued again (a re-upload or a
+	 *  Reindex from the file manager), so stopping a file never poisons it. */
+	cancelledIndexKeys: Set<string>;
 	pendingAgentRequests: Record<string, Promise<any>>;
 	aiChatHistoryCache: Record<string, { messages: ChatMessage[]; endOfList: boolean; startKeyHistory: string[] }>;
 	historyItemPolls: Map<string, PollHandle>;
@@ -107,6 +115,7 @@ export class ChatSession {
 		};
 		this.bgTaskQueue = [];
 		this.cancelledServerIds = new Set();
+		this.cancelledIndexKeys = new Set();
 		this.pendingAgentRequests = {};
 		this.aiChatHistoryCache = {};
 		this.historyItemPolls = new Map();
@@ -131,6 +140,21 @@ export class ChatSession {
 		}
 		this.historyItemPolls.set(id, { kind: kind, stop: stop });
 		return p;
+	}
+
+	/**
+	 * Stop and forget one item's poll. Used after a cancel: the row is either gone
+	 * (cancelled while queued) or flagged cancelled (cancelled while running), so
+	 * asking about it again only burns requests. Safe when no poll is attached, and
+	 * safe on an older skapi-js with no stop handle (the entry is then LEFT in the
+	 * map so a later drain cannot stack a second, unstoppable poll on the id).
+	 */
+	private _stopPoll(id: string): void {
+		var handle = this.historyItemPolls.get(id);
+		if (!handle) return;
+		if (typeof handle.stop !== 'function') return;
+		try { handle.stop(); } catch (e) { /* best effort */ }
+		this.historyItemPolls.delete(id);
 	}
 
 	/** True while any pause reason is active. */
@@ -778,13 +802,25 @@ export class ChatSession {
 		})).then(function (result: any) {
 			if (result && result.removed) {
 				self.cancelledServerIds.add(serverId as string);
+				self._stopPoll(serverId as string);
 				var qi = self.bgTaskQueue.findIndex(function (e) { return e.id === serverId; });
 				if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
 				var removeIdx = self.state.messages.findIndex(function (m) {
 					return m._serverItemId === serverId && (m.isPendingQueued || m.isPendingInProcess) && m.role === 'user';
 				});
 				if (removeIdx !== -1) {
-					self.state.messages[removeIdx] = { role: 'user', content: self.state.messages[removeIdx].content, isCancelled: true, _serverItemId: serverId };
+					// Carry the background/file markers onto the rebuild. Dropping them
+					// took a cancelled INDEXING pass out of its file's collapsed row
+					// (buildChatDisplayList only groups isBackgroundTask bubbles), so the
+					// row stayed "Indexing…" forever while a bare "Indexing: file" bubble
+					// appeared beside it.
+					var wasMsg = self.state.messages[removeIdx];
+					var cancelledMsg: ChatMessage = { role: 'user', content: wasMsg.content, isCancelled: true, _serverItemId: serverId };
+					if (wasMsg.isBackgroundTask) cancelledMsg.isBackgroundTask = true;
+					if (wasMsg._indexFile) cancelledMsg._indexFile = wasMsg._indexFile;
+					if (wasMsg._useBgQueue) cancelledMsg._useBgQueue = true;
+					if (wasMsg._ownerKey !== undefined) cancelledMsg._ownerKey = wasMsg._ownerKey;
+					self.state.messages[removeIdx] = cancelledMsg;
 					var thById = self.state.messages.findIndex(function (m) { return m._serverItemId === serverId && m.isPending && m.role === 'assistant'; });
 					if (thById !== -1) self.state.messages.splice(thById, 1);
 					else {
@@ -807,6 +843,47 @@ export class ChatSession {
 			var errMsg = err && typeof err.message === 'string' && err.message ? err.message : 'Could not remove from queue.';
 			var ci = self.state.messages.findIndex(function (m) { return m._serverItemId === serverId && m.role === 'user'; });
 			if (ci !== -1) { self.state.messages[ci] = Object.assign({}, self.state.messages[ci], { _cancelling: false, _cancelError: errMsg }); self.host.notify(); }
+		});
+	}
+
+	/**
+	 * Stop indexing a file, from its collapsed row — every pass at once, not just
+	 * the bubble the user happens to see.
+	 *
+	 * A big file is indexed as a CHAIN of passes, so cancelling only the live one
+	 * accomplishes nothing: the next pass is dispatched as soon as it settles.
+	 * Three things end the chain:
+	 *   1. every queued/running pass of this file is cancelled server-side
+	 *      (csr-cancel deletes a queued row and flags a running one "cancelled",
+	 *      which is also the worker's gate for NOT enqueueing the next window);
+	 *   2. the file is remembered in cancelledIndexKeys, so the client-driven
+	 *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
+	 *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
+	 *      drain rather than surfacing a fresh "Indexing…" bubble.
+	 *
+	 * Records already written by the passes that DID run are kept — this stops the
+	 * work, it does not undo it.
+	 */
+	cancelIndexingGroup(group: IndexingGroup): void {
+		var self = this;
+		if (!group || !group.key) return;
+		// The group belongs to the chat on screen, so scope its key the same way
+		// _indexKeyOf scopes a queued task's.
+		var scoped = this.getHistoryCacheKey() + '|' + group.key;
+		this.cancelledIndexKeys.add(scoped);
+		var ids = group.cancellableIds || [];
+		if (!ids.length) { this.host.notify(); return; }
+		ids.forEach(function (serverId) {
+			// Address the message by IDENTITY, not by the index captured when the
+			// display list was built: an earlier cancel in this same loop may already
+			// have spliced the array (a group can have more than one live pass), and a
+			// stale index would mark the WRONG bubble as cancelling.
+			var idx = self.state.messages.findIndex(function (m) {
+				return m._serverItemId === serverId && m.role === 'user' &&
+					(m.isPendingQueued || m.isPendingInProcess);
+			});
+			if (idx === -1) return;
+			self.cancelQueuedMessage(self.state.messages[idx], idx);
 		});
 	}
 
@@ -1083,12 +1160,97 @@ export class ChatSession {
 		this.updateHistoryCache();
 	}
 
+	/** How a bg task maps onto a collapsed row: the row's own key (storage path
+	 *  when known, else the filename), scoped to the chat it belongs to. A storage
+	 *  path is project-relative ("report.xlsx"), and ONE ChatSession serves every
+	 *  project — unscoped, stopping a file in one project would silently suppress
+	 *  the same filename's continuations in another. */
+	private _indexKeyOf(entry: BgTaskEntry): string {
+		if (!entry) return '';
+		var file = entry.storagePath || entry.filename;
+		if (!file) return '';
+		return entry.serviceId + '#' + entry.platform + '|' + file;
+	}
+
+	/**
+	 * Reconcile the bg queue with the files the user has stopped.
+	 *
+	 * A FIRST pass (no resumePass) is a fresh indexing request — a re-upload, or a
+	 * Reindex from the file manager — so it LIFTS the stop: the key is a storage
+	 * path, and without this an earlier cancel would silently kill every future
+	 * index of the same path. A continuation of a stopped file is dropped instead,
+	 * covering the pass that was dispatched in the moment before the cancel landed.
+	 */
+	private _applyIndexCancellations(): void {
+		if (!this.cancelledIndexKeys.size) return;
+		for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
+			var entry = this.bgTaskQueue[i];
+			var key = this._indexKeyOf(entry);
+			if (!key || !this.cancelledIndexKeys.has(key)) continue;
+			if (!entry.resumePass) { this.cancelledIndexKeys.delete(key); continue; }
+			this.bgTaskQueue.splice(i, 1);
+			this._stopPoll(entry.id);
+			this._cancelServerItem(entry.id);
+		}
+	}
+
+	/**
+	 * Cancel any live pass of a stopped file that turned up on its own.
+	 *
+	 * The client is not the only thing that continues a file: for PDFs and (when
+	 * windowed indexing is on) text/grid files the WORKER enqueues the next window
+	 * itself, and that pass reaches the chat through the history poll, never
+	 * through bgTaskQueue. The worker's own gate stops the chain when the running
+	 * row is cancelled — but if the row had already finished when the user hit
+	 * stop, the next window was queued a moment earlier and still arrives. Stop it
+	 * here rather than making the user hit stop again.
+	 *
+	 * Runs from drainBgTaskQueue, which both clients call after a history load.
+	 */
+	private _sweepCancelledIndexing(): void {
+		if (!this.cancelledIndexKeys.size) return;
+		var self = this;
+		var chatKey = this.getHistoryCacheKey();
+		var targets: { msg: ChatMessage; idx: number }[] = [];
+		this.state.messages.forEach(function (m, i) {
+			if (!m.isBackgroundTask || m.role !== 'user' || !m._serverItemId) return;
+			if (m._cancelling || m.isSendingToServer) return;
+			if (!(m.isPendingQueued || m.isPendingInProcess)) return;
+			var ref = m._indexFile;
+			var file = ref && (ref.path || ref.name);
+			if (!file || !self.cancelledIndexKeys.has(chatKey + '|' + file)) return;
+			targets.push({ msg: m, idx: i });
+		});
+		targets.forEach(function (t) {
+			var idx = self.state.messages.indexOf(t.msg);
+			self.cancelQueuedMessage(t.msg, idx === -1 ? t.idx : idx);
+		});
+	}
+
+	/** Best-effort server-side cancel of a bg-queue item that has no bubble (so
+	 *  cancelQueuedMessage, which drives one, has nothing to act on). */
+	private _cancelServerItem(serverId: string): void {
+		var id = this.host.getIdentity();
+		if (!serverId || (id.platform !== 'claude' && id.platform !== 'openai')) return;
+		var url = id.platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+		Promise.resolve(this.host.cancelRequest({
+			url: url, method: 'POST', id: serverId,
+			queue: (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX,
+			service: id.serviceId, owner: id.owner,
+		})).catch(function () { /* the pass may already have finished; nothing to do */ });
+	}
+
 	// Inject "Indexing: <file>" bubbles for queued bg tasks + attach their polls.
 	drainBgTaskQueue(): void {
 		var self = this;
 		var id = this.host.getIdentity();
 		var svcId = id.serviceId, plat = id.platform;
 		if (!svcId || plat === 'none' || !this.host.isViewMounted()) return;
+		// Before anything is surfaced: drop continuations of files the user stopped
+		// (and let a fresh first pass lift the stop), then cancel any worker-queued
+		// pass of a stopped file that reached the chat through history.
+		this._applyIndexCancellations();
+		this._sweepCancelledIndexing();
 		// Index messages by _serverItemId ONCE, so the per-entry presence/pending
 		// checks below are O(1) instead of a full messages.some() scan each. With a
 		// large bg queue (bulk uploads) the old nested scan was O(queue x messages)
@@ -1187,6 +1349,10 @@ export class ChatSession {
 		var self = this;
 		try {
 			if (!entry || !entry.storagePath) return;
+			// The user stopped this file from its collapsed row. Dispatching the next
+			// pass here is exactly what "stop" has to prevent — the cancelled pass
+			// settles, and without this the chain simply carries on.
+			if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
 			if (!isPagedReadFile(entry.filename, entry.mime)) return;
 			if (isImageVisionFile(entry.filename, entry.mime)) return; // worker owns this loop (PDF vision)
 			// When windowed indexing is on, the WORKER drives the text/grid loop too. The

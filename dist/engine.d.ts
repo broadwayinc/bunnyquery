@@ -641,6 +641,95 @@ interface ChatHost {
 }
 
 /**
+ * Background file-indexing turns, collapsed into ONE row per file.
+ *
+ * A single upload can produce many chat turns: the first "Indexing: <file>" pass
+ * plus up to MAX_INDEXING_RESUME_PASSES CONTINUE passes, each with its own
+ * request AND response bubble. Rendered flat, that reads as the same task
+ * repeating forever, and any real question the user asks in between gets buried.
+ *
+ * buildChatDisplayList turns the flat message array into a DISPLAY list in which
+ * every message belonging to one file (however far apart they sit, and whatever
+ * else is interleaved between them) is represented by a single group entry,
+ * rendered at the position of that file's NEWEST turn. Newest, not oldest, so:
+ *   - a running index sits at the bottom, where the activity is, and
+ *   - paging older history in never moves a row that is already on screen
+ *     (older passes simply join the group they already belong to).
+ *
+ * The group deliberately reports no authoritative pass TOTAL. History is paged
+ * newest-first, so any total computed from loaded messages is a lower bound that
+ * a later scroll-up would contradict. It reports STATE (indexing / indexed /
+ * failed), how many passes are currently loaded, and `mayHaveOlder` when the
+ * file's first pass is not among them.
+ *
+ * Pure and view-agnostic: agent.vue and the BunnyQuery widget both render from
+ * this, so the two stay identical.
+ */
+
+type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
+type IndexingGroup = {
+    /** Stable identity across re-renders and across history pages: storage path
+     *  when known (a file can be re-uploaded under the same name), else name. */
+    key: string;
+    name: string;
+    path?: string;
+    mime?: string;
+    size?: number;
+    /** True when any loaded pass was a re-index of an already-stored file. */
+    isReindex: boolean;
+    /** Every message of this file, in chat order, with its index in the source
+     *  array (so cancel/typewriter paths keep addressing the real message). */
+    members: {
+        msg: ChatMessage;
+        index: number;
+    }[];
+    /** Indexing passes LOADED (request bubbles), never a server-side total. */
+    passCount: number;
+    status: IndexingGroupStatus;
+    /** Server item ids of the passes that are still queued/running, so the row can
+     *  offer a stop button (ChatSession.cancelIndexingGroup cancels each). Empty
+     *  when nothing is cancellable — a finished file, or a live pass whose server
+     *  id has not come back yet. */
+    cancellableIds: string[];
+    /** A cancel request is in flight for one of the passes. */
+    cancelling: boolean;
+    /** Why the last cancel attempt failed (e.g. the pass had already finished). */
+    cancelError?: string;
+    /** The file's first pass is not among the loaded messages, so earlier passes
+     *  exist in history that has not been paged in yet. */
+    mayHaveOlder: boolean;
+    /** Position in the source array this collapsed row renders at. */
+    anchorIndex: number;
+};
+type DisplayEntry = {
+    kind: 'message';
+    msg: ChatMessage;
+    index: number;
+} | {
+    kind: 'indexing';
+    group: IndexingGroup;
+    index: number;
+};
+type BuildDisplayListOptions = {
+    /** True while older history remains unpaged, which is what makes a group
+     *  with no first pass genuinely incomplete rather than merely odd. */
+    hasMoreHistory?: boolean;
+};
+declare function parseIndexingLabel(content: string): {
+    name: string;
+    path?: string;
+    continued: boolean;
+    isReindex: boolean;
+} | null;
+/**
+ * Collapse background-indexing turns into per-file groups.
+ *
+ * Messages that are not background-indexing pass through untouched, at their
+ * original positions and with their original indices.
+ */
+declare function buildChatDisplayList(messages: ChatMessage[], opts?: BuildDisplayListOptions): DisplayEntry[];
+
+/**
  * ChatSession — framework-agnostic stateful chat orchestration.
  *
  * Ported verbatim from the bunnyquery widget's in-place state machine (which was
@@ -672,6 +761,13 @@ declare class ChatSession {
     state: ChatState;
     bgTaskQueue: BgTaskEntry[];
     cancelledServerIds: Set<string>;
+    /** Files whose indexing the user stopped, keyed exactly as buildChatDisplayList
+     *  keys a group (storage path, else filename). Cancelling one pass is not
+     *  enough on its own: the client dispatches CONTINUE passes for paged files, so
+     *  without this the next pass is enqueued the moment the cancelled one settles.
+     *  Cleared when a FIRST pass for the same file is queued again (a re-upload or a
+     *  Reindex from the file manager), so stopping a file never poisons it. */
+    cancelledIndexKeys: Set<string>;
     pendingAgentRequests: Record<string, Promise<any>>;
     aiChatHistoryCache: Record<string, {
         messages: ChatMessage[];
@@ -693,6 +789,14 @@ declare class ChatSession {
      * poll simply cannot be stopped and is left running — see pausePolling.
      */
     private _trackPoll;
+    /**
+     * Stop and forget one item's poll. Used after a cancel: the row is either gone
+     * (cancelled while queued) or flagged cancelled (cancelled while running), so
+     * asking about it again only burns requests. Safe when no poll is attached, and
+     * safe on an older skapi-js with no stop handle (the entry is then LEFT in the
+     * map so a later drain cannot stack a second, unstoppable poll on the id).
+     */
+    private _stopPoll;
     /** True while any pause reason is active. */
     isPollingPaused(): boolean;
     /**
@@ -746,6 +850,25 @@ declare class ChatSession {
     onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
     onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
+    /**
+     * Stop indexing a file, from its collapsed row — every pass at once, not just
+     * the bubble the user happens to see.
+     *
+     * A big file is indexed as a CHAIN of passes, so cancelling only the live one
+     * accomplishes nothing: the next pass is dispatched as soon as it settles.
+     * Three things end the chain:
+     *   1. every queued/running pass of this file is cancelled server-side
+     *      (csr-cancel deletes a queued row and flags a running one "cancelled",
+     *      which is also the worker's gate for NOT enqueueing the next window);
+     *   2. the file is remembered in cancelledIndexKeys, so the client-driven
+     *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
+     *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
+     *      drain rather than surfacing a fresh "Indexing…" bubble.
+     *
+     * Records already written by the passes that DID run are kept — this stops the
+     * work, it does not undo it.
+     */
+    cancelIndexingGroup(group: IndexingGroup): void;
     typewriteIntoIndex(idx: number, fullText: string, localId?: string): Promise<void>;
     private typewriterQueue;
     enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any>;
@@ -755,6 +878,39 @@ declare class ChatSession {
     resumePendingRequest(token: number): Promise<void>;
     handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
     applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
+    /** How a bg task maps onto a collapsed row: the row's own key (storage path
+     *  when known, else the filename), scoped to the chat it belongs to. A storage
+     *  path is project-relative ("report.xlsx"), and ONE ChatSession serves every
+     *  project — unscoped, stopping a file in one project would silently suppress
+     *  the same filename's continuations in another. */
+    private _indexKeyOf;
+    /**
+     * Reconcile the bg queue with the files the user has stopped.
+     *
+     * A FIRST pass (no resumePass) is a fresh indexing request — a re-upload, or a
+     * Reindex from the file manager — so it LIFTS the stop: the key is a storage
+     * path, and without this an earlier cancel would silently kill every future
+     * index of the same path. A continuation of a stopped file is dropped instead,
+     * covering the pass that was dispatched in the moment before the cancel landed.
+     */
+    private _applyIndexCancellations;
+    /**
+     * Cancel any live pass of a stopped file that turned up on its own.
+     *
+     * The client is not the only thing that continues a file: for PDFs and (when
+     * windowed indexing is on) text/grid files the WORKER enqueues the next window
+     * itself, and that pass reaches the chat through the history poll, never
+     * through bgTaskQueue. The worker's own gate stops the chain when the running
+     * row is cancelled — but if the row had already finished when the user hit
+     * stop, the next window was queued a moment earlier and still arrives. Stop it
+     * here rather than making the user hit stop again.
+     *
+     * Runs from drainBgTaskQueue, which both clients call after a history load.
+     */
+    private _sweepCancelledIndexing;
+    /** Best-effort server-side cancel of a bg-queue item that has no bubble (so
+     *  cancelQueuedMessage, which drives one, has nothing to act on). */
+    private _cancelServerItem;
     drainBgTaskQueue(): void;
     maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void;
     loadHistory(fetchMore?: boolean, token?: number): Promise<void>;
@@ -771,85 +927,5 @@ declare class ChatSession {
     stop(): void;
     bumpGate(): void;
 }
-
-/**
- * Background file-indexing turns, collapsed into ONE row per file.
- *
- * A single upload can produce many chat turns: the first "Indexing: <file>" pass
- * plus up to MAX_INDEXING_RESUME_PASSES CONTINUE passes, each with its own
- * request AND response bubble. Rendered flat, that reads as the same task
- * repeating forever, and any real question the user asks in between gets buried.
- *
- * buildChatDisplayList turns the flat message array into a DISPLAY list in which
- * every message belonging to one file (however far apart they sit, and whatever
- * else is interleaved between them) is represented by a single group entry,
- * rendered at the position of that file's NEWEST turn. Newest, not oldest, so:
- *   - a running index sits at the bottom, where the activity is, and
- *   - paging older history in never moves a row that is already on screen
- *     (older passes simply join the group they already belong to).
- *
- * The group deliberately reports no authoritative pass TOTAL. History is paged
- * newest-first, so any total computed from loaded messages is a lower bound that
- * a later scroll-up would contradict. It reports STATE (indexing / indexed /
- * failed), how many passes are currently loaded, and `mayHaveOlder` when the
- * file's first pass is not among them.
- *
- * Pure and view-agnostic: agent.vue and the BunnyQuery widget both render from
- * this, so the two stay identical.
- */
-
-type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
-type IndexingGroup = {
-    /** Stable identity across re-renders and across history pages: storage path
-     *  when known (a file can be re-uploaded under the same name), else name. */
-    key: string;
-    name: string;
-    path?: string;
-    mime?: string;
-    size?: number;
-    /** True when any loaded pass was a re-index of an already-stored file. */
-    isReindex: boolean;
-    /** Every message of this file, in chat order, with its index in the source
-     *  array (so cancel/typewriter paths keep addressing the real message). */
-    members: {
-        msg: ChatMessage;
-        index: number;
-    }[];
-    /** Indexing passes LOADED (request bubbles), never a server-side total. */
-    passCount: number;
-    status: IndexingGroupStatus;
-    /** The file's first pass is not among the loaded messages, so earlier passes
-     *  exist in history that has not been paged in yet. */
-    mayHaveOlder: boolean;
-    /** Position in the source array this collapsed row renders at. */
-    anchorIndex: number;
-};
-type DisplayEntry = {
-    kind: 'message';
-    msg: ChatMessage;
-    index: number;
-} | {
-    kind: 'indexing';
-    group: IndexingGroup;
-    index: number;
-};
-type BuildDisplayListOptions = {
-    /** True while older history remains unpaged, which is what makes a group
-     *  with no first pass genuinely incomplete rather than merely odd. */
-    hasMoreHistory?: boolean;
-};
-declare function parseIndexingLabel(content: string): {
-    name: string;
-    path?: string;
-    continued: boolean;
-    isReindex: boolean;
-} | null;
-/**
- * Collapse background-indexing turns into per-file groups.
- *
- * Messages that are not background-indexing pass through untouched, at their
- * original positions and with their original indices.
- */
-declare function buildChatDisplayList(messages: ChatMessage[], opts?: BuildDisplayListOptions): DisplayEntry[];
 
 export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

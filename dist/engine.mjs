@@ -413,6 +413,8 @@ ${placeholder}
 
 DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. Use the storage path above for the "src::" unique_id on the file-level record, and link every row/section record to it by reference.
 
+If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows into the record for the row it is anchored to (a \xABPHOTO A88\xBB marker in the grid text only says WHERE a picture sits - the picture itself is attached to this message). Never report that photo contents could not be extracted when images are attached here.
+
 Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to you automatically. Report only what you were actually shown, and never imply you have seen the whole file when the note beside the window says more remains.`;
 }
 function buildIndexingContinueMessage(attachment) {
@@ -1326,6 +1328,7 @@ var ChatSession = class {
     };
     this.bgTaskQueue = [];
     this.cancelledServerIds = /* @__PURE__ */ new Set();
+    this.cancelledIndexKeys = /* @__PURE__ */ new Set();
     this.pendingAgentRequests = {};
     this.aiChatHistoryCache = {};
     this.historyItemPolls = /* @__PURE__ */ new Map();
@@ -1347,6 +1350,23 @@ var ChatSession = class {
     }
     this.historyItemPolls.set(id, { kind, stop });
     return p;
+  }
+  /**
+   * Stop and forget one item's poll. Used after a cancel: the row is either gone
+   * (cancelled while queued) or flagged cancelled (cancelled while running), so
+   * asking about it again only burns requests. Safe when no poll is attached, and
+   * safe on an older skapi-js with no stop handle (the entry is then LEFT in the
+   * map so a later drain cannot stack a second, unstoppable poll on the id).
+   */
+  _stopPoll(id) {
+    var handle = this.historyItemPolls.get(id);
+    if (!handle) return;
+    if (typeof handle.stop !== "function") return;
+    try {
+      handle.stop();
+    } catch (e) {
+    }
+    this.historyItemPolls.delete(id);
   }
   /** True while any pause reason is active. */
   isPollingPaused() {
@@ -1925,6 +1945,7 @@ var ChatSession = class {
     })).then(function(result) {
       if (result && result.removed) {
         self.cancelledServerIds.add(serverId);
+        self._stopPoll(serverId);
         var qi = self.bgTaskQueue.findIndex(function(e) {
           return e.id === serverId;
         });
@@ -1933,7 +1954,13 @@ var ChatSession = class {
           return m._serverItemId === serverId && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user";
         });
         if (removeIdx !== -1) {
-          self.state.messages[removeIdx] = { role: "user", content: self.state.messages[removeIdx].content, isCancelled: true, _serverItemId: serverId };
+          var wasMsg = self.state.messages[removeIdx];
+          var cancelledMsg = { role: "user", content: wasMsg.content, isCancelled: true, _serverItemId: serverId };
+          if (wasMsg.isBackgroundTask) cancelledMsg.isBackgroundTask = true;
+          if (wasMsg._indexFile) cancelledMsg._indexFile = wasMsg._indexFile;
+          if (wasMsg._useBgQueue) cancelledMsg._useBgQueue = true;
+          if (wasMsg._ownerKey !== void 0) cancelledMsg._ownerKey = wasMsg._ownerKey;
+          self.state.messages[removeIdx] = cancelledMsg;
           var thById = self.state.messages.findIndex(function(m) {
             return m._serverItemId === serverId && m.isPending && m.role === "assistant";
           });
@@ -1968,6 +1995,42 @@ var ChatSession = class {
         self.state.messages[ci] = Object.assign({}, self.state.messages[ci], { _cancelling: false, _cancelError: errMsg });
         self.host.notify();
       }
+    });
+  }
+  /**
+   * Stop indexing a file, from its collapsed row — every pass at once, not just
+   * the bubble the user happens to see.
+   *
+   * A big file is indexed as a CHAIN of passes, so cancelling only the live one
+   * accomplishes nothing: the next pass is dispatched as soon as it settles.
+   * Three things end the chain:
+   *   1. every queued/running pass of this file is cancelled server-side
+   *      (csr-cancel deletes a queued row and flags a running one "cancelled",
+   *      which is also the worker's gate for NOT enqueueing the next window);
+   *   2. the file is remembered in cancelledIndexKeys, so the client-driven
+   *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
+   *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
+   *      drain rather than surfacing a fresh "Indexing…" bubble.
+   *
+   * Records already written by the passes that DID run are kept — this stops the
+   * work, it does not undo it.
+   */
+  cancelIndexingGroup(group) {
+    var self = this;
+    if (!group || !group.key) return;
+    var scoped = this.getHistoryCacheKey() + "|" + group.key;
+    this.cancelledIndexKeys.add(scoped);
+    var ids = group.cancellableIds || [];
+    if (!ids.length) {
+      this.host.notify();
+      return;
+    }
+    ids.forEach(function(serverId) {
+      var idx = self.state.messages.findIndex(function(m) {
+        return m._serverItemId === serverId && m.role === "user" && (m.isPendingQueued || m.isPendingInProcess);
+      });
+      if (idx === -1) return;
+      self.cancelQueuedMessage(self.state.messages[idx], idx);
     });
   }
   // --- typewriter -------------------------------------------------------
@@ -2241,12 +2304,97 @@ var ChatSession = class {
     this.enqueueTypewrite(userIdx + 1, answer || "No text response received from AI provider.", lid2);
     this.updateHistoryCache();
   }
+  /** How a bg task maps onto a collapsed row: the row's own key (storage path
+   *  when known, else the filename), scoped to the chat it belongs to. A storage
+   *  path is project-relative ("report.xlsx"), and ONE ChatSession serves every
+   *  project — unscoped, stopping a file in one project would silently suppress
+   *  the same filename's continuations in another. */
+  _indexKeyOf(entry) {
+    if (!entry) return "";
+    var file = entry.storagePath || entry.filename;
+    if (!file) return "";
+    return entry.serviceId + "#" + entry.platform + "|" + file;
+  }
+  /**
+   * Reconcile the bg queue with the files the user has stopped.
+   *
+   * A FIRST pass (no resumePass) is a fresh indexing request — a re-upload, or a
+   * Reindex from the file manager — so it LIFTS the stop: the key is a storage
+   * path, and without this an earlier cancel would silently kill every future
+   * index of the same path. A continuation of a stopped file is dropped instead,
+   * covering the pass that was dispatched in the moment before the cancel landed.
+   */
+  _applyIndexCancellations() {
+    if (!this.cancelledIndexKeys.size) return;
+    for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
+      var entry = this.bgTaskQueue[i];
+      var key = this._indexKeyOf(entry);
+      if (!key || !this.cancelledIndexKeys.has(key)) continue;
+      if (!entry.resumePass) {
+        this.cancelledIndexKeys.delete(key);
+        continue;
+      }
+      this.bgTaskQueue.splice(i, 1);
+      this._stopPoll(entry.id);
+      this._cancelServerItem(entry.id);
+    }
+  }
+  /**
+   * Cancel any live pass of a stopped file that turned up on its own.
+   *
+   * The client is not the only thing that continues a file: for PDFs and (when
+   * windowed indexing is on) text/grid files the WORKER enqueues the next window
+   * itself, and that pass reaches the chat through the history poll, never
+   * through bgTaskQueue. The worker's own gate stops the chain when the running
+   * row is cancelled — but if the row had already finished when the user hit
+   * stop, the next window was queued a moment earlier and still arrives. Stop it
+   * here rather than making the user hit stop again.
+   *
+   * Runs from drainBgTaskQueue, which both clients call after a history load.
+   */
+  _sweepCancelledIndexing() {
+    if (!this.cancelledIndexKeys.size) return;
+    var self = this;
+    var chatKey = this.getHistoryCacheKey();
+    var targets = [];
+    this.state.messages.forEach(function(m, i) {
+      if (!m.isBackgroundTask || m.role !== "user" || !m._serverItemId) return;
+      if (m._cancelling || m.isSendingToServer) return;
+      if (!(m.isPendingQueued || m.isPendingInProcess)) return;
+      var ref = m._indexFile;
+      var file = ref && (ref.path || ref.name);
+      if (!file || !self.cancelledIndexKeys.has(chatKey + "|" + file)) return;
+      targets.push({ msg: m, idx: i });
+    });
+    targets.forEach(function(t) {
+      var idx = self.state.messages.indexOf(t.msg);
+      self.cancelQueuedMessage(t.msg, idx === -1 ? t.idx : idx);
+    });
+  }
+  /** Best-effort server-side cancel of a bg-queue item that has no bubble (so
+   *  cancelQueuedMessage, which drives one, has nothing to act on). */
+  _cancelServerItem(serverId) {
+    var id = this.host.getIdentity();
+    if (!serverId || id.platform !== "claude" && id.platform !== "openai") return;
+    var url = id.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+    Promise.resolve(this.host.cancelRequest({
+      url,
+      method: "POST",
+      id: serverId,
+      queue: (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX,
+      service: id.serviceId,
+      owner: id.owner
+    })).catch(function() {
+    });
+  }
   // Inject "Indexing: <file>" bubbles for queued bg tasks + attach their polls.
   drainBgTaskQueue() {
     var self = this;
     var id = this.host.getIdentity();
     var svcId = id.serviceId, plat = id.platform;
     if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
+    this._applyIndexCancellations();
+    this._sweepCancelledIndexing();
     var presentIds = {};
     var pendingIds = {};
     this.state.messages.forEach(function(m) {
@@ -2343,6 +2491,7 @@ var ChatSession = class {
     var self = this;
     try {
       if (!entry || !entry.storagePath) return;
+      if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
       if (!isPagedReadFile(entry.filename, entry.mime)) return;
       if (isImageVisionFile(entry.filename, entry.mime)) return;
       if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
@@ -2850,6 +2999,8 @@ function buildChatDisplayList(messages, opts) {
         members: [],
         passCount: 0,
         status: "done",
+        cancellableIds: [],
+        cancelling: false,
         mayHaveOlder: false,
         anchorIndex: i
       };
@@ -2878,6 +3029,17 @@ function buildChatDisplayList(messages, opts) {
         active = true;
         break;
       }
+    }
+    var seenIds = {};
+    for (var ci = 0; ci < grp.members.length; ci++) {
+      var cm = grp.members[ci].msg;
+      if (cm._cancelling) grp.cancelling = true;
+      if (cm._cancelError) grp.cancelError = cm._cancelError;
+      if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
+      if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
+      if (seenIds[cm._serverItemId]) continue;
+      seenIds[cm._serverItemId] = true;
+      grp.cancellableIds.push(cm._serverItemId);
     }
     if (active) {
       grp.status = "active";

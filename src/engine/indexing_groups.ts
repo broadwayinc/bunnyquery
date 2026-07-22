@@ -43,6 +43,15 @@ export type IndexingGroup = {
 	/** Indexing passes LOADED (request bubbles), never a server-side total. */
 	passCount: number;
 	status: IndexingGroupStatus;
+	/** Server item ids of the passes that are still queued/running, so the row can
+	 *  offer a stop button (ChatSession.cancelIndexingGroup cancels each). Empty
+	 *  when nothing is cancellable — a finished file, or a live pass whose server
+	 *  id has not come back yet. */
+	cancellableIds: string[];
+	/** A cancel request is in flight for one of the passes. */
+	cancelling: boolean;
+	/** Why the last cancel attempt failed (e.g. the pass had already finished). */
+	cancelError?: string;
 	/** The file's first pass is not among the loaded messages, so earlier passes
 	 *  exist in history that has not been paged in yet. */
 	mayHaveOlder: boolean;
@@ -171,6 +180,8 @@ export function buildChatDisplayList(
 				members: [],
 				passCount: 0,
 				status: 'done',
+				cancellableIds: [],
+				cancelling: false,
 				mayHaveOlder: false,
 				anchorIndex: i,
 			};
@@ -200,6 +211,22 @@ export function buildChatDisplayList(
 		var active = false;
 		for (var mi = 0; mi < grp.members.length; mi++) {
 			if (isPendingMsg(grp.members[mi].msg)) { active = true; break; }
+		}
+		// What a stop button would act on: the REQUEST bubble of every pass that is
+		// still queued or running server-side. The assistant placeholder shares its
+		// pass's server id, so ids are de-duplicated. A pass mid-cancel is left out
+		// (its request is already on its way) but keeps the row in a cancelling
+		// state so the button does not flicker back to "stop".
+		var seenIds: { [id: string]: boolean } = {};
+		for (var ci = 0; ci < grp.members.length; ci++) {
+			var cm = grp.members[ci].msg;
+			if (cm._cancelling) grp.cancelling = true;
+			if (cm._cancelError) grp.cancelError = cm._cancelError;
+			if (cm.role !== 'user' || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
+			if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
+			if (seenIds[cm._serverItemId]) continue;
+			seenIds[cm._serverItemId] = true;
+			grp.cancellableIds.push(cm._serverItemId);
 		}
 		if (active) {
 			grp.status = 'active';

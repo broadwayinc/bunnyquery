@@ -229,6 +229,10 @@ export function buildIndexingWindowMessage(
 		`for tabular data (keyed by the column headers), or one record per section for prose. Capture every ` +
 		`value you can read. Use the storage path above for the "src::" unique_id on the file-level record, ` +
 		`and link every row/section record to it by reference.\n\n` +
+		`If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows ` +
+		`into the record for the row it is anchored to (a «PHOTO A88» marker in the grid text only says WHERE ` +
+		`a picture sits - the picture itself is attached to this message). Never report that photo contents ` +
+		`could not be extracted when images are attached here.\n\n` +
 		`Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest ` +
 		`of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to ` +
 		`you automatically. Report only what you were actually shown, and never imply you have seen the whole ` +

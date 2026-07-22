@@ -169,6 +169,27 @@
 /* Passes LOADED, never a server-side total: history pages newest-first, so any
    total derived from what is on screen is a lower bound. */
 .bq-index-count { flex: 0 0 auto; opacity: 0.75; font-size: 0.72rem; }
+/* Stop indexing. Only ever rendered while a file has a queued/running pass, so
+   it never competes with the row's normal (collapsed, finished) look. Sized off
+   the row's own font so it stays a thin strip, not a chat action button. */
+.bq-index-cancel {
+    flex: 0 0 auto;
+    padding: 0.1rem 0.4rem;
+    min-height: 0;
+    border: 1px solid currentColor;
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 0.68rem;
+    line-height: 1.3;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    box-shadow: none;
+    opacity: 0.8;
+}
+.bq-index-cancel:hover:not(.is-disabled) { background: var(--bq-warning-bg); color: var(--bq-warning); opacity: 1; }
+.bq-index-cancel.is-disabled { opacity: 0.45; cursor: default; pointer-events: none; }
 .bq-index-chevron {
     flex: 0 0 auto;
     font-size: 0.62rem;
@@ -197,6 +218,8 @@
     font-style: italic;
     color: var(--bq-muted);
 }
+/* A cancel that the server refused (the pass had already finished). */
+.bq-index-note.is-error { color: var(--bq-danger); }
 
 /* ---- in-bubble file / link anchors --------------------------------------*/
 .bq-file-download,
