@@ -547,7 +547,7 @@ export class ChatSession {
 			// under `key`, so a later loadChatHistory renders it.
 			self.state.sending = false;
 			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
-			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottom(true); });
+			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottomIfSticky(true); });
 		});
 	}
 
@@ -690,7 +690,9 @@ export class ChatSession {
 		this.promoteNextQueuedToRunning();
 		this.updateHistoryCache();
 		this.host.notify();
-		this.host.scrollToBottom(true);
+		// ARRIVAL, not a user action: only follow if the user is still pinned to
+		// the bottom. Scrolled-up readers keep their position.
+		this.host.scrollToBottomIfSticky(true);
 	}
 
 	onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void {
@@ -733,14 +735,14 @@ export class ChatSession {
 			}
 			if (serverId) this.cancelledServerIds.delete(serverId);
 			this._removeStrayPendingAssistants();
-			this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottom(true);
+			this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottomIfSticky(true);
 			return;
 		}
 		var targetIdx = this.resolveQueuedUserBubble(serverId);
 		if (targetIdx === undefined) { this.host.notify(); this.updateHistoryCache(); return; }
 		this.insertAtTarget({ role: 'assistant', content: getErrorMessage(err), isError: true }, targetIdx);
 		this._removeStrayPendingAssistants();
-		this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottom(true);
+		this.promoteNextQueuedToRunning(); this.updateHistoryCache(); this.host.notify(); this.host.scrollToBottomIfSticky(true);
 	}
 
 	cancelQueuedMessage(msg: ChatMessage, idx: number): void {
@@ -989,11 +991,11 @@ export class ChatSession {
 		if (!pending) return Promise.resolve();
 		if (this.state.messages.some(function (m) { return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue; })) return Promise.resolve();
 		this.state.sending = true;
-		this.host.scrollToBottom(true);
+		this.host.scrollToBottomIfSticky(true);
 		return Promise.resolve(pending).catch(function () { }).then(function () {
 			if (token !== self.state.gateRefreshToken) return;
 			self.state.sending = false;
-			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottom(true); });
+			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottomIfSticky(true); });
 		});
 	}
 
@@ -1080,7 +1082,7 @@ export class ChatSession {
 				self.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
 			}
 			presentIds[entry.id] = true; // keep the index consistent with the pushed bubbles
-			self.host.notify(); self.updateHistoryCache(); self.host.scrollToBottom(false);
+			self.host.notify(); self.updateHistoryCache(); self.host.scrollToBottomIfSticky(false);
 			}
 			if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
 				var capturedId = entry.id, capturedPlat = plat;

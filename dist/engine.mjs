@@ -1681,7 +1681,7 @@ var ChatSession = class {
       self.state.sending = false;
       if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
       return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
-        self.host.scrollToBottom(true);
+        self.host.scrollToBottomIfSticky(true);
       });
     });
   }
@@ -1815,7 +1815,7 @@ var ChatSession = class {
     this.promoteNextQueuedToRunning();
     this.updateHistoryCache();
     this.host.notify();
-    this.host.scrollToBottom(true);
+    this.host.scrollToBottomIfSticky(true);
   }
   onQueuedSendError(_composed, err, serverId, ownerKey) {
     if (serverId) this.historyItemPolls.delete(serverId);
@@ -1865,7 +1865,7 @@ var ChatSession = class {
       this.promoteNextQueuedToRunning();
       this.updateHistoryCache();
       this.host.notify();
-      this.host.scrollToBottom(true);
+      this.host.scrollToBottomIfSticky(true);
       return;
     }
     var targetIdx = this.resolveQueuedUserBubble(serverId);
@@ -1879,7 +1879,7 @@ var ChatSession = class {
     this.promoteNextQueuedToRunning();
     this.updateHistoryCache();
     this.host.notify();
-    this.host.scrollToBottom(true);
+    this.host.scrollToBottomIfSticky(true);
   }
   cancelQueuedMessage(msg, idx) {
     var self = this;
@@ -2151,13 +2151,13 @@ var ChatSession = class {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
     })) return Promise.resolve();
     this.state.sending = true;
-    this.host.scrollToBottom(true);
+    this.host.scrollToBottomIfSticky(true);
     return Promise.resolve(pending).catch(function() {
     }).then(function() {
       if (token !== self.state.gateRefreshToken) return;
       self.state.sending = false;
       return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
-        self.host.scrollToBottom(true);
+        self.host.scrollToBottomIfSticky(true);
       });
     });
   }
@@ -2240,7 +2240,7 @@ var ChatSession = class {
         presentIds[entry.id] = true;
         self.host.notify();
         self.updateHistoryCache();
-        self.host.scrollToBottom(false);
+        self.host.scrollToBottomIfSticky(false);
       }
       if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
         var capturedId = entry.id, capturedPlat = plat;
