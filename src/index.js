@@ -58,6 +58,7 @@ import {
     repairUrlWhitespace,
     classifyInlineLink,
     normalizeTrailingInlineToken,
+    formatChatTimestamp,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
     LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
@@ -2804,6 +2805,8 @@ import {
             if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
+            var ts = formatChatTimestamp(msg._ts);
+            if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
         }
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
     }

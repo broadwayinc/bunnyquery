@@ -76,6 +76,18 @@
     font-style: italic;
     clear: both;
 }
+/* Timestamp under a settled bubble (created for a user turn, response time for an
+   assistant turn). Muted and small so it never competes with the message. */
+.bq-msg-time {
+    display: block;
+    margin-top: 0.25rem;
+    font-size: 0.62rem;
+    line-height: 1;
+    color: var(--bq-muted);
+    opacity: 0.7;
+    clear: both;
+}
+.bq-message.is-user .bq-msg-time { text-align: right; }
 .bq-cancel-queue-btn {
     float: right;
     margin: -0.25rem -0.25rem 0.2rem 0.4rem;

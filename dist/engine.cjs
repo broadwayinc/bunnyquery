@@ -802,6 +802,26 @@ function buildBoundedChatMessages(options) {
   };
 }
 
+// src/engine/time.ts
+function wallClockNow() {
+  return Date.now();
+}
+function formatChatTimestamp(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms <= 0) return "";
+  try {
+    return new Date(ms).toLocaleString(void 0, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit"
+    });
+  } catch (e) {
+    return "";
+  }
+}
+
 // src/engine/requests.ts
 var ANTHROPIC_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages";
 var ANTHROPIC_MODELS_API_URL = "https://api.anthropic.com/v1/models";
@@ -1363,6 +1383,10 @@ function mapHistoryListToMessages(list, platform, opts) {
     var assistantText = isPending ? "" : (extractAssistantText(response) || "").trim() || "";
     var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
+    var createdTs = Number(item && item.created);
+    var updatedTs = Number(item && item.updated);
+    var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : isFinite(updatedTs) && updatedTs > 0 ? updatedTs : void 0;
+    var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : isFinite(createdTs) && createdTs > 0 ? createdTs : void 0;
     if (userText) {
       var displayContent;
       var indexFile = void 0;
@@ -1402,6 +1426,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (indexFile) userMsg._indexFile = indexFile;
       if (item._isOnBgQueue) userMsg._useBgQueue = true;
       if (serverItemId !== void 0) userMsg._serverItemId = serverItemId;
+      if (userTs !== void 0) userMsg._ts = userTs;
       mapped.push(userMsg);
     }
     if (isCancelledItem) ; else if (isInProcess) {
@@ -1416,11 +1441,13 @@ function mapHistoryListToMessages(list, platform, opts) {
       var em = { role: "assistant", content: getErrorMessage(response), isError: true };
       if (item._isBgTask) em.isBackgroundTask = true;
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
+      if (replyTs !== void 0) em._ts = replyTs;
       mapped.push(em);
     } else if (assistantText) {
       var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
+      if (replyTs !== void 0) okm._ts = replyTs;
       mapped.push(okm);
     }
   });
@@ -1833,7 +1860,7 @@ var ChatSession = class {
       var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
       this.aiChatHistoryCache[key] = {
         messages: offExisting.messages.concat([
-          { role: "user", content: composed, _ownerKey: key },
+          { role: "user", content: composed, _ownerKey: key, _ts: wallClockNow() },
           { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
         ]),
         endOfList: offExisting.endOfList,
@@ -1865,7 +1892,7 @@ var ChatSession = class {
         serviceId: id.serviceId,
         history: resolvedHistory.concat([{ role: "user", content: llmComposed }])
       });
-      var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true };
+      var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
       if (key) queuedBubble._ownerKey = key;
       if (useBgQueue) queuedBubble._useBgQueue = true;
       this.state.messages.push(queuedBubble);
@@ -1900,7 +1927,7 @@ var ChatSession = class {
       });
       return;
     }
-    this.state.messages.push({ role: "user", content: composed, ...key ? { _ownerKey: key } : {} });
+    this.state.messages.push({ role: "user", content: composed, _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} });
     this.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} });
     this.host.notify();
     this.updateHistoryCache();
@@ -1957,6 +1984,7 @@ var ChatSession = class {
     var existing = this.state.messages[nextIdx];
     var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
     if (existing._indexFile) promoted._indexFile = existing._indexFile;
+    if (existing._ts !== void 0) promoted._ts = existing._ts;
     if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
     if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
     this.state.messages[nextIdx] = promoted;
@@ -1978,6 +2006,7 @@ var ChatSession = class {
     var promoted = { role: "user", content: existing.content, isPendingInProcess: true };
     if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
     if (existing._indexFile) promoted._indexFile = existing._indexFile;
+    if (existing._ts !== void 0) promoted._ts = existing._ts;
     if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
     if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
     if (existing.isSendingToServer) promoted.isSendingToServer = true;
@@ -2027,6 +2056,7 @@ var ChatSession = class {
       var repl = { role: "user", content: exist.content };
       if (exist._serverItemId !== void 0) repl._serverItemId = exist._serverItemId;
       if (exist._ownerKey !== void 0) repl._ownerKey = exist._ownerKey;
+      if (exist._ts !== void 0) repl._ts = exist._ts;
       this.state.messages[userIdx] = repl;
     }
     var thinkingIdx = userIdx >= 0 ? this.state.messages.findIndex(function(m, i) {
@@ -2035,6 +2065,7 @@ var ChatSession = class {
     return thinkingIdx !== -1 ? thinkingIdx : userIdx >= 0 ? userIdx + 1 : -1;
   }
   insertAtTarget(msg, targetIdx) {
+    if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = wallClockNow();
     if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) this.state.messages[targetIdx] = msg;
     else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
     else this.state.messages.push(msg);
@@ -2371,6 +2402,8 @@ var ChatSession = class {
   }
   enqueueTypewrite(idx, fullText, localId) {
     var self = this;
+    var target = this.state.messages[idx];
+    if (target && target._ts === void 0) target._ts = wallClockNow();
     this.typewriterQueue = this.typewriterQueue.then(function() {
       return self.typewriteIntoIndex(idx, fullText, localId);
     });
@@ -2440,6 +2473,7 @@ var ChatSession = class {
     var u = this.state.messages[uIdx];
     var cleaned = { role: "user", content: u.content, _serverItemId: itemId };
     if (u.isBackgroundTask) cleaned.isBackgroundTask = true;
+    if (u._ts !== void 0) cleaned._ts = u._ts;
     if (u._indexFile) cleaned._indexFile = u._indexFile;
     this.state.messages[uIdx] = cleaned;
   }
@@ -2512,6 +2546,7 @@ var ChatSession = class {
     var ex = this.state.messages[userIdx];
     var settledUser = { role: "user", content: ex.content, _serverItemId: itemId };
     if (ex.isBackgroundTask) settledUser.isBackgroundTask = true;
+    if (ex._ts !== void 0) settledUser._ts = ex._ts;
     if (ex._indexFile) settledUser._indexFile = ex._indexFile;
     if (ex._useBgQueue) settledUser._useBgQueue = true;
     this.state.messages[userIdx] = settledUser;
@@ -3430,6 +3465,7 @@ exports.extractRemotePathFromAttachmentHref = extractRemotePathFromAttachmentHre
 exports.fillHistoryViewport = fillHistoryViewport;
 exports.filterListByClearHorizon = filterListByClearHorizon;
 exports.findAttachmentParser = findAttachmentParser;
+exports.formatChatTimestamp = formatChatTimestamp;
 exports.getAttachmentParsers = getAttachmentParsers;
 exports.getChatHistory = getChatHistory;
 exports.getContextWindow = getContextWindow;
@@ -3463,5 +3499,6 @@ exports.stripFileBlocksFromHistory = stripFileBlocksFromHistory;
 exports.transformContentWithImages = transformContentWithImages;
 exports.transformContentWithOpenAIImages = transformContentWithOpenAIImages;
 exports.truncateLabelForDisplay = truncateLabelForDisplay;
+exports.wallClockNow = wallClockNow;
 //# sourceMappingURL=engine.cjs.map
 //# sourceMappingURL=engine.cjs.map

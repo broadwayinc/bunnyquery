@@ -67,6 +67,12 @@ export interface ChatMessage {
 	_localId?: string;
 	_cancelling?: boolean;
 	_cancelError?: string;
+	/** Epoch ms shown as small text under the bubble. From the request history a
+	 *  USER bubble carries the request's `created` time and an ASSISTANT bubble the
+	 *  `updated` (response) time; a live bubble is stamped with the wall clock when
+	 *  it is created, then reconciled to the server value on the next history load.
+	 *  Absent while a turn is still pending, so no time shows on a "Thinking" bubble. */
+	_ts?: number;
 	// History cache key (`serviceId#platform`) this bubble was created under.
 	// Stamped on LOCALLY-created bubbles only (the optimistic user message and
 	// its "Thinking..." placeholder); server-mapped bubbles are identified by

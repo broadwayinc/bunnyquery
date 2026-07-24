@@ -64,6 +64,13 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		var assistantText = isPending ? '' : ((extractAssistantText(response) || '').trim() || '');
 		var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
 		var serverItemId = item && typeof item.id === 'string' && item.id ? item.id : undefined;
+		// A USER bubble shows when the request was made (`created`); an ASSISTANT
+		// bubble shows when its response landed (`updated`). Fall back to the other
+		// if one is missing (older records only carried `updated`).
+		var createdTs = Number(item && item.created);
+		var updatedTs = Number(item && item.updated);
+		var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : (isFinite(updatedTs) && updatedTs > 0 ? updatedTs : undefined);
+		var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : (isFinite(createdTs) && createdTs > 0 ? createdTs : undefined);
 
 		if (userText) {
 			var displayContent;
@@ -110,6 +117,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (indexFile) userMsg._indexFile = indexFile;
 			if (item._isOnBgQueue) userMsg._useBgQueue = true;
 			if (serverItemId !== undefined) userMsg._serverItemId = serverItemId;
+			if (userTs !== undefined) userMsg._ts = userTs;
 			mapped.push(userMsg);
 		}
 		if (isCancelledItem) { /* no assistant bubble */ }
@@ -123,6 +131,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			var em: any = { role: 'assistant', content: getErrorMessage(response), isError: true };
 			if (item._isBgTask) em.isBackgroundTask = true;
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
+			if (replyTs !== undefined) em._ts = replyTs;
 			mapped.push(em);
 		} else if (assistantText) {
 			// Safe db-only sanitize (forAssistant) so a volatile db url the model
@@ -130,6 +139,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
+			if (replyTs !== undefined) okm._ts = replyTs;
 			mapped.push(okm);
 		}
 	});

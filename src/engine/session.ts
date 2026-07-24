@@ -40,6 +40,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
+import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, PinnedDispatchContext } from './host';
 import type { IndexingGroup } from './indexing_groups';
@@ -477,7 +478,7 @@ export class ChatSession {
 			var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
 			this.aiChatHistoryCache[key] = {
 				messages: offExisting.messages.concat([
-					{ role: 'user', content: composed, _ownerKey: key },
+					{ role: 'user', content: composed, _ownerKey: key, _ts: wallClockNow() },
 					{ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, _ownerKey: key },
 				]),
 				endOfList: offExisting.endOfList,
@@ -500,7 +501,7 @@ export class ChatSession {
 				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
 				history: resolvedHistory.concat([{ role: 'user', content: llmComposed }]),
 			});
-			var queuedBubble: ChatMessage = { role: 'user', content: composed, isPendingQueued: true, isSendingToServer: true };
+			var queuedBubble: ChatMessage = { role: 'user', content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
 			if (key) queuedBubble._ownerKey = key;
 			if (useBgQueue) queuedBubble._useBgQueue = true;
 			this.state.messages.push(queuedBubble);
@@ -542,7 +543,7 @@ export class ChatSession {
 		// view unmount), then rendered from the cache via typewriteLatestReply. A
 		// later resumePendingRequest() re-renders it if the view remounted while the
 		// request was still in flight.
-		this.state.messages.push({ role: 'user', content: composed, ...(key ? { _ownerKey: key } : {}) });
+		this.state.messages.push({ role: 'user', content: composed, _ts: wallClockNow(), ...(key ? { _ownerKey: key } : {}) });
 		this.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) });
 		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.host.scrollToBottom(true);
 
@@ -598,6 +599,7 @@ export class ChatSession {
 		var existing = this.state.messages[nextIdx];
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true, isBackgroundTask: true };
 		if (existing._indexFile) promoted._indexFile = existing._indexFile;
+		if (existing._ts !== undefined) promoted._ts = existing._ts;
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
 		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		this.state.messages[nextIdx] = promoted;
@@ -618,6 +620,7 @@ export class ChatSession {
 		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true };
 		if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
 		if (existing._indexFile) promoted._indexFile = existing._indexFile;
+		if (existing._ts !== undefined) promoted._ts = existing._ts;
 		if (existing._serverItemId !== undefined) promoted._serverItemId = existing._serverItemId;
 		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
 		if (existing.isSendingToServer) promoted.isSendingToServer = true;
@@ -677,6 +680,7 @@ export class ChatSession {
 			var repl: ChatMessage = { role: 'user', content: exist.content };
 			if (exist._serverItemId !== undefined) repl._serverItemId = exist._serverItemId;
 			if (exist._ownerKey !== undefined) repl._ownerKey = exist._ownerKey;
+			if (exist._ts !== undefined) repl._ts = exist._ts;
 			this.state.messages[userIdx] = repl;
 		}
 		var thinkingIdx = userIdx >= 0
@@ -686,6 +690,9 @@ export class ChatSession {
 	}
 
 	insertAtTarget(msg: ChatMessage, targetIdx: number): void {
+		// Error/direct replies land here rather than through the typewriter, so this
+		// is where they pick up their display time.
+		if (msg && msg.role === 'assistant' && msg._ts === undefined) msg._ts = wallClockNow();
 		if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) this.state.messages[targetIdx] = msg;
 		else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
 		else this.state.messages.push(msg);
@@ -1000,6 +1007,12 @@ export class ChatSession {
 	private typewriterQueue: Promise<any> = Promise.resolve();
 	enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any> {
 		var self = this;
+		// Stamp the reply bubble's display time as it starts revealing. This is the
+		// single chokepoint every typed reply (immediate, queued, and bg-resolution)
+		// passes through, so it is where a live reply gets its "when it arrived"
+		// timestamp; a history reload later replaces it with the server `updated`.
+		var target = this.state.messages[idx];
+		if (target && target._ts === undefined) target._ts = wallClockNow();
 		this.typewriterQueue = this.typewriterQueue.then(function () { return self.typewriteIntoIndex(idx, fullText, localId); });
 		return this.typewriterQueue;
 	}
@@ -1068,6 +1081,7 @@ export class ChatSession {
 		var u = this.state.messages[uIdx];
 		var cleaned: ChatMessage = { role: 'user', content: u.content, _serverItemId: itemId };
 		if (u.isBackgroundTask) cleaned.isBackgroundTask = true;
+		if (u._ts !== undefined) cleaned._ts = u._ts;
 		// Carry the file ref: it is what keeps this pass in its file's collapsed
 		// row (the label parser is only a fallback for older cached bubbles).
 		if (u._indexFile) cleaned._indexFile = u._indexFile;
@@ -1156,6 +1170,7 @@ export class ChatSession {
 		// bg-queued chat cancelling against the right queue) once the pass settles.
 		var settledUser: ChatMessage = { role: 'user', content: ex.content, _serverItemId: itemId };
 		if (ex.isBackgroundTask) settledUser.isBackgroundTask = true;
+		if (ex._ts !== undefined) settledUser._ts = ex._ts;
 		if (ex._indexFile) settledUser._indexFile = ex._indexFile;
 		if (ex._useBgQueue) settledUser._useBgQueue = true;
 		this.state.messages[userIdx] = settledUser;

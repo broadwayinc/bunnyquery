@@ -5,9 +5,10 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The latest version on npm is **1.6.2**. Versions
-  1.6.3, 1.6.4 and 1.7.0 are built in the source tree but not yet published, and
-  are marked as such.
+- **Published vs built.** The latest version on npm is **1.7.0**. Version
+  **1.8.0** is built in the source tree but not yet published, and is marked as
+  such. (1.6.3 and 1.6.4 were never published on their own; their changes reached
+  npm inside 1.7.0.)
 - **Missing patch numbers.** A few versions on npm (1.2.1 most notably) are
   republishes with no distinct source commit behind them, so they have no entry
   here. Version 1.6.1 is the reverse case: it has commits but was never
@@ -18,7 +19,85 @@ A few notes on how to read this:
 
 ---
 
-## 1.7.0 (2026-07-23, latest published)
+## 1.8.0 (2026-07-24, unpublished)
+
+The inline-link system rebuilt around one shared classifier, the link bugs that
+prompted it, and a date-and-time under every message.
+
+### One link classifier, shared (was forked)
+
+- New `classifyInlineLink` in `src/engine/links.ts` is the single place that
+  decides what a link target IS: an external URL, a file in this project's db
+  storage (rendered as a re-mintable chip), or a bare storage path. Both clients
+  now render from it. `agent.vue`'s private fork of ~13 link helpers is deleted
+  and the widget's `buildLinkPartFromGroups` is a thin wrapper, so a link bug can
+  no longer be fixed in one client and left in the other, which is exactly how
+  every item in the next section reached production.
+
+### Link handling, fixed
+
+- **A URL containing a space no longer freezes the tab.** `createInlineLinkRegex`
+  had a nested-quantifier alternative that backtracks exponentially: a link whose
+  URL contained a space (which the MCP tools legitimately emit) took ~60s to parse
+  at 30 characters and did not finish beyond ~45. The regex now matches one
+  character per step with disjoint branches, so it is linear. Runs over the whole
+  reply on every render, so this was a hard hang, not a slow case.
+- **A URL with a space no longer renders as a dead download chip.** Whitespace
+  knocked a URL out of the URL branch into the storage-path branch, so an MCP
+  download link rendered as an `_expired_.url/https%3A/…` chip that resolved to
+  nothing. `isHttpUrlLike` classifies it correctly and `repairUrlWhitespace`
+  repairs it (whitespace stripped from our own `/download/<id>` links, whose
+  alphabet cannot contain it; percent-encoded elsewhere so a real `my report.csv`
+  survives).
+- **Stored attachment links no longer go dead on reload.** The `_expired_.url`
+  placeholder that the history sanitizer writes was not recognised when read back,
+  so every stored attachment link rendered as a non-refreshable link to a host
+  that does not resolve, and the model would copy the dead URL into new replies.
+  New `readExpiredAttachmentHref` is consulted before the plain-URL branch. Fixes
+  existing history on read; no migration.
+- **Only real files render as chips.** `mailto:`, `tel:`, `#anchor`, `http://`
+  and a db URL belonging to another project were all being turned into download
+  chips for storage paths that never existed. Only an `http(s)` URL on this
+  project's db host becomes a re-mintable file now; everything else is a plain
+  link.
+- A bare URL no longer swallows the sentence's trailing punctuation into its href.
+- The history sanitizer rewrites only this service's own db URLs, so a
+  third-party link pasted alongside an attachment is left intact instead of being
+  turned into a placeholder for a path that never existed.
+
+### `db:` link scheme
+
+- Storage-path links can now be **declared** rather than inferred:
+  `[name](db:folder/file.csv)`. The classifier strips the `db:` prefix and treats
+  the rest as a storage path, so link identity no longer depends on guessing from
+  the absence of `http`. Bare paths still resolve exactly as before, so no
+  existing message changes.
+
+### Timestamps under every message (new engine module `src/engine/time.ts`)
+
+- `formatChatTimestamp(ms)` and `wallClockNow()`, plus `ChatMessage._ts`. Every
+  settled bubble shows a small, muted date and time: a user bubble the request
+  time (`created`), an assistant bubble the response time (`updated`), down to the
+  second. Pending "Thinking" bubbles show nothing. History bubbles are stamped
+  from the request record; live bubbles are stamped from the wall clock and
+  reconciled to the server value on the next history load. Depends on the
+  `created` timestamp now exposed by `clientSecretRequestHistory` in skapi-js.
+
+### Expired-link TTLs unified
+
+- `EXPIRED_LINK_REFRESH_EXPIRES_SECONDS` (20 min) and `LINK_REFRESH_WINDOW_MS`
+  moved into the engine, with the trust window derived from the TTL so "the cache
+  must expire before the URL does" holds by construction.
+- **Widget parity.** The widget's expired-chip re-mint was minting a
+  `generate_temporary_cdn_url` link, which ignores `expires` and lives for the
+  rest of the UTC day plus the next (24 to 48h), while calling it a 10-minute
+  link, and it never dropped its cached href. It now mints a plain short-lived
+  presign like the dashboard and expires its cache on the same wall-clock
+  boundary.
+
+---
+
+## 1.7.0 (2026-07-23, published)
 
 Per-run indexing rows, and making older history reachable once a page of it
 collapses into a single row.
