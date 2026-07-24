@@ -5,10 +5,6 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Where 1.1 went.** npm carries `1.0.0`-`1.1.4` from the pre-restructure
-  `bunnychat` line; none of it is in this repository. The first 1.x version in
-  the source tree is **1.2.0** (the bunnychat to bunnyquery rename), so this log
-  begins there.
 - **Published vs built.** The latest version on npm is **1.6.2**. Versions
   1.6.3, 1.6.4 and 1.7.0 are built in the source tree but not yet published, and
   are marked as such.
