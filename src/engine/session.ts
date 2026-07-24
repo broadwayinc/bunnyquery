@@ -1127,10 +1127,23 @@ export class ChatSession {
 				if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
 				this.host.notify(); this.updateHistoryCache(); return;
 			}
+			var text = answer || 'No text response received from AI provider.';
+			// A background-indexing reply is INSIDE a collapsed row: nothing of it is
+			// on screen. Typewriting it anyway put it on the one shared, serial
+			// typewriter queue, so the user's own next reply — which IS on screen —
+			// lost its "Thinking..." spinner and sat as an EMPTY bubble for however
+			// long the invisible indexing summary took to reveal (seconds per pass,
+			// additive across files). It also held state.typing true for the whole
+			// time, which disables the platform/model pickers and no-ops Clear
+			// history, and ran a per-frame scroll for content nobody can see.
+			// Write it straight in; expanding the row then shows it complete.
+			if (wasBgTask) {
+				this.state.messages[idx] = { role: 'assistant', content: text, isBackgroundTask: true, _serverItemId: itemId };
+				this.host.notify(); this.updateHistoryCache(); return;
+			}
 			var lid = this._newLocalId();
 			this.state.messages[idx] = { role: 'assistant', content: '', _localId: lid, _serverItemId: itemId };
-			if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
-			this.host.notify(); this.enqueueTypewrite(idx, answer || 'No text response received from AI provider.', lid);
+			this.host.notify(); this.enqueueTypewrite(idx, text, lid);
 			this.updateHistoryCache(); return;
 		}
 		var userIdx = this.state.messages.findIndex(function (m) {
@@ -1152,11 +1165,17 @@ export class ChatSession {
 			this.state.messages.splice(userIdx + 1, 0, errReply);
 			this.host.notify(); this.updateHistoryCache(); return;
 		}
+		var text2 = answer || 'No text response received from AI provider.';
+		// Same as above: a collapsed row's reply is not on screen, so revealing it
+		// character by character only blocks the queue the visible reply needs.
+		if (ex.isBackgroundTask) {
+			this.state.messages.splice(userIdx + 1, 0, { role: 'assistant', content: text2, isBackgroundTask: true, _serverItemId: itemId });
+			this.host.notify(); this.updateHistoryCache(); return;
+		}
 		var lid2 = this._newLocalId();
 		var reply: ChatMessage = { role: 'assistant', content: '', _localId: lid2, _serverItemId: itemId };
-		if (ex.isBackgroundTask) reply.isBackgroundTask = true;
 		this.state.messages.splice(userIdx + 1, 0, reply);
-		this.host.notify(); this.enqueueTypewrite(userIdx + 1, answer || 'No text response received from AI provider.', lid2);
+		this.host.notify(); this.enqueueTypewrite(userIdx + 1, text2, lid2);
 		this.updateHistoryCache();
 	}
 
@@ -1315,12 +1334,28 @@ export class ChatSession {
 				}).catch(function (err: any) {
 					self.historyItemPolls.delete(capturedId);
 					var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
+					// Settle the REQUEST bubble first, unconditionally. Only a RUNNING
+					// pass gets an assistant placeholder, so for a queued one the lookup
+					// below finds nothing and every branch was skipped — leaving the
+					// request bubble isPendingQueued with its queue entry about to be
+					// spliced away, i.e. no poll left to ever clear it. One such bubble
+					// pins the whole collapsed row to "active": a spinner and a Stop
+					// button against a dead id, until the page is reloaded.
+					self._clearPendingUserBubble(capturedId);
 					var bi = self.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === capturedId; });
 					if (bi !== -1) {
 						if (isNotExists) self.state.messages.splice(bi, 1);
 						else self.state.messages[bi] = { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
-						self.host.notify(); self.updateHistoryCache();
+					} else if (!isNotExists) {
+						// No placeholder to turn into the error (a queued pass). Put one
+						// after the request bubble so the row reports the failure instead
+						// of quietly settling to "Indexed".
+						var ui = self.state.messages.findIndex(function (m) { return m.role === 'user' && m._serverItemId === capturedId; });
+						if (ui !== -1) {
+							self.state.messages.splice(ui + 1, 0, { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
+						}
 					}
+					self.host.notify(); self.updateHistoryCache();
 				}).then(function () {
 					// Keep the queue entry when the poll was merely stopped, or resuming
 					// would have nothing left to re-attach to.
@@ -1461,7 +1496,17 @@ export class ChatSession {
 				var serverIds: any = {};
 				mapped.forEach(function (m: any) { if (m._serverItemId) serverIds[m._serverItemId] = 1; });
 				var locallyCancelled: any = {};
-				self.state.messages.forEach(function (m) { if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = 1; });
+				self.state.messages.forEach(function (m) { if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = m; });
+				// A cancel the server has not acknowledged yet. Without carrying these
+				// across the replace, a collapsed row mid-cancel drops its "Stopping..."
+				// state and re-offers Stop; the second click cancels an id that is
+				// already gone and writes a bogus "Could not remove from queue." onto a
+				// run that WAS stopped successfully.
+				var inFlightCancel: any = {};
+				self.state.messages.forEach(function (m) {
+					if (!m._serverItemId) return;
+					if (m._cancelling || m._cancelError) inFlightCancel[m._serverItemId] = m;
+				});
 				// If the freshly-mapped server list ALREADY shows this in-flight turn
 				// as a pending placeholder (a non-bg pending assistant, which carries
 				// a real _serverItemId), re-pushing the local no-_serverItemId
@@ -1529,11 +1574,31 @@ export class ChatSession {
 					for (var ci = 0; ci < self.state.messages.length; ci++) {
 						var c = self.state.messages[ci];
 						if (!c._serverItemId || !locallyCancelled[c._serverItemId] || c.isCancelled) continue;
-						self.state.messages[ci] = { role: 'user', content: c.content, isCancelled: true, _serverItemId: c._serverItemId };
+						// Rebuild FROM the mapped bubble rather than as a bare literal:
+						// dropping isBackgroundTask / _indexFile here ejected a stopped
+						// indexing pass from its file's collapsed row, where it then rendered
+						// as a standalone "Indexing: <file>" chat bubble and left the row
+						// recomputing its passes as if that one had never happened.
+						self.state.messages[ci] = {
+							role: 'user', content: c.content, isCancelled: true, _serverItemId: c._serverItemId,
+							isBackgroundTask: c.isBackgroundTask, _indexFile: c._indexFile,
+							_useBgQueue: c._useBgQueue, _ownerKey: c._ownerKey,
+						};
 						if (ci + 1 < self.state.messages.length && self.state.messages[ci + 1].isPending && self.state.messages[ci + 1]._serverItemId === c._serverItemId) {
 							self.state.messages.splice(ci + 1, 1);
 						}
 					}
+				}
+				// Re-stamp a cancel that is still in flight (see inFlightCancel above).
+				// Only onto a bubble the server still reports as pending — once it has
+				// settled the flags describe nothing the user can act on.
+				for (var fi = 0; fi < self.state.messages.length; fi++) {
+					var fm = self.state.messages[fi];
+					var was = fm._serverItemId && inFlightCancel[fm._serverItemId];
+					if (!was || fm.isCancelled) continue;
+					if (!(fm.isPendingQueued || fm.isPendingInProcess || fm.isPending)) continue;
+					if (was._cancelling) fm._cancelling = true;
+					if (was._cancelError) fm._cancelError = was._cancelError;
 				}
 			}
 			// Only adopt page 1's cursor when page 1 IS the whole list. If older pages
@@ -1592,12 +1657,30 @@ export class ChatSession {
 							var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
 							var aIdx = self.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === capturedId; });
 							if (isNotExists) {
-								var isBg = aIdx !== -1 ? !!self.state.messages[aIdx].isBackgroundTask : false;
+								var uIdx = self.state.messages.findIndex(function (m) { return m.role === 'user' && m._serverItemId === capturedId && !m.isCancelled; });
+								// Decide bg-ness from whichever bubble actually exists. A
+								// QUEUED pass has no assistant placeholder (history.ts emits
+								// none), so reading it off the placeholder alone classified
+								// every queued indexing pass as foreground: the rebuild below
+								// then dropped isBackgroundTask/_indexFile, ejecting the pass
+								// from its collapsed row as a raw "Indexing: <file>" chat
+								// bubble, and promoteNextQueuedToRunning span up a "Thinking..."
+								// on an unrelated queued FOREGROUND message.
+								var isBg = (aIdx !== -1 && !!self.state.messages[aIdx].isBackgroundTask)
+									|| (uIdx !== -1 && !!self.state.messages[uIdx].isBackgroundTask);
 								if (aIdx !== -1) self.state.messages.splice(aIdx, 1);
 								if (!isBg) {
-									var uIdx = self.state.messages.findIndex(function (m) { return m.role === 'user' && m._serverItemId === capturedId && !m.isCancelled; });
 									if (uIdx !== -1) { var ex = self.state.messages[uIdx]; self.state.messages[uIdx] = { role: 'user', content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId }; }
 									self.cancelledServerIds.delete(capturedId); self.promoteNextQueuedToRunning();
+								} else if (uIdx !== -1) {
+									// Same carry-over every other rebuild does, so the pass stays
+									// a member of its file's row while reading as cancelled.
+									var bex = self.state.messages[uIdx];
+									var bcancelled: ChatMessage = { role: 'user', content: bex.content, isCancelled: true, isBackgroundTask: true, _serverItemId: bex._serverItemId };
+									if (bex._indexFile) bcancelled._indexFile = bex._indexFile;
+									if (bex._useBgQueue) bcancelled._useBgQueue = true;
+									self.state.messages[uIdx] = bcancelled;
+									self.promoteNextBgQueuedToRunning();
 								}
 								self.host.notify(); self.updateHistoryCache(); return;
 							}
@@ -1633,6 +1716,12 @@ export class ChatSession {
 				self.state.loadingHistory = false; self.state.loadingOlderHistory = false;
 				if (wasLoading) self.host.notify();
 			}
+			// Every first-page load ends here — mount, resumePolling, a cache-restore
+			// refresh — and every one of them can leave a box too short to scroll,
+			// which is the only trigger there is for reaching page 2. The view (which
+			// alone can measure) pages its way out of it. Fired after the flags are
+			// cleared so the fill loop does not see a request still in flight.
+			if (self.host.onHistoryLoaded) self.host.onHistoryLoaded(!!fetchMore, token as number);
 		});
 	}
 

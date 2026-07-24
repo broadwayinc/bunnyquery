@@ -54,6 +54,18 @@ export {
 	type MapHistoryOptions,
 } from './history';
 
+// Older history is reachable only by scrolling to the top of the message box, so
+// a box too short to scroll strands the user on page 1 — the normal state once a
+// page of history collapses into one indexing row. Shared so both chatboxes page
+// their way out of it identically.
+export {
+	fillHistoryViewport,
+	createHistoryFiller,
+	HISTORY_FILL_SLACK_PX,
+	MAX_HISTORY_FILL_PAGES,
+	type FillHistoryViewportOptions,
+} from './viewport_fill';
+
 // Tier-2: the stateful chat orchestration (queue/poll/cancel, typewriter,
 // bg-task drain, resolution). DOM-free; the consumer implements ChatHost.
 export { ChatSession } from './session';

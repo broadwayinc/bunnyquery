@@ -23,10 +23,16 @@ you can build your own chat UI on top of it. See
 - **Conversation history** — paginated, with "Fetching history…" indicators on
   first load and on scroll-up.
 - **Attachments** — drag-and-drop files and folders, per-file upload status
-  (uploading / failed / indexed), and overflow collapsing for large batches.
-  Images are read with vision/OCR, Office/text/code files are extracted
-  server-side, and PDFs are fetched by the model — see
+  (uploading / failed / indexed), overflow collapsing for large batches, and a
+  prompt when an upload hits a file that already exists (skip / reindex only /
+  overwrite, with "apply to all remaining"). Images are read with vision/OCR,
+  large documents and spreadsheets are read window by window, PDFs are rendered
+  to page images, and everything else extractable is inlined as text. See
   [Supported file types](#supported-file-types).
+- **Background indexing**: an uploaded file is indexed in the background,
+  across as many passes as it takes. A file's passes collapse into a single
+  status row in the chat that can be expanded, and stopped: "Stop" cancels every
+  queued and running pass at once and ends the continuation chain.
 - **Attachment parser plugins** — register a client-side parser so the widget
   extracts text in the browser from formats the model can't otherwise read, and
   indexes it directly. See [Attachment parser plugins](#attachment-parser-plugins).
@@ -138,15 +144,30 @@ BunnyQuery.logout();
 
 > `init()` is idempotent — calling it twice logs a warning and returns the existing
 > instance rather than re-mounting. On a successful mount it logs its version, e.g.
-> `[bunnyquery] v1.3.5`.
+> `[bunnyquery] v1.7.0`.
+
+See [HISTORY.md](HISTORY.md) for the release-by-release changelog.
 
 ## Supported file types
 
 When a user attaches a file, BunnyQuery makes its contents available to the AI
-automatically — detected by extension (with a MIME-type fallback), nothing to
-configure. There are three paths, plus a couple of caveats.
+automatically, detected by extension (with a MIME-type fallback), nothing to
+configure.
 
-### 1. Images — read directly by the model (vision + OCR)
+An attachment is used in two places, and they take different routes:
+
+- **In the chat message.** Extractable files are inlined as text; anything else
+  (PDFs, images) is handed over as a temporary link, which the proxy worker
+  re-mints just before the upstream call so a queued message can never hand the
+  model a stale URL.
+- **In background indexing**, where the file is read in full and saved into the
+  project's knowledge. This is the path with the window and page loops below.
+
+The routes are tried in this order: a [parser plugin](#attachment-parser-plugins),
+then PDF page rendering, then windowed or paged reading, then server-side
+extraction, then a plain link.
+
+### 1. Images: read directly by the model (vision + OCR)
 
 `.jpg` · `.jpeg` · `.png` · `.gif` · `.webp`
 
@@ -155,10 +176,51 @@ picture** and **reads any text in it (OCR)**. Works on both Claude and OpenAI.
 Only images referenced in the **most recent** message are inlined (older links
 may have expired).
 
-### 2. Documents, data & code — extracted on the server (inlined as text)
+### 2. PDFs: rendered to page images
+
+`.pdf`
+
+PDF text layers are often absent or unreliable, so a PDF is indexed **visually**:
+the proxy worker renders a window of pages (5 at a time) to images and injects
+them as image blocks in the indexing message. Tool-result images render on
+neither provider, which is why the pages have to be in the message itself. That
+makes scanned PDFs work as well as digital ones.
+
+The worker advances the window itself, off its renderer's true page count, and
+enqueues the next pass. Indexing a long document therefore does not depend on
+the browser tab staying open, and does not depend on the model correctly
+declaring itself finished.
+
+### 3. Large documents, spreadsheets & data: read window by window
+
+```
+.xls .xlsx .xlsm .ods      grids (rows plus embedded photos)
+.csv .tsv .tab             row-bounded windows with absolute row numbers
+.docx .pptx                documents
+.txt .md .markdown .log    plain text
+.json .jsonl .ndjson .xml .yaml .yml
+```
+
+These are read **one window at a time** and continued until the file is
+exhausted, rather than inlined once. Whole-file extraction is capped at 200,000
+characters, and against real files that cap was discarding most of every large
+upload: a 5MB `.txt` indexed 4.0% of its content, a 4.8MB `.json` 4.2%, a
+1.9M-character Korean `.txt` 10.5%, a `.docx` 70.6%. Nothing surfaced the loss,
+because the agent received a plausible-looking document with no way to know most
+of it was missing.
+
+Two drivers exist for this loop. By default the agent pages the file itself with
+the `readFileContent` tool. With the engine's `windowedIndexing` option enabled,
+the **worker** reads a window per request and continues from the reader's own
+cursor, so the traversal no longer has to fit inside the model's turn budget.
+That option is off by default and must only be turned on against a deployed
+worker (see [Importing the chat engine](#importing-the-chat-engine)); the widget
+does not enable it.
+
+### 4. Everything else extractable: inlined as text server-side
 
 The skapi proxy downloads the file, extracts its text **server-side**, and
-inlines that text into the request — the model reads it directly, with no
+inlines that text into the request, so the model reads it directly with no
 fetching. This keeps indexing consistent across model providers.
 
 **Office & e-book** (binary/zip, parsed):
@@ -178,21 +240,24 @@ Plus a **MIME fallback**: any file whose content type is text-like (`text/*`,
 `application/json`, `application/xml`, `*+json`, `*+xml`, `*+yaml`, …) is decoded
 even when its extension isn't in the list above.
 
-Encoding is auto-detected — UTF-8 (BOM-aware) → CP949/EUC-KR (Korean) → Latin-1.
-Extracted text is capped at **200,000 characters**; longer files are truncated
-with a `...[truncated for length; original N characters]` marker.
+Encoding is auto-detected: UTF-8 (BOM-aware), then CP949/EUC-KR (Korean), then
+Latin-1. Extracted text is capped at **200,000 characters**; longer files are
+truncated with a `...[truncated for length; original N characters]` marker. The
+formats listed in section 3 are windowed precisely so they never hit that cap.
 
-### 3. PDFs & other links — fetched by the model
+Note the overlap between sections 3 and 4 is deliberate: a `.docx` or a `.csv`
+is windowed when it is indexed, and extracted whole when it rides along in a
+chat message.
 
-`.pdf` (and any file that is neither an image nor server-extractable) is handed
-to the model as a temporary link, which it opens with its built-in web tool:
-**Claude** via `web_fetch`, **OpenAI** via `web_search` (external web access is
-enabled). Both can open and read PDFs, so PDFs work on either provider.
+### 5. Anything else: a plain link
 
-> A provider's web tool opens document/page-style URLs such as PDFs, but not
-> necessarily a bare *data-file* download (e.g. a raw `.csv`/`.tsv` link). That's
-> why those data formats are extracted **server-side** (path 2 above) instead of
-> being left to the model to fetch.
+A file that is none of the above is handed to the model as a temporary link,
+which it opens with its built-in web tool: **Claude** via `web_fetch`, **OpenAI**
+via `web_search` (external web access is enabled).
+
+> A provider's web tool opens document/page-style URLs, but not necessarily a
+> bare *data-file* download (e.g. a raw `.csv`/`.tsv` link). That is why those
+> data formats are extracted server-side instead of being left to the model.
 
 ### Caveats
 
@@ -205,16 +270,32 @@ enabled). Both can open and read PDFs, so PDFs work on either provider.
   [Attachment parser plugin](#attachment-parser-plugins) — it runs in the browser
   and feeds parsed text straight into indexing.
 
+### Re-indexing an existing file
+
+Uploading over a file that already exists prompts for skip, "reindex only", or
+overwrite. Choosing either of the latter two deletes the file's existing
+`src::<path>` index record first, and the skapi backend cascades that delete to
+the record's reference-linked children, so re-indexing **replaces** the file's
+knowledge rather than duplicating it.
+
+### Filenames
+
+Storage keys preserve Unicode letters, digits and spaces, NFC-normalized, so
+Korean, Japanese and accented Latin filenames survive upload intact. Only
+genuinely unsafe characters are replaced. The original name is always kept for
+display.
+
 ## Attachment parser plugins
 
-By default the chat agent reads images with vision/OCR, extracts
-Office/OpenDocument/EPUB and text/data/code files on the server, and lets the
-model fetch PDFs with its built-in web tool (`web_fetch` on Claude, `web_search`
-on OpenAI) — see [Supported file types](#supported-file-types). For any format
-read by **none** of these (e.g. a proprietary binary format), register a
-**parser plugin**: it runs in the browser, turns the
-uploaded file into text (or an HTML string), and the widget sends that content
-**inline** for indexing — no `web_fetch`, no server extraction for that file.
+By default the chat agent reads images with vision/OCR, renders PDF pages to
+images, reads large documents and spreadsheets window by window, and extracts
+Office/OpenDocument/EPUB and text/data/code files on the server. See
+[Supported file types](#supported-file-types). For any format read by **none**
+of these (e.g. a proprietary binary format), register a **parser plugin**: it
+runs in the browser, turns the uploaded file into text (or an HTML string), and
+the widget sends that content **inline** for indexing. A parser plugin takes
+precedence over every other route, so nothing is fetched or extracted for that
+file.
 
 BunnyQuery ships only the **mechanism**. You bring the parsing library (so the
 widget stays lean and you choose which formats and which library).
@@ -346,6 +427,37 @@ helpers — see the `.d.ts` shipped with `bunnyquery/engine`.
 | `clientSecretRequestHistory`  | `function` | `skapi.clientSecretRequestHistory`, bound to your Skapi instance. **Required.**                              |
 | `mcpBaseUrl`                  | `string`   | MCP server base URL (you resolve prod vs dev). **Required.**                                                  |
 | `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `clientSecretRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel — the widget's case). |
+| `attachmentParsers`           | `array?`   | Client-side attachment parsers, registered at configure time. More can be added later with `registerAttachmentParser()`. See [Attachment parser plugins](#attachment-parser-plugins). |
+| `windowedIndexing`            | `boolean?` | Opt in to **server-driven** windowed indexing for text and grid files (see [file types](#supported-file-types)). Off by default and must stay off until the worker that strips the `_skapi_window` directive is deployed: against an older worker the directive reaches the provider as an unknown body field and the call fails terminally with no retry. |
+
+### Display and paging helpers
+
+Two shared transforms exist so that a second chat UI behaves identically to the
+widget rather than approximately:
+
+- **`buildChatDisplayList`** collapses a file's many background-indexing turns
+  into one status row per indexing run, wherever those turns sit in the
+  conversation, rendered at that run's newest turn. It is pure and
+  view-agnostic; you render the resulting `DisplayEntry` list. Pair it with
+  `ChatSession.cancelIndexingGroup(group)` to give the row a working Stop
+  button, which cancels every queued and running pass of that file at once and
+  ends the continuation chain.
+- **`fillHistoryViewport` / `createHistoryFiller`** keep older history
+  reachable. Paging is triggered only by scrolling to the top of the message
+  box, so a box too short to scroll has no trigger at all, which is the normal
+  state once a page of history collapses into a single indexing row. Implement
+  the optional `ChatHost.onHistoryLoaded` hook, measure your own box, and let
+  the loop page until the reader genuinely gained reachable content.
+
+Other optional `ChatHost` hooks worth implementing: `deleteExistingFileRecord`
+(so a reindex replaces the file's knowledge instead of duplicating it) and
+`promptOverwrite` (the skip / reindex / overwrite prompt).
+
+`ChatSession.pausePolling(reason)` and `resumePolling(reason)` stop background
+indexing polls when nobody is looking (a hidden tab, a detached view). Replies
+the user is waiting on keep polling deliberately, so their results still land in
+the cache. Server-side work is untouched either way, so pausing drops traffic,
+never progress.
 
 ## OAuth & redirects
 
@@ -356,11 +468,27 @@ host page** — BunnyQuery reads the `?code=…&state=…` parameters, completes
 exchange, and cleans them from the URL automatically. No dedicated callback page is
 needed; just make sure the page that hosts the widget is a stable, reachable URL.
 
+Once granted, the connection is kept alive **silently**. When the stored grant
+ages out, BunnyQuery refreshes it through the OAuth `refresh_token` flow with no
+redirect, so an embedded widget never yanks the host page away mid-chat. It also
+refreshes on tab focus, because returning to a backgrounded tab after the grant
+expired would otherwise disconnect the next message. The full redirect is only a
+boot-time fallback for when the silent path cannot refresh.
+
 ## Notes
 
 - The widget fills its mount element. Give that element a real height (e.g.
   `height: 100dvh`) or it will collapse.
 - File and folder uploads are stored in your Skapi project's database storage and
   served from a temporary db-CDN URL (`hostDomain`); links in chat refresh on expiry.
+  Links a queued message carries are re-minted server-side immediately before the
+  upstream call, so a message that waits in the queue never hands the model a dead
+  URL.
+- The number of files attachable to a single message is capped, and beyond a
+  point the chips collapse into a "...(n) more" pill rather than being rendered.
+  Very large batches belong on a dedicated upload page, not the chat composer.
+- When your service database is frozen, the attach button and drag-and-drop are
+  hidden for non-admin users, mirroring the backend's own upload gate, so there
+  is no upload path that fails only at the end.
 - The agent shown in the header (`BunnyQuery · <project name>`) reflects the project
   configured for your Skapi service.

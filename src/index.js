@@ -54,9 +54,17 @@ import {
     buildDisplayExpiredAttachmentHref,
     getExpiredAttachmentVisiblePath,
     truncateLabelForDisplay,
+    isHttpUrlLike,
+    repairUrlWhitespace,
+    classifyInlineLink,
+    normalizeTrailingInlineToken,
+    EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
+    LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
+    createHistoryFiller,
+    HISTORY_FILL_SLACK_PX,
 } from "./engine";
 
 (function () {
@@ -1291,6 +1299,10 @@ import {
         if (CS.composerEl && CS.chatEl && CS.composerEl.parentNode !== CS.chatEl) CS.chatEl.appendChild(CS.composerEl);
         renderMessages();   // restore the chat (renderMessages no-ops while settings is open)
         scrollToBottom();
+        // The box is measurable again. Any fill that wanted to run while the
+        // panel was up was skipped, and the chat underneath may be a single
+        // collapsed indexing row with no way to scroll to older history.
+        ensureHistoryFillsViewport();
     }
     // Fetch profile/newsletter, then render the settings panel into the box.
     function renderAccount() {
@@ -1544,7 +1556,8 @@ import {
         // Rendered .bq-message nodes, indexed BY MESSAGE INDEX (sparse: a message
         // folded into a collapsed indexing row has no node of its own).
         messageEls: [],
-        // Expanded background-indexing rows, keyed by group key (storage path).
+        // Expanded background-indexing rows, keyed by RUN (group.runKey), not by
+        // file: re-indexing a file is a separate row and expands separately.
         indexGroupsOpen: {},
         messagesBox: null,       // .bq-messages element
         sending: false,
@@ -1608,6 +1621,13 @@ import {
         refreshMessageBubble: function (i) { refreshMessageBubble(i); },
         scrollToBottom: function (smooth) { return scrollToBottom(smooth); },
         scrollToBottomIfSticky: function (smooth) { return scrollToBottomIfSticky(smooth); },
+        // A first page can render shorter than the box (a file's every indexing
+        // pass folds into ONE row), and a box that cannot scroll never fires the
+        // scroll-to-top that is the sole trigger for loading page 2. Page out of
+        // it here — only the view can measure.
+        onHistoryLoaded: function (fetchMore, token) {
+            if (!fetchMore) ensureHistoryFillsViewport(token);
+        },
         cancelRequest: function (opts) { return S.skapi.cancelClientSecretRequest(opts); },
         refreshSession: function () { return refreshSkapiSession(); },
         formatIndexingLabel: function (name, mime, size, storagePath, reindex, continued) {
@@ -1789,7 +1809,10 @@ import {
         if (!CS.messagesBox || CS.chatSettingsOpen) return;
         var el = CS.messagesBox;
         CS.stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
-        if (el.scrollTop <= 60) fetchOlderHistoryIfNeeded();
+        // Not a single page: keep going until the scroll-up revealed something,
+        // or a page of pure indexing passes (which collapses into a row already
+        // on screen) leaves the user pinned at the top with nothing new.
+        if (el.scrollTop <= 60) pageOlderHistoryUntilTaller();
     }
     // Explicit user scroll-UP intent. wheel/touch fire synchronously on the
     // user's action (and never for programmatic scrolls), so releasing
@@ -1811,20 +1834,6 @@ import {
     }
 
     /* ---- render helpers (agent.vue) -------------------------------------- */
-    function normalizeTrailingInlineToken(value) {
-        if (!value) return value;
-        var out = value.replace(/[.,;:!?]+$/, "");
-        var trimUnmatched = function (openCh, closeCh) {
-            while (out.charAt(out.length - 1) === closeCh) {
-                var openCount = (out.match(new RegExp("\\" + openCh, "g")) || []).length;
-                var closeCount = (out.match(new RegExp("\\" + closeCh, "g")) || []).length;
-                if (closeCount > openCount) out = out.slice(0, -1); else break;
-            }
-        };
-        trimUnmatched("(", ")"); trimUnmatched("[", "]"); trimUnmatched("{", "}");
-        out = out.replace(/[`'"*>]+$/, "");
-        return out;
-    }
     function getOrCreateFileHref(filename, body) {
         var key = filename + " " + body;
         var existing = fileBlobCache.get(key);
@@ -1863,42 +1872,15 @@ import {
         if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeHtml(link.fullLabel) + '"');
         return "<a " + attrs.join(" ") + ">" + escapeHtml(labelText) + "</a>";
     }
+    // Classification is the ENGINE's (classifyInlineLink): what a link IS must
+    // not be decided twice, once here and once in agent.vue. This view supplies
+    // only what is local to it and renders whatever comes back.
     function buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6) {
-        var dbHostPrefix = "https://db." + hostDomain();
-        if (g1) {
-            var rawPath = normalizeTrailingInlineToken(g1);
-            var consumed = "src::" + rawPath;
-            var tail = full.slice(consumed.length);
-            var isUrl = /^https?:\/\//i.test(rawPath);
-            if (isUrl && /^https:\/\//i.test(rawPath) && rawPath.toLowerCase().indexOf(dbHostPrefix.toLowerCase()) !== 0) {
-                return { part: { type: "link", label: truncateLabelForDisplay(rawPath), fullLabel: rawPath, href: rawPath, expired: false }, tail: tail };
-            }
-            var remotePath = isUrl ? (extractRemotePathFromAttachmentHref(rawPath, S.serviceId) || normalizeAttachmentPathCandidate(rawPath)) : normalizeAttachmentPathCandidate(rawPath);
-            if (!remotePath) return null;
-            var expiredHref = buildDisplayExpiredAttachmentHref(remotePath, remotePath);
-            var cached = refreshedExpiredLinkMap[expiredHref];
-            return { part: { type: "link", label: truncateLabelForDisplay(remotePath), fullLabel: remotePath, href: cached || expiredHref, expired: !cached, expiredHref: expiredHref, remotePath: remotePath }, tail: tail };
-        }
-        if (g4 && g5) {
-            var rp = normalizeAttachmentPathCandidate(g5);
-            if (!rp) return null;
-            var eh = buildDisplayExpiredAttachmentHref(rp, rp);
-            var c2 = refreshedExpiredLinkMap[eh];
-            return { part: { type: "link", label: truncateLabelForDisplay(g4), fullLabel: g4, href: c2 || eh, expired: !c2, expiredHref: eh, remotePath: rp } };
-        }
-        var originalHref = g3 || g6 || "";
-        if (!originalHref) return null;
-        if (/^https:\/\//i.test(originalHref) && originalHref.toLowerCase().indexOf(dbHostPrefix.toLowerCase()) !== 0) {
-            var plainLabel = g2 || originalHref;
-            return { part: { type: "link", label: truncateLabelForDisplay(plainLabel), fullLabel: plainLabel, href: originalHref, expired: false } };
-        }
-        var rmp = extractRemotePathFromAttachmentHref(originalHref, S.serviceId);
-        var fbLabel = g2 || originalHref;
-        var ehref = rmp ? buildDisplayExpiredAttachmentHref(rmp, fbLabel) : originalHref;
-        var cfresh = refreshedExpiredLinkMap[ehref];
-        var expired = !!rmp && !cfresh;
-        var fullLabel = rmp ? getExpiredAttachmentVisiblePath(rmp, g2 || originalHref) : (g2 || originalHref);
-        return { part: { type: "link", label: truncateLabelForDisplay(fullLabel), fullLabel: fullLabel, href: cfresh || ehref, expired: expired, expiredHref: ehref, remotePath: rmp || undefined } };
+        return classifyInlineLink(full, [g1, g2, g3, g4, g5, g6], {
+            serviceId: S.serviceId,
+            dbHostPrefix: "https://db." + hostDomain(),
+            resolveFreshHref: function (expiredHref) { return refreshedExpiredLinkMap[expiredHref]; },
+        });
     }
     function parseMsgPartsHtml(content) {
         var placeholderHtml = [];
@@ -2066,16 +2048,22 @@ import {
     // Mint a temporary CDN url for a db file (request:'get-db'), matching
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
     // https://db.<hostDomain>/.
-    function getTemporaryUrlDb(path, expires) {
-        return S.skapi.util.request("get-signed-url", {
+    // `cdn` picks the branch DELIBERATELY. A generate_temporary_cdn_url url
+    // ignores `expires` entirely and lives until the end of the next UTC day
+    // (24-48h); a plain get-db presign honours `expires` to the second. Passing
+    // the flag while also passing a short `expires` is the trap: it reads as a
+    // 10 minute url and behaves as a two day one.
+    function getTemporaryUrlDb(path, expires, cdn) {
+        var body = {
             service: S.serviceId,
             owner: S.owner,
             request: "get-db",
             key: path,
             expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
             contentType: mimeGetType(path) || "application/octet-stream",
-            generate_temporary_cdn_url: true,
-        }, { auth: true, method: "post" }).then(function (res) {
+        };
+        if (cdn !== false) body.generate_temporary_cdn_url = true;
+        return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function (res) {
             var u = typeof res === "string" ? res : (res && res.url);
             if (!u) throw new Error("No temporary URL returned.");
             return "https://db." + hostDomain() + "/" + u;
@@ -2538,7 +2526,27 @@ import {
 
     function getPublicTemporaryUrl(remotePath) {
         if (!remotePath) return Promise.reject(new Error("Missing attachment path."));
-        return getTemporaryUrlDb(remotePath, ATTACHMENT_URL_EXPIRES_SECONDS);
+        // Same as the dashboard: a PLAIN presign honouring the shared TTL, not a
+        // cdn url. This used to hand out a 24-48h url while calling it 10 minutes.
+        return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false);
+    }
+
+    // Drop minted hrefs on the same wall-clock boundary the dashboard uses, so a
+    // cached href can never outlive the url behind it. Without this the widget
+    // held a fresh href for the life of the page.
+    var refreshedLinkExpiryTimer = null;
+    function expireAllRefreshedLinks() {
+        for (var k in refreshedExpiredLinkMap) delete refreshedExpiredLinkMap[k];
+    }
+    function scheduleNextLinkExpiryBoundary() {
+        if (refreshedLinkExpiryTimer) clearTimeout(refreshedLinkExpiryTimer);
+        var now = Date.now();
+        var next = Math.ceil(now / LINK_REFRESH_WINDOW_MS) * LINK_REFRESH_WINDOW_MS;
+        refreshedLinkExpiryTimer = setTimeout(function () {
+            expireAllRefreshedLinks();
+            renderMessages();
+            scheduleNextLinkExpiryBoundary();
+        }, Math.max(1, next - now));
     }
     function fetchFreshHrefForExpiredLink(expiredHref, remotePath) {
         var cached = refreshedExpiredLinkMap[expiredHref];
@@ -2551,6 +2559,7 @@ import {
             if (!resolved) return Promise.reject(new Error("Unable to refresh this expired attachment link."));
             return getPublicTemporaryUrl(resolved).then(function (fresh) {
                 refreshedExpiredLinkMap[expiredHref] = fresh;
+                scheduleNextLinkExpiryBoundary();
                 return fresh;
             });
         })().then(function (v) { refreshingLinkPromises.delete(expiredHref); delete refreshingLinkMap[expiredHref]; return v; },
@@ -2597,20 +2606,113 @@ import {
         var key = getClearHistoryStorageKey();
         if (key) lsSet(key, String(ts));
     }
-    // History fetch + bg-drain + poll-attach now live in session.loadHistory().
-    // The DOM scroll-restore for the older-prepend stays here (the engine is
-    // DOM-free): capture the pre-prepend scroll position, then re-anchor the
-    // viewport after the session prepends older messages + re-renders.
+    // History fetch + bg-drain + poll-attach live in session.loadHistory(). The
+    // viewport is re-anchored by renderMessages itself (captureScrollAnchor /
+    // restoreScrollAnchor), which has to do it anyway because a full re-render
+    // detaches every child and clamps scrollTop to 0. Anchoring to a ROW also
+    // survives what a pre/post scrollHeight delta cannot: an older page whose
+    // messages all join a collapsed indexing row already on screen adds no height
+    // at all, but does change that row's own height ("3+ passes" → "10 passes").
+    // Returns false when it did NOT issue a request, so the fill loop retries
+    // rather than reading the unchanged message count as an exhausted pager.
     function fetchOlderHistoryIfNeeded() {
-        if (CS.loadingHistory || CS.loadingOlderHistory || CS.historyEndOfList) return;
-        var prevH = CS.messagesBox ? CS.messagesBox.scrollHeight : 0;
-        var prevT = CS.messagesBox ? CS.messagesBox.scrollTop : 0;
-        session.loadHistory(true).then(function () {
-            if (!CS.messagesBox) return;
-            raf2().then(function () {
-                if (!CS.messagesBox) return;
-                CS.messagesBox.scrollTop = prevT + (CS.messagesBox.scrollHeight - prevH);
-            });
+        if (CS.historyEndOfList) return Promise.resolve(true);
+        if (CS.loadingHistory || CS.loadingOlderHistory) return Promise.resolve(false);
+        return session.loadHistory(true).then(function () { return true; });
+    }
+
+    // Can the user reach older history at all? Paging is triggered ONLY by
+    // scrolling to the top of this box, so a box with nothing to scroll has no
+    // trigger. No box (chat view not rendered) counts as "fine" — the load that
+    // renders it runs the fill again.
+    function messagesBoxCanScroll() {
+        // Not showing messages at all: no box, or the settings panel has taken
+        // over the box (renderMessages no-ops while it is open, so paging could
+        // never change the height and the loop would burn every page it has).
+        if (!CS.messagesBox || CS.chatSettingsOpen) return true;
+        return CS.messagesBox.scrollHeight - CS.messagesBox.clientHeight > HISTORY_FILL_SLACK_PX;
+    }
+
+    // The row currently at the top of the viewport, and how much scrollable
+    // content sits above it. GROWTH in that number — not growth in the box's
+    // total height — is what makes a scroll-up worthwhile: an older page whose
+    // messages all join a collapsed indexing row renders at that row's anchor,
+    // which can be far BELOW the reader, so the box gets taller while nothing
+    // new comes within their reach.
+    function topVisibleRowKey() {
+        var box = CS.messagesBox;
+        if (!box) return null;
+        var boxTop = box.getBoundingClientRect().top;
+        var kids = box.children;
+        for (var i = 0; i < kids.length; i++) {
+            var key = kids[i].getAttribute && kids[i].getAttribute("data-row-key");
+            if (!key) continue;
+            if (kids[i].getBoundingClientRect().top - boxTop + kids[i].offsetHeight > 0) return key;
+        }
+        return null;
+    }
+    function contentAboveRow(key) {
+        var box = CS.messagesBox;
+        if (!box) return null;
+        var boxTop = box.getBoundingClientRect().top;
+        var kids = box.children;
+        for (var i = 0; i < kids.length; i++) {
+            if (!kids[i].getAttribute || kids[i].getAttribute("data-row-key") !== key) continue;
+            return kids[i].getBoundingClientRect().top - boxTop + box.scrollTop;
+        }
+        return null;
+    }
+
+    // Shared plumbing for the two "keep paging older history" loops below. The
+    // loop is the engine's (createHistoryFiller), so agent.vue behaves
+    // identically; only the DOM measurement is view-side.
+    //
+    // One loop at a time, with a request that arrives mid-loop ANDed into it
+    // rather than dropped — see createHistoryFiller for why dropping picks the
+    // wrong winner. The token is captured per call, so the guards read the LIVE
+    // chat rather than whichever one happened to start the loop.
+    var _historyFillToken = 0;
+    var _historyFiller = createHistoryFiller({
+        isEndOfList: function () { return !!CS.historyEndOfList; },
+        isLoading: function () { return !!(CS.loadingHistory || CS.loadingOlderHistory); },
+        // The settings panel occupies the messages box and suppresses
+        // renderMessages, so a fill started before it opened must stop.
+        isStale: function () { return _historyFillToken !== CS.gateRefreshToken || !CS.messagesBox || CS.chatSettingsOpen; },
+        messageCount: function () { return CS.messages.length; },
+        fetchOlder: function () { return fetchOlderHistoryIfNeeded(); },
+    });
+    function pageOlderHistoryUntil(isSatisfied, token) {
+        if (token === undefined) token = CS.gateRefreshToken;
+        if (token !== CS.gateRefreshToken) return Promise.resolve();
+        _historyFillToken = token;
+        // Measure only once the just-fetched page has actually painted.
+        return _historyFiller.fill(function () { return raf2().then(isSatisfied); });
+    }
+
+    // Keep paging older history until this box can actually scroll. Without it a
+    // chat whose newest page collapses to a single indexing row (a file's every
+    // pass folds into ONE row — twenty-plus messages, one line) never overflows,
+    // never fires a scroll event, and so never loads page 2: the user's own
+    // conversation underneath the upload is unreachable.
+    function ensureHistoryFillsViewport(token) {
+        return pageOlderHistoryUntil(messagesBoxCanScroll, token);
+    }
+
+    // Keep paging until the scroll-up the user just made actually put something
+    // ABOVE them. One page is not enough: a page that is entirely one file's
+    // earlier passes joins the collapsed row already on screen, so it either adds
+    // no height at all or adds it at that row's anchor, below the fold — either
+    // way the reader stays pinned at scrollTop 0, where scrolling up again fires
+    // no further event.
+    function pageOlderHistoryUntilTaller() {
+        var anchorKey = topVisibleRowKey();
+        var before = anchorKey ? contentAboveRow(anchorKey) : null;
+        return pageOlderHistoryUntil(function () {
+            // Nothing to measure against (empty list, anchor row gone): let the
+            // single page that was just fetched stand.
+            if (!CS.messagesBox || !anchorKey || before === null) return true;
+            var now = contentAboveRow(anchorKey);
+            return now === null || now > before + HISTORY_FILL_SLACK_PX;
         });
     }
 
@@ -2751,6 +2853,9 @@ import {
         if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
         else CS.indexGroupsOpen[key] = true;
         renderMessages();
+        // Collapsing a row can drop the list below one screen, which removes the
+        // scroll-to-top pager trigger along with the height.
+        ensureHistoryFillsViewport();
     }
 
     function buildIndexGroupEl(group, isOpen) {
@@ -2794,11 +2899,11 @@ import {
             tabindex: "0",
             "aria-expanded": isOpen ? "true" : "false",
             title: isOpen ? "Hide indexing steps" : "Show indexing steps",
-            onclick: function () { toggleIndexGroup(group.key); },
+            onclick: function () { toggleIndexGroup(group.runKey); },
             onkeydown: function (e) {
                 if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
                 e.preventDefault();
-                toggleIndexGroup(group.key);
+                toggleIndexGroup(group.runKey);
             },
         },
             h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
@@ -2834,9 +2939,96 @@ import {
         return h("div", { class: "bq-history-loading" },
             h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" }));
     }
+    /* ---- scroll anchoring across a full re-render ---------------------------
+     * renderMessages rebuilds the whole list, and detaching every child collapses
+     * scrollHeight, which makes the browser clamp scrollTop to 0. A reader
+     * scrolled up into history was therefore yanked to the very top of the chat
+     * on EVERY re-render — a bg-indexing turn arriving, a poll resolving, a
+     * response streaming in — and landed on the scroll-to-top pager trigger while
+     * they were at it.
+     *
+     * Restoring the raw scrollTop is not enough either: rows move. A collapsed
+     * indexing row renders at its file's NEWEST turn, so when a new pass arrives
+     * the row jumps from wherever it sat to the bottom of the list and everything
+     * that was below it slides UP by a row. Anchoring to a ROW — remember which
+     * row was at the top of the viewport and where, then put that row back — is
+     * the only thing that survives both, and it subsumes the older-page prepend
+     * as well.
+     *
+     * Anchor identity must be stable across the re-render, so it is the server
+     * item id (or local id) rather than the array index, which every prepend
+     * renumbers.
+     *
+     * A collapsed indexing row is a BAD anchor precisely because it relocates:
+     * pinning it in place is what would drag the reader to the bottom along with
+     * it. So an ordinary message row is always preferred, and a group row is used
+     * only when nothing else is on screen — and then only if it did not move
+     * (data-row-pos names the turn it is anchored at). */
+    function rowAnchorKey(msg, index) {
+        if (!msg) return null;
+        // role, because one server item produces both a request and a response
+        // bubble under a single id.
+        var id = msg._serverItemId || msg._localId;
+        return id ? "s" + id + ":" + msg.role : "i" + index;
+    }
+    // Identifies the turn a collapsed row is currently anchored at. "" when the
+    // newest member has no server id yet, which reads as "cannot tell" and simply
+    // skips the moved-row check.
+    function indexGroupAnchorId(group) {
+        var last = group.members[group.members.length - 1];
+        return (last && last.msg && last.msg._serverItemId) || "";
+    }
+    function captureScrollAnchor() {
+        var box = CS.messagesBox;
+        // Pinned to the bottom: the bottom IS the anchor (see restore below).
+        if (!box || CS.stickToBottom) return null;
+        var boxTop = box.getBoundingClientRect().top;
+        var kids = box.children;
+        var fallback = null;
+        for (var i = 0; i < kids.length; i++) {
+            if (!kids[i].getAttribute) continue;
+            var key = kids[i].getAttribute("data-row-key");
+            if (!key) continue; // the sticky "Fetching history..." bar
+            var top = kids[i].getBoundingClientRect().top - boxTop;
+            // Rows still (partly) on screen. The offset from the top of the
+            // viewport is what has to be preserved; it is negative when the row
+            // starts above the fold.
+            if (top + kids[i].offsetHeight <= 0) continue;
+            var cand = { key: key, top: top, scrollTop: box.scrollTop, pos: kids[i].getAttribute("data-row-pos") };
+            if (cand.pos === null) return cand;      // an ordinary row: use it
+            if (!fallback) fallback = cand;          // a group row: only if nothing better
+        }
+        return fallback || { key: null, top: 0, scrollTop: box.scrollTop };
+    }
+    function restoreScrollAnchor(anchor) {
+        var box = CS.messagesBox;
+        if (!box) return;
+        // A reader pinned to the bottom stays pinned. This matters most for the
+        // viewport fill: prepending older history onto a list that was too short
+        // to scroll would otherwise leave the user staring at the OLDEST message,
+        // because the teardown above clamped scrollTop to 0.
+        if (!anchor || CS.stickToBottom) { box.scrollTop = box.scrollHeight; return; }
+        var boxTop = box.getBoundingClientRect().top;
+        var kids = box.children;
+        for (var i = 0; anchor.key && i < kids.length; i++) {
+            if (!kids[i].getAttribute || kids[i].getAttribute("data-row-key") !== anchor.key) continue;
+            // A collapsed indexing row that MOVED (a new pass re-anchored it to the
+            // file's newest turn) must not be pinned: doing so would drag the
+            // reader along with it, to the bottom of the chat.
+            if (anchor.pos && kids[i].getAttribute("data-row-pos") !== anchor.pos) break;
+            box.scrollTop += (kids[i].getBoundingClientRect().top - boxTop) - anchor.top;
+            return;
+        }
+        // The anchor row is gone (history replaced, its group collapsed) or it
+        // relocated. Falling back to the raw offset is at least no worse than the
+        // clamp to 0 that the teardown would otherwise leave.
+        box.scrollTop = anchor.scrollTop;
+    }
+
     function renderMessages() {
         if (!CS.messagesBox) return;
         if (CS.chatSettingsOpen) return; // the settings panel occupies the messages area
+        var anchor = captureScrollAnchor();
         clear(CS.messagesBox);
         CS.messageEls = [];
         // "Fetching history..." pinned at the top while paginating older history (scroll-up).
@@ -2860,21 +3052,34 @@ import {
         var rows = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
         rows.forEach(function (row) {
             if (row.kind === "indexing") {
-                var isOpen = !!CS.indexGroupsOpen[row.group.key];
-                CS.messagesBox.appendChild(buildIndexGroupEl(row.group, isOpen));
+                var isOpen = !!CS.indexGroupsOpen[row.group.runKey];
+                var groupEl = buildIndexGroupEl(row.group, isOpen);
+                // The group's own key: it survives passes joining the group and
+                // the row relocating to the file's newest turn. data-row-pos says
+                // WHICH turn it is currently anchored at, so the scroll anchor can
+                // tell that the row moved rather than dutifully following it (see
+                // captureScrollAnchor). It is the newest member's server id, not
+                // its array index, because a prepend renumbers indices without
+                // moving anything.
+                groupEl.setAttribute("data-row-key", "g" + row.group.runKey);
+                groupEl.setAttribute("data-row-pos", indexGroupAnchorId(row.group));
+                CS.messagesBox.appendChild(groupEl);
                 if (!isOpen) return;
                 row.group.members.forEach(function (member) {
                     var pass = buildMessageEl(member.msg, member.index);
                     pass.classList.add("bq-index-pass");
+                    pass.setAttribute("data-row-key", rowAnchorKey(member.msg, member.index));
                     CS.messageEls[member.index] = pass;
                     CS.messagesBox.appendChild(pass);
                 });
                 return;
             }
             var el = buildMessageEl(row.msg, row.index);
+            el.setAttribute("data-row-key", rowAnchorKey(row.msg, row.index));
             CS.messageEls[row.index] = el;
             CS.messagesBox.appendChild(el);
         });
+        restoreScrollAnchor(anchor);
     }
 
     function refreshMessageBubble(idx) {
@@ -3289,7 +3494,20 @@ import {
         // changes (no-op when the chat/attachments aren't mounted).
         if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
             S._resizeBound = true;
-            window.addEventListener("resize", function () { scheduleAttachmentOverflowRecompute(); });
+            window.addEventListener("resize", function () {
+                scheduleAttachmentOverflowRecompute();
+                // The box changed height without re-rendering, so nothing has put a
+                // reader who was pinned to the bottom back there — on mobile the
+                // on-screen keyboard opening pushes the newest reply below the fold
+                // and leaves it there. scrollToBottomIfSticky bails on its own if
+                // they had scrolled away. (agent.vue does this in
+                // applyAgentViewportHeight.)
+                scrollToBottomIfSticky(false);
+                // And a TALLER box can stop overflowing, which takes the
+                // scroll-to-top pager trigger away with it. The chat reaches that
+                // state easily: a page of indexing turns collapses to one ~40px row.
+                ensureHistoryFillsViewport();
+            });
         }
 
         // Keep the MCP grant warm: returning to a backgrounded tab after the

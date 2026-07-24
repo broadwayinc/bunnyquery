@@ -356,6 +356,26 @@ declare function buildBoundedChatMessages(options: BoundedChatOptions): {
 declare var EXPIRED_ATTACHMENT_URL_HOST: string;
 declare var EXPIRED_ATTACHMENT_URL_ORIGIN: string;
 declare var LINK_LABEL_MAX_DISPLAY_CHARS: number;
+/**
+ * Lifetime of the url minted when a user clicks an expired attachment chip.
+ *
+ * Mint it as a PLAIN get-db presign, never with generate_temporary_cdn_url: the
+ * cdn branch ignores `expires` entirely and hands back a url good for the rest of
+ * the current UTC day plus the next one, so a "20 minute" link would in fact live
+ * 24 to 48 hours. The dashboard has always done this correctly and the widget did
+ * not, which is precisely the kind of divergence a shared constant exists to stop.
+ */
+declare var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS: number;
+/**
+ * How long a client may keep serving an href it already minted before dropping
+ * back to the placeholder and re-minting.
+ *
+ * DERIVED from the TTL above, with five minutes of headroom, because the
+ * invariant "the cache must expire before the url does" used to be a comment
+ * next to two independent literals. If it is ever violated a client serves a
+ * dead url with no way to notice; deriving it makes that unrepresentable.
+ */
+declare var LINK_REFRESH_WINDOW_MS: number;
 declare function createInlineLinkRegex(): RegExp;
 declare function safeDecodeURIComponent(v: string): string;
 declare function encodePathSegments(path: string): string;
@@ -364,7 +384,86 @@ declare function extractRemotePathFromAttachmentHref(href: string, serviceId: st
 declare function getExpiredAttachmentVisiblePath(remotePath: string, fallback?: string): string;
 declare function buildDisplayExpiredAttachmentHref(remotePath: string, fallback?: string): string;
 declare function isServiceDbAttachmentHref(href: string, serviceId: string): boolean;
+/**
+ * Read the storage path back out of an `_expired_.url` placeholder.
+ *
+ * The placeholder is not a display detail: sanitizeAttachmentLinksForHistory
+ * writes it into PERSISTED history, and buildBoundedChatMessages replays it into
+ * the model's context. So it round-trips constantly and MUST be recognised on the
+ * way back in. Returns null for anything that is not the carrier.
+ */
+declare function readExpiredAttachmentHref(href: string): string | null;
 declare function sanitizeAttachmentLinksForHistory(content: string, serviceId: string, forAssistant?: boolean): string;
+/**
+ * Is this markdown link target a URL rather than a db storage path?
+ *
+ * The inline-link regex decides that by whether the target contains whitespace:
+ * its url branch forbids it, its bare-path branch allows it (a db path really can
+ * contain spaces). So a url that picked up a stray space anywhere in transit
+ * falls out of the url branch and is claimed by the path branch, and the view
+ * renders it as an `_expired_.url/https%3A/…` attachment chip that resolves to
+ * nothing. The view asks this FIRST, so what a link IS never depends on damage.
+ */
+declare function isHttpUrlLike(target: string): boolean;
+/**
+ * Repair whitespace inside a url. RFC 3986 has no legal whitespace anywhere in a
+ * URI, so a space in an href is always damage, never content.
+ *
+ * Two repairs, because the right one differs:
+ *   - Our own `/download/<id>` capability links (skapi-mcp file-download.js) are
+ *     base64url, optionally with a single `.` separating the payload and hmac of
+ *     the older self-describing token. That alphabet cannot contain whitespace,
+ *     so the spaces are purely damage and REMOVING them restores the exact link,
+ *     which is what makes an already-sent message clickable again. A model
+ *     reproducing one of these into its reply is exactly where the spaces come
+ *     from, which is also why the id is now short.
+ *   - Anything else keeps every character and only has the whitespace encoded,
+ *     the same thing a browser does with a space in an href. Stripping would be
+ *     wrong there: `…/exports/my report.csv` is a real file whose name has a
+ *     space in it, and deleting it points at a file that does not exist.
+ */
+declare function repairUrlWhitespace(href: string): string;
+/**
+ * Trim punctuation and unmatched wrappers that cling to a token in prose.
+ * `src::a/b.pdf).` -> `src::a/b.pdf`, while a balanced `file (v2).pdf` is kept.
+ */
+declare function normalizeTrailingInlineToken(value: string): string;
+/** A link the view renders. `expired` means the href is the `_expired_.url`
+ *  placeholder and a click must mint a fresh one from `remotePath`. */
+interface InlineLinkPart {
+    type: 'link';
+    label: string;
+    fullLabel: string;
+    href: string;
+    expired: boolean;
+    expiredHref?: string;
+    remotePath?: string;
+}
+interface InlineLinkContext {
+    /** Current project id: the leading segment to strip off a db url. */
+    serviceId: string;
+    /** `https://db.<hostDomain>` for this deployment. */
+    dbHostPrefix: string;
+    /** A fresh url already minted for this placeholder, if the view cached one. */
+    resolveFreshHref?: (expiredHref: string) => string | undefined;
+}
+/**
+ * Decide what ONE inline-link regex match actually is, and how to render it.
+ *
+ * This is the single place that answers "is this an external url, this project's
+ * db file, or a bare storage path", for every consumer. It used to live twice,
+ * once in agent.vue and once in the widget, and both copies had to be found and
+ * corrected for each of the link bugs this file's history records. A view now
+ * supplies its own context (project id, db host, cached-href lookup) and does
+ * nothing but turn the returned part into markup.
+ *
+ * `groups` is [g1..g6] from createInlineLinkRegex, in that order:
+ *   g1 src::<token>   g2/g3 [label](url)   g4/g5 [label](path)   g6 bare url
+ */
+declare function classifyInlineLink(full: string, groups: Array<string | undefined>, ctx: InlineLinkContext): {
+    part: InlineLinkPart;
+    tail?: string;
+} | null;
 declare function truncateLabelForDisplay(label: string): string;
 
 declare function filterListByClearHorizon(list: any[], clearedAt: number): any[];
@@ -379,6 +478,97 @@ type MapHistoryOptions = {
 declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions): {
     messages: any[];
     runningItemIds: string[];
+};
+
+/**
+ * Keep older history REACHABLE by paging until the message box actually gains
+ * something to scroll to.
+ *
+ * Older history is paged in by one trigger only: the user scrolling to the top
+ * of the message box. That trigger has two ways to die, and collapsed indexing
+ * rows cause both:
+ *
+ *   1. The box never scrolls. A file's every indexing pass (the first plus every
+ *      CONTINUE pass, request AND response bubble each) folds into ONE row, so a
+ *      full history page — twenty-plus messages — can render as a single line.
+ *      Content shorter than the viewport fires no scroll event, so page 2 is
+ *      never requested and any conversation the user had before that upload is
+ *      permanently out of reach.
+ *   2. The fetched page adds no height. A page that is entirely the same file's
+ *      earlier passes joins the collapsed row already on screen and renders
+ *      nothing new. The user, sitting at scrollTop 0, scrolls up again — and
+ *      because the position never changed, no further scroll event fires.
+ *
+ * Both are the same shape: fetch, re-measure, and keep going until the user
+ * genuinely gained reachable content, history ran out, or the pager stopped
+ * advancing. `isSatisfied` is what differs between the two (can the box scroll
+ * at all / did it grow), so the loop below takes it as a predicate.
+ *
+ * DOM-free like the rest of the engine — the caller supplies the measurement and
+ * awaits its own render before measuring, so agent.vue and the widget run the
+ * identical loop over their own pagers.
+ */
+/** Overflow (px) that counts as "the user can scroll here". Comfortably more
+ *  than the 60px top threshold that triggers the next page, so a filled box has
+ *  real room to scroll rather than sitting one pixel from the trigger. */
+declare const HISTORY_FILL_SLACK_PX = 64;
+/** Pages one fill pass will request before giving up. Reached only by a chat
+ *  whose history really is dozens of pages of one file's indexing passes; the
+ *  cap exists so a pager that stops advancing can never spin forever. */
+declare const MAX_HISTORY_FILL_PAGES = 24;
+type FillHistoryViewportOptions = {
+    /** The user has reachable content and paging can stop. Called AFTER the
+     *  caller's own render has settled (nextTick / rAF), since only the caller
+     *  knows when its view has painted — hence the allowance for a promise. */
+    isSatisfied: () => boolean | Promise<boolean>;
+    /** All history is loaded — nothing left to page in. */
+    isEndOfList: () => boolean;
+    /** A history request is already in flight. Waited out, not treated as a stop
+     *  condition: a background first-page refresh (the queue-detect tick fires one
+     *  every couple of seconds while a file is indexing) would otherwise swallow
+     *  the user's scroll-up entirely, and scrolling up again from scrollTop 0
+     *  produces no second event to retry with. */
+    isLoading: () => boolean;
+    /** Messages currently loaded. Used to detect a page that added nothing, which
+     *  means the pager is not advancing and looping would never terminate. */
+    messageCount: () => number;
+    /** Fetch ONE older page (the caller's own fetchMore path, scroll-restore and
+     *  all). Return `false` when the request was NOT issued (the caller's own
+     *  single-flight guard swallowed it) so the loop retries instead of reading
+     *  the unchanged message count as an exhausted pager. Anything else, including
+     *  undefined, means it was attempted. */
+    fetchOlder: () => Promise<boolean | void | any>;
+    /** The chat this fill was started for is gone (project switched, view
+     *  unmounted, gate token bumped). Checked between pages so a stale fill can
+     *  never keep paging another chat's history. */
+    isStale?: () => boolean;
+    maxPages?: number;
+};
+/**
+ * Page older history until `isSatisfied`, until history runs out, or until the
+ * pager stops advancing. Never throws: a failed page ends the fill, and the
+ * user's own scrolling remains the fallback trigger.
+ */
+declare function fillHistoryViewport(opts: FillHistoryViewportOptions): Promise<void>;
+/**
+ * One fill loop per view, with predicates COMBINED rather than dropped.
+ *
+ * Fills come from several places at once — a first page finishing, a window
+ * resize, a row being collapsed, and the user's own scroll to the top — and a
+ * plain "one at a time, drop the rest" guard picks the wrong winner: a resize
+ * fill (satisfied the moment the box can scroll at all) would swallow the user's
+ * scroll-up (which needs content specifically ABOVE them), and the scroll-up
+ * cannot be retried, because a reader parked at scrollTop 0 produces no further
+ * scroll event. Dropping the guard entirely is no better: every frame of a
+ * window drag would start its own 24-page loop.
+ *
+ * So a request that arrives mid-loop ANDs its predicate into the running one:
+ * the loop then keeps paging until EVERY caller is satisfied. Predicates that
+ * come true are dropped as it goes, so the cost stays flat.
+ */
+declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isSatisfied'>): {
+    fill: (isSatisfied: () => boolean | Promise<boolean>) => Promise<void>;
+    isRunning: () => boolean;
 };
 
 declare const MCP_NAME = "BunnyQuery";
@@ -593,6 +783,12 @@ interface ChatHost {
     scrollToBottom(smooth?: boolean): Promise<void> | void;
     /** Scroll only if the user is pinned to the bottom (does not force-pin). */
     scrollToBottomIfSticky(smooth?: boolean): Promise<void> | void;
+    /** A history page finished loading and rendering. OPTIONAL. The view uses it
+     *  to page further when the message box came out too short to scroll — the
+     *  only trigger for loading older history is a scroll to the top, so a box
+     *  that cannot scroll has no way to reach page 2 (see viewport_fill). Only
+     *  the view can measure that, which is why the engine merely announces it. */
+    onHistoryLoaded?(fetchMore: boolean, token: number): void;
     cancelRequest(opts: {
         url: string;
         method: string;
@@ -668,9 +864,19 @@ interface ChatHost {
 
 type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
 type IndexingGroup = {
-    /** Stable identity across re-renders and across history pages: storage path
-     *  when known (a file can be re-uploaded under the same name), else name. */
+    /** The FILE this row is about: storage path when known (a file can be
+     *  re-uploaded under a name that already exists elsewhere), else name. Shared
+     *  by every run of that file, and what ChatSession.cancelIndexingGroup and
+     *  _indexKeyOf match on — never use it as a render key. */
     key: string;
+    /** Identity of this ROW: one indexing RUN of that file. A file indexed on
+     *  Monday and re-indexed on Wednesday is two runs, and collapsing them into
+     *  one row erased Monday's from Monday's place in the conversation, claimed
+     *  its passes for Wednesday, and let Monday's failure be overwritten by
+     *  Wednesday's success. Numbered from the NEWEST run backwards (`#0` is the
+     *  newest) so paging in older history never renames a row already on screen.
+     *  This is the render key and the expansion key. */
+    runKey: string;
     name: string;
     path?: string;
     mime?: string;
@@ -928,4 +1134,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, type ExtractDirective, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingSystemPromptParams, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, readExpiredAttachmentHref, registerAttachmentParser, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };

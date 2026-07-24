@@ -288,7 +288,7 @@ File attachments: When a user message contains an "Attached files:" section with
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY had their text extracted on the server and inlined in the same message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read it directly there and do NOT call web_fetch for those files. A "[skapi: ...]" note in that block means the file could not be extracted.
 - For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.
-File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](path/to/file) for storage paths, or [filename](https://...) for external URLs. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
+File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
 File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
 File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
@@ -525,8 +525,10 @@ function isAuthExpiredError(input) {
 var EXPIRED_ATTACHMENT_URL_HOST = "_expired_.url";
 var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
 var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
+var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
 function createInlineLinkRegex() {
-  return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]+|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]+|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
+  return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
 }
 function safeDecodeURIComponent(v) {
   try {
@@ -586,16 +588,148 @@ function isServiceDbAttachmentHref(href, serviceId) {
     return false;
   }
 }
+function readExpiredAttachmentHref(href) {
+  if (!href) return null;
+  try {
+    var parsed = new URL(href);
+    if (parsed.hostname !== EXPIRED_ATTACHMENT_URL_HOST) return null;
+    return normalizeAttachmentPathCandidate(parsed.pathname || "") || null;
+  } catch (e) {
+    return null;
+  }
+}
 function sanitizeAttachmentLinksForHistory(content, serviceId, forAssistant) {
   if (!content) return content;
   if (!forAssistant && content.indexOf("Attached files:") === -1) return content;
   return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_m, label, href) {
-    if (forAssistant && !isServiceDbAttachmentHref(href, serviceId)) return _m;
+    if (!isServiceDbAttachmentHref(href, serviceId)) return _m;
     var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
-    var labelPath = normalizeAttachmentPathCandidate(label);
-    var fullPath = remotePath || labelPath;
-    if (!fullPath) return forAssistant ? _m : "[" + label + "](" + EXPIRED_ATTACHMENT_URL_ORIGIN + "/file)";
+    var fullPath = remotePath || normalizeAttachmentPathCandidate(label);
+    if (!fullPath) return _m;
     return "[" + label + "](" + buildDisplayExpiredAttachmentHref(fullPath, label) + ")";
+  });
+}
+function isHttpUrlLike(target) {
+  return /^https?:\/\//i.test((target || "").trim());
+}
+function repairUrlWhitespace(href) {
+  if (!href || !/\s/.test(href)) return href;
+  var stripped = href.replace(/\s+/g, "");
+  if (/^https?:\/\/[^/\s]+\/download\/[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$/i.test(stripped)) return stripped;
+  return href.trim().replace(/\s/g, "%20");
+}
+function normalizeTrailingInlineToken(value) {
+  if (!value) return value;
+  var out = value.replace(/[.,;:!?]+$/, "");
+  var trimUnmatched = function(openCh, closeCh) {
+    while (out.charAt(out.length - 1) === closeCh) {
+      var openCount = (out.match(new RegExp("\\" + openCh, "g")) || []).length;
+      var closeCount = (out.match(new RegExp("\\" + closeCh, "g")) || []).length;
+      if (closeCount > openCount) out = out.slice(0, -1);
+      else break;
+    }
+  };
+  trimUnmatched("(", ")");
+  trimUnmatched("[", "]");
+  trimUnmatched("{", "}");
+  out = out.replace(/[`'"*>]+$/, "");
+  return out;
+}
+function classifyInlineLink(full, groups, ctx) {
+  var g1 = groups[0], g2 = groups[1], g3 = groups[2], g4 = groups[3], g5 = groups[4], g6 = groups[5];
+  var dbHostPrefix = (ctx.dbHostPrefix || "").toLowerCase();
+  var fresh = function(expiredHref) {
+    return ctx.resolveFreshHref ? ctx.resolveFreshHref(expiredHref) : void 0;
+  };
+  var isDbHost = function(url) {
+    return !!dbHostPrefix && url.toLowerCase().indexOf(dbHostPrefix) === 0;
+  };
+  var asStoredFile = function(remotePath2, label) {
+    if (!remotePath2) return null;
+    var expiredHref = buildDisplayExpiredAttachmentHref(remotePath2, label);
+    var cached = fresh(expiredHref);
+    return {
+      part: {
+        type: "link",
+        label: truncateLabelForDisplay(label),
+        fullLabel: label,
+        href: cached || expiredHref,
+        expired: !cached,
+        expiredHref,
+        remotePath: remotePath2
+      }
+    };
+  };
+  if (g1) {
+    var rawPath = normalizeTrailingInlineToken(g1);
+    var tail = full.slice(("src::" + rawPath).length);
+    var srcIsUrl = isHttpUrlLike(rawPath);
+    if (srcIsUrl && !isDbHost(rawPath) && !readExpiredAttachmentHref(rawPath)) {
+      return {
+        part: { type: "link", label: truncateLabelForDisplay(rawPath), fullLabel: rawPath, href: rawPath, expired: false },
+        tail
+      };
+    }
+    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.serviceId) || normalizeAttachmentPathCandidate(rawPath) : normalizeAttachmentPathCandidate(rawPath));
+    var srcBuilt = asStoredFile(srcPath, srcPath);
+    return srcBuilt ? { part: srcBuilt.part, tail } : null;
+  }
+  if (g4 && g5) {
+    var dbTarget = /^db:(.+)$/i.exec(g5.trim());
+    if (dbTarget) {
+      var declared = asStoredFile(normalizeAttachmentPathCandidate(dbTarget[1]), g4);
+      if (!declared) return null;
+      declared.part.label = truncateLabelForDisplay(g4);
+      declared.part.fullLabel = g4;
+      return declared;
+    }
+    if (isHttpUrlLike(g5)) {
+      return classifyInlineLink(full, [void 0, g4, repairUrlWhitespace(g5), void 0, void 0, void 0], ctx);
+    }
+    var trimmedTarget = g5.trim();
+    if (/^[a-z][a-z0-9+.-]*:/i.test(trimmedTarget) || trimmedTarget.charAt(0) === "#") {
+      return {
+        part: { type: "link", label: truncateLabelForDisplay(g4), fullLabel: g4, href: trimmedTarget, expired: false }
+      };
+    }
+    var built = asStoredFile(normalizeAttachmentPathCandidate(g5), g4);
+    if (!built) return null;
+    built.part.label = truncateLabelForDisplay(g4);
+    built.part.fullLabel = g4;
+    return built;
+  }
+  var originalHref = g3 || g6 || "";
+  if (!originalHref) return null;
+  var urlTail;
+  if (!g3 && g6) {
+    var trimmedUrl = normalizeTrailingInlineToken(originalHref);
+    if (trimmedUrl !== originalHref) urlTail = originalHref.slice(trimmedUrl.length);
+    originalHref = trimmedUrl;
+  }
+  var withTail = function(r) {
+    return urlTail ? { part: r.part, tail: urlTail } : r;
+  };
+  var urlLabel = g2 || originalHref;
+  var carried = readExpiredAttachmentHref(originalHref);
+  if (carried) {
+    var carriedBuilt = asStoredFile(carried, g2 || carried);
+    if (carriedBuilt) {
+      if (g2) {
+        carriedBuilt.part.label = truncateLabelForDisplay(g2);
+        carriedBuilt.part.fullLabel = g2;
+      }
+      return withTail(carriedBuilt);
+    }
+  }
+  if (isServiceDbAttachmentHref(originalHref, ctx.serviceId)) {
+    var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.serviceId);
+    if (remotePath) {
+      var dbBuilt = asStoredFile(remotePath, getExpiredAttachmentVisiblePath(remotePath, urlLabel));
+      if (dbBuilt) return withTail(dbBuilt);
+    }
+  }
+  return withTail({
+    part: { type: "link", label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false }
   });
 }
 function truncateLabelForDisplay(label) {
@@ -1289,6 +1423,91 @@ function mapHistoryListToMessages(list, platform, opts) {
     }
   });
   return { messages: mapped, runningItemIds };
+}
+
+// src/engine/viewport_fill.ts
+var HISTORY_FILL_SLACK_PX = 64;
+var MAX_HISTORY_FILL_PAGES = 24;
+var IDLE_WAIT_STEP_MS = 120;
+var IDLE_WAIT_MAX_MS = 15e3;
+async function waitForIdle(opts, stale) {
+  var waited = 0;
+  while (opts.isLoading()) {
+    if (stale() || waited >= IDLE_WAIT_MAX_MS) return false;
+    await new Promise(function(r) {
+      setTimeout(r, IDLE_WAIT_STEP_MS);
+    });
+    waited += IDLE_WAIT_STEP_MS;
+  }
+  return !stale();
+}
+async function fillHistoryViewport(opts) {
+  var maxPages = typeof opts.maxPages === "number" ? opts.maxPages : MAX_HISTORY_FILL_PAGES;
+  var stale = function() {
+    return !!(opts.isStale && opts.isStale());
+  };
+  var swallowed = 0;
+  for (var page = 0; page < maxPages; page++) {
+    if (stale() || opts.isEndOfList()) return;
+    if (!await waitForIdle(opts, stale)) return;
+    var satisfied = false;
+    try {
+      satisfied = !!await opts.isSatisfied();
+    } catch {
+      return;
+    }
+    if (satisfied || stale()) return;
+    if (!await waitForIdle(opts, stale)) return;
+    var before = opts.messageCount();
+    var attempted;
+    try {
+      attempted = await opts.fetchOlder();
+    } catch {
+      return;
+    }
+    if (stale()) return;
+    if (attempted === false) {
+      if (++swallowed > 3) return;
+      page--;
+      continue;
+    }
+    if (opts.messageCount() <= before) return;
+  }
+}
+function createHistoryFiller(base) {
+  var pending = [];
+  var running = false;
+  async function allSatisfied() {
+    var next = [];
+    for (var i = 0; i < pending.length; i++) {
+      if (!await pending[i]()) next.push(pending[i]);
+    }
+    pending = next;
+    return pending.length === 0;
+  }
+  return {
+    isRunning: function() {
+      return running;
+    },
+    fill: function(isSatisfied) {
+      pending.push(isSatisfied);
+      if (running) return Promise.resolve();
+      running = true;
+      var done = function() {
+        running = false;
+        pending = [];
+      };
+      return fillHistoryViewport({
+        isSatisfied: allSatisfied,
+        isEndOfList: base.isEndOfList,
+        isLoading: base.isLoading,
+        messageCount: base.messageCount,
+        fetchOlder: base.fetchOlder,
+        isStale: base.isStale,
+        maxPages: base.maxPages
+      }).then(done, done);
+    }
+  };
 }
 
 // src/engine/session.ts
@@ -2270,11 +2489,17 @@ var ChatSession = class {
         this.updateHistoryCache();
         return;
       }
+      var text = answer || "No text response received from AI provider.";
+      if (wasBgTask) {
+        this.state.messages[idx] = { role: "assistant", content: text, isBackgroundTask: true, _serverItemId: itemId };
+        this.host.notify();
+        this.updateHistoryCache();
+        return;
+      }
       var lid = this._newLocalId();
       this.state.messages[idx] = { role: "assistant", content: "", _localId: lid, _serverItemId: itemId };
-      if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
       this.host.notify();
-      this.enqueueTypewrite(idx, answer || "No text response received from AI provider.", lid);
+      this.enqueueTypewrite(idx, text, lid);
       this.updateHistoryCache();
       return;
     }
@@ -2296,12 +2521,18 @@ var ChatSession = class {
       this.updateHistoryCache();
       return;
     }
+    var text2 = answer || "No text response received from AI provider.";
+    if (ex.isBackgroundTask) {
+      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: text2, isBackgroundTask: true, _serverItemId: itemId });
+      this.host.notify();
+      this.updateHistoryCache();
+      return;
+    }
     var lid2 = this._newLocalId();
     var reply = { role: "assistant", content: "", _localId: lid2, _serverItemId: itemId };
-    if (ex.isBackgroundTask) reply.isBackgroundTask = true;
     this.state.messages.splice(userIdx + 1, 0, reply);
     this.host.notify();
-    this.enqueueTypewrite(userIdx + 1, answer || "No text response received from AI provider.", lid2);
+    this.enqueueTypewrite(userIdx + 1, text2, lid2);
     this.updateHistoryCache();
   }
   /** How a bg task maps onto a collapsed row: the row's own key (storage path
@@ -2455,15 +2686,23 @@ var ChatSession = class {
         }).catch(function(err) {
           self.historyItemPolls.delete(capturedId);
           var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
+          self._clearPendingUserBubble(capturedId);
           var bi = self.state.messages.findIndex(function(m) {
             return m.isPending && m._serverItemId === capturedId;
           });
           if (bi !== -1) {
             if (isNotExists) self.state.messages.splice(bi, 1);
             else self.state.messages[bi] = { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
-            self.host.notify();
-            self.updateHistoryCache();
+          } else if (!isNotExists) {
+            var ui = self.state.messages.findIndex(function(m) {
+              return m.role === "user" && m._serverItemId === capturedId;
+            });
+            if (ui !== -1) {
+              self.state.messages.splice(ui + 1, 0, { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
+            }
           }
+          self.host.notify();
+          self.updateHistoryCache();
         }).then(function() {
           if (wasStopped) return;
           var qi = self.bgTaskQueue.findIndex(function(q) {
@@ -2598,7 +2837,12 @@ var ChatSession = class {
         });
         var locallyCancelled = {};
         self.state.messages.forEach(function(m) {
-          if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = 1;
+          if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = m;
+        });
+        var inFlightCancel = {};
+        self.state.messages.forEach(function(m) {
+          if (!m._serverItemId) return;
+          if (m._cancelling || m._cancelError) inFlightCancel[m._serverItemId] = m;
         });
         var mappedHasPendingAssistant = mapped.some(function(m) {
           return m.isPending && m.role === "assistant" && !m.isBackgroundTask;
@@ -2641,11 +2885,28 @@ var ChatSession = class {
           for (var ci = 0; ci < self.state.messages.length; ci++) {
             var c = self.state.messages[ci];
             if (!c._serverItemId || !locallyCancelled[c._serverItemId] || c.isCancelled) continue;
-            self.state.messages[ci] = { role: "user", content: c.content, isCancelled: true, _serverItemId: c._serverItemId };
+            self.state.messages[ci] = {
+              role: "user",
+              content: c.content,
+              isCancelled: true,
+              _serverItemId: c._serverItemId,
+              isBackgroundTask: c.isBackgroundTask,
+              _indexFile: c._indexFile,
+              _useBgQueue: c._useBgQueue,
+              _ownerKey: c._ownerKey
+            };
             if (ci + 1 < self.state.messages.length && self.state.messages[ci + 1].isPending && self.state.messages[ci + 1]._serverItemId === c._serverItemId) {
               self.state.messages.splice(ci + 1, 1);
             }
           }
+        }
+        for (var fi = 0; fi < self.state.messages.length; fi++) {
+          var fm = self.state.messages[fi];
+          var was = fm._serverItemId && inFlightCancel[fm._serverItemId];
+          if (!was || fm.isCancelled) continue;
+          if (!(fm.isPendingQueued || fm.isPendingInProcess || fm.isPending)) continue;
+          if (was._cancelling) fm._cancelling = true;
+          if (was._cancelError) fm._cancelError = was._cancelError;
         }
       }
       if (!keptOlderPages) {
@@ -2684,18 +2945,25 @@ var ChatSession = class {
                 return m.isPending && m._serverItemId === capturedId;
               });
               if (isNotExists) {
-                var isBg = aIdx !== -1 ? !!self.state.messages[aIdx].isBackgroundTask : false;
+                var uIdx = self.state.messages.findIndex(function(m) {
+                  return m.role === "user" && m._serverItemId === capturedId && !m.isCancelled;
+                });
+                var isBg = aIdx !== -1 && !!self.state.messages[aIdx].isBackgroundTask || uIdx !== -1 && !!self.state.messages[uIdx].isBackgroundTask;
                 if (aIdx !== -1) self.state.messages.splice(aIdx, 1);
                 if (!isBg) {
-                  var uIdx = self.state.messages.findIndex(function(m) {
-                    return m.role === "user" && m._serverItemId === capturedId && !m.isCancelled;
-                  });
                   if (uIdx !== -1) {
                     var ex = self.state.messages[uIdx];
                     self.state.messages[uIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId };
                   }
                   self.cancelledServerIds.delete(capturedId);
                   self.promoteNextQueuedToRunning();
+                } else if (uIdx !== -1) {
+                  var bex = self.state.messages[uIdx];
+                  var bcancelled = { role: "user", content: bex.content, isCancelled: true, isBackgroundTask: true, _serverItemId: bex._serverItemId };
+                  if (bex._indexFile) bcancelled._indexFile = bex._indexFile;
+                  if (bex._useBgQueue) bcancelled._useBgQueue = true;
+                  self.state.messages[uIdx] = bcancelled;
+                  self.promoteNextBgQueuedToRunning();
                 }
                 self.host.notify();
                 self.updateHistoryCache();
@@ -2726,6 +2994,7 @@ var ChatSession = class {
         self.state.loadingOlderHistory = false;
         if (wasLoading) self.host.notify();
       }
+      if (self.host.onHistoryLoaded) self.host.onHistoryLoaded(!!fetchMore, token);
     });
   }
   // --- attachment upload orchestration ---------------------------------
@@ -2971,27 +3240,42 @@ function buildChatDisplayList(messages, opts) {
   var hasMoreHistory = !!(opts && opts.hasMoreHistory);
   var groups = {};
   var order = [];
-  var keyOfIndex = new Array(list.length);
-  var keyByItemId = {};
-  var lastKey;
+  var runOfIndex = new Array(list.length);
+  var runByItemId = {};
+  var keyByName = {};
+  var openRunOfKey = {};
+  var runsOfKey = {};
+  var keyOfRun = {};
+  var runSeq = 0;
   for (var i = 0; i < list.length; i++) {
     var msg = list[i];
     if (!msg || !msg.isBackgroundTask) continue;
-    var key;
+    var runId;
     var ref = msg.role === "user" ? readFileRef(msg) : null;
     if (ref) {
-      key = ref.path || ref.name;
-    } else if (msg._serverItemId && keyByItemId[msg._serverItemId]) {
-      key = keyByItemId[msg._serverItemId];
+      var key = ref.path || keyByName[ref.name] || ref.name;
+      if (!ref.continued && openRunOfKey[key]) delete openRunOfKey[key];
+      runId = openRunOfKey[key];
+      if (!runId) {
+        runId = "run" + runSeq++;
+        openRunOfKey[key] = runId;
+        keyOfRun[runId] = key;
+        (runsOfKey[key] || (runsOfKey[key] = [])).push(runId);
+      }
+    } else if (msg._serverItemId && runByItemId[msg._serverItemId]) {
+      runId = runByItemId[msg._serverItemId];
     } else if (msg.role !== "user") {
-      key = lastKey;
+      runId = runOfIndex[i - 1];
     }
-    if (!key) continue;
-    var g = groups[key];
+    if (!runId) continue;
+    var g = groups[runId];
     if (!g) {
-      g = groups[key] = {
-        key,
-        name: ref ? ref.name : key,
+      var fileKey = keyOfRun[runId];
+      g = groups[runId] = {
+        key: fileKey,
+        runKey: runId,
+        // provisional; renumbered newest-first below
+        name: ref ? ref.name : fileKey,
         path: ref ? ref.path : void 0,
         mime: ref ? ref.mime : void 0,
         size: ref ? ref.size : void 0,
@@ -3004,7 +3288,7 @@ function buildChatDisplayList(messages, opts) {
         mayHaveOlder: false,
         anchorIndex: i
       };
-      order.push(key);
+      order.push(runId);
     }
     if (ref) {
       if (ref.name) g.name = ref.name;
@@ -3017,26 +3301,46 @@ function buildChatDisplayList(messages, opts) {
     }
     g.members.push({ msg, index: i });
     g.anchorIndex = i;
-    keyOfIndex[i] = key;
-    if (msg._serverItemId) keyByItemId[msg._serverItemId] = key;
-    lastKey = key;
+    runOfIndex[i] = runId;
+    if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
+    if (ref && ref.name) keyByName[ref.name] = g.key;
+  }
+  for (var rk in runsOfKey) {
+    var runIds = runsOfKey[rk];
+    for (var ri = 0; ri < runIds.length; ri++) {
+      var grpR = groups[runIds[ri]];
+      if (!grpR) continue;
+      var first = grpR.members[0];
+      var firstId = first && first.msg && (first.msg._serverItemId || first.msg._localId);
+      grpR.runKey = rk + "#" + (firstId || "n" + ri);
+    }
   }
   for (var oi = 0; oi < order.length; oi++) {
     var grp = groups[order[oi]];
+    var lastSettled = -1;
+    for (var si = 0; si < grp.members.length; si++) {
+      if (!isPendingMsg(grp.members[si].msg)) lastSettled = si;
+    }
     var active = false;
-    for (var mi = 0; mi < grp.members.length; mi++) {
+    for (var mi = lastSettled + 1; mi < grp.members.length; mi++) {
       if (isPendingMsg(grp.members[mi].msg)) {
         active = true;
+        break;
+      }
+    }
+    for (var xi = 0; xi < grp.members.length; xi++) {
+      if (grp.members[xi].msg._cancelling) {
+        grp.cancelling = true;
         break;
       }
     }
     var seenIds = {};
     for (var ci = 0; ci < grp.members.length; ci++) {
       var cm = grp.members[ci].msg;
-      if (cm._cancelling) grp.cancelling = true;
-      if (cm._cancelError) grp.cancelError = cm._cancelError;
+      if (cm._cancelError && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
       if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
       if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
+      if (ci < lastSettled) continue;
       if (seenIds[cm._serverItemId]) continue;
       seenIds[cm._serverItemId] = true;
       grp.cancellableIds.push(cm._serverItemId);
@@ -3061,16 +3365,16 @@ function buildChatDisplayList(messages, opts) {
   }
   var out = [];
   for (var j = 0; j < list.length; j++) {
-    var k = keyOfIndex[j];
-    if (k === void 0) {
+    var r = runOfIndex[j];
+    if (r === void 0) {
       out.push({ kind: "message", msg: list[j], index: j });
       continue;
     }
-    if (groups[k].anchorIndex === j) out.push({ kind: "indexing", group: groups[k], index: j });
+    if (groups[r].anchorIndex === j) out.push({ kind: "indexing", group: groups[r], index: j });
   }
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, clearAttachmentParsers, composeUserMessage, configureChatEngine, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, registerAttachmentParser, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, readExpiredAttachmentHref, registerAttachmentParser, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

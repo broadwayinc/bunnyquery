@@ -107,6 +107,12 @@ export interface ChatHost {
 	scrollToBottom(smooth?: boolean): Promise<void> | void;
 	/** Scroll only if the user is pinned to the bottom (does not force-pin). */
 	scrollToBottomIfSticky(smooth?: boolean): Promise<void> | void;
+	/** A history page finished loading and rendering. OPTIONAL. The view uses it
+	 *  to page further when the message box came out too short to scroll — the
+	 *  only trigger for loading older history is a scroll to the top, so a box
+	 *  that cannot scroll has no way to reach page 2 (see viewport_fill). Only
+	 *  the view can measure that, which is why the engine merely announces it. */
+	onHistoryLoaded?(fetchMore: boolean, token: number): void;
 
 	// --- skapi surface beyond configureChatEngine() ---
 	cancelRequest(opts: {
