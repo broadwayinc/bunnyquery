@@ -1617,15 +1617,19 @@ import {
      * markdown parse, DOM refs, scroll, attachments, and the auth/account shell.
      * Host fns are hoisted function declarations, so referencing them here (before
      * their definitions further down) is fine; the constructor never calls them. */
+    // Live identity read. Also snapshotted at Send time (PinnedDispatchContext) so
+    // a turn whose files are still uploading dispatches against the project/model
+    // it was asked of, not whatever is selected when the upload finishes.
+    function currentIdentity() {
+        return {
+            serviceId: S.serviceId, owner: S.owner,
+            userId: (S.user && S.user.user_id) || S.serviceId,
+            platform: S.aiPlatform, model: S.aiModel || undefined,
+            serviceName: S.serviceName, serviceDescription: S.serviceDescription,
+        };
+    }
     var session = new ChatSession({
-        getIdentity: function () {
-            return {
-                serviceId: S.serviceId, owner: S.owner,
-                userId: (S.user && S.user.user_id) || S.serviceId,
-                platform: S.aiPlatform, model: S.aiModel || undefined,
-                serviceName: S.serviceName, serviceDescription: S.serviceDescription,
-            };
-        },
+        getIdentity: function () { return currentIdentity(); },
         buildSystemPrompt: function () { return buildSystemPrompt(); },
         notify: function () { renderMessages(); },
         refreshMessageBubble: function (i) { refreshMessageBubble(i); },
@@ -1741,14 +1745,103 @@ import {
             .catch(function () { return false; });
     }
 
+    // A send with attachments is two serialized stages, chained SEPARATELY.
+    //
+    // Uploads run one at a time because a batch owns shared, single-instance
+    // machinery: the "this file exists" prompt is one modal, and the per-batch
+    // overwrite choice ("apply to all") is reset at the start of each run. Keeping
+    // them in send order also puts each turn's indexing requests on the server
+    // queue in that order.
+    //
+    // The dispatch stage is chained on its own so a turn waiting for indexing to
+    // finish does not hold up the NEXT send's uploads — that wait can run for
+    // minutes, and the point of all this is that the user is never blocked. Both
+    // chains are appended at Send time, so the turns still reach the server in the
+    // order they were typed.
+    var attachmentUploadChain = Promise.resolve();
+    var attachmentDispatchChain = Promise.resolve();
+    var attachmentBatchSeq = 0;
+    function enqueueAttachmentSend(job) {
+        var uploaded = attachmentUploadChain
+            .catch(function () { /* a failed batch must not stall the ones behind it */ })
+            .then(function () { return runAttachmentUpload(job); });
+        attachmentUploadChain = uploaded;
+        attachmentDispatchChain = attachmentDispatchChain
+            .catch(function () { /* likewise */ })
+            .then(function () { return uploaded; })
+            .then(function (urls) { return runAttachmentDispatch(job, urls); });
+    }
+
+    // Stage 1: upload this send's own batch of chips and enqueue their indexing.
+    // Resolves to the attachment urls, or null when the upload failed outright (the
+    // failure has been reported and nothing will be dispatched). Everything here
+    // happens AFTER the user has moved on, so it touches only what it captured at
+    // Send time.
+    function runAttachmentUpload(job) {
+        return session.uploadPendingAttachments(job.batchId).then(function (attachmentUrls) {
+            // Collect any failures (upload or indexing) now, grouped by error
+            // code + description, so we can report them once below.
+            var failureGroups = groupAttachmentFailures(CS.attachments.filter(function (a) {
+                return a._batchId === job.batchId;
+            }));
+            // Per-file "Indexing:" bubbles were already injected during upload (#1).
+            // Keep only this batch's FAILED chips (red/yellow) so the user can
+            // see/retry them; clear the successful ones.
+            clearSuccessfulAttachments(job.batchId);
+            if (failureGroups.length) showUploadErrorReport(failureGroups);
+            return attachmentUrls;
+        }).catch(function (err) {
+            console.error("[bunnyquery] attachment upload failed", err);
+            updateComposerControls(); renderAttachmentChips();
+            // Nothing will be dispatched, so settle the staged bubble rather than
+            // leaving it uploading forever — the user's text stays on screen above
+            // the failure instead of disappearing with it.
+            if (job.stageId) session.settleStagedMessage(job.stageId);
+            CS.messages.push({ role: "assistant", content: "Something went wrong while uploading attachments. " + ((err && err.message) || ""), isError: true });
+            renderMessages(); scrollToBottom(true);
+            return null;
+        });
+    }
+
+    // Stage 2: send the chat turn those files belong to LAST — after every indexing
+    // pass on the queue has finished, not merely after the uploads.
+    function runAttachmentDispatch(job, attachmentUrls) {
+        // Upload failed (already reported), or an attachment-only turn: the files
+        // are indexing and there is no chat message to send.
+        if (!attachmentUrls || !job.text) return Promise.resolve();
+        // The files are up; the turn is now just waiting its place in the queue.
+        if (job.stageId) session.markStagedMessageQueued(job.stageId);
+        // Indexing a file is a CHAIN — each pass is only enqueued once the previous
+        // one lands — so a turn sent when the uploads finish is answered from a
+        // half-read file, with the remaining passes queued up behind it. Wait for
+        // the background queue to actually drain. (Times out rather than stranding
+        // the message if a chain wedges server-side.)
+        return session.awaitIndexingDrained(job.pinned.identity).then(function () {
+            // Compose the user message (attachment-link block + office-extraction
+            // placeholders) via the shared engine helper — identical to agent.vue —
+            // then dispatch through the shared ChatSession (which owns the queued-
+            // vs-immediate decision, the cache+resume immediate-send model, the
+            // office extractContent, and the "-bg" queue routing). The pinned
+            // context carries the stage id so the bubble staged at Send time is
+            // replaced in place instead of a second one appearing at the bottom. A
+            // turn with attachments always goes on the "-bg" queue: that is the
+            // queue its files were indexed on, so it is the only one where being
+            // enqueued last means running last.
+            var c = composeUserMessage(job.text, attachmentUrls);
+            session.dispatchComposedMessage(c.composed, true, c.composedForLlm, c.extractContent, c.fileUrls, job.pinned);
+        });
+    }
+
     function sendMessage() {
         var inputEl = CS.messagesBox && CS.messagesBox.parentNode &&
             CS.messagesBox.parentNode.querySelector(".bq-input");
         var text = (inputEl ? inputEl.value : "").trim();
-        var hasAttachments = CS.attachments.length > 0;
+        // The chips THIS send takes. Chips already handed to an earlier send stay
+        // out of it (see composerAttachments).
+        var batchAttachments = composerAttachments();
+        var hasAttachments = batchAttachments.length > 0;
         if (!text && !hasAttachments) return;
         if (!chatEnabled() || S.aiPlatform === "none") return;
-        if (CS.uploadingAttachments) return; // already uploading; ignore double-submit
 
         // Over the attachment limit *with* a chat message: block the send. The
         // send button is disabled in this state, but the Enter key would bypass
@@ -1756,41 +1849,30 @@ import {
         recomputeAttachmentWarning();
         if (CS.attachmentWarning) { renderAttachmentChips(); updateComposerControls(); return; }
 
+        // Hand the composer back to the user before a single byte moves.
         if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
 
         if (!hasAttachments) { session.dispatchComposedMessage(text, false); return; }
 
-        // Upload attachments to db storage first, kick off background indexing,
-        // then send the (optional) chat turn on the bg queue so it runs AFTER
-        // the newly uploaded files have been indexed.
-        var bgBefore = bgTaskQueue.length;
-        session.uploadPendingAttachments().then(function (attachmentUrls) {
-            var hasNewIndexing = bgTaskQueue.length > bgBefore;
-            // Collect any failures (upload or indexing) now, grouped by error
-            // code + description, so we can report them once after the send below.
-            var failureGroups = groupAttachmentFailures(CS.attachments);
-            // Per-file "Indexing:" bubbles were already injected during upload (#1).
-            // Keep only the FAILED chips (red/yellow) so the user can see/retry;
-            // clear the successful ones.
-            clearSuccessfulAttachments();
-            if (text) {
-                // Compose the user message (attachment-link block + office-extraction
-                // placeholders) via the shared engine helper — identical to agent.vue —
-                // then dispatch through the shared ChatSession (which owns the queued-
-                // vs-immediate decision, the cache+resume immediate-send model, the
-                // office extractContent, and the "-bg" queue routing).
-                var c = composeUserMessage(text, attachmentUrls);
-                session.dispatchComposedMessage(c.composed, hasNewIndexing, c.composedForLlm, c.extractContent, c.fileUrls);
-            }
-            // After the uploads + indexing-queue requests are all made, surface a
-            // single report of everything that failed (grouped by error).
-            if (failureGroups.length) showUploadErrorReport(failureGroups);
-        }).catch(function (err) {
-            console.error("[bunnyquery] attachment upload failed", err);
-            CS.uploadingAttachments = false; updateComposerControls(); renderAttachmentChips();
-            CS.messages.push({ role: "assistant", content: "Something went wrong while uploading attachments. " + ((err && err.message) || ""), isError: true });
-            renderMessages(); scrollToBottom(true);
-        });
+        // The turn takes its chips with it (stamped with a batch id) and, when it
+        // has text, leaves a staged bubble behind so it holds the position it was
+        // sent in. Its files upload to db storage in the background, kicking off
+        // indexing; the chat turn then goes out on the bg queue so it runs AFTER
+        // those files are indexed — all of it behind whatever the user does next.
+        attachmentBatchSeq += 1;
+        var batchId = "batch_" + attachmentBatchSeq + "_" + Date.now();
+        batchAttachments.forEach(function (a) { a._batchId = batchId; });
+        // The chips just left the composer, so its affordances (Remove all, the
+        // warning) have to be recomputed now — the batch itself may not start for
+        // a while if an earlier one is still uploading.
+        recomputeAttachmentWarning(); renderAttachmentChips(); updateComposerControls();
+        var stageId = text ? session.stageOutgoingMessage(text) : undefined;
+        var pinned = {
+            identity: currentIdentity(),
+            systemPrompt: buildSystemPrompt(),
+            stageId: stageId,
+        };
+        enqueueAttachmentSend({ text: text, batchId: batchId, stageId: stageId, pinned: pinned });
     }
 
     function scrollToBottom(smooth) {
@@ -2119,9 +2201,19 @@ import {
         if (IMAGE_EXTENSION_RE.test(name) || type.indexOf("image/") === 0) return ESTIMATED_IMAGE_TOKENS;
         return 0; // unknown/opaque binary: web_fetch likely returns nothing useful
     }
+    // Chips that belong to the message being composed RIGHT NOW — everything not
+    // already handed to a send. Chips of an in-flight batch stay in the row (that
+    // is where their progress renders) but they belong to a message that is
+    // already on its way, so every composer-side rule reads this list instead of
+    // the raw one: the per-message file cap, the token budget, Send, Remove all.
+    function composerAttachments() {
+        return CS.attachments.filter(function (a) { return !a._batchId; });
+    }
     function attachmentsTokenEstimate() {
         var total = 0;
-        CS.attachments.forEach(function (a) {
+        // Composer chips only: the budget is per REQUEST, and an already-batched
+        // chip is part of a request that has been sent.
+        composerAttachments().forEach(function (a) {
             if (a.kind === "folder") { (a.files || []).forEach(function (f) { total += estimateFileTokenCost(f.file); }); }
             else if (a.file) total += estimateFileTokenCost(a.file);
         });
@@ -2130,7 +2222,7 @@ import {
     // Total FILE count (a folder counts as its file count), for the 20-file cap.
     function attachmentFileCount() {
         var n = 0;
-        CS.attachments.forEach(function (a) { n += (a.kind === "folder") ? (a.files ? a.files.length : 0) : 1; });
+        composerAttachments().forEach(function (a) { n += (a.kind === "folder") ? (a.files ? a.files.length : 0) : 1; });
         return n;
     }
     function currentInputTokenBudget() {
@@ -2191,6 +2283,8 @@ import {
     function appendAttachments(attObjs) {
         var seen = {};
         CS.attachments.forEach(function (a) { seen[attachmentKey(a)] = true; });
+        // Cap is per message, so it counts the composer's chips (attachmentFileCount)
+        // — files already handed to an in-flight send do not eat this budget.
         var remaining = MAX_ATTACHMENT_FILE_COUNT - attachmentFileCount();
         var dropped = 0;
         var changed = false;
@@ -2316,22 +2410,29 @@ import {
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
     }
+    // "Remove all" is a composer affordance: it drops what the user has staged for
+    // the NEXT message and leaves in-flight batches alone (those files belong to a
+    // message that is already sent — their own chip × cancels them individually).
     function clearAttachments() {
-        CS.attachments.forEach(function (a) { if (a._abort) { try { a._abort(); } catch (e) {} } });
-        CS.attachments = [];
+        CS.attachments = CS.attachments.filter(function (a) { return !!a._batchId; });
         CS.attachmentWarning = "";
         CS.attachmentCapNotice = "";
         renderAttachmentChips();
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
     }
-    // Keep only failed chips (red upload-fail / yellow index-fail) after a send so
-    // the user can see/retry them; clear the successfully-handled ones.
-    function clearSuccessfulAttachments() {
+    // Called when a batch finishes. Its successfully-handled chips go away; its
+    // failed ones (red upload-fail / yellow index-fail) are handed BACK to the
+    // composer — un-batched — so the next Send retries them. Chips belonging to
+    // other batches, and to the message being composed, are untouched.
+    function clearSuccessfulAttachments(batchId) {
         CS.attachments = CS.attachments.filter(function (a) {
-            return a.status === "error" || a.status === "indexError";
+            if (a._batchId !== batchId) return true;
+            if (a.status !== "error" && a.status !== "indexError") return false;
+            a._abort = null;
+            delete a._batchId;
+            return true;
         });
-        CS.attachments.forEach(function (a) { a._abort = null; });
         CS.attachmentCapNotice = "";
         recomputeAttachmentWarning();
         renderAttachmentChips();
@@ -2408,10 +2509,11 @@ import {
                 : formatBytes(att.file ? att.file.size : att.size);
             chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
             if (clickable) chip.appendChild(h("span", { class: "bq-attachment-arrow", text: "↗" }));
-            // Remove button: hidden during the upload batch (#2) and for finished
-            // (done) chips (the ↗ replaces it). Shown for pending + persisted
-            // failures so the user can clear them.
-            if (!CS.uploadingAttachments && att.status !== "done") {
+            // Remove button: hidden once the chip's bytes are moving (uploading) and
+            // for finished (done) chips (the ↗ replaces it). Shown for pending +
+            // persisted failures so the user can clear them — including a chip
+            // queued behind a big upload in the same batch.
+            if (att.status !== "uploading" && att.status !== "done") {
                 var rm = h("button", { class: "bq-attachment-remove", type: "button", title: "Remove", text: "×" });
                 rm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachment(att.id); });
                 chip.appendChild(rm);
@@ -2426,14 +2528,12 @@ import {
             var moreChip = h("div", { class: "bq-attachment bq-attachment-more",
                 title: moreNames.join("\n") });
             moreChip.appendChild(h("span", { class: "bq-attachment-name", text: "…(" + hidden.length + ") more" }));
-            if (!CS.uploadingAttachments) {
-                var moreRm = h("button", { class: "bq-attachment-remove", type: "button",
-                    title: "Remove these " + hidden.length, text: "×" });
-                moreRm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachments(hidden.map(function (a) { return a.id; })); });
-                moreChip.appendChild(moreRm);
-            }
+            var moreRm = h("button", { class: "bq-attachment-remove", type: "button",
+                title: "Remove these " + hidden.length, text: "×" });
+            moreRm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachments(hidden.map(function (a) { return a.id; })); });
+            moreChip.appendChild(moreRm);
             row.appendChild(moreChip);
-        } else if (!CS.uploadingAttachments && CS.attachments.length >= 2) {
+        } else if (composerAttachments().length >= 2) {
             var removeAll = h("button", { class: "bq-attachment-remove-all", type: "button",
                 title: "Remove all attachments" }, "Remove all ×");
             removeAll.addEventListener("click", function (e) { e.stopPropagation(); clearAttachments(); });
@@ -2452,15 +2552,17 @@ import {
         return ag < 99;
     }
     function updateComposerControls() {
-        var uploading = CS.uploadingAttachments;
-        if (CS.attachBtnEl) CS.attachBtnEl.disabled = uploading;
-        // #3: lock the chat input while the upload batch runs.
-        if (CS.inputEl) CS.inputEl.disabled = uploading;
-        // Block sending while uploading, or while an attachment warning is shown
-        // (too many files / over budget together with a chat message). The
-        // warning is only set when there is chat input text (recomputeAttachmentWarning).
-        // The cap notice (attachmentCapNotice) is informational and does NOT block.
-        if (CS.sendBtnEl) CS.sendBtnEl.disabled = uploading || !!CS.attachmentWarning;
+        // Nothing here is gated on CS.uploadingAttachments any more: a send whose
+        // files are still uploading has already left the composer (its chips are
+        // batched, its bubble is staged), so the user goes right on typing — and
+        // attaching — the next message.
+        if (CS.attachBtnEl) CS.attachBtnEl.disabled = false;
+        if (CS.inputEl) CS.inputEl.disabled = false;
+        // Block sending while an attachment warning is shown (too many files /
+        // over budget together with a chat message). The warning is only set when
+        // there is chat input text (recomputeAttachmentWarning). The cap notice
+        // (attachmentCapNotice) is informational and does NOT block.
+        if (CS.sendBtnEl) CS.sendBtnEl.disabled = !!CS.attachmentWarning;
     }
     function onAttachInputChange(inputEl) {
         if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -2817,7 +2919,8 @@ import {
             var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
             md.addEventListener("click", onBubbleLinkClick);
             bubble.appendChild(md);
-            if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
+            if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
+            else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
             var ts = formatChatTimestamp(msg._ts);

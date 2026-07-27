@@ -217,14 +217,15 @@ function isWindowedReadFile(name, mime) {
 }
 function composeUserMessage(text, attachmentUrls) {
   let composed = text;
+  let composedForLlm = composed;
   if (attachmentUrls.length > 0) {
     const lines = attachmentUrls.map((u) => `- [${u.name}](${u.url})`);
     composed = `${text}
 
 Attached files:
 ${lines.join("\n")}`;
+    composedForLlm = composed;
   }
-  let composedForLlm = composed;
   let extractContent;
   let fileUrls;
   if (attachmentUrls.length > 0) {
@@ -241,13 +242,13 @@ ${placeholder}
 ----- END FILE CONTENT -----`;
       });
       extractContent = directives;
-      composedForLlm = `${composed}
+      composedForLlm = `${composedForLlm}
 
 Extracted content of attached office files (read inline below; do NOT fetch their URLs):
 
 ` + sections.join("\n\n");
     }
-    const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name));
+    const urlFiles = [];
     if (urlFiles.length > 0) {
       fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
     }
@@ -291,6 +292,7 @@ File attachments: When a user message contains an "Attached files:" section with
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY had their text extracted on the server and inlined in the same message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read it directly there and do NOT call web_fetch for those files. A "[skapi: ...]" note in that block means the file could not be extracted.
 - For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.
+Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files, but be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
 File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
 File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
 File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
@@ -1432,7 +1434,7 @@ async function notifyAgentSaveAttachment(info) {
     const imageDetail = getOpenAIImageDetail(resolvedModel2);
     return clientSecretRequest({
       clientSecretName: "openai",
-      queue: (info.userId || service) + BG_INDEXING_QUEUE_SUFFIX,
+      queue: bgIndexingQueueName(info.userId, service),
       service,
       owner,
       ...pollOpt(),
@@ -1476,7 +1478,7 @@ async function notifyAgentSaveAttachment(info) {
   const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
   return clientSecretRequest({
     clientSecretName: "claude",
-    queue: (info.userId || service) + BG_INDEXING_QUEUE_SUFFIX,
+    queue: bgIndexingQueueName(info.userId, service),
     service,
     owner,
     ...pollOpt(),
@@ -1590,6 +1592,9 @@ async function listOpenAIModels(service, owner) {
   });
 }
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+function bgIndexingQueueName(userId, service) {
+  return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
+}
 function isBgIndexingQueue(queueName) {
   if (typeof queueName !== "string" || !queueName) return false;
   const prefix = queueName.split("|")[0];
@@ -1829,6 +1834,11 @@ function createHistoryFiller(base) {
 // src/engine/session.ts
 var WORKER_PASS_ADOPT_LIMIT = 20;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
+var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
+var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
+var INDEXING_DRAIN_IDLE_LOOKS = 2;
+var INDEXING_DRAIN_MIN_MS = 8e3;
+var INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1e3;
 var _g = typeof globalThis !== "undefined" ? globalThis : {};
 function nowMs() {
   return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
@@ -1901,6 +1911,25 @@ var ChatSession = class {
     this._pauseReasons = /* @__PURE__ */ new Set();
     this._resuming = false;
     this._lidSeq = 0;
+    this._stageSeq = 0;
+    this._uploadBatches = 0;
+    this._indexDispatchesInFlight = 0;
+  }
+  /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
+   *  live work from the moment it is sent, not from the moment it is acked. */
+  trackIndexDispatch(p) {
+    var self = this;
+    this._indexDispatchesInFlight += 1;
+    var release = function() {
+      self._indexDispatchesInFlight = Math.max(0, self._indexDispatchesInFlight - 1);
+    };
+    return p.then(function(v) {
+      release();
+      return v;
+    }, function(e) {
+      release();
+      throw e;
+    });
   }
   /**
    * Register a live poll so (a) a remount dedupes against it instead of stacking a
@@ -2006,6 +2035,7 @@ var ChatSession = class {
     if (!key) return;
     this.aiChatHistoryCache[key] = {
       messages: this.state.messages.filter(function(m) {
+        if (m._stageId) return false;
         return m._ownerKey === void 0 || m._ownerKey === key;
       }),
       endOfList: this.state.historyEndOfList,
@@ -2145,14 +2175,189 @@ var ChatSession = class {
     this.pendingAgentRequests[params.key] = run;
     return run;
   }
+  /**
+   * Put a turn on screen the INSTANT the user hits Send, before its attachments
+   * have finished uploading. Uploads run in the background now (the composer is
+   * cleared and stays usable), so without a staged bubble the message would
+   * appear only once its files were up — below anything the user sent in the
+   * meantime, in an order that never matches what they typed.
+   *
+   * Staged bubbles carry _useBgQueue because that is where a turn with
+   * attachments ultimately dispatches (behind its own indexing tasks). That flag
+   * is also what keeps promoteNextQueuedToRunning / resolveQueuedUserBubble off
+   * them: those advance the SERVER queue, and a staged turn has no server
+   * request behind it yet.
+   *
+   * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
+   */
+  stageOutgoingMessage(displayText) {
+    this._stageSeq += 1;
+    var stageId = "stg_" + this._stageSeq;
+    var key = this.getHistoryCacheKey();
+    var staged = {
+      role: "user",
+      content: displayText,
+      isPendingQueued: true,
+      isUploadingAttachments: true,
+      isSendingToServer: true,
+      _useBgQueue: true,
+      _stageId: stageId,
+      _ts: wallClockNow()
+    };
+    if (key) staged._ownerKey = key;
+    this.state.messages.push(staged);
+    this.host.notify();
+    this.host.scrollToBottom(true);
+    return stageId;
+  }
+  _stageIndex(list, stageId) {
+    if (!stageId) return -1;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i]._stageId === stageId) return i;
+    }
+    return -1;
+  }
+  /**
+   * Where a staged turn belongs once it is finally sent: BELOW every indexing
+   * row, because that is the order it ran in and the order the server history
+   * will report on the next load (its request id is newer than every pass it
+   * waited for). While its files were uploading it sat above them — the rows
+   * are injected as each file's pass starts, after the bubble was staged.
+   *
+   * Returns the index to insert at, or -1 to leave the turn where it is. Never
+   * moves a turn UP: a bubble that already sits below the indexing rows (or a
+   * chat with no indexing at all) must not jump backwards over anything.
+   */
+  _settledStagePosition(fromIdx) {
+    var lastBg = -1;
+    for (var i = 0; i < this.state.messages.length; i++) {
+      if (this.state.messages[i] && this.state.messages[i].isBackgroundTask) lastBg = i;
+    }
+    if (lastBg <= fromIdx) return -1;
+    return lastBg;
+  }
+  /** The staged turn's files are up; it is now just waiting its place in the
+   *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
+  markStagedMessageQueued(stageId) {
+    var idx = this._stageIndex(this.state.messages, stageId);
+    if (idx === -1) return;
+    var ex = this.state.messages[idx];
+    if (!ex.isUploadingAttachments) return;
+    this.state.messages[idx] = Object.assign({}, ex, { isUploadingAttachments: false });
+    this.host.notify();
+  }
+  /**
+   * Resolves once this project's background-indexing queue has nothing left to
+   * run, so a chat enqueued right after it is genuinely last.
+   *
+   * Sending the chat as soon as the uploads finish is not enough, which is the
+   * whole reason this exists: indexing a file is a CHAIN, and each pass is only
+   * enqueued once the previous one lands (the client mints CONTINUE passes for
+   * text/grid files, the worker mints them for PDFs and windowed reads). Every
+   * one of those passes therefore queues up BEHIND a chat sent at upload time,
+   * and the model answers from a file it has only partly read.
+   *
+   * The queue is read from the server's status index rather than from
+   * bgTaskQueue: that mirror holds only what this client dispatched or adopted,
+   * and it stops being maintained once the view unmounts. An empty answer has to
+   * repeat before it is believed — see INDEXING_DRAIN_IDLE_LOOKS — and a look
+   * that fails counts as busy, so a dropped request delays the turn instead of
+   * releasing it early.
+   *
+   * Reads the identity PINNED at Send time, never a live one: the user may be in
+   * another project by now, and this must keep asking about the one they sent
+   * from.
+   */
+  awaitIndexingDrained(identity) {
+    var self = this;
+    var svcId = identity && identity.serviceId;
+    var platform = identity && identity.platform;
+    if (!svcId || platform !== "claude" && platform !== "openai") return Promise.resolve("skipped");
+    var owner = identity.owner;
+    var queue = bgIndexingQueueName(identity.userId, svcId);
+    var startedAt = nowMs();
+    var deadline = startedAt + INDEXING_DRAIN_TIMEOUT_MS;
+    var idleLooks = 0;
+    var ask = function(status) {
+      return Promise.resolve(getChatHistory(
+        { service: svcId, owner, platform, queue, status },
+        { limit: WORKER_PASS_ADOPT_LIMIT }
+      )).catch(function() {
+        return null;
+      });
+    };
+    var hasLiveIndexing = function(res) {
+      var list = res && Array.isArray(res.list) ? res.list : [];
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        if (!item || item.status !== "pending" && item.status !== "running") continue;
+        if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) return true;
+      }
+      return false;
+    };
+    return new Promise(function(resolve) {
+      var again = function() {
+        setTimeout(look, idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS);
+      };
+      var look = function() {
+        if (nowMs() >= deadline) {
+          resolve("timedout");
+          return;
+        }
+        if (self._indexDispatchesInFlight > 0) {
+          idleLooks = 0;
+          again();
+          return;
+        }
+        Promise.all([ask("running"), ask("pending")]).then(function(res) {
+          var unknown = res[0] === null || res[1] === null;
+          if (unknown || hasLiveIndexing(res[0]) || hasLiveIndexing(res[1])) idleLooks = 0;
+          else idleLooks += 1;
+          if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) {
+            resolve("drained");
+            return;
+          }
+          again();
+        }, function() {
+          idleLooks = 0;
+          again();
+        });
+      };
+      look();
+    });
+  }
+  /**
+   * Abandon a staged turn — its uploads failed outright, so nothing will be
+   * dispatched. The bubble stays (the user's text is not silently thrown away)
+   * but settles into a plain, non-pending message; the caller reports the
+   * failure separately.
+   */
+  settleStagedMessage(stageId) {
+    var idx = this._stageIndex(this.state.messages, stageId);
+    if (idx === -1) return;
+    var ex = this.state.messages[idx];
+    var settled = { role: "user", content: ex.content };
+    if (ex._ownerKey !== void 0) settled._ownerKey = ex._ownerKey;
+    if (ex._ts !== void 0) settled._ts = ex._ts;
+    this.state.messages[idx] = settled;
+    this.host.notify();
+    this.updateHistoryCache();
+  }
   // composed = clean display text; composedForLlm carries office-extraction
   // placeholders for the provider only. useBgQueue routes a post-attachment turn
   // onto the "-bg" queue so it runs after indexing.
   dispatchComposedMessage(composed, useBgQueue, composedForLlm, extractContent, fileUrls, pinned) {
     var self = this;
-    if (!composed) return;
+    var stageId = pinned ? pinned.stageId : void 0;
+    if (!composed) {
+      if (stageId) this.settleStagedMessage(stageId);
+      return;
+    }
     var id = pinned ? pinned.identity : this.host.getIdentity();
-    if (id.platform === "none") return;
+    if (id.platform === "none") {
+      if (stageId) this.settleStagedMessage(stageId);
+      return;
+    }
     var llmComposed = composedForLlm || composed;
     var key = !id.serviceId ? "" : id.serviceId + "#" + id.platform;
     var offChat = !!key && key !== this.getHistoryCacheKey();
@@ -2163,7 +2368,7 @@ var ChatSession = class {
     var aiModel = id.model || void 0;
     var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
     var userId = id.userId || id.serviceId;
-    var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
+    var chatQueue = useBgQueue ? bgIndexingQueueName(userId) : userId;
     if (offChat) {
       var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function(m) {
         return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
@@ -2176,9 +2381,16 @@ var ChatSession = class {
         history: offHistory.concat([{ role: "user", content: llmComposed }])
       });
       var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+      var offUser = { role: "user", content: composed, _ownerKey: key, _ts: wallClockNow() };
+      var offStage = this._stageIndex(this.state.messages, stageId);
+      if (offStage !== -1) {
+        if (this.state.messages[offStage]._ts !== void 0) offUser._ts = this.state.messages[offStage]._ts;
+        this.state.messages.splice(offStage, 1);
+        this.host.notify();
+      }
       this.aiChatHistoryCache[key] = {
         messages: offExisting.messages.concat([
-          { role: "user", content: composed, _ownerKey: key, _ts: wallClockNow() },
+          offUser,
           { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
         ]),
         endOfList: offExisting.endOfList,
@@ -2213,14 +2425,26 @@ var ChatSession = class {
       var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
       if (key) queuedBubble._ownerKey = key;
       if (useBgQueue) queuedBubble._useBgQueue = true;
-      this.state.messages.push(queuedBubble);
+      var qStage = this._stageIndex(this.state.messages, stageId);
+      if (qStage !== -1) {
+        if (this.state.messages[qStage]._ts !== void 0) queuedBubble._ts = this.state.messages[qStage]._ts;
+        var qTarget = this._settledStagePosition(qStage);
+        if (qTarget === -1) {
+          this.state.messages.splice(qStage, 1, queuedBubble);
+        } else {
+          this.state.messages.splice(qStage, 1);
+          this.state.messages.splice(qTarget, 0, queuedBubble);
+        }
+      } else {
+        this.state.messages.push(queuedBubble);
+      }
       this.host.notify();
       this.updateHistoryCache();
       this.host.scrollToBottom(true);
       var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
       Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner)).then(function(result) {
         var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
-          return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
+          return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
         });
         var serverId = result && typeof result.id === "string" ? result.id : void 0;
         if (sendingIdx >= 0) {
@@ -2245,23 +2469,31 @@ var ChatSession = class {
       });
       return;
     }
-    this.state.messages.push({ role: "user", content: composed, _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} });
-    this.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} });
+    var immediateUser = { role: "user", content: composed, _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
+    var immediatePlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} };
+    var iStage = this._stageIndex(this.state.messages, stageId);
+    if (iStage !== -1) {
+      if (this.state.messages[iStage]._ts !== void 0) immediateUser._ts = this.state.messages[iStage]._ts;
+      var iTarget = this._settledStagePosition(iStage);
+      if (iTarget === -1) {
+        this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
+      } else {
+        this.state.messages.splice(iStage, 1);
+        this.state.messages.splice(iTarget, 0, immediateUser, immediatePlaceholder);
+      }
+    } else {
+      this.state.messages.push(immediateUser);
+      this.state.messages.push(immediatePlaceholder);
+    }
     this.host.notify();
     this.updateHistoryCache();
     this.state.sending = true;
     this.host.scrollToBottom(true);
     var historyForLlm = this.state.messages.filter(function(m) {
+      if (m === immediateUser) return false;
       return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
     });
-    if (llmComposed !== composed) {
-      for (var li = historyForLlm.length - 1; li >= 0; li--) {
-        if (historyForLlm[li].role === "user" && historyForLlm[li].content === composed) {
-          historyForLlm[li] = Object.assign({}, historyForLlm[li], { content: llmComposed });
-          break;
-        }
-      }
-    }
+    historyForLlm.push({ role: "user", content: llmComposed });
     var bounded = buildBoundedChatMessages({
       platform: aiPlatform,
       model: aiModel,
@@ -2502,7 +2734,7 @@ var ChatSession = class {
     if (platform !== "claude" && platform !== "openai") return;
     var url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
     var queueBase = id.userId || id.serviceId;
-    var queue = msg.isBackgroundTask || msg._useBgQueue ? queueBase + BG_INDEXING_QUEUE_SUFFIX : queueBase;
+    var queue = msg.isBackgroundTask || msg._useBgQueue ? bgIndexingQueueName(queueBase) : queueBase;
     this.state.messages[idx] = Object.assign({}, msg, { _cancelling: true, _cancelError: void 0 });
     this.host.notify();
     Promise.resolve(this.host.cancelRequest({
@@ -2988,7 +3220,7 @@ var ChatSession = class {
     if (!id.serviceId || platform !== "claude" && platform !== "openai") return;
     if (this.isPollingPaused() || !this.host.isViewMounted()) return;
     var svcId = id.serviceId, owner = id.owner;
-    var queue = (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX;
+    var queue = bgIndexingQueueName(id.userId, id.serviceId);
     var ask = function(status) {
       return Promise.resolve(getChatHistory(
         { service: svcId, owner, platform, queue, status },
@@ -3090,7 +3322,7 @@ var ChatSession = class {
       url,
       method: "POST",
       id: serverId,
-      queue: (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX,
+      queue: bgIndexingQueueName(id.userId, id.serviceId),
       service: id.serviceId,
       owner: id.owner
     })).catch(function() {
@@ -3219,7 +3451,7 @@ var ChatSession = class {
       if (pass > MAX_INDEXING_RESUME_PASSES) return;
       var id = this.host.getIdentity();
       if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
-      notifyAgentContinueIndexing({
+      this.trackIndexDispatch(notifyAgentContinueIndexing({
         platform: id.platform,
         model: id.model,
         service: id.serviceId,
@@ -3253,7 +3485,7 @@ var ChatSession = class {
         }
       }, function(e) {
         console.error("[chat-engine] resume-indexing dispatch failed", e);
-      });
+      }));
     } catch (e) {
     }
   }
@@ -3331,6 +3563,10 @@ var ChatSession = class {
           if (mm._ownerKey !== void 0 && mm._ownerKey !== loadKey) continue;
           if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
           if (!mm._serverItemId) {
+            if (mm._stageId) {
+              rescued.push(mm);
+              continue;
+            }
             if (mappedHasPendingAssistant) continue;
             if (mm.isSendingToServer || mm.isPendingQueued || mm.isPendingInProcess || mm.isPending) rescued.push(mm);
             else if (self.state.sending && mm.role === "user") {
@@ -3550,7 +3786,7 @@ var ChatSession = class {
           return preIndex.then(function() {
             return parseAttachmentContent(member.file, member.file.name, mime || void 0);
           }).then(function(parsedContent) {
-            return notifyAgentSaveAttachment({
+            return self.trackIndexDispatch(notifyAgentSaveAttachment({
               platform: id.platform,
               model: id.model,
               service: id.serviceId,
@@ -3589,7 +3825,7 @@ var ChatSession = class {
                 att.errorCode = e && (e.code || e.body && e.body.code) || "";
                 att.errorDetail = e && (e.message || e.body && e.body.message) || (typeof e === "string" ? e : "");
               }
-            });
+            }));
           });
         });
       });
@@ -3608,14 +3844,24 @@ var ChatSession = class {
   }
   // Upload all not-yet-done attachments sequentially. Resolves to the full
   // list of { name, url, storagePath } for composing the chat message.
-  uploadPendingAttachments() {
+  //
+  // `batchId` scopes the run to the chips stamped with it at Send time. The
+  // composer stays live during an upload, so by the time this runs the
+  // attachment list can already hold chips the user picked for the NEXT
+  // message — uploading those here would attach them to the wrong turn, and
+  // collecting the previous batch's finished urls would attach files the user
+  // already sent. Omitted (no batch) means every chip, the old behavior.
+  uploadPendingAttachments(batchId) {
     var self = this;
     this.host.resetOverwriteBatch();
+    this._uploadBatches += 1;
     this.state.uploadingAttachments = true;
     this.host.updateComposerControls();
     this.host.renderAttachmentChips();
     var collected = [];
-    var snapshot = this.state.attachments.slice();
+    var snapshot = this.state.attachments.filter(function(a) {
+      return batchId ? a._batchId === batchId : true;
+    });
     var chain = Promise.resolve();
     snapshot.forEach(function(att) {
       chain = chain.then(function() {
@@ -3651,7 +3897,8 @@ var ChatSession = class {
       });
     });
     var done = function() {
-      self.state.uploadingAttachments = false;
+      self._uploadBatches = Math.max(0, self._uploadBatches - 1);
+      self.state.uploadingAttachments = self._uploadBatches > 0;
       self.host.updateComposerControls();
       self.host.renderAttachmentChips();
       return collected;
@@ -3857,6 +4104,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

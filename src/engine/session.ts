@@ -28,7 +28,7 @@ import {
 	extractOpenAIText,
 	getChatHistory,
 	POLL_INTERVAL,
-	BG_INDEXING_QUEUE_SUFFIX,
+	bgIndexingQueueName,
 	isBgIndexingQueue,
 	ANTHROPIC_MESSAGES_API_URL,
 	OPENAI_RESPONSES_API_URL,
@@ -42,7 +42,7 @@ import { createInlineLinkRegex } from './links';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
-import type { ChatHost, ChatState, ChatMessage, PinnedDispatchContext } from './host';
+import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
 import type { IndexingGroup } from './indexing_groups';
 
 function sleep(ms: number): Promise<void> {
@@ -58,6 +58,30 @@ const WORKER_PASS_ADOPT_LIMIT = 20;
 // current one, so a look that wins that race sees an empty queue for a chain
 // that is still alive. Fixed and finite: this must never become a poll.
 const WORKER_PASS_ADOPT_ATTEMPTS = [0, 2000, 6000];
+
+// awaitIndexingDrained: how often it re-asks the background-indexing queue, and
+// how many consecutive empty answers it needs before believing the chains are
+// over. More than one for the same reason the adopt ladder above looks twice —
+// pass N+1 is written just after pass N resolves, so a single look lands in that
+// gap and reports an idle queue for a file that is still being read.
+//
+// Two cadences: while work is visibly running there is nothing to be gained by
+// asking often (an indexing pass takes tens of seconds, and a big file can hold
+// the queue for many minutes), but once the queue looks empty the confirming
+// look is all that stands between the user and their answer.
+const INDEXING_DRAIN_BUSY_POLL_MS = 8000;
+const INDEXING_DRAIN_CONFIRM_POLL_MS = 3000;
+const INDEXING_DRAIN_IDLE_LOOKS = 2;
+// Floor on the whole wait. The status index is eventually consistent, so the
+// pass this turn's own upload just enqueued can be missing from the first looks —
+// releasing on those would send the chat ahead of the very files it is asking
+// about. Costs nothing in the normal case, where the queue reports work
+// immediately and the wait is far longer than this anyway.
+const INDEXING_DRAIN_MIN_MS = 8000;
+// Ceiling on that wait. Past it the turn is sent regardless: an answer computed
+// against a partly-indexed file is a poor outcome, but a question that is never
+// asked at all because one chain wedged server-side is a worse one.
+const INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1000;
 
 // requestAnimationFrame / high-res clock, reached through globalThis so the
 // engine stays DOM-free at the type level (and degrades gracefully in non-DOM
@@ -107,6 +131,17 @@ export class ChatSession {
 	private _pauseReasons: Set<string>;
 	private _resuming: boolean;
 	private _lidSeq: number;
+	private _stageSeq: number;
+	/** How many attachment-upload batches are running. uploadingAttachments is a
+	 *  single flag but batches overlap (the composer stays live, so the user can
+	 *  send a second one while the first uploads), and a nested finish must not
+	 *  clear the flag out from under the batch still running. */
+	private _uploadBatches: number;
+	/** Indexing requests whose ack has not come back yet. Until it does the item
+	 *  is not on the server's queue, so awaitIndexingDrained cannot see it — and
+	 *  would read the gap between "pass N settled" and "pass N+1 accepted" as the
+	 *  file being finished. */
+	private _indexDispatchesInFlight: number;
 
 	constructor(host: ChatHost) {
 		this.host = host;
@@ -133,6 +168,18 @@ export class ChatSession {
 		this._pauseReasons = new Set();
 		this._resuming = false;
 		this._lidSeq = 0;
+		this._stageSeq = 0;
+		this._uploadBatches = 0;
+		this._indexDispatchesInFlight = 0;
+	}
+
+	/** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
+	 *  live work from the moment it is sent, not from the moment it is acked. */
+	trackIndexDispatch<T>(p: Promise<T>): Promise<T> {
+		var self = this;
+		this._indexDispatchesInFlight += 1;
+		var release = function () { self._indexDispatchesInFlight = Math.max(0, self._indexDispatchesInFlight - 1); };
+		return p.then(function (v) { release(); return v; }, function (e) { release(); throw e; });
 	}
 
 	/**
@@ -252,8 +299,15 @@ export class ChatSession {
 		// replay on every later visit to B. Bubbles with no _ownerKey (server
 		// history, bg tasks) are always kept. Single pass: this runs on the
 		// typewriter hot path.
+		//
+		// Staged bubbles (_stageId) are never cached. What resolves one is an
+		// in-page upload; a reload kills that upload but not the cache, so a cached
+		// staged bubble would come back as a message that uploads forever. Dropping
+		// it costs nothing while the page lives — a history refetch re-rescues it
+		// from state.messages, and a dispatch that no longer finds it just appends.
 		this.aiChatHistoryCache[key] = {
 			messages: this.state.messages.filter(function (m) {
+				if (m._stageId) return false;
 				return m._ownerKey === undefined || m._ownerKey === key;
 			}),
 			endOfList: this.state.historyEndOfList,
@@ -432,12 +486,177 @@ export class ChatSession {
 		return run;
 	}
 
+	/**
+	 * Put a turn on screen the INSTANT the user hits Send, before its attachments
+	 * have finished uploading. Uploads run in the background now (the composer is
+	 * cleared and stays usable), so without a staged bubble the message would
+	 * appear only once its files were up — below anything the user sent in the
+	 * meantime, in an order that never matches what they typed.
+	 *
+	 * Staged bubbles carry _useBgQueue because that is where a turn with
+	 * attachments ultimately dispatches (behind its own indexing tasks). That flag
+	 * is also what keeps promoteNextQueuedToRunning / resolveQueuedUserBubble off
+	 * them: those advance the SERVER queue, and a staged turn has no server
+	 * request behind it yet.
+	 *
+	 * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
+	 */
+	stageOutgoingMessage(displayText: string): string {
+		this._stageSeq += 1;
+		var stageId = 'stg_' + this._stageSeq;
+		var key = this.getHistoryCacheKey();
+		var staged: ChatMessage = {
+			role: 'user', content: displayText,
+			isPendingQueued: true, isUploadingAttachments: true, isSendingToServer: true,
+			_useBgQueue: true, _stageId: stageId, _ts: wallClockNow(),
+		};
+		if (key) staged._ownerKey = key;
+		this.state.messages.push(staged);
+		this.host.notify(); this.host.scrollToBottom(true);
+		return stageId;
+	}
+
+	private _stageIndex(list: ChatMessage[], stageId?: string): number {
+		if (!stageId) return -1;
+		for (var i = 0; i < list.length; i++) {
+			if (list[i] && list[i]._stageId === stageId) return i;
+		}
+		return -1;
+	}
+
+	/**
+	 * Where a staged turn belongs once it is finally sent: BELOW every indexing
+	 * row, because that is the order it ran in and the order the server history
+	 * will report on the next load (its request id is newer than every pass it
+	 * waited for). While its files were uploading it sat above them — the rows
+	 * are injected as each file's pass starts, after the bubble was staged.
+	 *
+	 * Returns the index to insert at, or -1 to leave the turn where it is. Never
+	 * moves a turn UP: a bubble that already sits below the indexing rows (or a
+	 * chat with no indexing at all) must not jump backwards over anything.
+	 */
+	private _settledStagePosition(fromIdx: number): number {
+		var lastBg = -1;
+		for (var i = 0; i < this.state.messages.length; i++) {
+			if (this.state.messages[i] && this.state.messages[i].isBackgroundTask) lastBg = i;
+		}
+		if (lastBg <= fromIdx) return -1;
+		// Splicing the staged bubble out first shifts everything after it down one.
+		return lastBg;
+	}
+
+	/** The staged turn's files are up; it is now just waiting its place in the
+	 *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
+	markStagedMessageQueued(stageId: string): void {
+		var idx = this._stageIndex(this.state.messages, stageId);
+		if (idx === -1) return;
+		var ex = this.state.messages[idx];
+		if (!ex.isUploadingAttachments) return;
+		this.state.messages[idx] = Object.assign({}, ex, { isUploadingAttachments: false });
+		this.host.notify();
+	}
+
+	/**
+	 * Resolves once this project's background-indexing queue has nothing left to
+	 * run, so a chat enqueued right after it is genuinely last.
+	 *
+	 * Sending the chat as soon as the uploads finish is not enough, which is the
+	 * whole reason this exists: indexing a file is a CHAIN, and each pass is only
+	 * enqueued once the previous one lands (the client mints CONTINUE passes for
+	 * text/grid files, the worker mints them for PDFs and windowed reads). Every
+	 * one of those passes therefore queues up BEHIND a chat sent at upload time,
+	 * and the model answers from a file it has only partly read.
+	 *
+	 * The queue is read from the server's status index rather than from
+	 * bgTaskQueue: that mirror holds only what this client dispatched or adopted,
+	 * and it stops being maintained once the view unmounts. An empty answer has to
+	 * repeat before it is believed — see INDEXING_DRAIN_IDLE_LOOKS — and a look
+	 * that fails counts as busy, so a dropped request delays the turn instead of
+	 * releasing it early.
+	 *
+	 * Reads the identity PINNED at Send time, never a live one: the user may be in
+	 * another project by now, and this must keep asking about the one they sent
+	 * from.
+	 */
+	awaitIndexingDrained(identity: ChatIdentity): Promise<'drained' | 'timedout' | 'skipped'> {
+		var self = this;
+		var svcId = identity && identity.serviceId;
+		var platform = identity && identity.platform;
+		if (!svcId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve('skipped' as const);
+		var owner = identity.owner;
+		var queue = bgIndexingQueueName(identity.userId, svcId);
+		var startedAt = nowMs();
+		var deadline = startedAt + INDEXING_DRAIN_TIMEOUT_MS;
+		var idleLooks = 0;
+		var ask = function (status: 'pending' | 'running') {
+			return Promise.resolve(getChatHistory(
+				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
+				{ limit: WORKER_PASS_ADOPT_LIMIT },
+			)).catch(function () { return null; });
+		};
+		// Ordinary chats are routed onto this queue too (_isOnBgQueue), and those
+		// are not work this turn has to wait behind — the server runs the queue in
+		// order, so being enqueued after them is enough.
+		var hasLiveIndexing = function (res: any): boolean {
+			var list = res && Array.isArray(res.list) ? res.list : [];
+			for (var i = 0; i < list.length; i++) {
+				var item = list[i];
+				if (!item || (item.status !== 'pending' && item.status !== 'running')) continue;
+				if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) return true;
+			}
+			return false;
+		};
+		return new Promise(function (resolve) {
+			var again = function () {
+				setTimeout(look, idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS);
+			};
+			var look = function () {
+				if (nowMs() >= deadline) { resolve('timedout'); return; }
+				// A pass whose ack is still in flight is not on the queue yet, so no
+				// look can see it.
+				if (self._indexDispatchesInFlight > 0) { idleLooks = 0; again(); return; }
+				Promise.all([ask('running'), ask('pending')]).then(function (res: any[]) {
+					var unknown = res[0] === null || res[1] === null;
+					if (unknown || hasLiveIndexing(res[0]) || hasLiveIndexing(res[1])) idleLooks = 0;
+					else idleLooks += 1;
+					if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) {
+						resolve('drained'); return;
+					}
+					again();
+				}, function () { idleLooks = 0; again(); });
+			};
+			look();
+		});
+	}
+
+	/**
+	 * Abandon a staged turn — its uploads failed outright, so nothing will be
+	 * dispatched. The bubble stays (the user's text is not silently thrown away)
+	 * but settles into a plain, non-pending message; the caller reports the
+	 * failure separately.
+	 */
+	settleStagedMessage(stageId: string): void {
+		var idx = this._stageIndex(this.state.messages, stageId);
+		if (idx === -1) return;
+		var ex = this.state.messages[idx];
+		var settled: ChatMessage = { role: 'user', content: ex.content };
+		if (ex._ownerKey !== undefined) settled._ownerKey = ex._ownerKey;
+		if (ex._ts !== undefined) settled._ts = ex._ts;
+		this.state.messages[idx] = settled;
+		this.host.notify(); this.updateHistoryCache();
+	}
+
 	// composed = clean display text; composedForLlm carries office-extraction
 	// placeholders for the provider only. useBgQueue routes a post-attachment turn
 	// onto the "-bg" queue so it runs after indexing.
 	dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void {
 		var self = this;
-		if (!composed) return;
+		// This turn may already have a bubble on screen, staged at Send time while
+		// its attachments uploaded. Every exit from here has to account for it:
+		// dispatching replaces it in place (so it keeps the position the user sent
+		// it in), and bailing settles it (so it never sits uploading forever).
+		var stageId = pinned ? pinned.stageId : undefined;
+		if (!composed) { if (stageId) this.settleStagedMessage(stageId); return; }
 		// A send can be dispatched LONG after the user hit Send (attachment
 		// uploads are awaited first), by which time the live identity may have
 		// moved to another project. The caller pins the identity + system prompt
@@ -445,7 +664,7 @@ export class ChatSession {
 		// question was actually asked of. Falls back to the live read when the
 		// caller doesn't pin (the widget, which has only one project anyway).
 		var id = pinned ? pinned.identity : this.host.getIdentity();
-		if (id.platform === 'none') return;
+		if (id.platform === 'none') { if (stageId) this.settleStagedMessage(stageId); return; }
 
 		var llmComposed = composedForLlm || composed;
 
@@ -469,7 +688,13 @@ export class ChatSession {
 		var aiModel = id.model || undefined;
 		var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
 		var userId = id.userId || id.serviceId;
-		var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
+		// Same string the indexing passes are enqueued under (bgIndexingQueueName),
+		// which is the whole reason this turn ends up behind them: the backend runs
+		// different queue names in parallel and only serialises a shared one.
+		var chatQueue = useBgQueue ? bgIndexingQueueName(userId) : userId;
+		// _stageIndex is -1 when nothing was staged, or when the staged bubble is
+		// gone (a remount rebuilds the list from the cache, which never holds staged
+		// bubbles); either way the branches below fall back to appending.
 
 		if (offChat) {
 			// Stage the turn in the pinned chat's cache and dispatch. The
@@ -486,9 +711,21 @@ export class ChatSession {
 				history: offHistory.concat([{ role: 'user', content: llmComposed }]),
 			});
 			var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
+			var offUser: ChatMessage = { role: 'user', content: composed, _ownerKey: key, _ts: wallClockNow() };
+			// The user hit Send here, then navigated away before the uploads
+			// finished. The staged bubble belongs to THAT chat, not the one now on
+			// screen, and the turn it stood in for is being cached below — so drop
+			// it from the live list instead of leaving a bubble that uploads
+			// forever in a project it does not belong to.
+			var offStage = this._stageIndex(this.state.messages, stageId);
+			if (offStage !== -1) {
+				if (this.state.messages[offStage]._ts !== undefined) offUser._ts = this.state.messages[offStage]._ts;
+				this.state.messages.splice(offStage, 1);
+				this.host.notify();
+			}
 			this.aiChatHistoryCache[key] = {
 				messages: offExisting.messages.concat([
-					{ role: 'user', content: composed, _ownerKey: key, _ts: wallClockNow() },
+					offUser,
 					{ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, _ownerKey: key },
 				]),
 				endOfList: offExisting.endOfList,
@@ -514,7 +751,20 @@ export class ChatSession {
 			var queuedBubble: ChatMessage = { role: 'user', content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
 			if (key) queuedBubble._ownerKey = key;
 			if (useBgQueue) queuedBubble._useBgQueue = true;
-			this.state.messages.push(queuedBubble);
+			var qStage = this._stageIndex(this.state.messages, stageId);
+			if (qStage !== -1) {
+				// Keep the send time the user saw, not the upload's finish time.
+				if (this.state.messages[qStage]._ts !== undefined) queuedBubble._ts = this.state.messages[qStage]._ts;
+				var qTarget = this._settledStagePosition(qStage);
+				if (qTarget === -1) {
+					this.state.messages.splice(qStage, 1, queuedBubble);
+				} else {
+					this.state.messages.splice(qStage, 1);
+					this.state.messages.splice(qTarget, 0, queuedBubble);
+				}
+			} else {
+				this.state.messages.push(queuedBubble);
+			}
 			this.host.notify(); this.updateHistoryCache(); this.host.scrollToBottom(true);
 
 			var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
@@ -523,9 +773,13 @@ export class ChatSession {
 					// Only ack a bubble that belongs to THIS chat — the search is
 					// positional, so on another project it would stamp this turn's
 					// _serverItemId onto that project's unrelated in-flight bubble.
+					// Staged bubbles (_stageId) are skipped for the same reason: they
+					// sit EARLIER in the list and match this shape exactly, so a turn
+					// whose files are still uploading would take the ack — and the
+					// server id — belonging to the turn that actually just sent.
 					var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function (m) {
 						return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === 'user' &&
-							(m._ownerKey === undefined || m._ownerKey === capturedKey);
+							!m._stageId && (m._ownerKey === undefined || m._ownerKey === capturedKey);
 					});
 					var serverId = result && typeof result.id === 'string' ? result.id : undefined;
 					if (sendingIdx >= 0) {
@@ -553,8 +807,23 @@ export class ChatSession {
 		// view unmount), then rendered from the cache via typewriteLatestReply. A
 		// later resumePendingRequest() re-renders it if the view remounted while the
 		// request was still in flight.
-		this.state.messages.push({ role: 'user', content: composed, _ts: wallClockNow(), ...(key ? { _ownerKey: key } : {}) });
-		this.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) });
+		var immediateUser: ChatMessage = { role: 'user', content: composed, _ts: wallClockNow(), ...(key ? { _ownerKey: key } : {}) };
+		var immediatePlaceholder: ChatMessage = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) };
+		var iStage = this._stageIndex(this.state.messages, stageId);
+		if (iStage !== -1) {
+			// Keep the send time the user saw, not the upload's finish time.
+			if (this.state.messages[iStage]._ts !== undefined) immediateUser._ts = this.state.messages[iStage]._ts;
+			var iTarget = this._settledStagePosition(iStage);
+			if (iTarget === -1) {
+				this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
+			} else {
+				this.state.messages.splice(iStage, 1);
+				this.state.messages.splice(iTarget, 0, immediateUser, immediatePlaceholder);
+			}
+		} else {
+			this.state.messages.push(immediateUser);
+			this.state.messages.push(immediatePlaceholder);
+		}
 		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.host.scrollToBottom(true);
 
 		// Same filter as the offChat and isQueuedSend paths above. It must drop the
@@ -576,18 +845,18 @@ export class ChatSession {
 		// flag is stripped when buildBoundedChatMessages maps down to {role,content}.
 		// The cost is that a retry now follows an unanswered question with no stated
 		// reason, which is a true account of what happened rather than a false one.
+		//
+		// The turn being sent is appended LAST rather than left wherever its bubble
+		// sits. A staged turn keeps the position it was sent in, which is NOT the
+		// end of the list once a message sent after it (while its files uploaded)
+		// has already been answered — and a history that ends on an assistant turn
+		// hits exactly the `last.role !== 'user'` bail described above.
 		var historyForLlm = this.state.messages.filter(function (m) {
+			if (m === immediateUser) return false;
 			return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
 				!m.isCancelled && !m.isBackgroundTask && !m.isError;
 		});
-		if (llmComposed !== composed) {
-			for (var li = historyForLlm.length - 1; li >= 0; li--) {
-				if (historyForLlm[li].role === 'user' && historyForLlm[li].content === composed) {
-					historyForLlm[li] = Object.assign({}, historyForLlm[li], { content: llmComposed });
-					break;
-				}
-			}
-		}
+		historyForLlm.push({ role: 'user', content: llmComposed });
 		var bounded = buildBoundedChatMessages({
 			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
 			history: historyForLlm,
@@ -833,7 +1102,7 @@ export class ChatSession {
 		if (platform !== 'claude' && platform !== 'openai') return;
 		var url = platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
 		var queueBase = id.userId || id.serviceId;
-		var queue = (msg.isBackgroundTask || msg._useBgQueue) ? queueBase + BG_INDEXING_QUEUE_SUFFIX : queueBase;
+		var queue = (msg.isBackgroundTask || msg._useBgQueue) ? bgIndexingQueueName(queueBase) : queueBase;
 		this.state.messages[idx] = Object.assign({}, msg, { _cancelling: true, _cancelError: undefined });
 		this.host.notify();
 		Promise.resolve(this.host.cancelRequest({
@@ -1364,7 +1633,7 @@ export class ChatSession {
 		if (!id.serviceId || (platform !== 'claude' && platform !== 'openai')) return;
 		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
 		var svcId = id.serviceId, owner = id.owner;
-		var queue = (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX;
+		var queue = bgIndexingQueueName(id.userId, id.serviceId);
 		var ask = function (status: 'pending' | 'running') {
 			return Promise.resolve(getChatHistory(
 				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
@@ -1491,7 +1760,7 @@ export class ChatSession {
 		var url = id.platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
 		Promise.resolve(this.host.cancelRequest({
 			url: url, method: 'POST', id: serverId,
-			queue: (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX,
+			queue: bgIndexingQueueName(id.userId, id.serviceId),
 			service: id.serviceId, owner: id.owner,
 		})).catch(function () { /* the pass may already have finished; nothing to do */ });
 	}
@@ -1640,7 +1909,10 @@ export class ChatSession {
 			if (pass > MAX_INDEXING_RESUME_PASSES) return; // give up after the cap
 			var id = this.host.getIdentity();
 			if (!id || id.platform === 'none' || id.serviceId !== entry.serviceId) return;
-			notifyAgentContinueIndexing({
+			// Counted as live work from here, not from the ack: awaitIndexingDrained
+			// asks the SERVER what is queued, and this pass is not queued until the
+			// call below returns. Without it a chat can slip in between two passes.
+			this.trackIndexDispatch(notifyAgentContinueIndexing({
 				platform: id.platform as 'claude' | 'openai',
 				model: id.model,
 				service: id.serviceId,
@@ -1666,7 +1938,7 @@ export class ChatSession {
 					});
 					self.drainBgTaskQueue();
 				}
-			}, function (e: any) { console.error('[chat-engine] resume-indexing dispatch failed', e); });
+			}, function (e: any) { console.error('[chat-engine] resume-indexing dispatch failed', e); }));
 		} catch (e) { /* best-effort: resume must never break bg-task resolution */ }
 	}
 
@@ -1763,6 +2035,13 @@ export class ChatSession {
 					if (mm._ownerKey !== undefined && mm._ownerKey !== loadKey) continue;
 					if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
 					if (!mm._serverItemId) {
+						// A staged turn (files still uploading) has no server request
+						// yet, so nothing in `mapped` can stand for it — rescue it
+						// unconditionally. The mappedHasPendingAssistant skip below is
+						// about a turn the server ALREADY has; applying it here would
+						// delete the user's message mid-upload whenever some other
+						// turn happened to be in flight.
+						if (mm._stageId) { rescued.push(mm); continue; }
 						if (mappedHasPendingAssistant) continue;
 						if (mm.isSendingToServer || mm.isPendingQueued || mm.isPendingInProcess || mm.isPending) rescued.push(mm);
 						else if (self.state.sending && mm.role === 'user') {
@@ -2036,7 +2315,9 @@ export class ChatSession {
 					return preIndex.then(function () {
 						return parseAttachmentContent(member.file, member.file.name, mime || undefined);
 					}).then(function (parsedContent: string | null) {
-					return notifyAgentSaveAttachment({
+					// Tracked so a chat waiting on awaitIndexingDrained cannot be sent
+					// in the window between this call and the queue accepting it.
+					return self.trackIndexDispatch(notifyAgentSaveAttachment({
 						platform: id.platform as 'claude' | 'openai',
 						model: id.model,
 						service: id.serviceId,
@@ -2071,7 +2352,7 @@ export class ChatSession {
 							att.errorCode = (e && (e.code || (e.body && e.body.code))) || '';
 							att.errorDetail = (e && (e.message || (e.body && e.body.message))) || (typeof e === 'string' ? e : '');
 						}
-					});
+					}));
 					});
 				});
 			});
@@ -2088,14 +2369,24 @@ export class ChatSession {
 
 	// Upload all not-yet-done attachments sequentially. Resolves to the full
 	// list of { name, url, storagePath } for composing the chat message.
-	uploadPendingAttachments(): Promise<Array<{ name: string; url: string; storagePath?: string }>> {
+	//
+	// `batchId` scopes the run to the chips stamped with it at Send time. The
+	// composer stays live during an upload, so by the time this runs the
+	// attachment list can already hold chips the user picked for the NEXT
+	// message — uploading those here would attach them to the wrong turn, and
+	// collecting the previous batch's finished urls would attach files the user
+	// already sent. Omitted (no batch) means every chip, the old behavior.
+	uploadPendingAttachments(batchId?: string): Promise<Array<{ name: string; url: string; storagePath?: string }>> {
 		var self = this;
 		this.host.resetOverwriteBatch();
+		this._uploadBatches += 1;
 		this.state.uploadingAttachments = true;
 		this.host.updateComposerControls();
 		this.host.renderAttachmentChips();
 		var collected: Array<{ name: string; url: string; storagePath?: string }> = [];
-		var snapshot = this.state.attachments.slice();
+		var snapshot = this.state.attachments.filter(function (a: any) {
+			return batchId ? a._batchId === batchId : true;
+		});
 		var chain: Promise<any> = Promise.resolve();
 		snapshot.forEach(function (att: any) {
 			chain = chain.then(function () {
@@ -2123,7 +2414,11 @@ export class ChatSession {
 			});
 		});
 		var done = function () {
-			self.state.uploadingAttachments = false; self.host.updateComposerControls(); self.host.renderAttachmentChips();
+			self._uploadBatches = Math.max(0, self._uploadBatches - 1);
+			// Only the LAST batch standing clears the flag — a second send made
+			// while this one was uploading is still running.
+			self.state.uploadingAttachments = self._uploadBatches > 0;
+			self.host.updateComposerControls(); self.host.renderAttachmentChips();
 			return collected;
 		};
 		return chain.then(done, done);

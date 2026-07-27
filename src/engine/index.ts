@@ -98,6 +98,7 @@ export {
 	// constants
 	POLL_INTERVAL,
 	BG_INDEXING_QUEUE_SUFFIX,
+	bgIndexingQueueName,
 	isBgIndexingQueue,
 	MCP_NAME,
 	DEFAULT_CLAUDE_MODEL,

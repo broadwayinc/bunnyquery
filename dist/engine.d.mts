@@ -826,7 +826,17 @@ type AttachmentSaveInfo = {
     model?: string;
     service: string;
     owner: string;
-    userId?: string;
+    /**
+     * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
+     * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
+     * `id.userId || id.serviceId`) — the backend serialises requests that share a
+     * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
+     * different base does not hold the chat back at all. It was optional once,
+     * defaulting to `service`; the chatbox omitted it, and its files were indexed
+     * on "<serviceId>-bg" while its question ran on "<userId>-bg" — the question
+     * was answered from a file nothing had read yet. Pass `userId || serviceId`.
+     */
+    userId: string;
     serviceName?: string;
     serviceDescription?: string;
     attachment: {
@@ -861,6 +871,14 @@ declare function extractOpenAIText(response: any): any;
 declare function listClaudeModels(service: string, owner: string): Promise<any>;
 declare function listOpenAIModels(service: string, owner: string): Promise<any>;
 declare const BG_INDEXING_QUEUE_SUFFIX = "-bg";
+/**
+ * The one place the background-indexing queue name is spelled out. The backend
+ * serialises requests sharing a queue name and runs different names in PARALLEL,
+ * so every indexing pass AND the chat turn that must wait behind them have to
+ * resolve to the identical string — see AttachmentSaveInfo.userId for what
+ * happens when they do not.
+ */
+declare function bgIndexingQueueName(userId?: string, service?: string): string;
 /**
  * True when a request belongs to the background-indexing queue.
  *
@@ -931,6 +949,11 @@ interface ChatIdentity {
 interface PinnedDispatchContext {
     identity: ChatIdentity;
     systemPrompt: string;
+    /** Id returned by stageOutgoingMessage. The turn's bubble is already on
+     *  screen (staged while its attachments upload), so dispatchComposedMessage
+     *  REPLACES that bubble in place instead of pushing a second one at the
+     *  bottom — the message keeps the position it was sent in. */
+    stageId?: string;
 }
 /**
  * The file a background-indexing bubble belongs to. Stamped on the REQUEST
@@ -964,6 +987,17 @@ interface ChatMessage {
     /** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
     _indexFile?: IndexingFileRef;
     _useBgQueue?: boolean;
+    /** Local id of a turn STAGED at Send time while its attachments upload. The
+     *  bubble exists before any server request does, so it is never matched by
+     *  _serverItemId and is never promoted/cancelled by the queue machinery —
+     *  dispatchComposedMessage consumes it (pinned.stageId) when the turn is
+     *  finally sent. Staged bubbles are deliberately kept OUT of the history
+     *  cache: an unmount kills the upload that would resolve them, so a cached
+     *  copy would replay as a bubble that uploads forever. */
+    _stageId?: string;
+    /** True on a staged bubble while its files are still uploading (renders
+     *  "(Uploading files...)" instead of "(In queue)"). */
+    isUploadingAttachments?: boolean;
     _serverItemId?: string;
     _localId?: string;
     _cancelling?: boolean;
@@ -1238,7 +1272,21 @@ declare class ChatSession {
     private _pauseReasons;
     private _resuming;
     private _lidSeq;
+    private _stageSeq;
+    /** How many attachment-upload batches are running. uploadingAttachments is a
+     *  single flag but batches overlap (the composer stays live, so the user can
+     *  send a second one while the first uploads), and a nested finish must not
+     *  clear the flag out from under the batch still running. */
+    private _uploadBatches;
+    /** Indexing requests whose ack has not come back yet. Until it does the item
+     *  is not on the server's queue, so awaitIndexingDrained cannot see it — and
+     *  would read the gap between "pass N settled" and "pass N+1 accepted" as the
+     *  file being finished. */
+    private _indexDispatchesInFlight;
     constructor(host: ChatHost);
+    /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
+     *  live work from the moment it is sent, not from the moment it is acked. */
+    trackIndexDispatch<T>(p: Promise<T>): Promise<T>;
     /**
      * Register a live poll so (a) a remount dedupes against it instead of stacking a
      * SECOND poll on the same item, and (b) pausePolling can stop it.
@@ -1300,6 +1348,68 @@ declare class ChatSession {
      */
     private _callProviderFor;
     dispatchAgentRequest(params: any): Promise<any>;
+    /**
+     * Put a turn on screen the INSTANT the user hits Send, before its attachments
+     * have finished uploading. Uploads run in the background now (the composer is
+     * cleared and stays usable), so without a staged bubble the message would
+     * appear only once its files were up — below anything the user sent in the
+     * meantime, in an order that never matches what they typed.
+     *
+     * Staged bubbles carry _useBgQueue because that is where a turn with
+     * attachments ultimately dispatches (behind its own indexing tasks). That flag
+     * is also what keeps promoteNextQueuedToRunning / resolveQueuedUserBubble off
+     * them: those advance the SERVER queue, and a staged turn has no server
+     * request behind it yet.
+     *
+     * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
+     */
+    stageOutgoingMessage(displayText: string): string;
+    private _stageIndex;
+    /**
+     * Where a staged turn belongs once it is finally sent: BELOW every indexing
+     * row, because that is the order it ran in and the order the server history
+     * will report on the next load (its request id is newer than every pass it
+     * waited for). While its files were uploading it sat above them — the rows
+     * are injected as each file's pass starts, after the bubble was staged.
+     *
+     * Returns the index to insert at, or -1 to leave the turn where it is. Never
+     * moves a turn UP: a bubble that already sits below the indexing rows (or a
+     * chat with no indexing at all) must not jump backwards over anything.
+     */
+    private _settledStagePosition;
+    /** The staged turn's files are up; it is now just waiting its place in the
+     *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
+    markStagedMessageQueued(stageId: string): void;
+    /**
+     * Resolves once this project's background-indexing queue has nothing left to
+     * run, so a chat enqueued right after it is genuinely last.
+     *
+     * Sending the chat as soon as the uploads finish is not enough, which is the
+     * whole reason this exists: indexing a file is a CHAIN, and each pass is only
+     * enqueued once the previous one lands (the client mints CONTINUE passes for
+     * text/grid files, the worker mints them for PDFs and windowed reads). Every
+     * one of those passes therefore queues up BEHIND a chat sent at upload time,
+     * and the model answers from a file it has only partly read.
+     *
+     * The queue is read from the server's status index rather than from
+     * bgTaskQueue: that mirror holds only what this client dispatched or adopted,
+     * and it stops being maintained once the view unmounts. An empty answer has to
+     * repeat before it is believed — see INDEXING_DRAIN_IDLE_LOOKS — and a look
+     * that fails counts as busy, so a dropped request delays the turn instead of
+     * releasing it early.
+     *
+     * Reads the identity PINNED at Send time, never a live one: the user may be in
+     * another project by now, and this must keep asking about the one they sent
+     * from.
+     */
+    awaitIndexingDrained(identity: ChatIdentity): Promise<'drained' | 'timedout' | 'skipped'>;
+    /**
+     * Abandon a staged turn — its uploads failed outright, so nothing will be
+     * dispatched. The bubble stays (the user's text is not silently thrown away)
+     * but settles into a plain, non-pending message; the caller reports the
+     * failure separately.
+     */
+    settleStagedMessage(stageId: string): void;
     dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void;
     promoteNextBgQueuedToRunning(): void;
     promoteNextQueuedToRunning(): void;
@@ -1423,7 +1533,7 @@ declare class ChatSession {
         url: string;
         storagePath: string;
     }>>;
-    uploadPendingAttachments(): Promise<Array<{
+    uploadPendingAttachments(batchId?: string): Promise<Array<{
         name: string;
         url: string;
         storagePath?: string;
@@ -1432,4 +1542,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };

@@ -28,6 +28,11 @@ export interface ChatIdentity {
 export interface PinnedDispatchContext {
 	identity: ChatIdentity;
 	systemPrompt: string;
+	/** Id returned by stageOutgoingMessage. The turn's bubble is already on
+	 *  screen (staged while its attachments upload), so dispatchComposedMessage
+	 *  REPLACES that bubble in place instead of pushing a second one at the
+	 *  bottom — the message keeps the position it was sent in. */
+	stageId?: string;
 }
 
 /**
@@ -63,6 +68,17 @@ export interface ChatMessage {
 	/** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
 	_indexFile?: IndexingFileRef;
 	_useBgQueue?: boolean;
+	/** Local id of a turn STAGED at Send time while its attachments upload. The
+	 *  bubble exists before any server request does, so it is never matched by
+	 *  _serverItemId and is never promoted/cancelled by the queue machinery —
+	 *  dispatchComposedMessage consumes it (pinned.stageId) when the turn is
+	 *  finally sent. Staged bubbles are deliberately kept OUT of the history
+	 *  cache: an unmount kills the upload that would resolve them, so a cached
+	 *  copy would replay as a bubble that uploads forever. */
+	_stageId?: string;
+	/** True on a staged bubble while its files are still uploading (renders
+	 *  "(Uploading files...)" instead of "(In queue)"). */
+	isUploadingAttachments?: boolean;
 	_serverItemId?: string;
 	_localId?: string;
 	_cancelling?: boolean;

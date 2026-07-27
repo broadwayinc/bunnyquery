@@ -233,11 +233,12 @@ export function composeUserMessage(
 	attachmentUrls: Array<{ name: string; url: string; storagePath?: string }>,
 ): ComposedUserMessage {
 	let composed = text;
+	let composedForLlm = composed;
 	if (attachmentUrls.length > 0) {
 		const lines = attachmentUrls.map((u) => `- [${u.name}](${u.url})`);
 		composed = `${text}\n\nAttached files:\n${lines.join('\n')}`;
+		composedForLlm = composed;
 	}
-	let composedForLlm = composed;
 	let extractContent: ExtractDirective[] | undefined;
 	let fileUrls: FileUrlDirective[] | undefined;
 	if (attachmentUrls.length > 0) {
@@ -251,17 +252,33 @@ export function composeUserMessage(
 				return `===== ${u.name} =====\n----- BEGIN FILE CONTENT -----\n${placeholder}\n----- END FILE CONTENT -----`;
 			});
 			extractContent = directives;
+			// Built on composedForLlm, not composed: the link block above may
+			// already carry the model-bound urls.
 			composedForLlm =
-				`${composed}\n\nExtracted content of attached office files ` +
+				`${composedForLlm}\n\nExtracted content of attached office files ` +
 				`(read inline below; do NOT fetch their URLs):\n\n` +
 				sections.join('\n\n');
 		}
-		// Files the model fetches by url (NOT server-extractable: PDFs, images) get
-		// a re-mint directive so the worker swaps the baked long-lived CDN url for a
-		// fresh short-lived one at send time. Extractable files are inlined as text,
-		// so their url is never fetched — no directive needed. A blank url (nothing
-		// to match/replace) is skipped.
-		const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name));
+		// Files the model fetches by url (NOT server-extractable: PDFs, images)
+		// CAN be flagged for the worker to re-mint just before the upstream call,
+		// so a request that waited in the queue never hands over a stale link.
+		//
+		// It is off, and must stay off until the worker mints a url that answers
+		// HEAD. What it mints today is an S3 SigV4 query presign, and a presign is
+		// bound to the ONE method it was signed for: `get_object`. HEAD the same
+		// url and S3 rejects the signature with 403 — measured, and the CDN url it
+		// replaces answers both. OpenAI probes a file url before downloading it,
+		// so from the day this went live EVERY chat carrying an image or PDF came
+		// back "Error while downloading file. Upstream status code: 403." — 100%
+		// of the requests that carried the directive, none of the ones that did
+		// not. Sending no directive leaves the CDN url in place, which is what
+		// worked before and answers HEAD; the drain gate (awaitIndexingDrained)
+		// covers the staleness this was meant to solve, since the turn is now
+		// dispatched only once the queue is empty rather than sitting in it.
+		const WORKER_URL_REMINT_ENABLED = false;
+		const urlFiles = WORKER_URL_REMINT_ENABLED
+			? attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name))
+			: [];
 		if (urlFiles.length > 0) {
 			fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
 		}

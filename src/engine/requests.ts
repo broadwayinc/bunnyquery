@@ -451,7 +451,17 @@ export type AttachmentSaveInfo = {
 	model?: string;
 	service: string;
 	owner: string;
-	userId?: string;
+	/**
+	 * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
+	 * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
+	 * `id.userId || id.serviceId`) — the backend serialises requests that share a
+	 * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
+	 * different base does not hold the chat back at all. It was optional once,
+	 * defaulting to `service`; the chatbox omitted it, and its files were indexed
+	 * on "<serviceId>-bg" while its question ran on "<userId>-bg" — the question
+	 * was answered from a file nothing had read yet. Pass `userId || serviceId`.
+	 */
+	userId: string;
 	serviceName?: string;
 	serviceDescription?: string;
 	attachment: {
@@ -599,7 +609,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		const imageDetail = getOpenAIImageDetail(resolvedModel);
 		return clientSecretRequest({
 			clientSecretName: 'openai',
-			queue: (info.userId || service) + BG_INDEXING_QUEUE_SUFFIX,
+			queue: bgIndexingQueueName(info.userId, service),
 			service,
 			owner,
 			...pollOpt(),
@@ -646,7 +656,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
 	return clientSecretRequest({
 		clientSecretName: 'claude',
-		queue: (info.userId || service) + BG_INDEXING_QUEUE_SUFFIX,
+		queue: bgIndexingQueueName(info.userId, service),
 		service,
 		owner,
 		...pollOpt(),
@@ -787,6 +797,17 @@ export async function listOpenAIModels(service: string, owner: string) {
 // Suffix for the background-indexing queue. Must sort *before* ':' (ASCII 58)
 // so the chat-history BETWEEN query never includes bg-queue items. '-' (45) works.
 export const BG_INDEXING_QUEUE_SUFFIX = '-bg';
+
+/**
+ * The one place the background-indexing queue name is spelled out. The backend
+ * serialises requests sharing a queue name and runs different names in PARALLEL,
+ * so every indexing pass AND the chat turn that must wait behind them have to
+ * resolve to the identical string — see AttachmentSaveInfo.userId for what
+ * happens when they do not.
+ */
+export function bgIndexingQueueName(userId?: string, service?: string): string {
+	return (userId || service || '') + BG_INDEXING_QUEUE_SUFFIX;
+}
 
 /**
  * True when a request belongs to the background-indexing queue.
