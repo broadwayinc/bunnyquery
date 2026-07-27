@@ -280,6 +280,9 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 You are a dedicated assistant for the project ID: "${formattedServiceId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
+Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records that usually share a table. So a question about the data almost always spans many records across several files. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY relevant table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset.
+Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
+Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index and tag filters match only exact values or leading prefixes, not substrings, so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY had their text extracted on the server and inlined in the same message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read it directly there and do NOT call web_fetch for those files. A "[skapi: ...]" note in that block means the file could not be extracted.
@@ -614,6 +617,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (/^https?:\/\/[^/\s]+\/download\/[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$/i.test(stripped)) return stripped;
     return href.trim().replace(/\s/g, "%20");
   }
+  function repairUrlEntities(href) {
+    if (!href || href.indexOf("&") === -1) return href;
+    var out = href, prev = "";
+    while (out !== prev) {
+      prev = out;
+      out = out.replace(/&amp;/gi, "&").replace(/&#0*38;/g, "&").replace(/&#x0*26;/gi, "&");
+    }
+    return out;
+  }
   function normalizeTrailingInlineToken(value) {
     if (!value) return value;
     var out = value.replace(/[.,;:!?]+$/, "");
@@ -661,8 +673,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var tail = full.slice(("src::" + rawPath).length);
       var srcIsUrl = isHttpUrlLike(rawPath);
       if (srcIsUrl && !isDbHost(rawPath) && !readExpiredAttachmentHref(rawPath)) {
+        var srcUrl = repairUrlEntities(rawPath);
         return {
-          part: { type: "link", label: truncateLabelForDisplay(rawPath), fullLabel: rawPath, href: rawPath, expired: false },
+          part: { type: "link", label: truncateLabelForDisplay(srcUrl), fullLabel: srcUrl, href: srcUrl, expired: false },
           tail
         };
       }
@@ -696,6 +709,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     var originalHref = g3 || g6 || "";
     if (!originalHref) return null;
+    originalHref = repairUrlEntities(originalHref);
     var urlTail;
     if (!g3 && g6) {
       var trimmedUrl = normalizeTrailingInlineToken(originalHref);
@@ -3382,7 +3396,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.7.0" ;
+    var BQ_VERSION = "1.8.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -6205,7 +6219,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
           bubble.appendChild(cancelBtn);
         }
-        var md = h("div", { class: "bq-md", html: parseMsgPartsHtml(msg.content) });
+        var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
         md.addEventListener("click", onBubbleLinkClick);
         bubble.appendChild(md);
         if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));

@@ -184,6 +184,33 @@ export function repairUrlWhitespace(href: string): string {
 }
 
 /**
+ * A model reproducing a URL sometimes HTML-escapes its `&` query separators as
+ * `&amp;` (or the numeric `&#38;` / `&#x26;`). Left in the href that escaping
+ * survives the client's own escapeAttr -> v-html/innerHTML decode round-trip and
+ * reaches the browser LITERALLY, so a presigned S3 URL is navigated with its
+ * parameters named `amp;Signature`, `amp;Expires`, `amp;response-content-type`,
+ * ... — the real params vanish, the signature can't be located, and S3 rejects
+ * it (the "링크가 안되" dead export link). Undo just that entity escaping.
+ *
+ * This is a no-op on a clean URL: a valid link carries a raw `&` between params
+ * and percent-encodes (`%26`) any literal ampersand that is data, so a real URL
+ * never contains `&amp;` to begin with. Mirrors repairUrlWhitespace: it repairs
+ * model damage, not the URL. The loop collapses a doubly-escaped `&amp;amp;` too.
+ */
+export function repairUrlEntities(href: string): string {
+	if (!href || href.indexOf('&') === -1) return href;
+	var out = href, prev = '';
+	while (out !== prev) {
+		prev = out;
+		out = out
+			.replace(/&amp;/gi, '&')
+			.replace(/&#0*38;/g, '&')
+			.replace(/&#x0*26;/gi, '&');
+	}
+	return out;
+}
+
+/**
  * Trim punctuation and unmatched wrappers that cling to a token in prose.
  * `src::a/b.pdf).` -> `src::a/b.pdf`, while a balanced `file (v2).pdf` is kept.
  */
@@ -280,8 +307,11 @@ export function classifyInlineLink(
 		// source into the storage-path branch, where it became a chip pointing at
 		// this project for someone else's file.
 		if (srcIsUrl && !isDbHost(rawPath) && !readExpiredAttachmentHref(rawPath)) {
+			// decode any model-introduced `&amp;` in the URL (tail stays keyed on
+			// the raw match length, so it is left untouched)
+			var srcUrl = repairUrlEntities(rawPath);
 			return {
-				part: { type: 'link', label: truncateLabelForDisplay(rawPath), fullLabel: rawPath, href: rawPath, expired: false },
+				part: { type: 'link', label: truncateLabelForDisplay(srcUrl), fullLabel: srcUrl, href: srcUrl, expired: false },
 				tail: tail,
 			};
 		}
@@ -337,6 +367,10 @@ export function classifyInlineLink(
 	// [label](url) and bare urls.
 	var originalHref = g3 || g6 || '';
 	if (!originalHref) return null;
+	// A model that reproduces the URL may have HTML-escaped its `&` separators;
+	// decode them now so every downstream check and the final href see a clean
+	// URL (otherwise a presigned link navigates with `&amp;` and 403s).
+	originalHref = repairUrlEntities(originalHref);
 	// A bare url swallows the punctuation that ends the sentence it sits in, so
 	// `see https://host/a.pdf.` linked to `a.pdf.` and 404'd. Trim it and hand the
 	// trimmed text back as `tail`, exactly as the src:: branch does.

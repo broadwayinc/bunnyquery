@@ -2799,7 +2799,10 @@ import {
                 if (!disabled) cancelBtn.addEventListener("click", function (e) { e.stopPropagation(); session.cancelQueuedMessage(msg, idx); });
                 bubble.appendChild(cancelBtn);
             }
-            var md = h("div", { class: "bq-md", html: parseMsgPartsHtml(msg.content) });
+            // translate:"no" keeps the browser's auto-translator from re-tokenizing
+            // the message text and dropping spaces (notably in Korean/CJK). It is the
+            // one text element that was missing the tag; mirrors agent.vue's div.bq-md.
+            var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
             md.addEventListener("click", onBubbleLinkClick);
             bubble.appendChild(md);
             if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
