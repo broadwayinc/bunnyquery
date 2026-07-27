@@ -232,7 +232,10 @@ export type CallClaudeWithMcpParams = {
 	onResponse?: (res: any) => void;
 	onError?: (err: any) => void;
 };
-export const POLL_INTERVAL = 1500;
+// Poll cadence for every client-secret request the chat waits on. Shared by the
+// engine's own poll sites and imported by agent.vue; the widget carries its own
+// copy in src/index.js that must be kept in step.
+export const POLL_INTERVAL = 3000;
 export async function callClaudeWithMcp({
 	prompt,
 	messages,

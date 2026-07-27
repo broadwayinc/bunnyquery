@@ -373,6 +373,102 @@ declare function buildBoundedChatMessages(options: BoundedChatOptions): {
 };
 
 /**
+ * How a text file the chat offers as a download is encoded and labelled, so that
+ * whatever opens it reads the characters correctly, in any language.
+ *
+ * When the model answers with a fenced ```name.ext block, the client turns that
+ * block into a Blob and an <a download>. We always write UTF-8, but several very
+ * common consumers do not assume UTF-8 when nothing in the file says so, and fall
+ * back to the reader's local ANSI codepage: CP949 in Korea, CP932 in Japan,
+ * CP936/CP950 in China and Taiwan, CP1251 for Cyrillic. The file is valid and
+ * every non-ASCII character still opens as mojibake.
+ *
+ * There is no single fix, because the way a file declares "this is UTF-8" is a
+ * property of the FORMAT:
+ *
+ *   - a spreadsheet (csv/tsv) and a Windows text editor read a BOM;
+ *   - HTML is opened from disk with no HTTP headers, so only an in-document
+ *     <meta charset> survives;
+ *   - XML carries its encoding in its declaration, and a WRONG declaration makes
+ *     a conforming parser fail outright;
+ *   - RTF is 7-bit, so non-ASCII has to be escaped into \uNNNN?;
+ *   - JSON, JSONL and YAML are UTF-8 by specification, and a BOM BREAKS them.
+ *
+ * Anything unrecognised is left byte-for-byte alone: an unknown extension is far
+ * more likely to be machine-parsed, where an uninvited BOM is a new bug, than to
+ * be opened by a legacy editor.
+ *
+ * MIRROR of skapi-mcp/download-encoding.js, which does the same job for files the
+ * server publishes (writeReport / exportRecordsToFile). A file the user gets from
+ * a fenced block and the same file published as a download must behave
+ * identically, so the two have to change together.
+ */
+declare const BOM = "\uFEFF";
+/** Files a spreadsheet or a Windows text editor opens directly. */
+declare const BOM_EXTS: Set<string>;
+/** Read from disk with no HTTP headers, so the declaration must be in the file. */
+declare const HTML_EXTS: Set<string>;
+declare const XML_EXTS: Set<string>;
+declare const RTF_EXTS: Set<string>;
+/** Content types by extension. Every text family carries an explicit charset. */
+declare const EXT_CONTENT_TYPES: Record<string, string>;
+type EncodingClass = 'bom' | 'html' | 'xml' | 'rtf' | 'none';
+declare function normalizeExt(ext: string | null | undefined): string;
+/** Extension of a filename, '' when it has none. */
+declare function extOf(filename: string | null | undefined): string;
+/** Which encoding declaration this format understands. */
+declare function encodingClassForExt(ext: string | null | undefined): EncodingClass;
+/** True when a file with this extension must be written BOM-first. */
+declare function needsBomForExt(ext: string | null | undefined): boolean;
+/**
+ * Content type to declare. Everything textual carries an explicit charset:
+ * without one the receiving end guesses, and it guesses the local codepage.
+ */
+declare function contentTypeForExt(ext: string | null | undefined, fallback?: string): string;
+declare function hasBom(text: string): boolean;
+declare const HTML_HEAD_WINDOW = 4096;
+/**
+ * Make an HTML document state its own encoding. Downloaded HTML is opened from
+ * disk, where the Content-Type we set no longer exists, so a document with no
+ * <meta charset> is decoded with the browser's locale default.
+ */
+declare function ensureHtmlCharset(text: string): string;
+/**
+ * Correct an XML declaration that names the wrong encoding.
+ *
+ * A MISSING declaration is left alone on purpose: XML with none is UTF-8 by
+ * specification, so every conforming parser already gets it right. A declaration
+ * naming EUC-KR over UTF-8 bytes, on the other hand, makes a parser fail outright.
+ */
+declare function ensureXmlEncoding(text: string): string;
+/** True when the body really is RTF rather than text merely named .rtf. */
+declare function looksLikeRtf(text: string): boolean;
+/**
+ * Escape every non-ASCII character into RTF's \uNNNN? form.
+ *
+ * RTF is 7-bit: a literal UTF-8 byte in the body is read through the codepage the
+ * header declares, which is how Korean, Japanese and Cyrillic RTF turns to
+ * mojibake in Word. \uNNNN? is codepage-independent.
+ *
+ * ASCII is never touched, which matters: backslashes and braces in an RTF body
+ * are control syntax, and "escaping" them would destroy the document. \u takes a
+ * SIGNED 16-bit value, so anything above 0x7FFF is emitted negative, and astral
+ * characters are emitted as their two surrogates.
+ */
+declare function escapeRtfNonAscii(text: string): string;
+/** Apply the format's encoding declaration to a whole document. */
+declare function applyEncodingDeclaration(text: string, ext: string | null | undefined): string;
+/**
+ * Everything a client needs to turn a fenced ```name.ext block into a download:
+ * the exact text to put in the Blob and the type to give it.
+ */
+declare function prepareDownloadText(filename: string, body: string): {
+    ext: string;
+    text: string;
+    contentType: string;
+};
+
+/**
  * Pure link/path helpers (no DOM, no marked). Moved verbatim from the chatbox.
  * `serviceId` is passed as a PARAMETER (the original read it from a global) so
  * the engine stays consumer-agnostic. The HTML-emitting helpers
@@ -721,7 +817,7 @@ type CallClaudeWithMcpParams = {
     onResponse?: (res: any) => void;
     onError?: (err: any) => void;
 };
-declare const POLL_INTERVAL = 1500;
+declare const POLL_INTERVAL = 3000;
 declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, }: CallClaudeWithMcpParams): Promise<any>;
 declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void): Promise<any>;
 declare function callOpenAIWithPublicMcp(prompt: string, service: string, owner: string, messages?: OpenAIMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void): Promise<any>;
@@ -1336,4 +1432,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };

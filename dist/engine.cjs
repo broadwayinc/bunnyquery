@@ -439,6 +439,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
 }
 
 // src/engine/errors.ts
+var STATUS_MESSAGE = {
+  "408": "The AI provider timed out before it started.",
+  "409": "The AI provider rejected the request as conflicting.",
+  "413": "The request was too large for the AI provider.",
+  "429": "The AI provider is rate limiting requests right now.",
+  "500": "The AI provider hit an internal error.",
+  "502": "The AI provider is temporarily unreachable.",
+  "503": "The AI provider is temporarily unavailable.",
+  "504": "The AI provider timed out."
+};
+function isTransientStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
 function getErrorMessage(input) {
   if (!input) return "Something went wrong.";
   if (typeof input === "string") return input;
@@ -446,6 +459,11 @@ function getErrorMessage(input) {
   if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
   if (input.body && typeof input.body.message === "string") return input.body.message;
   if (input.message) return input.message;
+  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : 0;
+  if (status) {
+    var text = STATUS_MESSAGE[String(status)] || (status >= 500 ? "The AI provider returned a server error." : "The AI provider rejected the request.");
+    return text + " (error " + status + ")" + (isTransientStatus(status) ? " This is usually temporary, please try again." : "");
+  }
   return "Something went wrong.";
 }
 function isErrorResponseBody(response) {
@@ -869,6 +887,166 @@ function buildBoundedChatMessages(options) {
   };
 }
 
+// src/engine/download_encoding.ts
+var BOM = "\uFEFF";
+var BOM_EXTS = /* @__PURE__ */ new Set(["csv", "tsv", "tab", "txt", "text", "log"]);
+var HTML_EXTS = /* @__PURE__ */ new Set(["html", "htm", "xhtml"]);
+var XML_EXTS = /* @__PURE__ */ new Set(["xml", "svg", "rss", "atom", "xsl", "xslt", "plist", "kml"]);
+var RTF_EXTS = /* @__PURE__ */ new Set(["rtf"]);
+var EXT_CONTENT_TYPES = {
+  csv: "text/csv; charset=utf-8",
+  tsv: "text/tab-separated-values; charset=utf-8",
+  tab: "text/tab-separated-values; charset=utf-8",
+  txt: "text/plain; charset=utf-8",
+  text: "text/plain; charset=utf-8",
+  log: "text/plain; charset=utf-8",
+  md: "text/markdown; charset=utf-8",
+  markdown: "text/markdown; charset=utf-8",
+  json: "application/json; charset=utf-8",
+  jsonl: "application/x-ndjson; charset=utf-8",
+  ndjson: "application/x-ndjson; charset=utf-8",
+  geojson: "application/geo+json; charset=utf-8",
+  yaml: "text/yaml; charset=utf-8",
+  yml: "text/yaml; charset=utf-8",
+  toml: "text/plain; charset=utf-8",
+  ini: "text/plain; charset=utf-8",
+  sql: "text/plain; charset=utf-8",
+  html: "text/html; charset=utf-8",
+  htm: "text/html; charset=utf-8",
+  xhtml: "application/xhtml+xml; charset=utf-8",
+  xml: "application/xml; charset=utf-8",
+  svg: "image/svg+xml; charset=utf-8",
+  css: "text/css; charset=utf-8",
+  js: "text/javascript; charset=utf-8",
+  ts: "text/plain; charset=utf-8",
+  py: "text/x-python; charset=utf-8",
+  sh: "text/x-shellscript; charset=utf-8",
+  srt: "application/x-subrip; charset=utf-8",
+  vtt: "text/vtt; charset=utf-8",
+  ics: "text/calendar; charset=utf-8",
+  vcf: "text/vcard; charset=utf-8",
+  // RTF is 7-bit ASCII by specification, so it takes no charset parameter.
+  rtf: "application/rtf",
+  // Binary types the model can only ever REFERENCE, never author in a fence, but
+  // which keep the type sensible if one ever shows up.
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp"
+};
+function normalizeExt(ext) {
+  return String(ext || "").trim().replace(/^\./, "").toLowerCase();
+}
+function extOf(filename) {
+  const name = String(filename || "");
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? normalizeExt(name.slice(dot + 1)) : "";
+}
+function encodingClassForExt(ext) {
+  const e = normalizeExt(ext);
+  if (BOM_EXTS.has(e)) return "bom";
+  if (HTML_EXTS.has(e)) return "html";
+  if (XML_EXTS.has(e)) return "xml";
+  if (RTF_EXTS.has(e)) return "rtf";
+  return "none";
+}
+function needsBomForExt(ext) {
+  return encodingClassForExt(ext) === "bom";
+}
+function contentTypeForExt(ext, fallback = "text/plain; charset=utf-8") {
+  return EXT_CONTENT_TYPES[normalizeExt(ext)] || fallback;
+}
+function hasBom(text) {
+  return typeof text === "string" && text.charCodeAt(0) === 65279;
+}
+var HTML_HEAD_WINDOW = 4096;
+var META_CHARSET_RE = /<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_-]+)/i;
+var META_HTTP_EQUIV_RE = /<meta[^>]+http-equiv\s*=\s*["']?content-type["']?[^>]*>/i;
+function ensureHtmlCharset(text) {
+  const src = String(text == null ? "" : text);
+  const head = src.slice(0, HTML_HEAD_WINDOW);
+  const declared = META_CHARSET_RE.exec(head);
+  if (declared) {
+    if (declared[1].toLowerCase().replace(/[^a-z0-9]/g, "") === "utf8") return src;
+    const start = declared.index + declared[0].length - declared[1].length;
+    return src.slice(0, start) + "utf-8" + src.slice(start + declared[1].length);
+  }
+  const httpEquiv = META_HTTP_EQUIV_RE.exec(head);
+  if (httpEquiv) {
+    return src.slice(0, httpEquiv.index) + '<meta charset="utf-8">' + src.slice(httpEquiv.index + httpEquiv[0].length);
+  }
+  const tag = '<meta charset="utf-8">';
+  const headOpen = /<head[^>]*>/i.exec(head);
+  if (headOpen) {
+    const at = headOpen.index + headOpen[0].length;
+    return src.slice(0, at) + "\n" + tag + src.slice(at);
+  }
+  const htmlOpen = /<html[^>]*>/i.exec(head);
+  if (htmlOpen) {
+    const at = htmlOpen.index + htmlOpen[0].length;
+    return src.slice(0, at) + "\n<head>" + tag + "</head>" + src.slice(at);
+  }
+  const doctype = /<!doctype[^>]*>/i.exec(head);
+  if (doctype) {
+    const at = doctype.index + doctype[0].length;
+    return src.slice(0, at) + "\n" + tag + src.slice(at);
+  }
+  return tag + "\n" + src;
+}
+var XML_DECL_RE = /^\s*<\?xml\s[^?]*\?>/i;
+function ensureXmlEncoding(text) {
+  const src = String(text == null ? "" : text);
+  const decl = XML_DECL_RE.exec(src);
+  if (!decl) return src;
+  const found = /encoding\s*=\s*["']([^"']*)["']/i.exec(decl[0]);
+  if (!found) return src;
+  if (found[1].toLowerCase().replace(/[^a-z0-9]/g, "") === "utf8") return src;
+  const fixedDecl = decl[0].slice(0, found.index) + found[0].replace(found[1], "UTF-8") + decl[0].slice(found.index + found[0].length);
+  return fixedDecl + src.slice(decl[0].length);
+}
+var RTF_SIGNATURE_RE = /^[\s﻿]*\{\\rtf/i;
+function looksLikeRtf(text) {
+  return RTF_SIGNATURE_RE.test(String(text == null ? "" : text));
+}
+function escapeRtfNonAscii(text) {
+  const src = String(text == null ? "" : text);
+  let out = "";
+  let plainFrom = 0;
+  for (let i = 0; i < src.length; i++) {
+    const code = src.charCodeAt(i);
+    if (code < 128) continue;
+    out += src.slice(plainFrom, i);
+    out += `\\u${code > 32767 ? code - 65536 : code}?`;
+    plainFrom = i + 1;
+  }
+  return plainFrom === 0 ? src : out + src.slice(plainFrom);
+}
+function applyEncodingDeclaration(text, ext) {
+  const src = String(text == null ? "" : text);
+  switch (encodingClassForExt(ext)) {
+    case "bom":
+      return hasBom(src) ? src : BOM + src;
+    case "html":
+      return ensureHtmlCharset(src);
+    case "xml":
+      return ensureXmlEncoding(src);
+    case "rtf":
+      return looksLikeRtf(src) ? escapeRtfNonAscii(src) : hasBom(src) ? src : BOM + src;
+    default:
+      return src;
+  }
+}
+function prepareDownloadText(filename, body) {
+  const ext = extOf(filename);
+  return {
+    ext,
+    text: applyEncodingDeclaration(body, ext),
+    contentType: contentTypeForExt(ext)
+  };
+}
+
 // src/engine/time.ts
 function wallClockNow() {
   return Date.now();
@@ -1041,7 +1219,7 @@ function applyHistoryCacheBreakpoint(messages) {
     return { ...m, content: blocks };
   });
 }
-var POLL_INTERVAL = 1500;
+var POLL_INTERVAL = 3e3;
 async function callClaudeWithMcp({
   prompt,
   messages,
@@ -1990,7 +2168,7 @@ var ChatSession = class {
     var chatQueue = useBgQueue ? userId + BG_INDEXING_QUEUE_SUFFIX : userId;
     if (offChat) {
       var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function(m) {
-        return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask;
+        return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
       });
       var offBounded = buildBoundedChatMessages({
         platform: aiPlatform,
@@ -2025,7 +2203,7 @@ var ChatSession = class {
     }
     if (isQueuedSend) {
       var resolvedHistory = this.state.messages.filter(function(m) {
-        return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask;
+        return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
       });
       var boundedQ = buildBoundedChatMessages({
         platform: aiPlatform,
@@ -2076,7 +2254,7 @@ var ChatSession = class {
     this.state.sending = true;
     this.host.scrollToBottom(true);
     var historyForLlm = this.state.messages.filter(function(m) {
-      return !m.isCancelled && !m.isBackgroundTask;
+      return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
     });
     if (llmComposed !== composed) {
       for (var li = historyForLlm.length - 1; li >= 0; li--) {
@@ -3682,6 +3860,8 @@ function buildChatDisplayList(messages, opts) {
 }
 
 exports.BG_INDEXING_QUEUE_SUFFIX = BG_INDEXING_QUEUE_SUFFIX;
+exports.BOM = BOM;
+exports.BOM_EXTS = BOM_EXTS;
 exports.CLAUDE_INPUT_CAP_RATIO = CLAUDE_INPUT_CAP_RATIO;
 exports.CLAUDE_PER_REQUEST_INPUT_CAP = CLAUDE_PER_REQUEST_INPUT_CAP;
 exports.CONTEXT_WINDOW_BY_MODEL = CONTEXT_WINDOW_BY_MODEL;
@@ -3692,9 +3872,12 @@ exports.DEFAULT_OPENAI_MODEL = DEFAULT_OPENAI_MODEL;
 exports.EXPIRED_ATTACHMENT_URL_HOST = EXPIRED_ATTACHMENT_URL_HOST;
 exports.EXPIRED_ATTACHMENT_URL_ORIGIN = EXPIRED_ATTACHMENT_URL_ORIGIN;
 exports.EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
+exports.EXT_CONTENT_TYPES = EXT_CONTENT_TYPES;
 exports.HISTORY_BUDGET_RATIO = HISTORY_BUDGET_RATIO;
 exports.HISTORY_FILL_SLACK_PX = HISTORY_FILL_SLACK_PX;
 exports.HISTORY_TOKEN_BUDGET = HISTORY_TOKEN_BUDGET;
+exports.HTML_EXTS = HTML_EXTS;
+exports.HTML_HEAD_WINDOW = HTML_HEAD_WINDOW;
 exports.LINK_LABEL_MAX_DISPLAY_CHARS = LINK_LABEL_MAX_DISPLAY_CHARS;
 exports.LINK_REFRESH_WINDOW_MS = LINK_REFRESH_WINDOW_MS;
 exports.MAX_HISTORY_FILL_PAGES = MAX_HISTORY_FILL_PAGES;
@@ -3705,7 +3888,10 @@ exports.MIN_INPUT_TOKEN_BUDGET = MIN_INPUT_TOKEN_BUDGET;
 exports.OUTPUT_TOKEN_RESERVE = OUTPUT_TOKEN_RESERVE;
 exports.POLL_INTERVAL = POLL_INTERVAL;
 exports.RENDER_FROM_TOKEN = RENDER_FROM_TOKEN;
+exports.RTF_EXTS = RTF_EXTS;
 exports.TOOL_AND_RESPONSE_BUFFER = TOOL_AND_RESPONSE_BUFFER;
+exports.XML_EXTS = XML_EXTS;
+exports.applyEncodingDeclaration = applyEncodingDeclaration;
 exports.buildAiAgentValue = buildAiAgentValue;
 exports.buildBoundedChatMessages = buildBoundedChatMessages;
 exports.buildChatDisplayList = buildChatDisplayList;
@@ -3725,11 +3911,17 @@ exports.classifyInlineLink = classifyInlineLink;
 exports.clearAttachmentParsers = clearAttachmentParsers;
 exports.composeUserMessage = composeUserMessage;
 exports.configureChatEngine = configureChatEngine;
+exports.contentTypeForExt = contentTypeForExt;
 exports.createHistoryFiller = createHistoryFiller;
 exports.createInlineLinkRegex = createInlineLinkRegex;
 exports.encodePathSegments = encodePathSegments;
+exports.encodingClassForExt = encodingClassForExt;
+exports.ensureHtmlCharset = ensureHtmlCharset;
+exports.ensureXmlEncoding = ensureXmlEncoding;
+exports.escapeRtfNonAscii = escapeRtfNonAscii;
 exports.estimateMessageTokens = estimateMessageTokens;
 exports.estimateTextTokens = estimateTextTokens;
+exports.extOf = extOf;
 exports.extractClaudeText = extractClaudeText;
 exports.extractLastUserTextFromRequest = extractLastUserTextFromRequest;
 exports.extractOpenAIText = extractOpenAIText;
@@ -3745,6 +3937,7 @@ exports.getErrorMessage = getErrorMessage;
 exports.getExpiredAttachmentVisiblePath = getExpiredAttachmentVisiblePath;
 exports.getProjectContextWindow = getProjectContextWindow;
 exports.groupAttachmentFailures = groupAttachmentFailures;
+exports.hasBom = hasBom;
 exports.isAuthExpiredError = isAuthExpiredError;
 exports.isBgIndexingQueue = isBgIndexingQueue;
 exports.isErrorResponseBody = isErrorResponseBody;
@@ -3756,9 +3949,12 @@ exports.isServerExtractable = isServerExtractable;
 exports.isServiceDbAttachmentHref = isServiceDbAttachmentHref;
 exports.listClaudeModels = listClaudeModels;
 exports.listOpenAIModels = listOpenAIModels;
+exports.looksLikeRtf = looksLikeRtf;
 exports.makeExtractPlaceholder = makeExtractPlaceholder;
 exports.mapHistoryListToMessages = mapHistoryListToMessages;
+exports.needsBomForExt = needsBomForExt;
 exports.normalizeAttachmentPathCandidate = normalizeAttachmentPathCandidate;
+exports.normalizeExt = normalizeExt;
 exports.normalizeTextContent = normalizeTextContent;
 exports.normalizeTrailingInlineToken = normalizeTrailingInlineToken;
 exports.notifyAgentSaveAttachment = notifyAgentSaveAttachment;
@@ -3766,6 +3962,7 @@ exports.parseAiAgentValue = parseAiAgentValue;
 exports.parseAttachmentContent = parseAttachmentContent;
 exports.parseIndexingLabel = parseIndexingLabel;
 exports.parseIndexingRequestText = parseIndexingRequestText;
+exports.prepareDownloadText = prepareDownloadText;
 exports.readExpiredAttachmentHref = readExpiredAttachmentHref;
 exports.registerAttachmentParser = registerAttachmentParser;
 exports.registerModelContextWindows = registerModelContextWindows;

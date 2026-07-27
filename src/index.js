@@ -61,6 +61,11 @@ import {
     classifyInlineLink,
     normalizeTrailingInlineToken,
     formatChatTimestamp,
+    // Per-format UTF-8 declaration for downloadable files, single-sourced in
+    // engine/download_encoding.ts and mirrored in skapi-mcp.
+    prepareDownloadText,
+    extOf,
+    EXT_CONTENT_TYPES,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
     LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
@@ -103,7 +108,9 @@ import {
     var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
     var DEFAULT_OPENAI_MODEL = "gpt-5.4";
 
-    var POLL_INTERVAL = 1500;
+    // Keep in step with POLL_INTERVAL in src/engine/requests.ts (agent.vue reads
+    // the engine's copy, this is the widget's).
+    var POLL_INTERVAL = 3000;
     var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
@@ -1841,15 +1848,17 @@ import {
         var key = filename + " " + body;
         var existing = fileBlobCache.get(key);
         if (existing) return existing;
-        var contentType = mimeGetType(filename) || "text/plain";
-        var ext = (String(filename || "").split(".").pop() || "").toLowerCase();
-        var isText = /^text\//i.test(contentType) || /application\/(json|xml|csv|yaml|x-yaml|javascript)/i.test(contentType);
-        // Prepend a UTF-8 BOM for spreadsheet-family text: Korean-Windows Excel
-        // otherwise decodes a BOM-less CSV as CP949 and mojibakes every column.
-        var needsBom = ext === "csv" || ext === "tsv" || ext === "tab";
-        var type = isText ? contentType + "; charset=utf-8" : contentType;
-        var data = needsBom ? "﻿" + body : body;
-        var href = URL.createObjectURL(new Blob([data], { type: type }));
+        // The engine decides how this format declares UTF-8: a BOM for a spreadsheet
+        // or a text file, <meta charset> for HTML, \u escapes for RTF, nothing at all
+        // for the formats that are UTF-8 by spec and that a BOM would break. Without
+        // it a Korean CSV opens as CP949 mojibake in Excel, and so does every other
+        // non-Latin script. Mirrored server-side in skapi-mcp/download-encoding.js.
+        var prepared = prepareDownloadText(filename, body);
+        // mimeGetType covers the long tail the engine map does not name (images).
+        var type = EXT_CONTENT_TYPES[extOf(filename)]
+            || mimeGetType(filename)
+            || "text/plain; charset=utf-8";
+        var href = URL.createObjectURL(new Blob([prepared.text], { type: type }));
         fileBlobCache.set(key, href);
         return href;
     }

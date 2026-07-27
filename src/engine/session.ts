@@ -479,7 +479,7 @@ export class ChatSession {
 			// the pending bubble in this same cache entry when the reply lands.
 			var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function (m) {
 				return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
-					!m.isCancelled && !m.isBackgroundTask;
+					!m.isCancelled && !m.isBackgroundTask && !m.isError;
 			});
 			var offBounded = buildBoundedChatMessages({
 				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
@@ -505,7 +505,7 @@ export class ChatSession {
 		if (isQueuedSend) {
 			var resolvedHistory = this.state.messages.filter(function (m) {
 				return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
-					!m.isCancelled && !m.isBackgroundTask;
+					!m.isCancelled && !m.isBackgroundTask && !m.isError;
 			});
 			var boundedQ = buildBoundedChatMessages({
 				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
@@ -557,7 +557,29 @@ export class ChatSession {
 		this.state.messages.push({ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) });
 		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.host.scrollToBottom(true);
 
-		var historyForLlm = this.state.messages.filter(function (m) { return !m.isCancelled && !m.isBackgroundTask; });
+		// Same filter as the offChat and isQueuedSend paths above. It must drop the
+		// pending flags too: the `isPending` placeholder pushed two lines up is the
+		// in-flight "Thinking..." bubble, and leaving it in sent a trailing
+		// `{role:'assistant', content:''}` upstream on EVERY immediate send. That is
+		// a last-assistant-turn prefill, which the Claude platform rejects outright,
+		// and on both platforms it made the history end on an assistant turn, so
+		// prepareOpenAIMessages / prepareClaudeMessages bailed at their
+		// `last.role !== 'user'` guard and silently stopped converting attached
+		// images into image blocks.
+		//
+		// `isError` is dropped in all three paths for a different reason: those
+		// bubbles are written by THIS client, never by the model. Every site that
+		// sets `isError: true` fills content from getErrorMessage() or the literal
+		// 'Request was cancelled.', so filtering them discards no model-authored
+		// text. Keeping them handed the model a turn it never produced ("The AI
+		// provider is temporarily unreachable..."), attributed to itself, because the
+		// flag is stripped when buildBoundedChatMessages maps down to {role,content}.
+		// The cost is that a retry now follows an unanswered question with no stated
+		// reason, which is a true account of what happened rather than a false one.
+		var historyForLlm = this.state.messages.filter(function (m) {
+			return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
+				!m.isCancelled && !m.isBackgroundTask && !m.isError;
+		});
 		if (llmComposed !== composed) {
 			for (var li = historyForLlm.length - 1; li >= 0; li--) {
 				if (historyForLlm[li].role === 'user' && historyForLlm[li].content === composed) {

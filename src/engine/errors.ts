@@ -3,6 +3,23 @@
  * agent.vue / bunnyquery chatbox so both consumers share one implementation.
  */
 
+// Plain-language text per upstream status, for the case below where the provider
+// gave us no readable message of its own.
+var STATUS_MESSAGE: { [code: string]: string } = {
+	'408': 'The AI provider timed out before it started.',
+	'409': 'The AI provider rejected the request as conflicting.',
+	'413': 'The request was too large for the AI provider.',
+	'429': 'The AI provider is rate limiting requests right now.',
+	'500': 'The AI provider hit an internal error.',
+	'502': 'The AI provider is temporarily unreachable.',
+	'503': 'The AI provider is temporarily unavailable.',
+	'504': 'The AI provider timed out.',
+};
+
+function isTransientStatus(status: number): boolean {
+	return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 export function getErrorMessage(input: any): string {
 	if (!input) return 'Something went wrong.';
 	if (typeof input === 'string') return input;
@@ -10,6 +27,23 @@ export function getErrorMessage(input: any): string {
 	if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
 	if (input.body && typeof input.body.message === 'string') return input.body.message;
 	if (input.message) return input.message;
+
+	// Every branch above assumes the provider answered with JSON. It does not
+	// always: a gateway failure in front of the model API (Cloudflare's "502 Bad
+	// gateway" page, an ALB error page) arrives as an HTML STRING in `body`, so
+	// `body.error` / `body.message` are undefined on it and the user used to get a
+	// bare 'Something went wrong.' with no way to tell a provider outage from a
+	// bug in their own data. The status code is the one thing we always have, so
+	// say what it means and whether retrying is worth it.
+	var status = typeof input.status_code === 'number' ? input.status_code
+		: typeof input.status === 'number' ? input.status : 0;
+	if (status) {
+		var text = STATUS_MESSAGE[String(status)]
+			|| (status >= 500 ? 'The AI provider returned a server error.'
+				: 'The AI provider rejected the request.');
+		return text + ' (error ' + status + ')'
+			+ (isTransientStatus(status) ? ' This is usually temporary, please try again.' : '');
+	}
 	return 'Something went wrong.';
 }
 

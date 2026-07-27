@@ -45,6 +45,9 @@ export * from './prompts';
 // normalization, and history mapping — shared so both consumers stay identical.
 export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError } from './errors';
 export * from './budget';
+// Per-format UTF-8 declaration for files offered as a download. Shared so a fenced
+// block and a server-published file open identically in Excel, Word and a browser.
+export * from './download_encoding';
 export * from './links';
 export * from './time';
 export * from './ai_agent';
