@@ -47,11 +47,19 @@ export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryabl
 export * from './budget';
 export * from './links';
 export * from './time';
+export * from './ai_agent';
 export {
 	filterListByClearHorizon,
 	normalizeTextContent,
 	extractLastUserTextFromRequest,
 	mapHistoryListToMessages,
+	// The indexing-prompt reader. Exported because the prompt is the only record
+	// of what a pass is about, so anything that meets a pass without a bubble
+	// (a history rebuild, an adopted worker pass, agent.vue's own mapper) has to
+	// read it the same way or the two will not group together.
+	isIndexingRequestText,
+	parseIndexingRequestText,
+	type IndexingRequestRef,
 	type MapHistoryOptions,
 } from './history';
 

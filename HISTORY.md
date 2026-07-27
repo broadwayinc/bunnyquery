@@ -19,59 +19,10 @@ A few notes on how to read this:
 
 ---
 
-## 1.8.0 (2026-07-24, unpublished)
+## 1.8.0 (2026-07-27, published)
 
-The inline-link system rebuilt around one shared classifier, the link bugs that
-prompted it, and a date-and-time under every message.
-
-### One link classifier, shared (was forked)
-
-- New `classifyInlineLink` in `src/engine/links.ts` is the single place that
-  decides what a link target IS: an external URL, a file in this project's db
-  storage (rendered as a re-mintable chip), or a bare storage path. Both clients
-  now render from it. `agent.vue`'s private fork of ~13 link helpers is deleted
-  and the widget's `buildLinkPartFromGroups` is a thin wrapper, so a link bug can
-  no longer be fixed in one client and left in the other, which is exactly how
-  every item in the next section reached production.
-
-### Link handling, fixed
-
-- **A URL containing a space no longer freezes the tab.** `createInlineLinkRegex`
-  had a nested-quantifier alternative that backtracks exponentially: a link whose
-  URL contained a space (which the MCP tools legitimately emit) took ~60s to parse
-  at 30 characters and did not finish beyond ~45. The regex now matches one
-  character per step with disjoint branches, so it is linear. Runs over the whole
-  reply on every render, so this was a hard hang, not a slow case.
-- **A URL with a space no longer renders as a dead download chip.** Whitespace
-  knocked a URL out of the URL branch into the storage-path branch, so an MCP
-  download link rendered as an `_expired_.url/https%3A/…` chip that resolved to
-  nothing. `isHttpUrlLike` classifies it correctly and `repairUrlWhitespace`
-  repairs it (whitespace stripped from our own `/download/<id>` links, whose
-  alphabet cannot contain it; percent-encoded elsewhere so a real `my report.csv`
-  survives).
-- **Stored attachment links no longer go dead on reload.** The `_expired_.url`
-  placeholder that the history sanitizer writes was not recognised when read back,
-  so every stored attachment link rendered as a non-refreshable link to a host
-  that does not resolve, and the model would copy the dead URL into new replies.
-  New `readExpiredAttachmentHref` is consulted before the plain-URL branch. Fixes
-  existing history on read; no migration.
-- **Only real files render as chips.** `mailto:`, `tel:`, `#anchor`, `http://`
-  and a db URL belonging to another project were all being turned into download
-  chips for storage paths that never existed. Only an `http(s)` URL on this
-  project's db host becomes a re-mintable file now; everything else is a plain
-  link.
-- A bare URL no longer swallows the sentence's trailing punctuation into its href.
-- The history sanitizer rewrites only this service's own db URLs, so a
-  third-party link pasted alongside an attachment is left intact instead of being
-  turned into a placeholder for a path that never existed.
-
-### `db:` link scheme
-
-- Storage-path links can now be **declared** rather than inferred:
-  `[name](db:folder/file.csv)`. The classifier strips the `db:` prefix and treats
-  the rest as a storage path, so link identity no longer depends on guessing from
-  the absence of `http`. Bare paths still resolve exactly as before, so no
-  existing message changes.
+A date-and-time under every message, the export-link fix, and the indexing
+prompt rules that stop an answer being drawn from a partial read.
 
 ### Timestamps under every message (new engine module `src/engine/time.ts`)
 
@@ -83,24 +34,44 @@ prompted it, and a date-and-time under every message.
   reconciled to the server value on the next history load. Depends on the
   `created` timestamp now exposed by `clientSecretRequestHistory` in skapi-js.
 
-### Expired-link TTLs unified
+### Export and download links repaired
 
-- `EXPIRED_LINK_REFRESH_EXPIRES_SECONDS` (20 min) and `LINK_REFRESH_WINDOW_MS`
-  moved into the engine, with the trust window derived from the TTL so "the cache
-  must expire before the URL does" holds by construction.
-- **Widget parity.** The widget's expired-chip re-mint was minting a
-  `generate_temporary_cdn_url` link, which ignores `expires` and lives for the
-  rest of the UTC day plus the next (24 to 48h), while calling it a 10-minute
-  link, and it never dropped its cached href. It now mints a plain short-lived
-  presign like the dashboard and expires its cache on the same wall-clock
-  boundary.
+- New `repairUrlEntities` in `src/engine/links.ts`, applied in both the `src::`
+  branch and the generic `[label](url)` / bare-URL branch of
+  `classifyInlineLink`. A model reproducing a download link sometimes wrote the
+  query separators HTML-escaped (`&amp;`), which reached the browser literally, so
+  the real parameters vanished, the signature could not be found, and storage
+  rejected the link. This is the dead CSV/export link.
+
+### Answers must not come from a partial read
+
+- Three new instruction blocks in `src/engine/prompts/chat_system_prompt.ts`:
+  "Complete answers over stored data", "Never assert absence from a partial read",
+  and "Embedded values". A default query returns roughly the first 50 records,
+  which is a sample; the model was counting, totalling and asserting absence from
+  it. It must now read the complete matching set across every relevant table and
+  file, and fetch-and-match itself when the value it wants sits inside a longer
+  string. Mirrored in the MCP tool descriptions.
+
+### Widget parity
+
+- The message body carries `translate: "no"`, matching `agent.vue`. Chrome's page
+  translator was re-tokenizing bubble text and dropping spaces, which mangled
+  Korean and other CJK content, including data read out of the user's own files.
+- The widget bootstrap now passes `windowedIndexing` (default on, opt out with
+  `windowedIndexing: false` in init opts). It was never passing the key, so
+  `windowedIndexingEnabled()` stayed false and embedders fell back to the
+  client-driven CONTINUE loop capped at `MAX_INDEXING_RESUME_PASSES`: the tab had
+  to stay open and a large text or grid file stopped early. `apply_file_windows`
+  is deployed in all 7 regions, which is the precondition the flag exists for.
 
 ---
 
-## 1.7.0 (2026-07-23, published)
+## 1.7.0 (2026-07-24, published)
 
-Per-run indexing rows, and making older history reachable once a page of it
-collapses into a single row.
+Per-run indexing rows, making older history reachable once a page of it collapses
+into a single row, and the inline-link system rebuilt around one shared
+classifier.
 
 ### Collapsed rows are now per indexing RUN, not per file
 
@@ -196,9 +167,70 @@ New `src/engine/viewport_fill.ts`, exported as `fillHistoryViewport`,
   classified every queued indexing pass as foreground, ejected it from its row,
   and span up a "Thinking..." on an unrelated queued foreground message.
 
+### One link classifier, shared (was forked)
+
+- New `classifyInlineLink` in `src/engine/links.ts` is the single place that
+  decides what a link target IS: an external URL, a file in this project's db
+  storage (rendered as a re-mintable chip), or a bare storage path. Both clients
+  now render from it. `agent.vue`'s private fork of ~13 link helpers is deleted
+  and the widget's `buildLinkPartFromGroups` is a thin wrapper, so a link bug can
+  no longer be fixed in one client and left in the other, which is exactly how
+  every item in the next section reached production.
+
+### Link handling, fixed
+
+- **A URL containing a space no longer freezes the tab.** `createInlineLinkRegex`
+  had a nested-quantifier alternative that backtracks exponentially: a link whose
+  URL contained a space (which the MCP tools legitimately emit) took ~60s to parse
+  at 30 characters and did not finish beyond ~45. The regex now matches one
+  character per step with disjoint branches, so it is linear. Runs over the whole
+  reply on every render, so this was a hard hang, not a slow case.
+- **A URL with a space no longer renders as a dead download chip.** Whitespace
+  knocked a URL out of the URL branch into the storage-path branch, so an MCP
+  download link rendered as an `_expired_.url/https%3A/…` chip that resolved to
+  nothing. `isHttpUrlLike` classifies it correctly and `repairUrlWhitespace`
+  repairs it (whitespace stripped from our own `/download/<id>` links, whose
+  alphabet cannot contain it; percent-encoded elsewhere so a real `my report.csv`
+  survives).
+- **Stored attachment links no longer go dead on reload.** The `_expired_.url`
+  placeholder that the history sanitizer writes was not recognised when read back,
+  so every stored attachment link rendered as a non-refreshable link to a host
+  that does not resolve, and the model would copy the dead URL into new replies.
+  New `readExpiredAttachmentHref` is consulted before the plain-URL branch. Fixes
+  existing history on read; no migration.
+- **Only real files render as chips.** `mailto:`, `tel:`, `#anchor`, `http://`
+  and a db URL belonging to another project were all being turned into download
+  chips for storage paths that never existed. Only an `http(s)` URL on this
+  project's db host becomes a re-mintable file now; everything else is a plain
+  link.
+- A bare URL no longer swallows the sentence's trailing punctuation into its href.
+- The history sanitizer rewrites only this service's own db URLs, so a
+  third-party link pasted alongside an attachment is left intact instead of being
+  turned into a placeholder for a path that never existed.
+
+### `db:` link scheme
+
+- Storage-path links can now be **declared** rather than inferred:
+  `[name](db:folder/file.csv)`. The classifier strips the `db:` prefix and treats
+  the rest as a storage path, so link identity no longer depends on guessing from
+  the absence of `http`. Bare paths still resolve exactly as before, so no
+  existing message changes.
+
+### Expired-link TTLs unified
+
+- `EXPIRED_LINK_REFRESH_EXPIRES_SECONDS` (20 min) and `LINK_REFRESH_WINDOW_MS`
+  moved into the engine, with the trust window derived from the TTL so "the cache
+  must expire before the URL does" holds by construction.
+- **Widget parity.** The widget's expired-chip re-mint was minting a
+  `generate_temporary_cdn_url` link, which ignores `expires` and lives for the
+  rest of the UTC day plus the next (24 to 48h), while calling it a 10-minute
+  link, and it never dropped its cached href. It now mints a plain short-lived
+  presign like the dashboard and expires its cache on the same wall-clock
+  boundary.
+
 ---
 
-## 1.6.4 (unpublished)
+## 1.6.4 (never published on its own; shipped inside 1.7.0)
 
 Collapsed background-indexing rows, and a Stop button that actually ends the
 chain.
@@ -269,7 +301,7 @@ chain.
 
 ---
 
-## 1.6.3 (unpublished)
+## 1.6.3 (never published on its own; shipped inside 1.7.0)
 
 - Continue passes get a compact "Indexing (continuing)" label so a big file's
   multi-window run reads as progress rather than the same task repeating.
@@ -282,7 +314,7 @@ chain.
 
 ---
 
-## 1.6.2 (2026-07-22)
+## 1.6.2 (2026-07-22, published)
 
 Server-driven windowed indexing, and polling that stops when nobody is looking.
 
@@ -409,7 +441,7 @@ identity already pointed at project B.
 
 ---
 
-## 1.6.0 (2026-07-16)
+## 1.6.0 (2026-07-16, published)
 
 Version bump only, republishing 1.5.7's engine.
 

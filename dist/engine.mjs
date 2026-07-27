@@ -755,25 +755,74 @@ function truncateLabelForDisplay(label) {
 // src/engine/budget.ts
 var CONTEXT_WINDOW_DEFAULT = { claude: 2e5, openai: 128e3 };
 var CONTEXT_WINDOW_BY_MODEL = {
-  "claude-opus-4-7": 2e5,
+  // exact ids
+  "claude-opus-5": 1e6,
+  "claude-opus-4-8": 1e6,
+  "claude-opus-4-7": 1e6,
+  "claude-sonnet-5": 1e6,
+  "claude-sonnet-4-6": 1e6,
   "claude-sonnet-4": 2e5,
-  "gpt-5.4": 128e3
+  "claude-haiku-4-5": 2e5,
+  "gpt-5.4": 128e3,
+  "gpt-5.6-luna": 128e3,
+  // family keys
+  "claude-opus": 1e6,
+  "claude-sonnet": 1e6,
+  "claude-haiku": 2e5,
+  "gpt-5.6": 128e3,
+  "gpt-5": 128e3
 };
+var apiReportedContextWindows = {};
+function registerModelContextWindows(models) {
+  if (!Array.isArray(models)) return;
+  for (var i = 0; i < models.length; i++) {
+    var m = models[i];
+    var id = (m && m.id ? String(m.id) : "").trim().toLowerCase();
+    var reported = m ? Number(m.max_input_tokens) : NaN;
+    if (id && Number.isFinite(reported) && reported > 0) {
+      apiReportedContextWindows[id] = Math.floor(reported);
+    }
+  }
+}
+var projectContextWindows = {};
+function setProjectContextWindow(serviceId, tokens) {
+  var key = (serviceId || "").trim();
+  if (!key) return;
+  var n = Number(tokens);
+  if (Number.isFinite(n) && n > 0) projectContextWindows[key] = Math.floor(n);
+  else delete projectContextWindows[key];
+}
+function getProjectContextWindow(serviceId) {
+  var key = (serviceId || "").trim();
+  return key && projectContextWindows[key] ? projectContextWindows[key] : null;
+}
 var OUTPUT_TOKEN_RESERVE = 22e3;
 var TOOL_AND_RESPONSE_BUFFER = 4e3;
 var MIN_INPUT_TOKEN_BUDGET = 8e3;
 var CLAUDE_PER_REQUEST_INPUT_CAP = 28e3;
 var MAX_HISTORY_MESSAGES = 20;
 var HISTORY_TOKEN_BUDGET = 8e3;
+var CLAUDE_INPUT_CAP_RATIO = 0.16;
+var HISTORY_BUDGET_RATIO = 0.08;
 function estimateTextTokens(text) {
   return Math.ceil((text || "").length / 3);
 }
 function estimateMessageTokens(msg) {
   return estimateTextTokens(msg.content) + estimateTextTokens(msg.role) + 6;
 }
-function getContextWindow(platform, model) {
+function getContextWindow(platform, model, serviceId) {
+  var override = serviceId ? getProjectContextWindow(serviceId) : null;
+  if (override) return override;
   var normalized = (model || "").trim().toLowerCase();
-  if (normalized && CONTEXT_WINDOW_BY_MODEL[normalized]) return CONTEXT_WINDOW_BY_MODEL[normalized];
+  if (normalized) {
+    if (apiReportedContextWindows[normalized]) return apiReportedContextWindows[normalized];
+    if (CONTEXT_WINDOW_BY_MODEL[normalized]) return CONTEXT_WINDOW_BY_MODEL[normalized];
+    var parts = normalized.split("-");
+    for (var end = parts.length - 1; end > 0; end--) {
+      var family = parts.slice(0, end).join("-");
+      if (CONTEXT_WINDOW_BY_MODEL[family]) return CONTEXT_WINDOW_BY_MODEL[family];
+    }
+  }
   return CONTEXT_WINDOW_DEFAULT[platform];
 }
 function stripFileBlocksFromHistory(content) {
@@ -781,15 +830,19 @@ function stripFileBlocksFromHistory(content) {
   return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
 }
 function buildBoundedChatMessages(options) {
-  var contextWindow = getContextWindow(options.platform, options.model);
+  var contextWindow = getContextWindow(options.platform, options.model, options.serviceId);
   var contextBasedBudget = Math.max(
     MIN_INPUT_TOKEN_BUDGET,
     contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER
   );
-  var availableInputBudget = options.platform === "claude" ? Math.min(contextBasedBudget, CLAUDE_PER_REQUEST_INPUT_CAP) : contextBasedBudget;
+  var scaled = !!(options.serviceId && getProjectContextWindow(options.serviceId));
+  var claudeInputCap = scaled ? Math.max(CLAUDE_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * CLAUDE_INPUT_CAP_RATIO)) : CLAUDE_PER_REQUEST_INPUT_CAP;
+  var availableInputBudget = options.platform === "claude" ? Math.min(contextBasedBudget, claudeInputCap) : contextBasedBudget;
   var systemCost = estimateTextTokens(options.systemPrompt) + 12;
-  var budgetForHistory = Math.max(1e3, Math.min(HISTORY_TOKEN_BUDGET, availableInputBudget - systemCost));
-  var windowed = options.history.slice(-MAX_HISTORY_MESSAGES);
+  var historyAllowance = scaled ? Math.max(HISTORY_TOKEN_BUDGET, Math.round(contextBasedBudget * HISTORY_BUDGET_RATIO)) : HISTORY_TOKEN_BUDGET;
+  var budgetForHistory = Math.max(1e3, Math.min(historyAllowance, availableInputBudget - systemCost));
+  var maxHistoryMessages = scaled ? Math.max(MAX_HISTORY_MESSAGES, Math.round(MAX_HISTORY_MESSAGES * (budgetForHistory / HISTORY_TOKEN_BUDGET))) : MAX_HISTORY_MESSAGES;
+  var windowed = options.history.slice(-maxHistoryMessages);
   var latestIndex = windowed.length - 1;
   var trimmed = windowed.map(function(m, i2) {
     if (i2 === latestIndex) return m;
@@ -832,6 +885,40 @@ function formatChatTimestamp(ms) {
   } catch (e) {
     return "";
   }
+}
+
+// src/engine/ai_agent.ts
+function normalizePlatform(raw) {
+  var p = (raw || "").trim().toLowerCase();
+  return p === "claude" || p === "openai" ? p : null;
+}
+function parseAiAgentValue(value) {
+  var raw = (value || "").trim();
+  if (!raw || raw.toLowerCase() === "none") {
+    return { platform: null, model: "", contextWindow: null, hasPlatform: false };
+  }
+  var firstHash = raw.indexOf("#");
+  if (firstHash === -1) {
+    var only = normalizePlatform(raw);
+    return { platform: only, model: "", contextWindow: null, hasPlatform: !!only };
+  }
+  var platform = normalizePlatform(raw.slice(0, firstHash));
+  var rest = raw.slice(firstHash + 1);
+  var secondHash = rest.indexOf("#");
+  var model = (secondHash === -1 ? rest : rest.slice(0, secondHash)).trim();
+  var windowRaw = secondHash === -1 ? "" : rest.slice(secondHash + 1).trim();
+  var parsedWindow = windowRaw ? Number(windowRaw) : NaN;
+  var contextWindow = Number.isFinite(parsedWindow) && parsedWindow > 0 ? Math.floor(parsedWindow) : null;
+  return { platform, model, contextWindow, hasPlatform: !!platform };
+}
+function buildAiAgentValue(platform, model, contextWindow) {
+  var p = (platform || "").trim().toLowerCase();
+  if (!p || p === "none") return "none";
+  var m = (model || "").trim();
+  if (!m) return p;
+  var n = Number(contextWindow);
+  if (!Number.isFinite(n) || n <= 0) return p + "#" + m;
+  return p + "#" + m + "#" + Math.floor(n);
 }
 
 // src/engine/requests.ts
@@ -1342,7 +1429,8 @@ async function getChatHistory(params, fetchOptions) {
       method: "POST"
     },
     { service: params.service, owner: params.owner },
-    params.queue ? { queue: params.queue } : {}
+    params.queue ? { queue: params.queue } : {},
+    params.status ? { status: params.status } : {}
   );
   return chatEngineConfig().clientSecretRequestHistory(
     p,
@@ -1379,6 +1467,25 @@ function extractLastUserTextFromRequest(requestBody) {
   }
   return "";
 }
+function isIndexingRequestText(userText) {
+  if (typeof userText !== "string") return false;
+  return userText.indexOf("A new file has just been uploaded") === 0 || userText.indexOf("CONTINUE indexing") === 0;
+}
+function parseIndexingRequestText(userText) {
+  if (typeof userText !== "string" || !userText) return null;
+  var nameMatch = userText.match(/^- name: (.+)$/m);
+  if (!nameMatch) return null;
+  var mimeMatch = userText.match(/^- mime type: (.+)$/m);
+  var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
+  var pathMatch = userText.match(/^- storage path: (.+)$/m);
+  return {
+    name: nameMatch[1].trim(),
+    path: pathMatch ? pathMatch[1].trim() : void 0,
+    mime: mimeMatch ? mimeMatch[1].trim() : void 0,
+    size: sizeMatch ? Number(sizeMatch[1]) : void 0,
+    continued: userText.indexOf("CONTINUE indexing") === 0
+  };
+}
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
   var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
@@ -1403,27 +1510,17 @@ function mapHistoryListToMessages(list, platform, opts) {
       var displayContent;
       var indexFile = void 0;
       if (item._isBgTask) {
-        var nameMatch = userText.match(/^- name: (.+)$/m);
-        if (nameMatch) {
-          var mimeMatch = userText.match(/^- mime type: (.+)$/m);
-          var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
-          var pathMatch = userText.match(/^- storage path: (.+)$/m);
-          var isContinuePass = userText.indexOf("CONTINUE indexing") === 0;
+        var ref = parseIndexingRequestText(userText);
+        if (ref) {
           displayContent = opts.formatIndexingLabel(
-            nameMatch[1].trim(),
-            mimeMatch ? mimeMatch[1].trim() : "",
-            sizeMatch ? Number(sizeMatch[1]) : null,
-            pathMatch ? pathMatch[1].trim() : void 0,
+            ref.name,
+            ref.mime || "",
+            typeof ref.size === "number" ? ref.size : null,
+            ref.path,
             false,
-            isContinuePass
+            ref.continued
           );
-          indexFile = {
-            name: nameMatch[1].trim(),
-            path: pathMatch ? pathMatch[1].trim() : void 0,
-            mime: mimeMatch ? mimeMatch[1].trim() : void 0,
-            size: sizeMatch ? Number(sizeMatch[1]) : void 0,
-            continued: isContinuePass
-          };
+          indexFile = ref;
         } else {
           displayContent = userText;
         }
@@ -1552,6 +1649,8 @@ function createHistoryFiller(base) {
 }
 
 // src/engine/session.ts
+var WORKER_PASS_ADOPT_LIMIT = 20;
+var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
 var _g = typeof globalThis !== "undefined" ? globalThis : {};
 function nowMs() {
   return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
@@ -1571,6 +1670,35 @@ function isPollStopped(res) {
 var ChatSession = class {
   constructor(host) {
     this.typewriterQueue = Promise.resolve();
+    /**
+     * Pick up indexing passes the WORKER minted, which no client ever dispatched.
+     *
+     * For a PDF (and for text/grid when windowed indexing is on) the worker writes
+     * pass N+1's row itself, inside pass N's invocation, right after saving pass
+     * N's result. That row reaches this client through nothing at all: it is not in
+     * bgTaskQueue (the client never asked for it) and it is not in state.messages
+     * (only a first-page history load maps it in, which happens on mount, project
+     * switch or tab return). So between two worker passes every pass the client
+     * knows about is settled, and the collapsed row renders "Indexed  N passes"
+     * with no spinner and no Stop, for a file that is still being read. A user who
+     * believes that then asks questions against a half-indexed file — which is what
+     * this exists to prevent.
+     *
+     * So when a background indexing pass settles, ask the bg queue what is still
+     * unresolved on it and adopt anything unknown as an ordinary BgTaskEntry.
+     * drainBgTaskQueue then treats it exactly like a pass this client dispatched:
+     * same bubble, same `_indexFile` (so it joins the file's collapsed row), same
+     * poll — and that poll settling runs this again, so the chain is followed to
+     * its end. `status`-scoped so the reply carries the live items only, never a
+     * page of finished ones with their bodies.
+     *
+     * Termination: the only trigger is a pass SETTLING, which happens once per
+     * pass. An adopted item that is still running is not re-adopted (its id is
+     * already polled), and when the queue holds nothing unknown the chain stops on
+     * its own. Nothing here is periodic — a timer that re-reads history is the
+     * shape that previously looped fetchHistoryPage after an already-DONE index.
+     */
+    this._adoptingWorkerPasses = false;
     this.host = host;
     this.state = {
       messages: [],
@@ -2516,8 +2644,21 @@ var ChatSession = class {
   }
   // --- background-task resolution + drain -------------------------------
   handleHistoryItemResolution(itemId, response, platform) {
+    var indexRef = this._indexRefOfItem(itemId);
     this.applyHistoryItemResolution(itemId, response, platform);
     this.promoteNextBgQueuedToRunning();
+    if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
+  }
+  /** The file an already-rendered background pass is about, off its request
+   *  bubble. Null for an ordinary turn, which is most of them. */
+  _indexRefOfItem(itemId) {
+    if (!itemId) return null;
+    for (var i = 0; i < this.state.messages.length; i++) {
+      var m = this.state.messages[i];
+      if (m._serverItemId !== itemId || m.role !== "user" || !m.isBackgroundTask) continue;
+      return m._indexFile || null;
+    }
+    return null;
   }
   applyHistoryItemResolution(itemId, response, platform) {
     this.historyItemPolls.delete(itemId);
@@ -2650,6 +2791,116 @@ var ChatSession = class {
       var idx = self.state.messages.indexOf(t.msg);
       self.cancelQueuedMessage(t.msg, idx === -1 ? t.idx : idx);
     });
+  }
+  /**
+   * True when the WORKER, not this client, drives the rest of this file's chain.
+   * The mirror image of the early returns in maybeResumeIndexing: whatever that
+   * refuses to continue is exactly what nothing client-side is tracking.
+   */
+  _isWorkerDrivenIndexing(filename, mime) {
+    if (!isPagedReadFile(filename, mime)) return false;
+    if (isImageVisionFile(filename, mime)) return true;
+    return windowedIndexingEnabled() && isWindowedReadFile(filename, mime);
+  }
+  _adoptWorkerIndexingPasses(attempt) {
+    var self = this;
+    if (this._adoptingWorkerPasses) return;
+    var id = this.host.getIdentity();
+    var platform = id.platform;
+    if (!id.serviceId || platform !== "claude" && platform !== "openai") return;
+    if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+    var svcId = id.serviceId, owner = id.owner;
+    var queue = (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX;
+    var ask = function(status) {
+      return Promise.resolve(getChatHistory(
+        { service: svcId, owner, platform, queue, status },
+        { limit: WORKER_PASS_ADOPT_LIMIT }
+      )).catch(function() {
+        return null;
+      });
+    };
+    this._adoptingWorkerPasses = true;
+    Promise.all([ask("running"), ask("pending")]).then(function(results) {
+      self._adoptingWorkerPasses = false;
+      var now = self.host.getIdentity();
+      if (now.serviceId !== svcId || now.platform !== platform) return;
+      if (!self.host.isViewMounted()) return;
+      var adoptedIds = [];
+      for (var ri = 0; ri < results.length; ri++) {
+        var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
+        for (var i = 0; i < list.length; i++) {
+          if (self._adoptWorkerIndexingItem(list[i], svcId, platform)) adoptedIds.push(list[i].id);
+        }
+      }
+      if (adoptedIds.length) {
+        self.drainBgTaskQueue();
+        if (self._isTrackingAny(adoptedIds)) return;
+      }
+      if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) return;
+      setTimeout(function() {
+        var later = self.host.getIdentity();
+        if (later.serviceId !== svcId || later.platform !== platform) return;
+        if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+        self._adoptWorkerIndexingPasses(attempt + 1);
+      }, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
+    }, function() {
+      self._adoptingWorkerPasses = false;
+    });
+  }
+  /** Any of these ids still queued or still polled, i.e. surviving work. */
+  _isTrackingAny(ids) {
+    for (var i = 0; i < ids.length; i++) {
+      if (this.historyItemPolls.has(ids[i])) return true;
+      for (var q = 0; q < this.bgTaskQueue.length; q++) {
+        if (this.bgTaskQueue[q].id === ids[i]) return true;
+      }
+    }
+    return false;
+  }
+  /** One live bg-queue item -> a BgTaskEntry, if it is an indexing pass this
+   *  client is not already tracking. Returns whether it was adopted. */
+  _adoptWorkerIndexingItem(item, svcId, platform) {
+    if (!item || typeof item.id !== "string" || !item.id) return false;
+    if (item.status !== "pending" && item.status !== "running") return false;
+    if (typeof item.poll !== "function") return false;
+    if (this.historyItemPolls.has(item.id)) return false;
+    for (var q = 0; q < this.bgTaskQueue.length; q++) {
+      if (this.bgTaskQueue[q].id === item.id) return false;
+    }
+    for (var m = 0; m < this.state.messages.length; m++) {
+      var msg = this.state.messages[m];
+      if (msg._serverItemId !== item.id) continue;
+      if (!(msg.isPending || msg.isPendingInProcess || msg.isPendingQueued)) return false;
+    }
+    var body = item.request_body;
+    if (!body || typeof body !== "object") return false;
+    if (platform === "claude" ? !Array.isArray(body.messages) : !Array.isArray(body.input)) return false;
+    var userText = extractLastUserTextFromRequest(body);
+    if (!isIndexingRequestText(userText)) return false;
+    var ref = parseIndexingRequestText(userText);
+    if (!ref || !ref.name) return false;
+    if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
+    this.bgTaskQueue.push({
+      serviceId: svcId,
+      platform,
+      id: item.id,
+      filename: ref.name,
+      storagePath: ref.path,
+      mime: ref.mime,
+      size: ref.size,
+      status: item.status === "running" ? "running" : "pending",
+      poll: item.poll,
+      // Drives the "(continuing)" label and marks this as a continuation for
+      // _applyIndexCancellations, which must not read a CONTINUE pass as the
+      // fresh first pass that lifts a stop.
+      resumePass: ref.continued ? 1 : 0
+    });
+    return true;
+  }
+  /** Follow the chain on from a background indexing pass that just settled. */
+  _followWorkerIndexingChain(filename, mime) {
+    if (!this._isWorkerDrivenIndexing(filename, mime)) return;
+    this._adoptWorkerIndexingPasses(0);
   }
   /** Best-effort server-side cancel of a bg-queue item that has no bubble (so
    *  cancelQueuedMessage, which drives one, has nothing to act on). */
@@ -2861,8 +3112,7 @@ var ChatSession = class {
       var chatList = history && Array.isArray(history.list) ? history.list : [];
       chatList.forEach(function(item) {
         if (isBgIndexingQueue(item.queue_name)) {
-          var userText = extractLastUserTextFromRequest(item.request_body);
-          if (typeof userText === "string" && (userText.indexOf("A new file has just been uploaded") === 0 || userText.indexOf("CONTINUE indexing") === 0)) item._isBgTask = true;
+          if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) item._isBgTask = true;
           else item._isOnBgQueue = true;
         }
       });
@@ -3429,6 +3679,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, readExpiredAttachmentHref, registerAttachmentParser, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

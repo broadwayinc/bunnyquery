@@ -833,8 +833,16 @@ export const INDEXING_COMPLETE_MARKER = 'INDEXING_COMPLETE';
 // a small cap suffices.
 export const MAX_INDEXING_RESUME_PASSES = 6;
 
+/**
+ * `queue` narrows the fetch to one processing chain; `status` narrows it to items
+ * in one state. Passing both is how the client asks "is there still unresolved
+ * work on the background-indexing queue?" without pulling a page of chat history
+ * (see ChatSession._adoptWorkerIndexingPasses) — the server answers that from a
+ * status-keyed index, so the reply carries only the live items, not the bodies of
+ * everything already finished.
+ */
 export async function getChatHistory(
-	params: { service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string },
+	params: { service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string; status?: 'pending' | 'running' | 'resolved' | 'failed' },
 	fetchOptions: Record<string, any>,
 ) {
 	const url =
@@ -848,10 +856,11 @@ export async function getChatHistory(
 		},
 		{ service: params.service, owner: params.owner },
 		params.queue ? { queue: params.queue } : {},
+		params.status ? { status: params.status } : {},
 	);
 
 	return chatEngineConfig().clientSecretRequestHistory(
-		p as { url: string; method: 'POST'; queue?: string },
+		p as { url: string; method: 'POST'; queue?: string; status?: string },
 		Object.assign({ ascending: false }, fetchOptions),
 	);
 }

@@ -39,7 +39,7 @@ import { windowedIndexingEnabled } from './config';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
-import { mapHistoryListToMessages, extractLastUserTextFromRequest } from './history';
+import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, PinnedDispatchContext } from './host';
@@ -48,6 +48,16 @@ import type { IndexingGroup } from './indexing_groups';
 function sleep(ms: number): Promise<void> {
 	return new Promise(function (r) { setTimeout(r, ms); });
 }
+
+// How many live items one look at the background-indexing queue asks for. The
+// queue is FIFO per user, so a healthy chain has one running plus at most a
+// couple queued; the cap only bounds a pathological backlog.
+const WORKER_PASS_ADOPT_LIMIT = 20;
+// Delays before each look (the first is immediate). More than one because the
+// worker writes the next pass's row a few milliseconds AFTER it resolves the
+// current one, so a look that wins that race sees an empty queue for a chain
+// that is still alive. Fixed and finite: this must never become a poll.
+const WORKER_PASS_ADOPT_ATTEMPTS = [0, 2000, 6000];
 
 // requestAnimationFrame / high-res clock, reached through globalThis so the
 // engine stays DOM-free at the type level (and degrades gracefully in non-DOM
@@ -1111,8 +1121,29 @@ export class ChatSession {
 
 	// --- background-task resolution + drain -------------------------------
 	handleHistoryItemResolution(itemId: string, response: any, platform: string): void {
+		// Which file this turn was indexing, read BEFORE the resolution rewrites the
+		// bubbles. Every settling turn funnels through here — the bg drain's own
+		// poll, the history poll, and agent.vue's forked history poll, which calls
+		// straight into this method — so hooking the chain follow-up here is what
+		// makes it work in both clients without either of them forking a call site.
+		var indexRef = this._indexRefOfItem(itemId);
 		this.applyHistoryItemResolution(itemId, response, platform);
 		this.promoteNextBgQueuedToRunning();
+		// A worker-driven chain has no client-side record of its next pass, so a
+		// settling pass is the only moment there is to go looking for one.
+		if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
+	}
+
+	/** The file an already-rendered background pass is about, off its request
+	 *  bubble. Null for an ordinary turn, which is most of them. */
+	private _indexRefOfItem(itemId: string): { name?: string; mime?: string } | null {
+		if (!itemId) return null;
+		for (var i = 0; i < this.state.messages.length; i++) {
+			var m = this.state.messages[i];
+			if (m._serverItemId !== itemId || m.role !== 'user' || !m.isBackgroundTask) continue;
+			return m._indexFile || null;
+		}
+		return null;
 	}
 
 	applyHistoryItemResolution(itemId: string, response: any, platform: string): void {
@@ -1259,6 +1290,175 @@ export class ChatSession {
 			var idx = self.state.messages.indexOf(t.msg);
 			self.cancelQueuedMessage(t.msg, idx === -1 ? t.idx : idx);
 		});
+	}
+
+	/**
+	 * True when the WORKER, not this client, drives the rest of this file's chain.
+	 * The mirror image of the early returns in maybeResumeIndexing: whatever that
+	 * refuses to continue is exactly what nothing client-side is tracking.
+	 */
+	private _isWorkerDrivenIndexing(filename?: string, mime?: string): boolean {
+		if (!isPagedReadFile(filename, mime)) return false;
+		if (isImageVisionFile(filename, mime)) return true;
+		return windowedIndexingEnabled() && isWindowedReadFile(filename, mime);
+	}
+
+	/**
+	 * Pick up indexing passes the WORKER minted, which no client ever dispatched.
+	 *
+	 * For a PDF (and for text/grid when windowed indexing is on) the worker writes
+	 * pass N+1's row itself, inside pass N's invocation, right after saving pass
+	 * N's result. That row reaches this client through nothing at all: it is not in
+	 * bgTaskQueue (the client never asked for it) and it is not in state.messages
+	 * (only a first-page history load maps it in, which happens on mount, project
+	 * switch or tab return). So between two worker passes every pass the client
+	 * knows about is settled, and the collapsed row renders "Indexed  N passes"
+	 * with no spinner and no Stop, for a file that is still being read. A user who
+	 * believes that then asks questions against a half-indexed file — which is what
+	 * this exists to prevent.
+	 *
+	 * So when a background indexing pass settles, ask the bg queue what is still
+	 * unresolved on it and adopt anything unknown as an ordinary BgTaskEntry.
+	 * drainBgTaskQueue then treats it exactly like a pass this client dispatched:
+	 * same bubble, same `_indexFile` (so it joins the file's collapsed row), same
+	 * poll — and that poll settling runs this again, so the chain is followed to
+	 * its end. `status`-scoped so the reply carries the live items only, never a
+	 * page of finished ones with their bodies.
+	 *
+	 * Termination: the only trigger is a pass SETTLING, which happens once per
+	 * pass. An adopted item that is still running is not re-adopted (its id is
+	 * already polled), and when the queue holds nothing unknown the chain stops on
+	 * its own. Nothing here is periodic — a timer that re-reads history is the
+	 * shape that previously looped fetchHistoryPage after an already-DONE index.
+	 */
+	private _adoptingWorkerPasses = false;
+	private _adoptWorkerIndexingPasses(attempt: number): void {
+		var self = this;
+		// One in flight at a time. The query is queue-WIDE, so a second file's pass
+		// settling in the same moment is covered by the query already running.
+		if (this._adoptingWorkerPasses) return;
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!id.serviceId || (platform !== 'claude' && platform !== 'openai')) return;
+		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+		var svcId = id.serviceId, owner = id.owner;
+		var queue = (id.userId || id.serviceId) + BG_INDEXING_QUEUE_SUFFIX;
+		var ask = function (status: 'pending' | 'running') {
+			return Promise.resolve(getChatHistory(
+				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
+				{ limit: WORKER_PASS_ADOPT_LIMIT },
+			)).catch(function () { return null; });
+		};
+		this._adoptingWorkerPasses = true;
+		Promise.all([ask('running'), ask('pending')]).then(function (results: any[]) {
+			self._adoptingWorkerPasses = false;
+			// The chat may have changed under the query; adopting into another
+			// project's session is the cross-project bubble leak all over again.
+			var now = self.host.getIdentity();
+			if (now.serviceId !== svcId || now.platform !== platform) return;
+			if (!self.host.isViewMounted()) return;
+			var adoptedIds: string[] = [];
+			for (var ri = 0; ri < results.length; ri++) {
+				var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
+				for (var i = 0; i < list.length; i++) {
+					if (self._adoptWorkerIndexingItem(list[i], svcId, platform as 'claude' | 'openai')) adoptedIds.push(list[i].id);
+				}
+			}
+			if (adoptedIds.length) {
+				self.drainBgTaskQueue();
+				// Only an item the drain KEPT means the chain is still going. One it
+				// threw straight back out is not progress and must not end the ladder:
+				// the status index is eventually consistent, so a look taken the
+				// instant a pass settles can still report that pass as running, and a
+				// pass belonging to a file the user stopped is dropped on sight. Both
+				// used to read as "found the next pass", which ended the search for a
+				// pass that had not been written yet.
+				if (self._isTrackingAny(adoptedIds)) return;
+			}
+			// Nothing yet. The worker writes pass N+1 a few milliseconds AFTER it
+			// flips pass N to resolved, so a poll that lands in that gap sees an
+			// empty queue for a chain that is very much alive — and with no pass
+			// left to settle, nothing would ever ask again. Look once or twice more
+			// before believing the file is finished.
+			if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) return;
+			setTimeout(function () {
+				var later = self.host.getIdentity();
+				if (later.serviceId !== svcId || later.platform !== platform) return;
+				if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+				self._adoptWorkerIndexingPasses(attempt + 1);
+			}, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
+		}, function () { self._adoptingWorkerPasses = false; });
+	}
+
+	/** Any of these ids still queued or still polled, i.e. surviving work. */
+	private _isTrackingAny(ids: string[]): boolean {
+		for (var i = 0; i < ids.length; i++) {
+			if (this.historyItemPolls.has(ids[i])) return true;
+			for (var q = 0; q < this.bgTaskQueue.length; q++) {
+				if (this.bgTaskQueue[q].id === ids[i]) return true;
+			}
+		}
+		return false;
+	}
+
+	/** One live bg-queue item -> a BgTaskEntry, if it is an indexing pass this
+	 *  client is not already tracking. Returns whether it was adopted. */
+	private _adoptWorkerIndexingItem(item: any, svcId: string, platform: 'claude' | 'openai'): boolean {
+		if (!item || typeof item.id !== 'string' || !item.id) return false;
+		if (item.status !== 'pending' && item.status !== 'running') return false;
+		if (typeof item.poll !== 'function') return false;
+		// Already known: a pass this client dispatched, or one adopted earlier that
+		// has not settled yet. Adopting twice would stack a second poll on one item.
+		if (this.historyItemPolls.has(item.id)) return false;
+		for (var q = 0; q < this.bgTaskQueue.length; q++) {
+			if (this.bgTaskQueue[q].id === item.id) return false;
+		}
+		// Already SETTLED here. The status index is eventually consistent, so the
+		// pass that just finished can still come back as running; re-adopting it
+		// would re-poll a dead item and, worse, read as the chain continuing.
+		for (var m = 0; m < this.state.messages.length; m++) {
+			var msg = this.state.messages[m];
+			if (msg._serverItemId !== item.id) continue;
+			if (!(msg.isPending || msg.isPendingInProcess || msg.isPendingQueued)) return false;
+		}
+		// The bg queue also carries ordinary chats routed onto it (_isOnBgQueue), and
+		// both platforms share one queue name, so check the shape as well: a claude
+		// request body has `messages`, an openai one has `input`. Adopting the other
+		// platform's item would poll it against this platform's url.
+		var body = item.request_body;
+		if (!body || typeof body !== 'object') return false;
+		if (platform === 'claude' ? !Array.isArray((body as any).messages) : !Array.isArray((body as any).input)) return false;
+		var userText = extractLastUserTextFromRequest(body);
+		if (!isIndexingRequestText(userText)) return false;
+		var ref = parseIndexingRequestText(userText);
+		if (!ref || !ref.name) return false;
+		// Only chains the worker drives. A client-driven file is already tracked by
+		// the entry that dispatched it, and adopting a copy of it would hand
+		// maybeResumeIndexing an entry whose resumePass no longer counts that
+		// chain's passes — which is the cap that stops it running forever.
+		if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
+		this.bgTaskQueue.push({
+			serviceId: svcId,
+			platform: platform,
+			id: item.id,
+			filename: ref.name,
+			storagePath: ref.path,
+			mime: ref.mime,
+			size: ref.size,
+			status: item.status === 'running' ? 'running' : 'pending',
+			poll: item.poll,
+			// Drives the "(continuing)" label and marks this as a continuation for
+			// _applyIndexCancellations, which must not read a CONTINUE pass as the
+			// fresh first pass that lifts a stop.
+			resumePass: ref.continued ? 1 : 0,
+		});
+		return true;
+	}
+
+	/** Follow the chain on from a background indexing pass that just settled. */
+	private _followWorkerIndexingChain(filename?: string, mime?: string): void {
+		if (!this._isWorkerDrivenIndexing(filename, mime)) return;
+		this._adoptWorkerIndexingPasses(0);
 	}
 
 	/** Best-effort server-side cancel of a bg-queue item that has no bubble (so
@@ -1485,8 +1685,7 @@ export class ChatSession {
 			var chatList = history && Array.isArray(history.list) ? history.list : [];
 			chatList.forEach(function (item: any) {
 				if (isBgIndexingQueue(item.queue_name)) {
-					var userText = extractLastUserTextFromRequest(item.request_body);
-					if (typeof userText === 'string' && (userText.indexOf('A new file has just been uploaded') === 0 || userText.indexOf('CONTINUE indexing') === 0)) item._isBgTask = true;
+					if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) item._isBgTask = true;
 					else item._isOnBgQueue = true;
 				}
 			});

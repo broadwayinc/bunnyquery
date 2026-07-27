@@ -40,6 +40,46 @@ export function extractLastUserTextFromRequest(requestBody: any): string {
 	return '';
 }
 
+/** The two openings an indexing prompt can have. A bg-queue item that starts with
+ *  neither is an ordinary chat that happened to be routed onto that queue. */
+export function isIndexingRequestText(userText: any): boolean {
+	if (typeof userText !== 'string') return false;
+	return userText.indexOf('A new file has just been uploaded') === 0 || userText.indexOf('CONTINUE indexing') === 0;
+}
+
+export type IndexingRequestRef = {
+	name: string;
+	path?: string;
+	mime?: string;
+	size?: number;
+	/** A CONTINUE pass rather than the run's first. */
+	continued: boolean;
+};
+
+/**
+ * The file an indexing prompt is about, read back out of the prompt itself.
+ *
+ * The prompt is the only description of the pass that survives on the server, so
+ * this is how BOTH a history rebuild and a worker-minted pass the client never
+ * dispatched (ChatSession._adoptWorkerIndexingPasses) recover the file. Shared so
+ * the two produce the same `_indexFile`, which is what makes them group together.
+ */
+export function parseIndexingRequestText(userText: any): IndexingRequestRef | null {
+	if (typeof userText !== 'string' || !userText) return null;
+	var nameMatch = userText.match(/^- name: (.+)$/m);
+	if (!nameMatch) return null;
+	var mimeMatch = userText.match(/^- mime type: (.+)$/m);
+	var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
+	var pathMatch = userText.match(/^- storage path: (.+)$/m);
+	return {
+		name: nameMatch[1].trim(),
+		path: pathMatch ? pathMatch[1].trim() : undefined,
+		mime: mimeMatch ? mimeMatch[1].trim() : undefined,
+		size: sizeMatch ? Number(sizeMatch[1]) : undefined,
+		continued: userText.indexOf('CONTINUE indexing') === 0,
+	};
+}
+
 export type MapHistoryOptions = {
 	clearedAt: number;
 	serviceId: string;
@@ -78,31 +118,21 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			// alongside the formatted label so grouping never has to parse it back.
 			var indexFile: any = undefined;
 			if (item._isBgTask) {
-				var nameMatch = userText.match(/^- name: (.+)$/m);
-				if (nameMatch) {
-					var mimeMatch = userText.match(/^- mime type: (.+)$/m);
-					var sizeMatch = userText.match(/^- size \(bytes\): (\d+)$/m);
-					var pathMatch = userText.match(/^- storage path: (.+)$/m);
+				var ref = parseIndexingRequestText(userText);
+				if (ref) {
 					// A CONTINUE pass ("CONTINUE indexing …") gets the compact
 					// continuation label; a first pass ("A new file …") gets the full
 					// one. Mirrors agent.vue's mapHistoryListToMessages so a big file's
 					// windows read as progress, not the same task repeating.
-					var isContinuePass = userText.indexOf('CONTINUE indexing') === 0;
 					displayContent = opts.formatIndexingLabel(
-						nameMatch[1].trim(),
-						mimeMatch ? mimeMatch[1].trim() : '',
-						sizeMatch ? Number(sizeMatch[1]) : null,
-						pathMatch ? pathMatch[1].trim() : undefined,
+						ref.name,
+						ref.mime || '',
+						typeof ref.size === 'number' ? ref.size : null,
+						ref.path,
 						false,
-						isContinuePass
+						ref.continued
 					);
-					indexFile = {
-						name: nameMatch[1].trim(),
-						path: pathMatch ? pathMatch[1].trim() : undefined,
-						mime: mimeMatch ? mimeMatch[1].trim() : undefined,
-						size: sizeMatch ? Number(sizeMatch[1]) : undefined,
-						continued: isContinuePass,
-					};
+					indexFile = ref;
 				} else {
 					displayContent = userText;
 				}

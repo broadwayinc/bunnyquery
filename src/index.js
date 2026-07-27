@@ -37,6 +37,8 @@ import {
     groupAttachmentFailures,
     notifyAgentSaveAttachment,
     buildChatSystemPrompt,
+    setProjectContextWindow,
+    parseAiAgentValue as engineParseAiAgentValue,
     // pure helpers (Tier-1.5) — error detection, token budget, link/path, history mapping
     getErrorMessage,
     isErrorResponseBody,
@@ -3323,6 +3325,13 @@ import {
         var parsed = parseAiAgentValue(raw);
         S.aiPlatform = parsed.platform;
         S.aiModel = parsed.model;
+        // Honor the project's context-window override (third segment of
+        // `ai_agent`, set by the owner in the dashboard's project settings).
+        // The widget has no settings surface of its own: its users are site
+        // visitors, not project owners, so it applies the setting rather than
+        // offering a control. Without an override the engine keeps its fixed
+        // ceilings, so this is a no-op for every project that has not set one.
+        setProjectContextWindow(S.serviceId, engineParseAiAgentValue(raw).contextWindow);
         S.serviceName = conn.service_name || "";
         S.serviceDescription = conn.service_description || "";
     }
@@ -3495,6 +3504,15 @@ import {
             clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
             mcpBaseUrl: mcpBaseUrl(),
             poll: 0,
+            // Server-driven windowed indexing. Off by default in the engine because the
+            // worker must strip `_skapi_window` first, or the provider rejects the whole
+            // call with no retry. `apply_file_windows` is deployed in every region
+            // (verified 2026-07-27 against the deployed ClientSecretKeyPollingWorker in
+            // all 7), so the widget now opts in like agent.vue does. Without it the
+            // widget fell back to the client-driven CONTINUE loop capped at
+            // MAX_INDEXING_RESUME_PASSES, which needs the tab kept open and stops early
+            // on a big file. Pass windowedIndexing: false in init opts to opt back out.
+            windowedIndexing: S.opts.windowedIndexing !== false,
             // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
             attachmentParsers: S.opts.attachmentParsers || undefined,
         });

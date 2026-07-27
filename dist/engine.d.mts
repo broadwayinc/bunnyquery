@@ -312,18 +312,44 @@ declare function isAuthExpiredError(input: any): boolean;
 
 declare var CONTEXT_WINDOW_DEFAULT: Record<string, number>;
 declare var CONTEXT_WINDOW_BY_MODEL: Record<string, number>;
+/**
+ * Record context windows from a provider models listing. Accepts the raw list
+ * items and reads `max_input_tokens` (Anthropic); items without it are skipped,
+ * so passing an OpenAI listing is a no-op rather than an error.
+ */
+declare function registerModelContextWindows(models: Array<{
+    id?: string;
+    max_input_tokens?: number;
+}> | null | undefined): void;
+declare function setProjectContextWindow(serviceId: string, tokens: number | null | undefined): void;
+declare function getProjectContextWindow(serviceId: string): number | null;
 declare var OUTPUT_TOKEN_RESERVE: number;
 declare var TOOL_AND_RESPONSE_BUFFER: number;
 declare var MIN_INPUT_TOKEN_BUDGET: number;
 declare var CLAUDE_PER_REQUEST_INPUT_CAP: number;
 declare var MAX_HISTORY_MESSAGES: number;
 declare var HISTORY_TOKEN_BUDGET: number;
+declare var CLAUDE_INPUT_CAP_RATIO: number;
+declare var HISTORY_BUDGET_RATIO: number;
 declare function estimateTextTokens(text: string): number;
 declare function estimateMessageTokens(msg: {
     role: string;
     content: string;
 }): number;
-declare function getContextWindow(platform: string, model?: string): number;
+/**
+ * Resolve a model's context window, most specific source first:
+ *   1. per-project override (project settings)
+ *   2. the provider's own models listing (Anthropic `max_input_tokens`)
+ *   3. an exact entry in CONTEXT_WINDOW_BY_MODEL
+ *   4. a family entry, by dropping trailing '-' segments off the id
+ *   5. the platform default
+ *
+ * Step 4 is why a new or suffixed id no longer drops straight to the platform
+ * default: 'gpt-5.6-luna' resolves via 'gpt-5.6', and a dated Claude snapshot
+ * such as 'claude-opus-4-7-20260101' resolves via 'claude-opus-4-7'. The walk
+ * stops at the first hit, so a more specific entry always wins over its family.
+ */
+declare function getContextWindow(platform: string, model?: string, serviceId?: string): number;
 declare function stripFileBlocksFromHistory(content: string): string;
 type BoundedChatOptions = {
     platform: string;
@@ -498,9 +524,61 @@ declare function wallClockNow(): number;
  */
 declare function formatChatTimestamp(ms?: number): string;
 
+/**
+ * The `ai_agent` service option, parsed and serialized in ONE place.
+ *
+ * Stored on the skapi service record as up to three '#'-delimited segments:
+ *
+ *   none                                  AI chat disabled
+ *   claude                                platform chosen, no model saved yet
+ *   claude#claude-sonnet-4-6              platform + model
+ *   claude#claude-sonnet-4-6#400000       platform + model + context-window override
+ *
+ * The third segment is new and optional, so every value written before it
+ * existed parses unchanged with `contextWindow: null`. Nothing writes a third
+ * segment without a model, because the window is meaningless without one.
+ *
+ * This lived as four separate copies (agent.vue, dbfile.vue, service.vue, and
+ * the widget's index.js), which is how the format drifts. New callers should
+ * import from here rather than re-deriving the split.
+ */
+type AiAgentPlatform = 'claude' | 'openai' | null;
+type ParsedAiAgent = {
+    /** null when unset or explicitly 'none'. */
+    platform: AiAgentPlatform;
+    /** '' when no model has been saved. */
+    model: string;
+    /** Per-project context-window override in tokens, or null to use the model's. */
+    contextWindow: number | null;
+    /** True when a real platform is configured (i.e. not unset and not 'none'). */
+    hasPlatform: boolean;
+};
+declare function parseAiAgentValue(value: string | null | undefined): ParsedAiAgent;
+declare function buildAiAgentValue(platform: string | null | undefined, model?: string | null, contextWindow?: number | null): string;
+
 declare function filterListByClearHorizon(list: any[], clearedAt: number): any[];
 declare function normalizeTextContent(content: any): string;
 declare function extractLastUserTextFromRequest(requestBody: any): string;
+/** The two openings an indexing prompt can have. A bg-queue item that starts with
+ *  neither is an ordinary chat that happened to be routed onto that queue. */
+declare function isIndexingRequestText(userText: any): boolean;
+type IndexingRequestRef = {
+    name: string;
+    path?: string;
+    mime?: string;
+    size?: number;
+    /** A CONTINUE pass rather than the run's first. */
+    continued: boolean;
+};
+/**
+ * The file an indexing prompt is about, read back out of the prompt itself.
+ *
+ * The prompt is the only description of the pass that survives on the server, so
+ * this is how BOTH a history rebuild and a worker-minted pass the client never
+ * dispatched (ChatSession._adoptWorkerIndexingPasses) recover the file. Shared so
+ * the two produce the same `_indexFile`, which is what makes them group together.
+ */
+declare function parseIndexingRequestText(userText: any): IndexingRequestRef | null;
 type MapHistoryOptions = {
     clearedAt: number;
     serviceId: string;
@@ -713,11 +791,20 @@ type BgTaskEntry = {
     /** How many CONTINUE passes have already run for this file (resume-across-passes). */
     resumePass?: number;
 };
+/**
+ * `queue` narrows the fetch to one processing chain; `status` narrows it to items
+ * in one state. Passing both is how the client asks "is there still unresolved
+ * work on the background-indexing queue?" without pulling a page of chat history
+ * (see ChatSession._adoptWorkerIndexingPasses) — the server answers that from a
+ * status-keyed index, so the reply carries only the live items, not the bodies of
+ * everything already finished.
+ */
 declare function getChatHistory(params: {
     service?: string;
     owner?: string;
     platform: 'claude' | 'openai';
     queue?: string;
+    status?: 'pending' | 'running' | 'resolved' | 'failed';
 }, fetchOptions: Record<string, any>): Promise<any>;
 
 /**
@@ -1152,6 +1239,9 @@ declare class ChatSession {
     _clearPendingUserBubble(itemId: string): void;
     resumePendingRequest(token: number): Promise<void>;
     handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
+    /** The file an already-rendered background pass is about, off its request
+     *  bubble. Null for an ordinary turn, which is most of them. */
+    private _indexRefOfItem;
     applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
     /** How a bg task maps onto a collapsed row: the row's own key (storage path
      *  when known, else the filename), scoped to the chat it belongs to. A storage
@@ -1183,6 +1273,49 @@ declare class ChatSession {
      * Runs from drainBgTaskQueue, which both clients call after a history load.
      */
     private _sweepCancelledIndexing;
+    /**
+     * True when the WORKER, not this client, drives the rest of this file's chain.
+     * The mirror image of the early returns in maybeResumeIndexing: whatever that
+     * refuses to continue is exactly what nothing client-side is tracking.
+     */
+    private _isWorkerDrivenIndexing;
+    /**
+     * Pick up indexing passes the WORKER minted, which no client ever dispatched.
+     *
+     * For a PDF (and for text/grid when windowed indexing is on) the worker writes
+     * pass N+1's row itself, inside pass N's invocation, right after saving pass
+     * N's result. That row reaches this client through nothing at all: it is not in
+     * bgTaskQueue (the client never asked for it) and it is not in state.messages
+     * (only a first-page history load maps it in, which happens on mount, project
+     * switch or tab return). So between two worker passes every pass the client
+     * knows about is settled, and the collapsed row renders "Indexed  N passes"
+     * with no spinner and no Stop, for a file that is still being read. A user who
+     * believes that then asks questions against a half-indexed file — which is what
+     * this exists to prevent.
+     *
+     * So when a background indexing pass settles, ask the bg queue what is still
+     * unresolved on it and adopt anything unknown as an ordinary BgTaskEntry.
+     * drainBgTaskQueue then treats it exactly like a pass this client dispatched:
+     * same bubble, same `_indexFile` (so it joins the file's collapsed row), same
+     * poll — and that poll settling runs this again, so the chain is followed to
+     * its end. `status`-scoped so the reply carries the live items only, never a
+     * page of finished ones with their bodies.
+     *
+     * Termination: the only trigger is a pass SETTLING, which happens once per
+     * pass. An adopted item that is still running is not re-adopted (its id is
+     * already polled), and when the queue holds nothing unknown the chain stops on
+     * its own. Nothing here is periodic — a timer that re-reads history is the
+     * shape that previously looped fetchHistoryPage after an already-DONE index.
+     */
+    private _adoptingWorkerPasses;
+    private _adoptWorkerIndexingPasses;
+    /** Any of these ids still queued or still polled, i.e. surviving work. */
+    private _isTrackingAny;
+    /** One live bg-queue item -> a BgTaskEntry, if it is an indexing pass this
+     *  client is not already tracking. Returns whether it was adopted. */
+    private _adoptWorkerIndexingItem;
+    /** Follow the chain on from a background indexing pass that just settled. */
+    private _followWorkerIndexingChain;
     /** Best-effort server-side cancel of a bg-queue item that has no bubble (so
      *  cancelQueuedMessage, which drives one, has nothing to act on). */
     private _cancelServerItem;
@@ -1203,4 +1336,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAttachmentContent, parseIndexingLabel, readExpiredAttachmentHref, registerAttachmentParser, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, TOOL_AND_RESPONSE_BUFFER, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, createHistoryFiller, createInlineLinkRegex, encodePathSegments, estimateMessageTokens, estimateTextTokens, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, makeExtractPlaceholder, mapHistoryListToMessages, normalizeAttachmentPathCandidate, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
