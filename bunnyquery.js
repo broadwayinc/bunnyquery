@@ -3303,7 +3303,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           cancellableIds: [],
           cancelling: false,
           mayHaveOlder: false,
-          anchorIndex: i
+          // The run's first loaded pass, and never re-stamped: see the file
+          // docstring. `anchorId` is filled in once every member is known.
+          anchorIndex: i,
+          anchorId: ""
         };
         order.push(runId);
       }
@@ -3317,7 +3320,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         g.passCount++;
       }
       g.members.push({ msg, index: i });
-      g.anchorIndex = i;
       runOfIndex[i] = runId;
       if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
       if (ref && ref.name) keyByName[ref.name] = g.key;
@@ -3379,6 +3381,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       grp.mayHaveOlder = !sawFirstPass && hasMoreHistory;
+      var anchor = grp.members[0];
+      grp.anchorIndex = anchor.index;
+      grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
     }
     var out = [];
     for (var j = 0; j < list.length; j++) {
@@ -6347,8 +6352,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return id ? "s" + id + ":" + msg.role : "i" + index;
     }
     function indexGroupAnchorId(group) {
-      var last = group.members[group.members.length - 1];
-      return last && last.msg && last.msg._serverItemId || "";
+      return group.anchorId || "";
     }
     function captureScrollAnchor() {
       var box = CS.messagesBox;

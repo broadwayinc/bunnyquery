@@ -3335,7 +3335,10 @@ function buildChatDisplayList(messages, opts) {
         cancellableIds: [],
         cancelling: false,
         mayHaveOlder: false,
-        anchorIndex: i
+        // The run's first loaded pass, and never re-stamped: see the file
+        // docstring. `anchorId` is filled in once every member is known.
+        anchorIndex: i,
+        anchorId: ""
       };
       order.push(runId);
     }
@@ -3349,7 +3352,6 @@ function buildChatDisplayList(messages, opts) {
       g.passCount++;
     }
     g.members.push({ msg, index: i });
-    g.anchorIndex = i;
     runOfIndex[i] = runId;
     if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
     if (ref && ref.name) keyByName[ref.name] = g.key;
@@ -3411,6 +3413,9 @@ function buildChatDisplayList(messages, opts) {
       }
     }
     grp.mayHaveOlder = !sawFirstPass && hasMoreHistory;
+    var anchor = grp.members[0];
+    grp.anchorIndex = anchor.index;
+    grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
   }
   var out = [];
   for (var j = 0; j < list.length; j++) {

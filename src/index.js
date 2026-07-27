@@ -2637,9 +2637,9 @@ import {
     // The row currently at the top of the viewport, and how much scrollable
     // content sits above it. GROWTH in that number — not growth in the box's
     // total height — is what makes a scroll-up worthwhile: an older page whose
-    // messages all join a collapsed indexing row renders at that row's anchor,
-    // which can be far BELOW the reader, so the box gets taller while nothing
-    // new comes within their reach.
+    // messages all join a collapsed indexing row adds no row of its own (they
+    // fold into the row that is already there), so the box can get taller while
+    // nothing new comes within the reader's reach.
     function topVisibleRowKey() {
         var box = CS.messagesBox;
         if (!box) return null;
@@ -2701,10 +2701,11 @@ import {
 
     // Keep paging until the scroll-up the user just made actually put something
     // ABOVE them. One page is not enough: a page that is entirely one file's
-    // earlier passes joins the collapsed row already on screen, so it either adds
-    // no height at all or adds it at that row's anchor, below the fold — either
-    // way the reader stays pinned at scrollTop 0, where scrolling up again fires
-    // no further event.
+    // earlier passes joins the collapsed row already on screen and adds no row of
+    // its own, so the reader stays pinned at scrollTop 0, where scrolling up again
+    // fires no further event. (If that page carried the run's FIRST pass, the row
+    // is re-identified — `contentAboveRow` finds no such row, and the loop stops
+    // rather than paging on a measurement it can no longer make.)
     function pageOlderHistoryUntilTaller() {
         var anchorKey = topVisibleRowKey();
         var before = anchorKey ? contentAboveRow(anchorKey) : null;
@@ -2954,21 +2955,21 @@ import {
      * they were at it.
      *
      * Restoring the raw scrollTop is not enough either: rows move. A collapsed
-     * indexing row renders at its file's NEWEST turn, so when a new pass arrives
-     * the row jumps from wherever it sat to the bottom of the list and everything
-     * that was below it slides UP by a row. Anchoring to a ROW — remember which
-     * row was at the top of the viewport and where, then put that row back — is
-     * the only thing that survives both, and it subsumes the older-page prepend
-     * as well.
+     * indexing row renders at its run's FIRST pass, so a new pass no longer moves
+     * it, but an older page carrying earlier passes of that run still does — and
+     * everything below a row that moves or changes height slides by. Anchoring to
+     * a ROW — remember which row was at the top of the viewport and where, then
+     * put that row back — is the only thing that survives both, and it subsumes
+     * the older-page prepend as well.
      *
      * Anchor identity must be stable across the re-render, so it is the server
      * item id (or local id) rather than the array index, which every prepend
      * renumbers.
      *
-     * A collapsed indexing row is a BAD anchor precisely because it relocates:
-     * pinning it in place is what would drag the reader to the bottom along with
-     * it. So an ordinary message row is always preferred, and a group row is used
-     * only when nothing else is on screen — and then only if it did not move
+     * A collapsed indexing row is a WEAK anchor because it can still relocate:
+     * pinning it while it moves is what would drag the reader along with it. So
+     * an ordinary message row is always preferred, and a group row is used only
+     * when nothing else is on screen — and then only if it did not move
      * (data-row-pos names the turn it is anchored at). */
     function rowAnchorKey(msg, index) {
         if (!msg) return null;
@@ -2977,12 +2978,14 @@ import {
         var id = msg._serverItemId || msg._localId;
         return id ? "s" + id + ":" + msg.role : "i" + index;
     }
-    // Identifies the turn a collapsed row is currently anchored at. "" when the
-    // newest member has no server id yet, which reads as "cannot tell" and simply
-    // skips the moved-row check.
+    // Identifies the turn a collapsed row is currently anchored at. Straight from
+    // the engine: WHICH member the row renders at is buildChatDisplayList's
+    // decision, and re-deriving it here as "the last member" made this disagree
+    // with the engine the moment the anchor moved to the run's FIRST pass. "" when
+    // that turn has no id yet, which reads as "cannot tell" and simply skips the
+    // moved-row check.
     function indexGroupAnchorId(group) {
-        var last = group.members[group.members.length - 1];
-        return (last && last.msg && last.msg._serverItemId) || "";
+        return group.anchorId || "";
     }
     function captureScrollAnchor() {
         var box = CS.messagesBox;

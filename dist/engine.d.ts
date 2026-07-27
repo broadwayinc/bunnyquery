@@ -883,12 +883,34 @@ interface ChatHost {
  * repeating forever, and any real question the user asks in between gets buried.
  *
  * buildChatDisplayList turns the flat message array into a DISPLAY list in which
- * every message belonging to one file (however far apart they sit, and whatever
- * else is interleaved between them) is represented by a single group entry,
- * rendered at the position of that file's NEWEST turn. Newest, not oldest, so:
- *   - a running index sits at the bottom, where the activity is, and
- *   - paging older history in never moves a row that is already on screen
- *     (older passes simply join the group they already belong to).
+ * every message belonging to one run of one file (however far apart the passes
+ * sit, and whatever else is interleaved between them) is represented by a single
+ * group entry, rendered at the position of that run's FIRST loaded pass.
+ *
+ * First, not newest. The message array is ordered by request CREATION time, and
+ * a run's later passes are created one at a time as the previous one resolves —
+ * by the client for the paged text path, and by the WORKER itself for the
+ * rendered-page (PDF) path, which the client only learns about on its next
+ * first-page history fetch. So a pass is routinely created minutes after the
+ * upload, on a queue that runs in parallel with the foreground chat. Anchoring
+ * at the newest pass meant one such late pass dragged the whole run — every
+ * earlier pass with it — below any question the user had asked in the meantime,
+ * and made a run that had visibly finished before the question render after it.
+ * Anchoring at the first pass puts the row where the run actually began, which
+ * is a position no later pass can change:
+ *   - a new pass never relocates the row, so nothing under the reader shifts;
+ *   - a question asked after the upload always renders below the row, which is
+ *     the order it happened in.
+ * The cost is that a long-running index does not follow the conversation to the
+ * bottom: once the user has chatted past the upload, the spinner and the Stop
+ * button sit above their newest turns. That is a scroll away, and the row no
+ * longer lies about when the work started.
+ *
+ * Paging older history is the one thing that CAN move the row: an older page
+ * carrying earlier passes of a run already on screen moves it up into that page.
+ * That happens at most once per run, only for a run whose start was never
+ * loaded (`mayHaveOlder`), and it is the same event that already re-derives
+ * `runKey` — so the view treats it as a new row either way.
  *
  * The group deliberately reports no authoritative pass TOTAL. History is paged
  * newest-first, so any total computed from loaded messages is a lower bound that
@@ -911,9 +933,10 @@ type IndexingGroup = {
      *  Monday and re-indexed on Wednesday is two runs, and collapsing them into
      *  one row erased Monday's from Monday's place in the conversation, claimed
      *  its passes for Wednesday, and let Monday's failure be overwritten by
-     *  Wednesday's success. Numbered from the NEWEST run backwards (`#0` is the
-     *  newest) so paging in older history never renames a row already on screen.
-     *  This is the render key and the expansion key. */
+     *  Wednesday's success. Named after the run's FIRST loaded pass (see where it
+     *  is assigned below), so passes appended to the run and other runs appearing
+     *  on either side of it never rename a row already on screen. This is the
+     *  render key and the expansion key. */
     runKey: string;
     name: string;
     path?: string;
@@ -942,8 +965,16 @@ type IndexingGroup = {
     /** The file's first pass is not among the loaded messages, so earlier passes
      *  exist in history that has not been paged in yet. */
     mayHaveOlder: boolean;
-    /** Position in the source array this collapsed row renders at. */
+    /** Position in the source array this collapsed row renders at: the index of
+     *  the run's FIRST loaded pass (see the file docstring for why not the last). */
     anchorIndex: number;
+    /** Identity of the turn at `anchorIndex` — its server item id, or its local id
+     *  while it has none, or `''` when it has neither. The views stamp this on the
+     *  row (`data-row-pos`) so the scroll anchor can tell a row that RELOCATED (an
+     *  older page moved the run's start) from one that merely gained a pass. They
+     *  must not re-derive it from `members`: which member the row renders at is
+     *  this module's decision, and the two silently disagreed once already. */
+    anchorId: string;
 };
 type DisplayEntry = {
     kind: 'message';
