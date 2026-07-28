@@ -44,11 +44,17 @@ const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretReques
 // model silently fell through to 'auto' — i.e. the cheap tiers that most need
 // resolution were the ones getting downsampled images.
 //
-// Base models keep their exact previous behavior ('original'). A suffixed
-// variant resolves to 'high' rather than 'original': 'high' is the universally
-// supported value, and we have no way to confirm a given variant accepts
-// 'original' — sending an unsupported value would fail the whole request, which
-// is far worse than a slightly less detailed image.
+// Variants used to resolve to 'high' rather than 'original' on the reasoning that
+// 'high' is universally supported and an unsupported value would fail the whole
+// request. The cost of that caution turned out to be real: 'high' downsamples to
+// a 512px grid, so the small tiers that most need resolution were reading dense
+// scans at the lower of the two settings, and gpt-5.4-nano reports it cannot make
+// out the text where gpt-5.4 (on 'original') can. Variants now get 'original' too.
+//
+// If a variant rejects 'original' the failure is loud and immediate (a terminal
+// 400 on the whole request, no retry), so flip VARIANT_IMAGE_DETAIL back to
+// 'high' and it is undone. That is the one word to change.
+const VARIANT_IMAGE_DETAIL = 'original';
 const getOpenAIImageDetail = (model?: string) => {
 	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
 	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -65,7 +71,7 @@ const getOpenAIImageDetail = (model?: string) => {
 		return DEFAULT_OPENAI_IMAGE_DETAIL;
 	}
 
-	return isVariant ? 'high' : 'original';
+	return isVariant ? VARIANT_IMAGE_DETAIL : 'original';
 };
 
 // Per-image `detail` for WORKER-RENDERED document pages (the `_skapi_render`

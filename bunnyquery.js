@@ -1092,6 +1092,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
   var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
+  var VARIANT_IMAGE_DETAIL = "original";
   var getOpenAIImageDetail = (model) => {
     const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
     const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -1105,7 +1106,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (!supportsOriginal) {
       return DEFAULT_OPENAI_IMAGE_DETAIL;
     }
-    return isVariant ? "high" : "original";
+    return isVariant ? VARIANT_IMAGE_DETAIL : "original";
   };
   var getRenderImageDetail = (model) => {
     const detail = getOpenAIImageDetail(model);
