@@ -1382,6 +1382,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           name: attachment.name,
           mime: attachment.mime,
           kind: "window",
+          // Same per-image `detail` the render path sends. Without it the worker falls
+          // back to its model-blind default of 'high', so a spreadsheet's embedded
+          // photos were tiled at lower resolution than the SAME model gets for a PDF
+          // page or a chat attachment. That is why a model could describe an attached
+          // photo but reported the pictures inside a sheet as only partly legible.
+          detail: renderDetail,
           auto_continue: true,
           continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true)
         }
@@ -1786,6 +1792,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var INDEXING_DRAIN_IDLE_LOOKS = 2;
   var INDEXING_DRAIN_MIN_MS = 8e3;
   var INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1e3;
+  var INDEXING_DRAIN_LOOK_TIMEOUT_MS = 45e3;
+  var INDEXING_DRAIN_NUDGE_MIN_GAP_MS = 1500;
   var _g = typeof globalThis !== "undefined" ? globalThis : {};
   function nowMs() {
     return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
@@ -1861,6 +1869,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this._stageSeq = 0;
       this._uploadBatches = 0;
       this._indexDispatchesInFlight = 0;
+      this._drainNudges = [];
     }
     /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
      *  live work from the moment it is sent, not from the moment it is acked. */
@@ -1877,6 +1886,31 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         release();
         throw e;
       });
+    }
+    /**
+     * Something just happened that plausibly ENDED indexing work, so let any waiting
+     * turn look now instead of sitting out the rest of its busy interval.
+     *
+     * A nudge changes only WHEN a look happens, never what it concludes: the two
+     * agreeing idle looks, the confirm gap between them, "a failed look counts as
+     * busy" and the minimum wait are all untouched. That is why it is safe to fire
+     * from places that are merely good guesses.
+     *
+     * Fired from end-of-chain points ONLY: the adopt ladder giving up, a resume
+     * declining to continue, a pass failing. Not from every settling pass (one nudge
+     * per pass per file for the whole run), and not from an indexing request being
+     * accepted — see the note in trackIndexDispatch for why that one is actively
+     * harmful rather than merely wasteful.
+     */
+    _nudgeIndexingDrain() {
+      if (!this._drainNudges.length) return;
+      var list = this._drainNudges.slice();
+      for (var i = 0; i < list.length; i++) {
+        try {
+          list[i]();
+        } catch (e) {
+        }
+      }
     }
     /**
      * Register a live poll so (a) a remount dedupes against it instead of stacking a
@@ -2147,6 +2181,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         isPendingQueued: true,
         isUploadingAttachments: true,
         isSendingToServer: true,
+        _dimSending: true,
+        // A staged bubble has no server id for minutes, and its indexing rows are
+        // now inserted ABOVE it — so its array index moves. Both views fall back to
+        // the index when a bubble has no id, which would re-key (and in Vue, remount)
+        // this bubble on every file, restarting its transition and losing it as a
+        // scroll anchor. A local id it keeps for its whole life fixes both.
+        _localId: this._newLocalId(),
         _useBgQueue: true,
         _stageId: stageId,
         _ts: wallClockNow()
@@ -2165,32 +2206,46 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return -1;
     }
     /**
-     * Where a staged turn belongs once it is finally sent: BELOW every indexing
-     * row, because that is the order it ran in and the order the server history
-     * will report on the next load (its request id is newer than every pass it
-     * waited for). While its files were uploading it sat above them — the rows
-     * are injected as each file's pass starts, after the bubble was staged.
+     * Staged turn, phase 2: its files are up and it is now waiting for the whole
+     * indexing chain behind them. Swaps "(Uploading files...)" for
+     * "(Indexing files...)"; the bubble stays dimmed, because from the user's side
+     * nothing has been handed over yet.
      *
-     * Returns the index to insert at, or -1 to leave the turn where it is. Never
-     * moves a turn UP: a bubble that already sits below the indexing rows (or a
-     * chat with no indexing at all) must not jump backwards over anything.
+     * It deliberately does NOT say "(In queue)" here. The turn is not queued behind
+     * anything the server knows about yet — it is waiting on work that can run for
+     * minutes — and claiming otherwise is what made the wait look like a stall.
      */
-    _settledStagePosition(fromIdx) {
-      var lastBg = -1;
-      for (var i = 0; i < this.state.messages.length; i++) {
-        if (this.state.messages[i] && this.state.messages[i].isBackgroundTask) lastBg = i;
-      }
-      if (lastBg <= fromIdx) return -1;
-      return lastBg;
-    }
-    /** The staged turn's files are up; it is now just waiting its place in the
-     *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
-    markStagedMessageQueued(stageId) {
+    markStagedMessageIndexing(stageId) {
       var idx = this._stageIndex(this.state.messages, stageId);
       if (idx === -1) return;
       var ex = this.state.messages[idx];
       if (!ex.isUploadingAttachments) return;
-      this.state.messages[idx] = Object.assign({}, ex, { isUploadingAttachments: false });
+      this.state.messages[idx] = Object.assign({}, ex, {
+        isUploadingAttachments: false,
+        isAwaitingIndexing: true
+      });
+      this.host.notify();
+    }
+    /**
+     * Staged turn, phase 3: the last of its files has finished indexing, so the turn
+     * is genuinely just queued now. Full opacity + "(In queue)".
+     *
+     * Clears the PRESENTATIONAL _dimSending only; isSendingToServer stays set until
+     * the server actually acks (it is the token that ack matches on). Called by the
+     * clients the instant awaitIndexingDrained resolves, i.e. immediately before the
+     * dispatch that replaces this bubble — dispatchComposedMessage carries the
+     * cleared flag onto the replacement so the turn does not blink back to dimmed.
+     */
+    markStagedMessageReady(stageId) {
+      var idx = this._stageIndex(this.state.messages, stageId);
+      if (idx === -1) return;
+      var ex = this.state.messages[idx];
+      if (!ex.isAwaitingIndexing && !ex._dimSending && !ex.isUploadingAttachments) return;
+      this.state.messages[idx] = Object.assign({}, ex, {
+        isUploadingAttachments: false,
+        isAwaitingIndexing: false,
+        _dimSending: false
+      });
       this.host.notify();
     }
     /**
@@ -2226,11 +2281,29 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var deadline = startedAt + INDEXING_DRAIN_TIMEOUT_MS;
       var idleLooks = 0;
       var ask = function(status) {
-        return Promise.resolve(getChatHistory(
-          { service: svcId, owner, platform, queue, status },
-          { limit: WORKER_PASS_ADOPT_LIMIT }
-        )).catch(function() {
-          return null;
+        var answered = false;
+        return new Promise(function(res) {
+          var bail = null;
+          var settle = function(v) {
+            if (answered) return;
+            answered = true;
+            if (bail) {
+              clearTimeout(bail);
+              bail = null;
+            }
+            res(v);
+          };
+          bail = setTimeout(function() {
+            settle(null);
+          }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
+          Promise.resolve(getChatHistory(
+            { service: svcId, owner, platform, queue, status },
+            { limit: WORKER_PASS_ADOPT_LIMIT }
+          )).then(function(r) {
+            settle(r);
+          }, function() {
+            settle(null);
+          });
         });
       };
       var hasLiveIndexing = function(res) {
@@ -2243,12 +2316,42 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return false;
       };
       return new Promise(function(resolve) {
-        var again = function() {
-          setTimeout(look, idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS);
+        var timer = null;
+        var lastLookAt = -Infinity;
+        var nudgedThisInterval = false;
+        var inFlight = false;
+        var finish = function(v) {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          var ni = self._drainNudges.indexOf(nudge);
+          if (ni !== -1) self._drainNudges.splice(ni, 1);
+          resolve(v);
+        };
+        var again = function(ms) {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          var wait = ms == null ? idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS : ms;
+          timer = setTimeout(look, wait);
+        };
+        var nudge = function() {
+          if (idleLooks > 0) return;
+          if (inFlight) return;
+          if (nudgedThisInterval) return;
+          if (self._indexDispatchesInFlight > 0) return;
+          nudgedThisInterval = true;
+          again(Math.max(0, INDEXING_DRAIN_NUDGE_MIN_GAP_MS - (nowMs() - lastLookAt)));
         };
         var look = function() {
+          timer = null;
+          if (inFlight) return;
+          lastLookAt = nowMs();
+          nudgedThisInterval = false;
           if (nowMs() >= deadline) {
-            resolve("timedout");
+            finish("timedout");
             return;
           }
           if (self._indexDispatchesInFlight > 0) {
@@ -2256,20 +2359,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             again();
             return;
           }
+          inFlight = true;
           Promise.all([ask("running"), ask("pending")]).then(function(res) {
+            inFlight = false;
             var unknown = res[0] === null || res[1] === null;
             if (unknown || hasLiveIndexing(res[0]) || hasLiveIndexing(res[1])) idleLooks = 0;
             else idleLooks += 1;
             if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) {
-              resolve("drained");
+              finish("drained");
               return;
             }
             again();
           }, function() {
+            inFlight = false;
             idleLooks = 0;
             again();
           });
         };
+        self._drainNudges.push(nudge);
         look();
       });
     }
@@ -2286,6 +2393,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var settled = { role: "user", content: ex.content };
       if (ex._ownerKey !== void 0) settled._ownerKey = ex._ownerKey;
       if (ex._ts !== void 0) settled._ts = ex._ts;
+      if (ex._localId !== void 0) settled._localId = ex._localId;
       this.state.messages[idx] = settled;
       this.host.notify();
       this.updateHistoryCache();
@@ -2369,19 +2477,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           serviceId: id.serviceId,
           history: resolvedHistory.concat([{ role: "user", content: llmComposed }])
         });
-        var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
+        var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _dimSending: true, _localId: this._newLocalId(), _ts: wallClockNow() };
         if (key) queuedBubble._ownerKey = key;
         if (useBgQueue) queuedBubble._useBgQueue = true;
         var qStage = this._stageIndex(this.state.messages, stageId);
         if (qStage !== -1) {
-          if (this.state.messages[qStage]._ts !== void 0) queuedBubble._ts = this.state.messages[qStage]._ts;
-          var qTarget = this._settledStagePosition(qStage);
-          if (qTarget === -1) {
-            this.state.messages.splice(qStage, 1, queuedBubble);
-          } else {
-            this.state.messages.splice(qStage, 1);
-            this.state.messages.splice(qTarget, 0, queuedBubble);
-          }
+          var qEx = this.state.messages[qStage];
+          if (qEx._ts !== void 0) queuedBubble._ts = qEx._ts;
+          if (qEx._dimSending === false) queuedBubble._dimSending = false;
+          if (qEx._localId) queuedBubble._localId = qEx._localId;
+          this.state.messages.splice(qStage, 1, queuedBubble);
         } else {
           this.state.messages.push(queuedBubble);
         }
@@ -2395,7 +2500,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
           var serverId = result && typeof result.id === "string" ? result.id : void 0;
           if (sendingIdx >= 0) {
-            var upd = Object.assign({}, self.state.messages[sendingIdx], { isSendingToServer: false });
+            var upd = Object.assign({}, self.state.messages[sendingIdx], { isSendingToServer: false, _dimSending: false });
             if (serverId) upd._serverItemId = serverId;
             self.state.messages[sendingIdx] = upd;
             self.host.notify();
@@ -2416,18 +2521,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         });
         return;
       }
-      var immediateUser = { role: "user", content: composed, _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
+      var immediateUser = { role: "user", content: composed, _localId: this._newLocalId(), _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
       var immediatePlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} };
       var iStage = this._stageIndex(this.state.messages, stageId);
       if (iStage !== -1) {
-        if (this.state.messages[iStage]._ts !== void 0) immediateUser._ts = this.state.messages[iStage]._ts;
-        var iTarget = this._settledStagePosition(iStage);
-        if (iTarget === -1) {
-          this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
-        } else {
-          this.state.messages.splice(iStage, 1);
-          this.state.messages.splice(iTarget, 0, immediateUser, immediatePlaceholder);
-        }
+        var iEx = this.state.messages[iStage];
+        if (iEx._ts !== void 0) immediateUser._ts = iEx._ts;
+        if (iEx._localId) immediateUser._localId = iEx._localId;
+        this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
       } else {
         this.state.messages.push(immediateUser);
         this.state.messages.push(immediatePlaceholder);
@@ -2507,12 +2608,41 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
       if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
       if (existing.isSendingToServer) promoted.isSendingToServer = true;
+      if (existing._dimSending) promoted._dimSending = true;
+      if (existing._localId !== void 0) promoted._localId = existing._localId;
       this.state.messages[nextIdx] = promoted;
       var placeholder = { role: "assistant", content: "", isPending: true };
       if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
       if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
       this.state.messages.splice(nextIdx + 1, 0, placeholder);
       this.host.notify();
+    }
+    /**
+     * The "Thinking..." placeholder belonging to the user bubble at `userIdx`, or -1.
+     *
+     * Every path that creates one puts it IMMEDIATELY after its user bubble
+     * (promoteNextQueuedToRunning, the immediate-send pair, applyHistoryItemResolution),
+     * so ownership is adjacency — modulo background bubbles, which get spliced in
+     * around them. Taking the first pending assistant ANYWHERE below instead was a
+     * hijack: a turn sent with attachments never gets a placeholder of its own
+     * (promoteNextQueuedToRunning skips _useBgQueue turns) and now keeps the position
+     * it was sent in, so an ordinary turn sent while its files indexed sits BELOW it
+     * with a placeholder of its own — and the attachment turn's answer was rendered
+     * as the answer to that unrelated question.
+     */
+    _ownThinkingIndex(userIdx, serverId) {
+      if (userIdx < 0) return -1;
+      for (var i = userIdx + 1; i < this.state.messages.length; i++) {
+        var m = this.state.messages[i];
+        if (!m) return -1;
+        if (m.isBackgroundTask) continue;
+        if (m.isPending && m.role === "assistant") {
+          if (serverId && m._serverItemId && m._serverItemId !== serverId) return -1;
+          return i;
+        }
+        return -1;
+      }
+      return -1;
     }
     resolveQueuedUserBubble(serverId) {
       var liveKey = this.getHistoryCacheKey();
@@ -2540,9 +2670,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (userIdx >= 0) {
           var ex = this.state.messages[userIdx];
           this.state.messages[userIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId, ...ex._ownerKey !== void 0 ? { _ownerKey: ex._ownerKey } : {} };
-          var thIdx = this.state.messages.findIndex(function(m, i) {
-            return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-          });
+          var thIdx = this._ownThinkingIndex(userIdx, serverId);
           if (thIdx !== -1) this.state.messages.splice(thIdx, 1);
         }
         this.promoteNextQueuedToRunning();
@@ -2554,16 +2682,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (exist._serverItemId !== void 0) repl._serverItemId = exist._serverItemId;
         if (exist._ownerKey !== void 0) repl._ownerKey = exist._ownerKey;
         if (exist._ts !== void 0) repl._ts = exist._ts;
+        if (exist._localId !== void 0) repl._localId = exist._localId;
         this.state.messages[userIdx] = repl;
       }
-      var thinkingIdx = userIdx >= 0 ? this.state.messages.findIndex(function(m, i) {
-        return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-      }) : -1;
+      var thinkingIdx = this._ownThinkingIndex(userIdx, serverId);
       return thinkingIdx !== -1 ? thinkingIdx : userIdx >= 0 ? userIdx + 1 : -1;
     }
     insertAtTarget(msg, targetIdx) {
       if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = wallClockNow();
-      if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) this.state.messages[targetIdx] = msg;
+      var tgt = targetIdx >= 0 ? this.state.messages[targetIdx] : void 0;
+      var replaceable = !!tgt && !!tgt.isPending && !tgt.isBackgroundTask && this._isOwnPlaceholderOf(targetIdx, this._owningUserIndex(targetIdx));
+      if (replaceable) this.state.messages[targetIdx] = msg;
       else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
       else this.state.messages.push(msg);
     }
@@ -2682,7 +2811,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
       var queueBase = id.userId || id.serviceId;
       var queue = msg.isBackgroundTask || msg._useBgQueue ? bgIndexingQueueName(queueBase) : queueBase;
-      this.state.messages[idx] = Object.assign({}, msg, { _cancelling: true, _cancelError: void 0 });
+      var at = this.state.messages[idx] && this.state.messages[idx]._serverItemId === serverId && this.state.messages[idx].role === msg.role ? idx : this.state.messages.findIndex(function(m) {
+        return m._serverItemId === serverId && m.role === msg.role;
+      });
+      if (at !== -1) {
+        this.state.messages[at] = Object.assign({}, this.state.messages[at], { _cancelling: true, _cancelError: void 0 });
+      }
       this.host.notify();
       Promise.resolve(this.host.cancelRequest({
         url,
@@ -2942,21 +3076,69 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.promoteNextQueuedToRunning();
       return this.enqueueTypewrite(pendingIdx, latest.content, lid);
     }
-    // Remove any leftover non-background pending ("Thinking…") assistant bubbles.
-    // There is normally at most ONE such bubble at a time (promoteNext* refuses to
-    // add a second), so any extra is a duplicate — it appears when a concurrent
-    // history refetch re-maps the still-"running" turn into a pending placeholder
-    // (with a real _serverItemId) while the local pending bubble (no _serverItemId)
-    // is rescued and re-appended (see loadHistory rescue below). Each resolve path
-    // only replaces the FIRST pending bubble, so without this a stray "Thinking…"
-    // survives next to the reply/error. MUST run AFTER the resolved bubble has been
-    // made non-pending and BEFORE promoteNext*() (so a freshly-promoted Thinking,
-    // which is added only once no pending assistant remains, is preserved).
+    // Remove leftover non-background pending ("Thinking…") assistant bubbles: the
+    // duplicate that appears when a concurrent history refetch re-maps the still-
+    // "running" turn into a pending placeholder (with a real _serverItemId) while the
+    // local pending bubble (no _serverItemId) is rescued and re-appended (see the
+    // loadHistory rescue below), and the orphan a resolve leaves when it splices its
+    // reply beside a placeholder instead of into it. Each resolve path only replaces
+    // ONE pending bubble, so without this a stray "Thinking…" survives forever next to
+    // the reply. MUST run AFTER the resolved bubble has been made non-pending and
+    // BEFORE promoteNext*() (which only adds a Thinking once none remains).
+    //
+    // It used to take EVERY one, on the premise that there is at most one at a time
+    // because promoteNext* refuses to add a second. That premise never covered the
+    // immediate-send path, which creates its pair directly — and a turn sent with
+    // attachments does not block the composer and resolves on its own queue, so an
+    // ordinary question asked while files index is in flight, with a placeholder of
+    // its own, exactly when the attachment turn resolves. Sweeping it left that
+    // question with no spinner and, worse, nowhere for its answer to land:
+    // typewriteLatestReply bails when there is no pending assistant, so the reply
+    // reached the cache and never the screen.
+    //
+    // The discriminator is the owning USER bubble. A live immediate send's user bubble
+    // carries NO pending flags (its in-flight-ness lives in state.sending), while every
+    // duplicate this sweep is for belongs to a user bubble that is still pending — and
+    // an orphan has no user bubble above it at all.
     _removeStrayPendingAssistants() {
       for (var k = this.state.messages.length - 1; k >= 0; k--) {
         var m = this.state.messages[k];
-        if (m.isPending && m.role === "assistant" && !m.isBackgroundTask) this.state.messages.splice(k, 1);
+        if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
+        if (this._isLiveImmediatePlaceholder(k)) continue;
+        this.state.messages.splice(k, 1);
       }
+    }
+    /** Index of the USER bubble the message at `idx` belongs to — the nearest one
+     *  above it, stepping over background bubbles (a file's indexing rows are
+     *  inserted between turns). -1 when the nearest thing above is not a user turn,
+     *  which for a placeholder means it is an orphan. */
+    _owningUserIndex(idx) {
+      for (var j = idx - 1; j >= 0; j--) {
+        var p = this.state.messages[j];
+        if (!p) return -1;
+        if (p.isBackgroundTask) continue;
+        return p.role === "user" ? j : -1;
+      }
+      return -1;
+    }
+    /** The bubble at `idx` is the "Thinking…" of a DIFFERENT turn that is still
+     *  waiting for its answer, so the sweep above must leave it alone. */
+    _isLiveImmediatePlaceholder(idx) {
+      var ui = this._owningUserIndex(idx);
+      if (ui === -1) return false;
+      var p = this.state.messages[ui];
+      return !p.isPending && !p.isPendingQueued && !p.isPendingInProcess && !p.isPendingOlder && !p.isSendingToServer && !p.isCancelled;
+    }
+    /** A pending assistant at `idx` is the placeholder OF the turn above it, so a
+     *  reply may take its slot. Every path that makes one copies the parent's
+     *  _serverItemId (or neither has one yet), so a mismatch means the slot belongs to
+     *  some other request and the reply must be spliced in beside it, not on top. */
+    _isOwnPlaceholderOf(idx, userIdx) {
+      if (userIdx === -1) return false;
+      var ph = this.state.messages[idx], u = this.state.messages[userIdx];
+      if (!ph || !u) return false;
+      if (ph._serverItemId === void 0 || u._serverItemId === void 0) return true;
+      return ph._serverItemId === u._serverItemId;
     }
     // Drop the pending flags on the resolved turn's USER bubble (preserving its
     // content + background-task marker). Needed because a bg "Indexing:" turn's user
@@ -3193,7 +3375,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           self.drainBgTaskQueue();
           if (self._isTrackingAny(adoptedIds)) return;
         }
-        if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) return;
+        if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
+          self._nudgeIndexingDrain();
+          return;
+        }
         setTimeout(function() {
           var later = self.host.getIdentity();
           if (later.serviceId !== svcId || later.platform !== platform) return;
@@ -3318,9 +3503,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           };
           if (isRunning) userBubble.isPendingInProcess = true;
           else userBubble.isPendingQueued = true;
-          self.state.messages.push(userBubble);
-          if (isRunning) {
-            self.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
+          var stageAt = self._stageIndex(self.state.messages, entry.stageId);
+          var runningBubble = isRunning ? { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id } : null;
+          if (stageAt === -1) {
+            self.state.messages.push(userBubble);
+            if (runningBubble) self.state.messages.push(runningBubble);
+          } else if (runningBubble) {
+            self.state.messages.splice(stageAt, 0, userBubble, runningBubble);
+          } else {
+            self.state.messages.splice(stageAt, 0, userBubble);
           }
           presentIds[entry.id] = true;
           self.host.notify();
@@ -3360,6 +3551,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }
             self.host.notify();
             self.updateHistoryCache();
+            if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+              self._nudgeIndexingDrain();
+            }
           }).then(function() {
             if (wasStopped) return;
             var qi = self.bgTaskQueue.findIndex(function(q) {
@@ -3385,17 +3579,32 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     // as well would now double-index every window.
     maybeResumeIndexing(entry, response, platform) {
       var self = this;
+      var endOfClientChain = function() {
+        self._nudgeIndexingDrain();
+      };
       try {
         if (!entry || !entry.storagePath) return;
         if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
-        if (!isPagedReadFile(entry.filename, entry.mime)) return;
+        if (!isPagedReadFile(entry.filename, entry.mime)) {
+          endOfClientChain();
+          return;
+        }
         if (isImageVisionFile(entry.filename, entry.mime)) return;
         if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
-        if (isErrorResponseBody(response)) return;
+        if (isErrorResponseBody(response)) {
+          endOfClientChain();
+          return;
+        }
         var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
-        if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
+        if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
+          endOfClientChain();
+          return;
+        }
         var pass = (entry.resumePass || 0) + 1;
-        if (pass > MAX_INDEXING_RESUME_PASSES) return;
+        if (pass > MAX_INDEXING_RESUME_PASSES) {
+          endOfClientChain();
+          return;
+        }
         var id = this.host.getIdentity();
         if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
         this.trackIndexDispatch(notifyAgentContinueIndexing({
@@ -3427,6 +3636,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               status: ack.status === "running" ? "running" : "pending",
               poll: ack.poll,
               resumePass: pass
+              // Deliberately NOT stamped with entry.stageId. Only a batch's FIRST
+              // pass anchors to the turn; a continuation appends, which is the
+              // order the server queued it in and therefore the order
+              // promoteNextBgQueuedToRunning should spin it in. It costs nothing
+              // on screen: a continuation is folded into the run whose row
+              // already sits above the turn, and renders nothing at its own
+              // index (indexing_groups anchors a run at its FIRST loaded pass).
             });
             self.drainBgTaskQueue();
           }
@@ -3661,7 +3877,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     // Upload one attachment (a file = 1 member, a folder = N) to db storage and
     // queue indexing per member. The bytes I/O + chip rendering go through host
     // hooks; the overwrite/reindex flow, status lifecycle, and indexing live here.
-    uploadSingleAttachment(att) {
+    uploadSingleAttachment(att, stageId) {
       var self = this;
       var id = this.host.getIdentity();
       att.status = "uploading";
@@ -3761,7 +3977,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                     mime: mime || void 0,
                     size: member.file.size,
                     status: ack.status === "running" ? "running" : "pending",
-                    poll: ack.poll
+                    poll: ack.poll,
+                    // Puts this file's row directly above the chat turn it was
+                    // attached to (drainBgTaskQueue). Undefined for an
+                    // attachment-only send, which appends.
+                    stageId
                   });
                   self.drainBgTaskQueue();
                 }
@@ -3798,7 +4018,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     // message — uploading those here would attach them to the wrong turn, and
     // collecting the previous batch's finished urls would attach files the user
     // already sent. Omitted (no batch) means every chip, the old behavior.
-    uploadPendingAttachments(batchId) {
+    //
+    // `stageId` is the turn these chips were attached to, carried onto every indexing
+    // task so its collapsed row renders directly ABOVE that turn's bubble (see
+    // BgTaskEntry.stageId). Omitted for an attachment-only send, which has no turn.
+    uploadPendingAttachments(batchId, stageId) {
       var self = this;
       this.host.resetOverwriteBatch();
       this._uploadBatches += 1;
@@ -3827,7 +4051,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               return;
             }
           }
-          return self.uploadSingleAttachment(att).then(function(us) {
+          return self.uploadSingleAttachment(att, stageId).then(function(us) {
             collected.push.apply(collected, us);
           }).catch(function(err) {
             var removed = !self.state.attachments.some(function(a) {
@@ -5883,7 +6107,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
     }
     function runAttachmentUpload(job) {
-      return session.uploadPendingAttachments(job.batchId).then(function(attachmentUrls) {
+      return session.uploadPendingAttachments(job.batchId, job.stageId).then(function(attachmentUrls) {
         var failureGroups = groupAttachmentFailures(CS.attachments.filter(function(a) {
           return a._batchId === job.batchId;
         }));
@@ -5903,8 +6127,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function runAttachmentDispatch(job, attachmentUrls) {
       if (!attachmentUrls || !job.text) return Promise.resolve();
-      if (job.stageId) session.markStagedMessageQueued(job.stageId);
+      if (job.stageId) session.markStagedMessageIndexing(job.stageId);
       return session.awaitIndexingDrained(job.pinned.identity).then(function() {
+        if (job.stageId) session.markStagedMessageReady(job.stageId);
         var c = composeUserMessage(job.text, attachmentUrls);
         session.dispatchComposedMessage(c.composed, true, c.composedForLlm, c.extractContent, c.fileUrls, job.pinned);
       });
@@ -6893,7 +7118,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (msg.isError) cls.push("is-error");
       if (msg.isCancelled) cls.push("is-cancelled");
       if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
-      if (msg.isSendingToServer || msg._cancelling) cls.push("is-sending-to-server");
+      if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
       var bubble;
       if (msg.isPending) {
         bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
@@ -6917,6 +7142,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         md.addEventListener("click", onBubbleLinkClick);
         bubble.appendChild(md);
         if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
+        else if (msg.isAwaitingIndexing) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Indexing files...)" }));
         else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
         if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
         if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
@@ -6949,6 +7175,82 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (group.passCount <= 1 && !group.mayHaveOlder) return "";
       return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
+    var stopIndexState = { runKey: "", fileKey: "", handle: null };
+    function findCancellableIndexGroup(runKey, fileKey) {
+      if (!runKey) return null;
+      var list = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+      var byFile = null;
+      for (var i = 0; i < list.length; i++) {
+        var row = list[i];
+        if (row.kind !== "indexing") continue;
+        var live = row.group.cancellableIds.length && !row.group.cancelling ? row.group : null;
+        if (row.group.runKey === runKey) return live;
+        if (!byFile && live && fileKey && row.group.key === fileKey) byFile = row.group;
+      }
+      return byFile;
+    }
+    function stopIndexModalIsOpen() {
+      var hnd = stopIndexState.handle;
+      if (hnd && hnd.root && hnd.root.parentNode) return true;
+      stopIndexState.runKey = "";
+      stopIndexState.fileKey = "";
+      stopIndexState.handle = null;
+      return false;
+    }
+    function closeStopIndexModal() {
+      var hnd = stopIndexState.handle;
+      stopIndexState.runKey = "";
+      stopIndexState.fileKey = "";
+      stopIndexState.handle = null;
+      if (hnd) hnd.close();
+    }
+    function syncStopIndexModal() {
+      if (!stopIndexModalIsOpen()) return;
+      if (!findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)) closeStopIndexModal();
+    }
+    function openStopIndexModal(group) {
+      if (!group || group.cancelling) return;
+      closeStopIndexModal();
+      stopIndexState.runKey = group.runKey;
+      stopIndexState.fileKey = group.key;
+      var name = group.name;
+      stopIndexState.handle = openModal(function(close) {
+        var stopBtn = h("button", { class: "btn btn--danger", type: "button" }, "Stop indexing");
+        stopBtn.addEventListener("click", function() {
+          var runKey = stopIndexState.runKey;
+          var fileKey = stopIndexState.fileKey;
+          closeStopIndexModal();
+          var live = findCancellableIndexGroup(runKey, fileKey);
+          if (live) session.cancelIndexingGroup(live);
+        });
+        return h(
+          "div",
+          { class: "bq-modal" },
+          h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
+          h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Stop indexing" })),
+          // The file name is user data: translate="no" keeps a browser
+          // translator from rewriting it (agent.vue tags it the same way).
+          h(
+            "p",
+            { class: "bq-modal-desc" },
+            "Stop indexing \u201C",
+            h("span", { translate: "no", text: name }),
+            "\u201D?"
+          ),
+          h(
+            "p",
+            { class: "bq-modal-desc bq-modal-delete-warn" },
+            "Whatever has been indexed so far stays searchable, and the pass already running finishes on the server. The remaining passes are dropped, not paused, so the file stays partly indexed until you reindex it."
+          ),
+          h(
+            "div",
+            { class: "bq-modal-btns" },
+            h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Keep indexing"),
+            stopBtn
+          )
+        );
+      });
+    }
     function toggleIndexGroup(key) {
       if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
       else CS.indexGroupsOpen[key] = true;
@@ -6977,7 +7279,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (group.cancelling) cancelBtn.disabled = true;
         else cancelBtn.addEventListener("click", function(e) {
           e.stopPropagation();
-          session.cancelIndexingGroup(group);
+          openStopIndexModal(group);
         });
         cancelBtn.addEventListener("keydown", function(e) {
           e.stopPropagation();
@@ -7080,6 +7382,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       box.scrollTop = anchor.scrollTop;
     }
     function renderMessages() {
+      syncStopIndexModal();
       if (!CS.messagesBox) return;
       if (CS.chatSettingsOpen) return;
       var anchor = captureScrollAnchor();

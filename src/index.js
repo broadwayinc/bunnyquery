@@ -1778,7 +1778,10 @@ import {
     // happens AFTER the user has moved on, so it touches only what it captured at
     // Send time.
     function runAttachmentUpload(job) {
-        return session.uploadPendingAttachments(job.batchId).then(function (attachmentUrls) {
+        // stageId: each file's indexing row is inserted directly ABOVE this turn's
+        // staged bubble, so the collapsed row sits right before the message its files
+        // came with from the moment it appears (see BgTaskEntry.stageId).
+        return session.uploadPendingAttachments(job.batchId, job.stageId).then(function (attachmentUrls) {
             // Collect any failures (upload or indexing) now, grouped by error
             // code + description, so we can report them once below.
             var failureGroups = groupAttachmentFailures(CS.attachments.filter(function (a) {
@@ -1809,14 +1812,19 @@ import {
         // Upload failed (already reported), or an attachment-only turn: the files
         // are indexing and there is no chat message to send.
         if (!attachmentUrls || !job.text) return Promise.resolve();
-        // The files are up; the turn is now just waiting its place in the queue.
-        if (job.stageId) session.markStagedMessageQueued(job.stageId);
+        // The files are up; what the turn is waiting on now is their INDEXING.
+        if (job.stageId) session.markStagedMessageIndexing(job.stageId);
         // Indexing a file is a CHAIN — each pass is only enqueued once the previous
         // one lands — so a turn sent when the uploads finish is answered from a
         // half-read file, with the remaining passes queued up behind it. Wait for
         // the background queue to actually drain. (Times out rather than stranding
         // the message if a chain wedges server-side.)
         return session.awaitIndexingDrained(job.pinned.identity).then(function () {
+            // The files are indexed: the turn is genuinely just queued now, so it
+            // reads solid and "(In queue)" from this instant — not once the request
+            // lands, which is another round trip after a wait measured in minutes.
+            // Fires on 'timedout' and 'skipped' too: the turn is being sent either way.
+            if (job.stageId) session.markStagedMessageReady(job.stageId);
             // Compose the user message (attachment-link block + office-extraction
             // placeholders) via the shared engine helper — identical to agent.vue —
             // then dispatch through the shared ChatSession (which owns the queued-
@@ -2897,7 +2905,10 @@ import {
         if (msg.isError) cls.push("is-error");
         if (msg.isCancelled) cls.push("is-cancelled");
         if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
-        if (msg.isSendingToServer || msg._cancelling) cls.push("is-sending-to-server");
+        // The DIM reads _dimSending, not isSendingToServer: an attachment turn is
+        // un-dimmed the moment its files finish indexing, while its own request is
+        // still un-acked for a moment longer (see ChatMessage._dimSending).
+        if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
 
         var bubble;
         if (msg.isPending) {
@@ -2919,7 +2930,10 @@ import {
             var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
             md.addEventListener("click", onBubbleLinkClick);
             bubble.appendChild(md);
+            // Order matters: a staged turn carries isPendingQueued the whole way
+            // through, so the two attachment phases have to be tested first.
             if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
+            else if (msg.isAwaitingIndexing) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Indexing files...)" }));
             else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
@@ -2970,6 +2984,99 @@ import {
         return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
 
+    /* ---- stop-indexing confirmation ----------------------------------------
+     * The row's Stop only ASKS. Cancelling is not resumable from the row (the
+     * queued passes are dropped, not paused, so finishing the file means
+     * reindexing it from the start), and the button sits inside a one-line row
+     * the user is often just trying to expand — one stray click should not throw
+     * away an hour of indexing. agent.vue asks with the same wording.
+     *
+     * State holds the run KEY, not the group object: the display list is rebuilt
+     * on every render, so a group captured at click time goes stale within
+     * seconds and a pass queued while the dialog sat open would be missing from
+     * the cancellableIds we would then cancel. */
+    var stopIndexState = { runKey: "", fileKey: "", handle: null };
+
+    // The live group the open dialog is about, or null once it stops being
+    // cancellable. Rows are matched by runKey; the FILE key is the fallback for
+    // the one thing that renames a run under an open dialog — an older history
+    // page arriving with the run's true first pass, which the run is named after.
+    // Without it the confirm would silently cancel nothing.
+    function findCancellableIndexGroup(runKey, fileKey) {
+        if (!runKey) return null;
+        var list = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+        var byFile = null;
+        for (var i = 0; i < list.length; i++) {
+            var row = list[i];
+            if (row.kind !== "indexing") continue;
+            var live = row.group.cancellableIds.length && !row.group.cancelling ? row.group : null;
+            if (row.group.runKey === runKey) return live;
+            if (!byFile && live && fileKey && row.group.key === fileKey) byFile = row.group;
+        }
+        return byFile;
+    }
+
+    // openModal's own dismissals (backdrop click, ×) just detach the root, so a
+    // dismissed dialog is detected here rather than through a callback.
+    function stopIndexModalIsOpen() {
+        var hnd = stopIndexState.handle;
+        if (hnd && hnd.root && hnd.root.parentNode) return true;
+        stopIndexState.runKey = "";
+        stopIndexState.fileKey = "";
+        stopIndexState.handle = null;
+        return false;
+    }
+
+    function closeStopIndexModal() {
+        var hnd = stopIndexState.handle;
+        stopIndexState.runKey = "";
+        stopIndexState.fileKey = "";
+        stopIndexState.handle = null;
+        if (hnd) hnd.close();
+    }
+
+    // The file can finish (or fail, or start cancelling) while the dialog sits
+    // open, which takes the row's Stop away — drop the dialog with it rather than
+    // leave a dead confirm on screen offering to cancel nothing. Called from every
+    // renderMessages; the list rebuild only happens while a confirm is actually
+    // open, which is a human-timescale window.
+    function syncStopIndexModal() {
+        if (!stopIndexModalIsOpen()) return;
+        if (!findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)) closeStopIndexModal();
+    }
+
+    function openStopIndexModal(group) {
+        if (!group || group.cancelling) return;
+        closeStopIndexModal();
+        stopIndexState.runKey = group.runKey;
+        stopIndexState.fileKey = group.key;
+        var name = group.name;
+        stopIndexState.handle = openModal(function (close) {
+            var stopBtn = h("button", { class: "btn btn--danger", type: "button" }, "Stop indexing");
+            stopBtn.addEventListener("click", function () {
+                var runKey = stopIndexState.runKey;
+                var fileKey = stopIndexState.fileKey;
+                closeStopIndexModal();
+                // Re-resolve: the row this was opened from is several renders old.
+                var live = findCancellableIndexGroup(runKey, fileKey);
+                if (live) session.cancelIndexingGroup(live);
+            });
+            return h("div", { class: "bq-modal" },
+                h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
+                h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Stop indexing" })),
+                // The file name is user data: translate="no" keeps a browser
+                // translator from rewriting it (agent.vue tags it the same way).
+                h("p", { class: "bq-modal-desc" },
+                    "Stop indexing “", h("span", { translate: "no", text: name }), "”?"),
+                h("p", { class: "bq-modal-desc bq-modal-delete-warn" },
+                    "Whatever has been indexed so far stays searchable, and the pass already running finishes on the server. " +
+                    "The remaining passes are dropped, not paused, so the file stays partly indexed until you reindex it."),
+                h("div", { class: "bq-modal-btns" },
+                    h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Keep indexing"),
+                    stopBtn));
+        });
+    }
+
     function toggleIndexGroup(key) {
         if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
         else CS.indexGroupsOpen[key] = true;
@@ -3007,7 +3114,7 @@ import {
             if (group.cancelling) cancelBtn.disabled = true;
             else cancelBtn.addEventListener("click", function (e) {
                 e.stopPropagation();
-                session.cancelIndexingGroup(group);
+                openStopIndexModal(group);
             });
             cancelBtn.addEventListener("keydown", function (e) { e.stopPropagation(); });
         }
@@ -3149,6 +3256,10 @@ import {
     }
 
     function renderMessages() {
+        // Before the early returns below: a cleared history and an opened settings
+        // panel both take the row (and its Stop) off screen while the confirm this
+        // opened is still sitting on top of the widget.
+        syncStopIndexModal();
         if (!CS.messagesBox) return;
         if (CS.chatSettingsOpen) return; // the settings panel occupies the messages area
         var anchor = captureScrollAnchor();

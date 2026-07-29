@@ -61,7 +61,17 @@ export interface ChatMessage {
 	isPendingInProcess?: boolean;
 	isPendingQueued?: boolean;
 	isPendingOlder?: boolean;
+	/** PROTOCOL flag: true from the moment a queued turn is dispatched until the
+	 *  server acknowledges it. It is the token the ack's findIndex matches on, so
+	 *  nothing may clear it early. It is NOT a style input — see _dimSending. */
 	isSendingToServer?: boolean;
+	/** PRESENTATIONAL flag: render this bubble dimmed because the turn has not been
+	 *  handed over yet. Split from isSendingToServer because an ATTACHMENT turn is
+	 *  un-dimmed the instant its files finish indexing, while the request itself is
+	 *  still un-acked for another moment; dropping isSendingToServer to achieve that
+	 *  would cost the turn its _serverItemId (the ack matches on that flag alone, and
+	 *  a _useBgQueue turn is excluded from every fallback that would recover it). */
+	_dimSending?: boolean;
 	isCancelled?: boolean;
 	isError?: boolean;
 	isBackgroundTask?: boolean;
@@ -76,9 +86,14 @@ export interface ChatMessage {
 	 *  cache: an unmount kills the upload that would resolve them, so a cached
 	 *  copy would replay as a bubble that uploads forever. */
 	_stageId?: string;
-	/** True on a staged bubble while its files are still uploading (renders
-	 *  "(Uploading files...)" instead of "(In queue)"). */
+	/** Staged-turn phase 1: its files are still uploading. Renders
+	 *  "(Uploading files...)", dimmed. */
 	isUploadingAttachments?: boolean;
+	/** Staged-turn phase 2: the files are up and the turn is waiting for the whole
+	 *  background-indexing chain behind them to finish. Renders "(Indexing files...)",
+	 *  still dimmed. Cleared (with _dimSending) by markStagedMessageReady the moment
+	 *  the queue drains, which is when the turn genuinely becomes "(In queue)". */
+	isAwaitingIndexing?: boolean;
 	_serverItemId?: string;
 	_localId?: string;
 	_cancelling?: boolean;

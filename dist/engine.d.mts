@@ -904,6 +904,13 @@ type BgTaskEntry = {
     }) => Promise<any>) | undefined;
     /** How many CONTINUE passes have already run for this file (resume-across-passes). */
     resumePass?: number;
+    /** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
+     *  drainBgTaskQueue inserts this pass's bubble directly ABOVE that turn's bubble, so the
+     *  collapsed row sits where the reader expects it — right before the message the files
+     *  came with — from the moment it appears, instead of the turn being moved down past it
+     *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
+     *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
+    stageId?: string;
 };
 /**
  * `queue` narrows the fetch to one processing chain; `status` narrows it to items
@@ -980,7 +987,17 @@ interface ChatMessage {
     isPendingInProcess?: boolean;
     isPendingQueued?: boolean;
     isPendingOlder?: boolean;
+    /** PROTOCOL flag: true from the moment a queued turn is dispatched until the
+     *  server acknowledges it. It is the token the ack's findIndex matches on, so
+     *  nothing may clear it early. It is NOT a style input — see _dimSending. */
     isSendingToServer?: boolean;
+    /** PRESENTATIONAL flag: render this bubble dimmed because the turn has not been
+     *  handed over yet. Split from isSendingToServer because an ATTACHMENT turn is
+     *  un-dimmed the instant its files finish indexing, while the request itself is
+     *  still un-acked for another moment; dropping isSendingToServer to achieve that
+     *  would cost the turn its _serverItemId (the ack matches on that flag alone, and
+     *  a _useBgQueue turn is excluded from every fallback that would recover it). */
+    _dimSending?: boolean;
     isCancelled?: boolean;
     isError?: boolean;
     isBackgroundTask?: boolean;
@@ -995,9 +1012,14 @@ interface ChatMessage {
      *  cache: an unmount kills the upload that would resolve them, so a cached
      *  copy would replay as a bubble that uploads forever. */
     _stageId?: string;
-    /** True on a staged bubble while its files are still uploading (renders
-     *  "(Uploading files...)" instead of "(In queue)"). */
+    /** Staged-turn phase 1: its files are still uploading. Renders
+     *  "(Uploading files...)", dimmed. */
     isUploadingAttachments?: boolean;
+    /** Staged-turn phase 2: the files are up and the turn is waiting for the whole
+     *  background-indexing chain behind them to finish. Renders "(Indexing files...)",
+     *  still dimmed. Cleared (with _dimSending) by markStagedMessageReady the moment
+     *  the queue drains, which is when the turn genuinely becomes "(In queue)". */
+    isAwaitingIndexing?: boolean;
     _serverItemId?: string;
     _localId?: string;
     _cancelling?: boolean;
@@ -1283,10 +1305,32 @@ declare class ChatSession {
      *  would read the gap between "pass N settled" and "pass N+1 accepted" as the
      *  file being finished. */
     private _indexDispatchesInFlight;
+    /** Live awaitIndexingDrained waiters, one callback each. A nudge only pulls that
+     *  waiter's NEXT look forward; it can never make one conclude anything, so a
+     *  wrong nudge costs one pair of requests and the look reports busy. Overlapping
+     *  waiters are normal — the composer stays live, so a second send can be
+     *  uploading while the first waits. */
+    private _drainNudges;
     constructor(host: ChatHost);
     /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
      *  live work from the moment it is sent, not from the moment it is acked. */
     trackIndexDispatch<T>(p: Promise<T>): Promise<T>;
+    /**
+     * Something just happened that plausibly ENDED indexing work, so let any waiting
+     * turn look now instead of sitting out the rest of its busy interval.
+     *
+     * A nudge changes only WHEN a look happens, never what it concludes: the two
+     * agreeing idle looks, the confirm gap between them, "a failed look counts as
+     * busy" and the minimum wait are all untouched. That is why it is safe to fire
+     * from places that are merely good guesses.
+     *
+     * Fired from end-of-chain points ONLY: the adopt ladder giving up, a resume
+     * declining to continue, a pass failing. Not from every settling pass (one nudge
+     * per pass per file for the whole run), and not from an indexing request being
+     * accepted — see the note in trackIndexDispatch for why that one is actively
+     * harmful rather than merely wasteful.
+     */
+    private _nudgeIndexingDrain;
     /**
      * Register a live poll so (a) a remount dedupes against it instead of stacking a
      * SECOND poll on the same item, and (b) pausePolling can stop it.
@@ -1366,20 +1410,27 @@ declare class ChatSession {
     stageOutgoingMessage(displayText: string): string;
     private _stageIndex;
     /**
-     * Where a staged turn belongs once it is finally sent: BELOW every indexing
-     * row, because that is the order it ran in and the order the server history
-     * will report on the next load (its request id is newer than every pass it
-     * waited for). While its files were uploading it sat above them — the rows
-     * are injected as each file's pass starts, after the bubble was staged.
+     * Staged turn, phase 2: its files are up and it is now waiting for the whole
+     * indexing chain behind them. Swaps "(Uploading files...)" for
+     * "(Indexing files...)"; the bubble stays dimmed, because from the user's side
+     * nothing has been handed over yet.
      *
-     * Returns the index to insert at, or -1 to leave the turn where it is. Never
-     * moves a turn UP: a bubble that already sits below the indexing rows (or a
-     * chat with no indexing at all) must not jump backwards over anything.
+     * It deliberately does NOT say "(In queue)" here. The turn is not queued behind
+     * anything the server knows about yet — it is waiting on work that can run for
+     * minutes — and claiming otherwise is what made the wait look like a stall.
      */
-    private _settledStagePosition;
-    /** The staged turn's files are up; it is now just waiting its place in the
-     *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
-    markStagedMessageQueued(stageId: string): void;
+    markStagedMessageIndexing(stageId: string): void;
+    /**
+     * Staged turn, phase 3: the last of its files has finished indexing, so the turn
+     * is genuinely just queued now. Full opacity + "(In queue)".
+     *
+     * Clears the PRESENTATIONAL _dimSending only; isSendingToServer stays set until
+     * the server actually acks (it is the token that ack matches on). Called by the
+     * clients the instant awaitIndexingDrained resolves, i.e. immediately before the
+     * dispatch that replaces this bubble — dispatchComposedMessage carries the
+     * cleared flag onto the replacement so the turn does not blink back to dimmed.
+     */
+    markStagedMessageReady(stageId: string): void;
     /**
      * Resolves once this project's background-indexing queue has nothing left to
      * run, so a chat enqueued right after it is genuinely last.
@@ -1413,6 +1464,20 @@ declare class ChatSession {
     dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void;
     promoteNextBgQueuedToRunning(): void;
     promoteNextQueuedToRunning(): void;
+    /**
+     * The "Thinking..." placeholder belonging to the user bubble at `userIdx`, or -1.
+     *
+     * Every path that creates one puts it IMMEDIATELY after its user bubble
+     * (promoteNextQueuedToRunning, the immediate-send pair, applyHistoryItemResolution),
+     * so ownership is adjacency — modulo background bubbles, which get spliced in
+     * around them. Taking the first pending assistant ANYWHERE below instead was a
+     * hijack: a turn sent with attachments never gets a placeholder of its own
+     * (promoteNextQueuedToRunning skips _useBgQueue turns) and now keeps the position
+     * it was sent in, so an ordinary turn sent while its files indexed sits BELOW it
+     * with a placeholder of its own — and the attachment turn's answer was rendered
+     * as the answer to that unrelated question.
+     */
+    private _ownThinkingIndex;
     resolveQueuedUserBubble(serverId?: string): number | undefined;
     insertAtTarget(msg: ChatMessage, targetIdx: number): void;
     onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
@@ -1442,6 +1507,19 @@ declare class ChatSession {
     enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any>;
     typewriteLatestReply(key: string): Promise<any>;
     _removeStrayPendingAssistants(): void;
+    /** Index of the USER bubble the message at `idx` belongs to — the nearest one
+     *  above it, stepping over background bubbles (a file's indexing rows are
+     *  inserted between turns). -1 when the nearest thing above is not a user turn,
+     *  which for a placeholder means it is an orphan. */
+    private _owningUserIndex;
+    /** The bubble at `idx` is the "Thinking…" of a DIFFERENT turn that is still
+     *  waiting for its answer, so the sweep above must leave it alone. */
+    private _isLiveImmediatePlaceholder;
+    /** A pending assistant at `idx` is the placeholder OF the turn above it, so a
+     *  reply may take its slot. Every path that makes one copies the parent's
+     *  _serverItemId (or neither has one yet), so a mismatch means the slot belongs to
+     *  some other request and the reply must be spliced in beside it, not on top. */
+    private _isOwnPlaceholderOf;
     _clearPendingUserBubble(itemId: string): void;
     resumePendingRequest(token: number): Promise<void>;
     handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
@@ -1528,12 +1606,12 @@ declare class ChatSession {
     drainBgTaskQueue(): void;
     maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void;
     loadHistory(fetchMore?: boolean, token?: number): Promise<void>;
-    uploadSingleAttachment(att: any): Promise<Array<{
+    uploadSingleAttachment(att: any, stageId?: string): Promise<Array<{
         name: string;
         url: string;
         storagePath: string;
     }>>;
-    uploadPendingAttachments(batchId?: string): Promise<Array<{
+    uploadPendingAttachments(batchId?: string, stageId?: string): Promise<Array<{
         name: string;
         url: string;
         storagePath?: string;

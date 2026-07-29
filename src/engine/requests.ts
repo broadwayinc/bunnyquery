@@ -566,6 +566,12 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					name: attachment.name,
 					mime: attachment.mime,
 					kind: 'window',
+					// Same per-image `detail` the render path sends. Without it the worker falls
+					// back to its model-blind default of 'high', so a spreadsheet's embedded
+					// photos were tiled at lower resolution than the SAME model gets for a PDF
+					// page or a chat attachment. That is why a model could describe an attached
+					// photo but reported the pictures inside a sheet as only partly legible.
+					detail: renderDetail,
 					auto_continue: true,
 					continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true),
 				},
@@ -848,6 +854,13 @@ export type BgTaskEntry = {
 	poll: ((opts: { latency: number }) => Promise<any>) | undefined;
 	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
 	resumePass?: number;
+	/** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
+	 *  drainBgTaskQueue inserts this pass's bubble directly ABOVE that turn's bubble, so the
+	 *  collapsed row sits where the reader expects it — right before the message the files
+	 *  came with — from the moment it appears, instead of the turn being moved down past it
+	 *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
+	 *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
+	stageId?: string;
 };
 
 // Token the indexing agent appends to its final message ONLY when it has fully read and
