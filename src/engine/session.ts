@@ -23,6 +23,7 @@ import {
 	notifyAgentSaveAttachment,
 	notifyAgentContinueIndexing,
 	INDEXING_COMPLETE_MARKER,
+	EMPTY_INDEXING_REPLY,
 	MAX_INDEXING_RESUME_PASSES,
 	extractClaudeText,
 	extractOpenAIText,
@@ -164,6 +165,26 @@ export class ChatSession {
 	 *  waiters are normal — the composer stays live, so a second send can be
 	 *  uploading while the first waits. */
 	private _drainNudges: Array<() => void>;
+	/** Stages whose upload/dispatch chain is still running in THIS page. Lives and
+	 *  dies with those chains, so it is what tells a staged bubble restored from the
+	 *  history cache whether anything is still working on it (see
+	 *  settleDeadStagedMessages). Today the cache dies with the page too and every
+	 *  restored stage is live; this stays correct if that ever changes. */
+	private _liveStages: { [stageId: string]: boolean };
+	/** Files the SERVER currently has unresolved indexing work for, by the same key
+	 *  a collapsed row uses (storage path, else filename), and whether we have asked
+	 *  even once for this chat.
+	 *
+	 *  This is the only thing that can tell a WORKER-driven run (a PDF's page loop, a
+	 *  windowed read) that it is over. Those chains are advanced inside the worker off
+	 *  the renderer's page count; the client sees passes appear and settle and can
+	 *  never tell "between passes" from "finished" by looking at them. Asking the
+	 *  queue is how it finds out. Until it has asked, `checked` is false and the view
+	 *  says "still working", which is the honest reading of not knowing — and the one
+	 *  that does not repeat the bug where a row claimed "Indexed" mid-run. */
+	/** The chat the live-index snapshot (state.liveIndexKeys) was taken for, so a
+	 *  project switch drops it. */
+	private _liveIndexKey: string;
 
 	constructor(host: ChatHost) {
 		this.host = host;
@@ -180,6 +201,8 @@ export class ChatSession {
 			historyStartKeyHistory: [],
 			historyRequestToken: 0,
 			gateRefreshToken: 0,
+			liveIndexKeys: {},
+			liveIndexChecked: false,
 		};
 		this.bgTaskQueue = [];
 		this.cancelledServerIds = new Set();
@@ -194,6 +217,116 @@ export class ChatSession {
 		this._uploadBatches = 0;
 		this._indexDispatchesInFlight = 0;
 		this._drainNudges = [];
+		this._liveStages = {};
+		this._liveIndexKey = '';
+	}
+
+	/** What the display layer needs to decide whether a run is finished. `keys` holds
+	 *  every file the server still has indexing work for; `checked` is false until the
+	 *  first answer for this chat, and false means "we do not know yet". */
+	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean } {
+		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+	}
+
+	/**
+	 * Replace the live-index snapshot from a queue query's raw items.
+	 *
+	 * Whole-snapshot, never incremental: the query returns everything unresolved on
+	 * the queue, so a file MISSING from it is precisely the fact we are after. Merging
+	 * would make a finished file impossible to observe.
+	 */
+	private _recordLiveIndexKeys(lists: any[]): void {
+		var next: { [k: string]: boolean } = {};
+		// A page that came back FULL is not a whole-queue answer: the query is capped
+		// and ordered newest-first, so a bulk upload of 40 files returns the 20 newest
+		// and omits the 20 about to run. Absence would then read as "finished" for
+		// exactly the files that have not been touched yet. Report not-knowing instead.
+		var truncated = false;
+		// Locally settled already. The adopt path refuses these items for the same
+		// reason and says why: the status index is eventually consistent, so the pass
+		// that just finished can still come back as running. Counting it as live work
+		// leaves a finished file spinning with nothing left to ever settle and correct
+		// it — the two readings of one payload must not disagree.
+		var settledIds: { [id: string]: boolean } = {};
+		this.state.messages.forEach(function (m) {
+			if (!m._serverItemId) return;
+			if (m.isPending || m.isPendingInProcess || m.isPendingQueued) return;
+			settledIds[m._serverItemId] = true;
+		});
+		for (var li = 0; li < lists.length; li++) {
+			var list = lists[li] && Array.isArray(lists[li].list) ? lists[li].list : [];
+			if (list.length >= WORKER_PASS_ADOPT_LIMIT) truncated = true;
+			for (var i = 0; i < list.length; i++) {
+				var item = list[i];
+				if (!item || (item.status !== 'pending' && item.status !== 'running')) continue;
+				if (item.id && settledIds[item.id]) continue;
+				var text = extractLastUserTextFromRequest(item.request_body);
+				if (!isIndexingRequestText(text)) continue; // an ordinary chat on this queue
+				var ref = parseIndexingRequestText(text);
+				if (!ref) continue;
+				// BOTH, not `path || name`. A row's key is normally the storage path,
+				// but buildChatDisplayList falls back to the filename when the pass it
+				// opened the run with carried no path (an old cached bubble, a label
+				// with no link). A key recorded one way and looked up the other misses,
+				// and a miss reads as FINISHED — the one direction that must never
+				// happen by accident. Recording both can only over-match, which shows a
+				// loader on a file that is done: visibly cautious instead of silently
+				// wrong.
+				if (ref.path) next[ref.path] = true;
+				if (ref.name) next[ref.name] = true;
+			}
+		}
+		var nowChecked = !truncated;
+		var was = this.state.liveIndexKeys, changed = this.state.liveIndexChecked !== nowChecked;
+		if (!changed) {
+			for (var k in next) if (!was[k]) { changed = true; break; }
+			if (!changed) for (var k2 in was) if (!next[k2]) { changed = true; break; }
+		}
+		this.state.liveIndexKeys = next;
+		this.state.liveIndexChecked = nowChecked;
+		if (changed) this.host.notify();
+	}
+
+	/** Forget the snapshot: it describes ONE chat's queue, and the answer for the
+	 *  project the user just switched to is unknown until it is asked for again. */
+	private _resetLiveIndexKeys(): void {
+		this.state.liveIndexKeys = {};
+		this.state.liveIndexChecked = false;
+	}
+
+	/**
+	 * Ask the queue what is still indexing, once, for the chat that is on screen.
+	 *
+	 * Seeds the snapshot on a history load. Without it a reloaded chat has no way to
+	 * learn that a run it can see is over: the adopt ladder that normally answers this
+	 * only fires when a pass SETTLES, and after a reload there is no pass left to
+	 * settle — so every finished worker-driven row would spin forever.
+	 *
+	 * Best-effort: a failure leaves `checked` false, which reads as "still working"
+	 * rather than as a false all-clear.
+	 *
+	 * Delegates to the adopt ladder rather than asking once. A single empty look is
+	 * exactly what that ladder exists to distrust — the worker writes pass N+1 a few
+	 * milliseconds AFTER flipping pass N to resolved, so a query landing in that gap
+	 * sees an empty queue for a chain that is very much alive. One look would turn
+	 * that into a confident "Indexed" with a green check, on the one scenario this
+	 * whole feature is for, and nothing would ever re-ask: the ladder is normally
+	 * triggered by a pass SETTLING, and after a reload there is no pass left to
+	 * settle. The ladder re-asks at 0/2s/6s, records each answer, and as a bonus
+	 * adopts and polls any live pass it finds, which makes the row genuinely active
+	 * instead of merely unconfirmed.
+	 */
+	refreshLiveIndexState(): void {
+		this._adoptWorkerIndexingPasses(0);
+	}
+
+	/** Forget what we know about which files are indexing. For a consumer whose
+	 *  history loading is its own fork and so never reaches loadHistory's reset —
+	 *  a snapshot describes ONE chat's queue, and carrying it into another project
+	 *  would let a row there claim to be finished on someone else's evidence. */
+	resetLiveIndexState(): void {
+		this._liveIndexKey = '';
+		this._resetLiveIndexKeys();
 	}
 
 	/** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
@@ -356,14 +489,22 @@ export class ChatSession {
 		// history, bg tasks) are always kept. Single pass: this runs on the
 		// typewriter hot path.
 		//
-		// Staged bubbles (_stageId) are never cached. What resolves one is an
-		// in-page upload; a reload kills that upload but not the cache, so a cached
-		// staged bubble would come back as a message that uploads forever. Dropping
-		// it costs nothing while the page lives — a history refetch re-rescues it
-		// from state.messages, and a dispatch that no longer finds it just appends.
+		// Staged bubbles (_stageId) ARE cached, deliberately. They used to be dropped
+		// on the theory that a reload kills the upload but not the cache, leaving a
+		// message that uploads forever — but this cache is an in-memory field on a
+		// singleton created at module load, so a reload takes it and the upload chain
+		// together and that state is unreachable. What dropping them DID cost was
+		// real: state.messages is shared across projects, so both clients filter it by
+		// _ownerKey on every chat switch, and with no cached copy the bubble was
+		// destroyed outright. A user who sent a question with a file and then looked at
+		// another project lost the question for the whole indexing wait and got it back
+		// at the bottom minutes later.
+		//
+		// isLiveStage + settleDeadStagedMessages keep the original concern honest if
+		// this cache is ever persisted: a restored stage whose upload no longer exists
+		// settles into a plain message instead of uploading forever.
 		this.aiChatHistoryCache[key] = {
 			messages: this.state.messages.filter(function (m) {
-				if (m._stageId) return false;
 				return m._ownerKey === undefined || m._ownerKey === key;
 			}),
 			endOfList: this.state.historyEndOfList,
@@ -417,6 +558,11 @@ export class ChatSession {
 		for (var j = 0; j < msgs.length; j++) {
 			var u = msgs[j];
 			if (!u || u.role !== 'user' || u.isBackgroundTask) continue;
+			// A STAGED bubble matches this shape exactly — pending, no server id, so the
+			// id test below cannot rule it out — and sits EARLIER in the list than the
+			// turn actually resolving. Settling it would strip its _stageId and its
+			// upload state, silently killing a turn whose files are still going up.
+			if (u._stageId) continue;
 			if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
 			if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
 			var settled: ChatMessage = { role: 'user', content: u.content };
@@ -574,9 +720,45 @@ export class ChatSession {
 			_useBgQueue: true, _stageId: stageId, _ts: wallClockNow(),
 		};
 		if (key) staged._ownerKey = key;
+		this._liveStages[stageId] = true;
 		this.state.messages.push(staged);
 		this.host.notify(); this.host.scrollToBottom(true);
 		return stageId;
+	}
+
+	/** Is anything in this page still uploading/dispatching for this stage? */
+	isLiveStage(stageId?: string): boolean {
+		return !!stageId && !!this._liveStages[stageId];
+	}
+
+	/**
+	 * Settle any staged bubble in `list` whose chain no longer exists, and return the
+	 * list (a new array only if something changed).
+	 *
+	 * The caller is a cache restore. A staged bubble is the one kind of message whose
+	 * resolution lives entirely in page memory — no server request stands behind it
+	 * yet — so a copy that outlives its upload would render "(Uploading files...)"
+	 * forever with nothing left to finish it. Today nothing can: this cache dies with
+	 * the page, so every restored stage is still live and this is a no-op. It exists
+	 * so that stops being a silent assumption.
+	 */
+	settleDeadStagedMessages(list: ChatMessage[]): ChatMessage[] {
+		if (!Array.isArray(list)) return list;
+		var self = this;
+		var dead = false;
+		for (var i = 0; i < list.length; i++) {
+			var m = list[i];
+			if (m && m._stageId && !self._liveStages[m._stageId]) { dead = true; break; }
+		}
+		if (!dead) return list;
+		return list.map(function (m) {
+			if (!m || !m._stageId || self._liveStages[m._stageId]) return m;
+			var settled: ChatMessage = { role: 'user', content: m.content };
+			if (m._ownerKey !== undefined) settled._ownerKey = m._ownerKey;
+			if (m._ts !== undefined) settled._ts = m._ts;
+			if (m._localId !== undefined) settled._localId = m._localId;
+			return settled;
+		});
 	}
 
 	private _stageIndex(list: ChatMessage[], stageId?: string): number {
@@ -768,6 +950,9 @@ export class ChatSession {
 	 * failure separately.
 	 */
 	settleStagedMessage(stageId: string): void {
+		// Retired even when the bubble is not on screen (another project is): the
+		// chain is over either way, and a cached copy must not read as still working.
+		delete this._liveStages[stageId];
 		var idx = this._stageIndex(this.state.messages, stageId);
 		if (idx === -1) return;
 		var ex = this.state.messages[idx];
@@ -799,6 +984,9 @@ export class ChatSession {
 		// caller doesn't pin (the widget, which has only one project anyway).
 		var id = pinned ? pinned.identity : this.host.getIdentity();
 		if (id.platform === 'none') { if (stageId) this.settleStagedMessage(stageId); return; }
+		// Past every bail: this turn is going out, so its stage is over whichever
+		// branch below takes it, and whether or not the bubble is still on screen.
+		if (stageId) delete this._liveStages[stageId];
 
 		var llmComposed = composedForLlm || composed;
 
@@ -857,8 +1045,22 @@ export class ChatSession {
 				this.state.messages.splice(offStage, 1);
 				this.host.notify();
 			}
+			// The cached copy of that same staged bubble has to go with it. offUser is
+			// the turn it stood in for, appended just below; leaving both would show the
+			// question twice on the next visit, permanently — the cache is restored
+			// verbatim. (Its _ts is recovered above only when the live bubble is still
+			// there; take it from the cached copy otherwise, so the turn keeps the time
+			// the user sent it at rather than the upload's finish time.)
+			var offCached = offExisting.messages;
+			if (stageId) {
+				offCached = offCached.filter(function (m) {
+					if (m._stageId !== stageId) return true;
+					if (offStage === -1 && m._ts !== undefined) offUser._ts = m._ts;
+					return false;
+				});
+			}
 			this.aiChatHistoryCache[key] = {
-				messages: offExisting.messages.concat([
+				messages: offCached.concat([
 					offUser,
 					{ role: 'assistant', content: '', isPending: true, isPendingInProcess: true, _ownerKey: key },
 				]),
@@ -1706,8 +1908,21 @@ export class ChatSession {
 		var isErr = isErrorResponseBody(response);
 		var answer = isErr ? getErrorMessage(response)
 			: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim();
-		// Hide the internal indexing-completion marker from the displayed summary.
-		if (!isErr && answer) answer = answer.split(INDEXING_COMPLETE_MARKER).join('').trim();
+		// Record the marker BEFORE hiding it from the displayed summary: the display
+		// layer needs it as a structured fact, and searching the shown text for it
+		// afterwards would find nothing. Mirrors history.ts, so a run reads the same
+		// live and after a reload.
+		//
+		// The STRIP happens in the background branches only, not here. It used to run
+		// on every answer, so an ordinary chat reply that merely mentioned the token
+		// had it silently cut out of the user's text (leaving a double space) — and
+		// the history mappers never did that, so the same reply read differently
+		// before and after a reload. Only an INDEXING pass has a protocol token to
+		// hide.
+		var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+		var stripMarker = function (t: string): string {
+			return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join('').trim() : t;
+		};
 		var idx = this.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === itemId; });
 		if (idx !== -1) {
 			// A bg "Indexing:" turn pushes a user bubble (isPendingInProcess) ALONGSIDE
@@ -1738,7 +1953,7 @@ export class ChatSession {
 			// history, and ran a per-frame scroll for content nobody can see.
 			// Write it straight in; expanding the row then shows it complete.
 			if (wasBgTask) {
-				this.state.messages[idx] = { role: 'assistant', content: text, isBackgroundTask: true, _serverItemId: itemId };
+				this.state.messages[idx] = { role: 'assistant', content: stripMarker(text) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...(reportedComplete ? { _indexComplete: true } : {}) };
 				this.host.notify(); this.updateHistoryCache(); return;
 			}
 			var lid = this._newLocalId();
@@ -1770,7 +1985,7 @@ export class ChatSession {
 		// Same as above: a collapsed row's reply is not on screen, so revealing it
 		// character by character only blocks the queue the visible reply needs.
 		if (ex.isBackgroundTask) {
-			this.state.messages.splice(userIdx + 1, 0, { role: 'assistant', content: text2, isBackgroundTask: true, _serverItemId: itemId });
+			this.state.messages.splice(userIdx + 1, 0, { role: 'assistant', content: stripMarker(text2) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...(reportedComplete ? { _indexComplete: true } : {}) });
 			this.host.notify(); this.updateHistoryCache(); return;
 		}
 		var lid2 = this._newLocalId();
@@ -1912,6 +2127,14 @@ export class ChatSession {
 			var now = self.host.getIdentity();
 			if (now.serviceId !== svcId || now.platform !== platform) return;
 			if (!self.host.isViewMounted()) return;
+			// Free: this is already the whole-queue snapshot the display layer needs to
+			// tell a worker-driven run's "between passes" from its "finished".
+			//
+			// A null is a FAILED query, and the adoption loop below reads it as an empty
+			// list — harmless there (nothing to adopt) but not here: recording it would
+			// publish "the queue holds nothing" on the strength of a request that never
+			// answered, which reads as finished. Not knowing is the honest state.
+			if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
 			var adoptedIds: string[] = [];
 			for (var ri = 0; ri < results.length; ri++) {
 				var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
@@ -2284,6 +2507,14 @@ export class ChatSession {
 		}
 		this.state.historyRequestToken = token;
 		this.state.loadingHistory = true;
+		// A first-page load is the one moment the chat may have changed under us. The
+		// old snapshot describes the previous project's queue; keeping it would let a
+		// row here claim it was finished on evidence from somewhere else. Re-seeded
+		// when this load lands.
+		if (!fetchMore && loadKey !== this._liveIndexKey) {
+			this._liveIndexKey = loadKey;
+			this._resetLiveIndexKeys();
+		}
 		if (fetchMore) this.state.loadingOlderHistory = true;
 		this.host.notify(); // surface "Fetching history..." while it loads
 		var platform = id.platform as 'claude' | 'openai';
@@ -2540,6 +2771,11 @@ export class ChatSession {
 				self.drainBgTaskQueue();
 			}
 
+			// Learn which files the queue is still working on. Only on a FIRST page:
+			// this describes the whole queue, not the page, so paging older history
+			// would re-ask for an answer that has not changed.
+			if (!fetchMore) self.refreshLiveIndexState();
+
 			// Sticky, NOT forcing: this runs after every first-page load, including
 			// the one resumePolling fires on visibilitychange. Forcing yanked a
 			// reader who had scrolled up back to the bottom. On a genuine mount the
@@ -2628,9 +2864,23 @@ export class ChatSession {
 					// enqueued. Best-effort + optional-hook guarded: a missing record,
 					// a permission error, or a host without the hook must not block
 					// indexing.
+					// Then CREATE the file record before any pass is enqueued. Ordering matters: the
+					// delete above wipes it (and cascades to its rows), so creating first would just
+					// delete what we made. Every pass references "src::<path>", and a pass is a
+					// separate model turn that cannot know whether an earlier one created it, so
+					// guaranteeing it here is what stops the backend rejecting whole windows with
+					// NOT_EXISTS on reference.unique_id.
 					var preIndex = (existedBefore && typeof self.host.deleteExistingFileRecord === 'function')
 						? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { })
 						: Promise.resolve();
+					preIndex = preIndex.then(function () {
+						if (typeof self.host.ensureFileIndexRecord !== 'function') return;
+						return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
+							name: member.file.name,
+							mime: mime || undefined,
+							size: member.file.size,
+						})).catch(function () { });
+					});
 					// Run a client-side attachment parser (e.g. .hwp) if one matches; its
 					// output is inlined into the indexing request (falls back to office
 					// extraction / web_fetch when no parser matches or it yields nothing).

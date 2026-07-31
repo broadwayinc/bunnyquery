@@ -77,6 +77,22 @@ export interface ChatMessage {
 	isBackgroundTask?: boolean;
 	/** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
 	_indexFile?: IndexingFileRef;
+	/** Set on a background-indexing RESPONSE bubble whose raw answer carried the
+	 *  INDEXING_COMPLETE marker. Stamped before the marker is stripped for display,
+	 *  in every path that builds one (live resolution and both history mappers), so
+	 *  a run reads the same before and after a reload.
+	 *
+	 *  Meaningful ONLY for a client-driven chain, where it is the very signal
+	 *  maybeResumeIndexing stops on. The worker-driven paths (PDF vision, windowed
+	 *  reads) advance off the renderer's page count and their prompt deliberately
+	 *  never asks for the marker, so a model that emits one there is guessing —
+	 *  which is how an 88-page file once "finished" at page 15. */
+	_indexComplete?: boolean;
+	/** Set on a background-indexing RESPONSE bubble the SERVER marked as its run's
+	 *  last pass. The only completion fact a worker-driven chain can state, and the
+	 *  only one that survives a reload. Absent until the backend stamps it; the
+	 *  display layer treats absence as "not known", never as "not finished". */
+	_indexFinal?: boolean;
 	_useBgQueue?: boolean;
 	/** Local id of a turn STAGED at Send time while its attachments upload. The
 	 *  bubble exists before any server request does, so it is never matched by
@@ -128,6 +144,14 @@ export interface ChatState {
 	historyStartKeyHistory: string[];
 	historyRequestToken: number;
 	gateRefreshToken: number;
+	/** Files the SERVER still has unresolved indexing work for, by the key a
+	 *  collapsed row uses (storage path, else filename). Lives on the state rather
+	 *  than privately so a reactive consumer re-renders when it changes. */
+	liveIndexKeys: { [fileKey: string]: boolean };
+	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
+	 *  means "we have not found out", which the display layer reads as still
+	 *  working — never as an all-clear. */
+	liveIndexChecked: boolean;
 }
 
 export interface ChatHost {
@@ -186,6 +210,12 @@ export interface ChatHost {
 	 *  through to a plain re-index. Implementations must be best-effort (swallow
 	 *  "not found" / permission errors so indexing still proceeds). */
 	deleteExistingFileRecord?(storagePath: string): Promise<any>;
+	/**
+	 * Create the file's "src::<storagePath>" record before indexing starts, so every pass has a
+	 * reference target that exists. Optional: a host without it keeps the old behaviour, where
+	 * whichever pass got there first created the record and the others hoped it had.
+	 */
+	ensureFileIndexRecord?(storagePath: string, meta?: { name?: string; mime?: string; size?: number }): Promise<any>;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;

@@ -231,6 +231,59 @@ export function normalizeTrailingInlineToken(value: string): string {
 	return out;
 }
 
+/**
+ * Extensions a BROWSER can paint in an <img>, mapped to the content type the
+ * presign must declare.
+ *
+ * The content type is not optional here. get_signed_url only sets
+ * ResponseContentType when the caller passes `contentType`, and otherwise falls
+ * back to application/octet-stream, which a new tab DOWNLOADS instead of
+ * displaying. Since the whole point of the preview is that clicking it shows the
+ * picture, the mint has to name the real type.
+ *
+ * Deliberately narrower than the extraction/vision lists elsewhere in the repo:
+ *   heic/heif out: Safari paints them, Chrome and Firefox show a broken image,
+ *                  and it is the format every iPhone photo arrives in, so the
+ *                  failure would be common and would read as a bug.
+ *   tif/wmf/emf out: no mainstream browser paints them.
+ *   svg        out: inside an <img> an SVG is script-disabled and safe, but this
+ *                  feature's click target is a TOP-LEVEL navigation, where an
+ *                  SVG executes its own <script> in the serving origin with that
+ *                  origin's cookies, from user-uploaded content. A preview is an
+ *                  invitation to click exactly that.
+ */
+export var PREVIEWABLE_IMAGE_CONTENT_TYPES: Record<string, string> = {
+	png: 'image/png',
+	jpg: 'image/jpeg',
+	jpeg: 'image/jpeg',
+	gif: 'image/gif',
+	webp: 'image/webp',
+	avif: 'image/avif',
+	bmp: 'image/bmp',
+};
+
+/** Extension of a path or url, query and fragment stripped, '' when none. */
+export function previewableExtOf(nameOrPath: string | null | undefined): string {
+	var v = String(nameOrPath || '');
+	// A storage path may legally contain '?', so this cannot reuse extOf().
+	var cut = v.search(/[?#]/);
+	if (cut !== -1) v = v.slice(0, cut);
+	v = v.replace(/[\\/]+$/, '');
+	var dot = v.lastIndexOf('.');
+	if (dot <= 0) return '';
+	var ext = v.slice(dot + 1).trim().toLowerCase();
+	return /^[a-z0-9]+$/.test(ext) ? ext : '';
+}
+
+export function isPreviewableImagePath(nameOrPath: string | null | undefined): boolean {
+	return !!PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)];
+}
+
+/** Content type to hand the presign so a new tab displays rather than downloads. */
+export function previewImageContentType(nameOrPath: string | null | undefined): string | null {
+	return PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)] || null;
+}
+
 /** A link the view renders. `expired` means the href is the `_expired_.url`
  *  placeholder and a click must mint a fresh one from `remotePath`. */
 export interface InlineLinkPart {
@@ -241,6 +294,12 @@ export interface InlineLinkPart {
 	expired: boolean;
 	expiredHref?: string;
 	remotePath?: string;
+	/**
+	 * Set only for a file WE host whose PATH says a browser can paint it. Its
+	 * presence IS the "render a preview" decision, so a view never re-tests the
+	 * label and never tests `href` (which is the _expired_.url placeholder).
+	 */
+	image?: { ext: string; contentType: string };
 }
 
 export interface InlineLinkContext {
@@ -283,17 +342,22 @@ export function classifyInlineLink(
 		if (!remotePath) return null;
 		var expiredHref = buildDisplayExpiredAttachmentHref(remotePath, label);
 		var cached = fresh(expiredHref);
-		return {
-			part: {
-				type: 'link',
-				label: truncateLabelForDisplay(label),
-				fullLabel: label,
-				href: cached || expiredHref,
-				expired: !cached,
-				expiredHref: expiredHref,
-				remotePath: remotePath,
-			},
+		var part: InlineLinkPart = {
+			type: 'link',
+			label: truncateLabelForDisplay(label),
+			fullLabel: label,
+			href: cached || expiredHref,
+			expired: !cached,
+			expiredHref: expiredHref,
+			remotePath: remotePath,
 		};
+		// The PATH decides, never the label. The file is fetched by path, so the
+		// path is the only claim with consequences: a model-written label reading
+		// "chart.png" on a .xlsx would otherwise mint a url and paint a broken box.
+		var ext = previewableExtOf(remotePath);
+		var ct = PREVIEWABLE_IMAGE_CONTENT_TYPES[ext];
+		if (ct) part.image = { ext: ext, contentType: ct };
+		return { part: part };
 	};
 
 	// src::<token> — a path, or a url the model copied out of a record.

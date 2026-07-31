@@ -123,7 +123,17 @@
     border: 1px solid var(--bq-line);
     background: rgba(127, 127, 127, 0.05);
 }
+/* Three states, three colours, and the row is readable at a glance without
+   opening it:
+     yellow  working on it now      (.is-active)
+     green   indexed, confirmed     (.is-indexed)
+     grey    not known yet          (.is-resolving, and the base look)
+   Grey is the DEFAULT rather than a colour of its own, so anything that has not
+   earned green or yellow reads as "no claim" — which is also what a cancelled
+   row should look like, and what an unrecognised future state would fall back
+   to. Red stays reserved for a failure. */
 .bq-index-group.is-active { border-color: var(--bq-warning-border); background: var(--bq-warning-bg); }
+.bq-index-group.is-indexed { border-color: var(--bq-success-border); background: var(--bq-success-bg); }
 .bq-index-group.is-error { border-color: var(--bq-danger); background: var(--bq-danger-bg); }
 
 .bq-index-head {
@@ -146,7 +156,12 @@
 }
 .bq-index-head:hover { background: rgba(127, 127, 127, 0.08); color: var(--bq-muted); }
 .bq-index-group.is-active .bq-index-head { color: var(--bq-warning); }
+.bq-index-group.is-indexed .bq-index-head { color: var(--bq-success); }
 .bq-index-group.is-error .bq-index-head { color: var(--bq-danger); }
+/* Stated rather than inherited: a waiting row keeping the muted default is a
+   DECISION (it is not claiming a state), not an oversight, and writing it here
+   means adding a colour to the base rule cannot silently give it one. */
+.bq-index-group.is-resolving .bq-index-head { color: var(--bq-muted); }
 
 /* Status glyph. The active one is a circular-arrow SVG the consumer inlines
    (never an icon font: agent.vue's Material Symbols build gates glyphs behind
@@ -162,8 +177,17 @@
 .bq-index-icon svg { width: 100%; height: 100%; display: block; }
 .bq-index-group.is-active .bq-index-icon svg { animation: bq-index-spin 1.1s linear infinite; }
 @keyframes bq-index-spin { to { transform: rotate(360deg); } }
+/* Waiting to find out (a run whose earlier passes are still being paged in, a
+   file whose queue state has not been answered). Deliberately NOT the active
+   look: no warning colour and no spin, because a spinning glyph on a chat row is
+   read as "this file is being worked on right now" and that is the one thing this
+   state does not know. A slow fade says "pending" without claiming progress. */
+.bq-index-group.is-resolving .bq-index-icon svg { animation: bq-index-fade 1.6s ease-in-out infinite; }
+@keyframes bq-index-fade { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {
     .bq-index-group.is-active .bq-index-icon svg { animation-duration: 3s; }
+    /* A fade has no end state to settle on, so it stops rather than slows. */
+    .bq-index-group.is-resolving .bq-index-icon svg { animation: none; opacity: 0.7; }
 }
 
 .bq-index-label {
@@ -222,8 +246,28 @@
     border-left: 2px solid var(--bq-line);
 }
 .bq-message.bq-index-pass .bq-bubble { font-size: 0.78rem; }
-/* Close the run: the next ordinary message needs its normal breathing room. */
-.bq-message.bq-index-pass + :not(.bq-index-pass) { margin-top: 0.55rem; }
+/* Close the run: the next ordinary message needs its normal breathing room.
+   NOT scoped to .bq-message: the trailing loader below is a run member too, and
+   requiring .bq-message would silently drop the gap whenever it is the last one. */
+.bq-index-pass + :not(.bq-index-pass) { margin-top: 0.55rem; }
+/* Trailing loader: an open row keeps a "still working" mark of its own for as long
+   as the file's indexing is not confirmed over. It sits on the same rail as the
+   passes so it reads as the run continuing rather than as a message of its own —
+   which is why the rail is repeated here instead of reusing the rule above, whose
+   selector requires .bq-message. */
+.bq-index-tail {
+    margin-bottom: 0.3rem;
+    margin-left: 0.7rem;
+    padding: 0.1rem 0 0.1rem 0.7rem;
+    border-left: 2px solid var(--bq-line);
+    font-size: 0.78rem;
+    color: var(--bq-muted);
+}
+/* An open row animates for as long as the file is indexing, which can be minutes.
+   Readers who ask for less motion get the static end state. */
+@media (prefers-reduced-motion: reduce) {
+    .bq-index-tail .bq-loader::after { animation: none; content: '...'; }
+}
 .bq-index-note {
     padding: 0 0.6rem 0.45rem;
     font-size: 0.7rem;
@@ -257,6 +301,57 @@
 /* While the temporary URL is being re-resolved the click is swallowed — show a
    busy cursor and dim it so it reads as "working, don't click again". */
 .bq-link-button.is-refreshing { cursor: progress; opacity: 0.6; }
+
+/* ---- inline image previews ----------------------------------------------*/
+/* The anchor IS the preview: picture on top, the ordinary chip underneath as a
+   caption. The caption is the FALLBACK, not decoration: when the url dies or the
+   file is gone the <img> hides itself and what is left is exactly the text chip
+   this feature replaced, still clickable. */
+.bq-link-button.is-image-preview {
+    display: inline-block;
+    max-width: 100%;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    vertical-align: top;
+    margin: 0.25em 0;
+}
+/* Qualified with .bq-md because `.bq-md img` below already sets max-width and
+   would otherwise out-specify a bare .bq-img-preview. */
+.bq-md img.bq-img-preview {
+    display: block;
+    /* Bounded on BOTH axes so a 12000px panorama and a 40x9000 sliver each land
+       inside the bubble; width/height auto keep the aspect ratio. The bubble cap
+       differs per client, so the preview carries its own. */
+    max-width: min(100%, 320px);
+    max-height: 320px;
+    width: auto;
+    height: auto;
+    border-radius: 4px;
+    border: 1px solid var(--bq-line);
+    /* A transparent PNG is invisible on paper without this. */
+    background: rgba(127, 127, 127, 0.08);
+}
+/* Keyed on the MISSING src, not on a state class: the element is emitted with no
+   src at all (the url has to be minted first) and a src-less <img> would
+   otherwise paint the browser's broken-image glyph. */
+.bq-md img.bq-img-preview:not([src]),
+.bq-md img.bq-img-preview[data-bq-img-state="error"] { display: none; }
+/* The dot trail covers the mint round trip, then gets out of the way. */
+.bq-md img.bq-img-preview[src] ~ [data-bq-img-loader],
+.bq-md img.bq-img-preview[data-bq-img-state="error"] ~ [data-bq-img-loader] { display: none; }
+.bq-img-preview-caption {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+/* A collapsed indexing row is a single line and its label is the indexed file's
+   own path, which is frequently an image. Never grow that row into a picture. */
+.bq-index-label .bq-md img.bq-img-preview,
+.bq-index-label [data-bq-img-loader] { display: none; }
 
 /* ---- rendered-markdown body ----------------------------------------------*/
 /* Overrides the bubble's `white-space: pre-wrap` since marked already produces

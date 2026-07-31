@@ -55,6 +55,64 @@ const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretReques
 // 400 on the whole request, no retry), so flip VARIANT_IMAGE_DETAIL back to
 // 'high' and it is undone. That is the one word to change.
 const VARIANT_IMAGE_DETAIL = 'original';
+
+// Extra Responses-API knobs for NANO models on INDEXING passes only.
+//
+// `detail` (above) governs what the model SEES; these govern how it thinks and how completely it
+// writes. Nano strips vision detail to hit its latency target and compresses layout when
+// transcribing, which is the documented reason to raise verbosity FOR IT SPECIFICALLY. mini and the
+// base/named models do not need it, so they are excluded rather than paying its output cost.
+//
+// Deliberately NOT applied to chat: high verbosity makes ordinary replies longer and worse, and the
+// chat path has no transcription job to justify it.
+//
+// Two things to keep in mind, both of which is why these are separate switches:
+//   1. An UNKNOWN body field is fatal here, not ignored. The engine already documents it for
+//      `_skapi_window`: it "reaches the provider as an unknown body field and the call fails
+//      terminally with no retry". If a field name is wrong, EVERY indexing pass dies. Set either
+//      constant to null to remove the field entirely.
+//   2. Reasoning tokens are billed against max_output_tokens on this API. An indexing pass spends
+//      its output budget emitting postRecords calls, so buying reasoning takes budget away from the
+//      records themselves and can truncate them.
+//
+// Effort was OFF, and the measurement that turned it on: across one nano run's photo records, only
+// 5 of 28 image text fields carried a concrete identifier read off the tag (a part number, a tag id).
+// The other 23 held a generic scene description. Reading small handwriting off a photographed label
+// is exactly the kind of work a moment of deliberation buys, so it is now on at the LOWEST setting:
+// enough to help the transcription, small enough that it does not eat the record budget that point 2
+// warns about. Raise it to 'medium' only alongside MAX_TOKENS, and re-measure that 5-of-28 ratio
+// rather than assuming; set it back to null to remove the field entirely.
+const VARIANT_TEXT_VERBOSITY: string | null = 'high';
+const VARIANT_REASONING_EFFORT: string | null = 'low';
+
+/**
+ * True only for a NANO model, including a dated nano snapshot. NOT mini, not a base model, and not
+ * a named variant like gpt-5.6-luna: those transcribe faithfully on their own and do not need the
+ * knob, so paying its output cost on them would be waste.
+ */
+const isOpenAINano = (model?: string) => {
+	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+	if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+
+	// Family floor, same shape as getOpenAIImageDetail's. "Contains nano" alone also matches
+	// gpt-4.1-nano and anything else a project might name, and these are body fields an older
+	// model REJECTS rather than ignores: one 400 with no retry kills every indexing pass. Only
+	// gpt-5.4 and newer are known to take `text.verbosity` and `reasoning.effort`.
+	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = match[2] === undefined ? null : Number(match[2]);
+	return major > 5 || (major === 5 && minor !== null && minor >= 4);
+};
+
+/** The nano-only indexing knobs, as body fields. Empty for every other model, or when switched off. */
+const variantIndexingOptions = (model?: string) => {
+	if (!isOpenAINano(model)) return {};
+	return {
+		...(VARIANT_TEXT_VERBOSITY ? { text: { verbosity: VARIANT_TEXT_VERBOSITY } } : {}),
+		...(VARIANT_REASONING_EFFORT ? { reasoning: { effort: VARIANT_REASONING_EFFORT } } : {}),
+	};
+};
 const getOpenAIImageDetail = (model?: string) => {
 	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
 	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -634,6 +692,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			data: {
 				model: resolvedModel,
 				max_output_tokens: MAX_TOKENS,
+				// Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
+				...variantIndexingOptions(resolvedModel),
 				...skapiExtract,
 				...skapiRender,
 				...skapiWindow,
@@ -870,11 +930,24 @@ export type BgTaskEntry = {
 // asks the model whether it is finished — the worker advances that loop off the renderer's
 // page count — so this marker has no say in whether a PDF keeps going.
 export const INDEXING_COMPLETE_MARKER = 'INDEXING_COMPLETE';
+// What an indexing pass's bubble says when its ENTIRE answer was the completion
+// token and stripping it left nothing. Without a stand-in the history mappers emit
+// no bubble at all for that pass (their `else if (assistantText)` guard fails on the
+// empty string) while the live path emits one — so the same run read as finished
+// live and unfinished after a reload, and the row's loader came back.
+export const EMPTY_INDEXING_REPLY = 'Finished reading this file.';
 // Cap on CONTINUE passes per file, so a file the agent can never mark complete (or a
 // pathological loop) stops instead of re-dispatching forever. The text/grid paging path
 // reads MANY windows within a single pass (the agent loops readFileContent in one turn), so
 // a small cap suffices.
 export const MAX_INDEXING_RESUME_PASSES = 6;
+
+// Records per chat-history page. Bigger than skapi's own default so the first load
+// (and each scroll-up page) covers more of the conversation in one round-trip — a
+// short page leaves the box unfilled and forces the viewport-fill loop to page
+// again immediately. Callers that want a narrower page (the queue/status probes in
+// ChatSession) pass their own `limit`, which wins over this default.
+export const CHAT_HISTORY_PAGE_LIMIT = 100;
 
 /**
  * `queue` narrows the fetch to one processing chain; `status` narrows it to items
@@ -904,6 +977,6 @@ export async function getChatHistory(
 
 	return chatEngineConfig().clientSecretRequestHistory(
 		p as { url: string; method: 'POST'; queue?: string; status?: string },
-		Object.assign({ ascending: false }, fetchOptions),
+		Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions),
 	);
 }

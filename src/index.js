@@ -61,6 +61,12 @@ import {
     classifyInlineLink,
     normalizeTrailingInlineToken,
     formatChatTimestamp,
+    // Inline image previews: the chip/preview markup is shared with agent.vue so
+    // the two clients cannot drift, and the url mint is cached outside the parse.
+    renderInlineLinkHtml,
+    IMAGE_PREVIEWS_PER_MESSAGE,
+    hydrateImagePreviews,
+    clearImagePreviewCache,
     // Per-format UTF-8 declaration for downloadable files, single-sourced in
     // engine/download_encoding.ts and mirrored in skapi-mcp.
     prepareDownloadText,
@@ -1566,8 +1572,10 @@ import {
         // Rendered .bq-message nodes, indexed BY MESSAGE INDEX (sparse: a message
         // folded into a collapsed indexing row has no node of its own).
         messageEls: [],
-        // Expanded background-indexing rows, keyed by RUN (group.runKey), not by
-        // file: re-indexing a file is a separate row and expands separately.
+        // Expanded background-indexing rows, keyed by FILE (group.key). Not by run:
+        // runKey is renamed whenever an earlier pass of the run loads, which closed
+        // a row the user had opened. Two runs of one file therefore share an open
+        // state, which is the right reading of "show me this file's steps".
         indexGroupsOpen: {},
         messagesBox: null,       // .bq-messages element
         sending: false,
@@ -1577,6 +1585,12 @@ import {
         stickToBottom: true,
         loadingHistory: false,
         loadingOlderHistory: false,
+        // The viewport-fill LOOP is running (createHistoryFiller.onRunningChange).
+        // Spans the gaps between its pages, where loadingOlderHistory keeps dropping
+        // back to false; a collapsed indexing row that is still waiting for its own
+        // earlier passes renders off this rather than flickering once per page.
+        // View-side, not delegated to session.state: the filler is view-side too.
+        historyFilling: false,
         historyEndOfList: false,
         historyStartKeyHistory: [],
         historyRequestToken: 0,
@@ -1935,7 +1949,7 @@ import {
 
     /* ---- render helpers (agent.vue) -------------------------------------- */
     function getOrCreateFileHref(filename, body) {
-        var key = filename + " " + body;
+        var key = filename + "\u0000" + body;
         var existing = fileBlobCache.get(key);
         if (existing) return existing;
         // The engine decides how this format declares UTF-8: a BOM for a spreadsheet
@@ -1956,23 +1970,14 @@ import {
         var text = "↗ " + filename;
         return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
     }
-    function linkToAnchorHtml(link) {
-        var refreshing = !!refreshingLinkMap[link.expiredHref || link.href];
-        var cls = ["bq-link-button"];
-        if (link.expired) cls.push("is-expired");
-        if (refreshing) cls.push("is-refreshing");
-        var labelText = "↗ " + link.label + (refreshing ? " (fetching...)" : "");
-        var attrs = [
-            'class="' + cls.join(" ") + '"', 'href="' + escapeHtml(link.href) + '"',
-            'target="_blank"', 'rel="noopener noreferrer"',
-            'title="' + escapeHtml(link.fullLabel || link.label) + '"',
-            'download="' + escapeHtml(link.fullLabel || link.label) + '"', 'data-bq-link="1"',
-        ];
-        if (link.expired) attrs.push('data-bq-expired="1"');
-        if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeHtml(link.expiredHref) + '"');
-        if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeHtml(link.remotePath) + '"');
-        if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeHtml(link.fullLabel) + '"');
-        return "<a " + attrs.join(" ") + ">" + escapeHtml(labelText) + "</a>";
+    // The markup is the ENGINE's (renderInlineLinkHtml): this used to be a byte
+    // for byte copy of agent.vue's emitter, and the image preview would have had
+    // to be written into both. This view supplies only what is local to it.
+    function linkToAnchorHtml(link, allowImagePreview) {
+        return renderInlineLinkHtml(link, {
+            refreshing: !!refreshingLinkMap[link.expiredHref || link.href],
+            allowImagePreview: allowImagePreview,
+        });
     }
     // Classification is the ENGINE's (classifyInlineLink): what a link IS must
     // not be decided twice, once here and once in agent.vue. This view supplies
@@ -2000,12 +2005,20 @@ import {
         }
         var codeMasks = [];
         working = working.replace(/`[^`\n]+`/g, function (match) { var idx = codeMasks.length; codeMasks.push(match); return "C" + idx + ""; });
+        // Each preview costs a presign call and an image download once hydrated,
+        // and a reply listing a folder can name dozens. Past the budget a link
+        // renders as the ordinary text chip. Local to this call, so the output
+        // stays a pure function of `content`.
+        var previewsLeft = IMAGE_PREVIEWS_PER_MESSAGE;
         var linkRe = createInlineLinkRegex();
         working = working.replace(linkRe, function (full) {
             var args = Array.prototype.slice.call(arguments, 1, 7);
             var built = buildLinkPartFromGroups(full, args[0], args[1], args[2], args[3], args[4], args[5]);
             if (!built) return full;
-            return pushPlaceholder(linkToAnchorHtml(built.part)) + (built.tail || "");
+            var allow = previewsLeft > 0;
+            var html = linkToAnchorHtml(built.part, allow);
+            if (allow && built.part.image) previewsLeft--;
+            return pushPlaceholder(html) + (built.tail || "");
         });
         working = working.replace(/C(\d+)/g, function (_m, idx) { return codeMasks[Number(idx)] || ""; });
         var html;
@@ -2155,14 +2168,18 @@ import {
     // (24-48h); a plain get-db presign honours `expires` to the second. Passing
     // the flag while also passing a short `expires` is the trap: it reads as a
     // 10 minute url and behaves as a two day one.
-    function getTemporaryUrlDb(path, expires, cdn) {
+    // `contentType` overrides the extension guess. It is what decides whether a
+    // new tab DISPLAYS the file or downloads it: get_signed_url only sets
+    // ResponseContentType when we pass one, and application/octet-stream always
+    // downloads. The image preview passes the type the engine classified.
+    function getTemporaryUrlDb(path, expires, cdn, contentType) {
         var body = {
             service: S.serviceId,
             owner: S.owner,
             request: "get-db",
             key: path,
             expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
-            contentType: mimeGetType(path) || "application/octet-stream",
+            contentType: contentType || mimeGetType(path) || "application/octet-stream",
         };
         if (cdn !== false) body.generate_temporary_cdn_url = true;
         return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function (res) {
@@ -2653,6 +2670,33 @@ import {
         return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false);
     }
 
+    // Inline image previews. The mint is the same plain presign the link chips
+    // use, with the content type the engine classified so the url a click opens
+    // DISPLAYS the picture instead of downloading it.
+    function imagePreviewCtx() {
+        return {
+            scope: S.serviceId || "default",
+            mint: function (remotePath, contentType) {
+                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType);
+            },
+            // An image arriving late pushes the conversation down under the
+            // viewport. Re-pin only if the user was already at the bottom.
+            onLoad: function () { scrollToBottomIfSticky(false); },
+            onError: function (path, err) { console.warn("[bunnyquery] image preview failed", path, err); },
+        };
+    }
+    function hydrateMessageImagePreviews() {
+        if (!CS.messagesBox) return;
+        var nodes = CS.messagesBox.querySelectorAll("img.bq-img-preview:not([data-bq-img-state])");
+        if (!nodes.length) return;
+        // A collapsed indexing row is one line and its label is the indexed
+        // file's own path, which is often an image. Never mint for those.
+        var list = Array.prototype.filter.call(nodes, function (n) {
+            return !(n.closest && n.closest(".bq-index-label"));
+        });
+        if (list.length) hydrateImagePreviews(list, imagePreviewCtx());
+    }
+
     // Drop minted hrefs on the same wall-clock boundary the dashboard uses, so a
     // cached href can never outlive the url behind it. Without this the widget
     // held a fresh href for the life of the page.
@@ -2802,6 +2846,15 @@ import {
         isStale: function () { return _historyFillToken !== CS.gateRefreshToken || !CS.messagesBox || CS.chatSettingsOpen; },
         messageCount: function () { return CS.messages.length; },
         fetchOlder: function () { return fetchOlderHistoryIfNeeded(); },
+        // A collapsed indexing row whose run begins above the loaded window says
+        // "loading" for as long as the pages that would complete it keep coming, and
+        // that span is the LOOP, not a page (see createHistoryFiller). Rendering the
+        // flip is safe from here: renderMessages never starts a fill of its own, and
+        // the loop's own guard has already flipped before this is called.
+        onRunningChange: function (running) {
+            CS.historyFilling = running;
+            renderMessages();
+        },
     });
     function pageOlderHistoryUntil(isSatisfied, token) {
         if (token === undefined) token = CS.gateRefreshToken;
@@ -2955,18 +3008,42 @@ import {
     var INDEX_ICON_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>';
     var INDEX_ICON_ERROR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><path d="M12 16.6h.01"/></svg>';
     var INDEX_ICON_CANCELLED = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.2 8.2l7.6 7.6"/></svg>';
+    // "Not known yet" — a clock, deliberately NOT the circular arrow: a spinning
+    // sync glyph is how this row says WORK IS HAPPENING, and the whole point of
+    // this state is that it is not claiming that. CSS fades it instead of spinning.
+    var INDEX_ICON_PENDING = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.4V12l3.3 2"/></svg>';
 
+    // Head and tail must never contradict each other, so both read `finished` BEFORE
+    // status: a run between two passes has status "done" and is not finished, and a
+    // check-mark reading "Indexed" over a still-spinning tail is the exact claim this
+    // is meant to stop making. Cancelled is tested first because a stop is final
+    // whatever else is true, then `resolving` — which outranks `finished` for the
+    // same reason `finished` outranks status: it is the coarsest thing known, and
+    // both of the answers below it are derived from data still arriving. Mirrored
+    // verbatim in agent.vue.
     function indexGroupIcon(group) {
-        if (group.status === "active") return INDEX_ICON_ACTIVE;
-        if (group.status === "error") return INDEX_ICON_ERROR;
         if (group.status === "cancelled") return INDEX_ICON_CANCELLED;
+        if (group.resolving) return INDEX_ICON_PENDING;
+        if (!group.finished) return INDEX_ICON_ACTIVE;
+        if (group.status === "error") return INDEX_ICON_ERROR;
         return INDEX_ICON_DONE;
     }
 
     function indexGroupVerb(group) {
-        if (group.status === "active") return group.isReindex ? "Reindexing" : "Indexing";
-        if (group.status === "error") return "Indexing failed:";
         if (group.status === "cancelled") return "Indexing cancelled:";
+        // Name the wait. "Loading history" is a statement about the CHAT being paged
+        // in, not about the file — the row deliberately says nothing about the file
+        // until it has the run's beginning to say it from.
+        //
+        // Short on purpose. The label is one nowrap ellipsized line shared with the
+        // file name, and at the widget's narrow end (~360px) the row has roughly
+        // 196px for both: a 26-character verb ate the name down to a few characters
+        // for the whole wait, which trades one confusing row for another.
+        if (group.resolving) {
+            return group.resolvingReason === "history" ? "Loading history:" : "Checking status:";
+        }
+        if (!group.finished) return group.isReindex ? "Reindexing" : "Indexing";
+        if (group.status === "error") return "Indexing failed:";
         return group.isReindex ? "Reindexed" : "Indexed";
     }
 
@@ -3077,6 +3154,11 @@ import {
         });
     }
 
+    // Keyed by FILE (group.key), NOT by run (group.runKey): a run is named after its
+    // first LOADED pass, so it is renamed the moment an earlier pass arrives —
+    // routine while a worker-driven chain runs, because an adopted pass reaches the
+    // client before the ones before it are paged in. Keyed by run, a row the user had
+    // opened closed itself every time that happened. See IndexingGroup.key.
     function toggleIndexGroup(key) {
         if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
         else CS.indexGroupsOpen[key] = true;
@@ -3088,8 +3170,22 @@ import {
 
     function buildIndexGroupEl(group, isOpen) {
         var cls = ["bq-index-group"];
-        if (group.status === "active") cls.push("is-active");
-        if (group.status === "error") cls.push("is-error");
+        // The row's colour, one class per state: yellow working, green indexed, red
+        // failed, grey not-known-yet and grey for anything else, cancelled included.
+        // Same ordering as indexGroupIcon: is-active is the WORKING look (warning
+        // colour, a spinning glyph) and must never win over is-resolving, where "not
+        // confirmed over" is precisely what has not been established; is-indexed
+        // mirrors the DONE glyph and is reachable only from status 'done', so a
+        // failure or a stop can never come out green.
+        //
+        // Each condition is self-contained, NOT chained with `else`: agent.vue
+        // expresses these as a class-binding object, where every entry stands alone,
+        // and the two clients must be the same booleans rather than the same
+        // outcome reached two different ways.
+        if (group.resolving) cls.push("is-resolving");
+        if (!group.resolving && !group.finished && group.status !== "cancelled") cls.push("is-active");
+        if (!group.resolving && group.finished && group.status === "done") cls.push("is-indexed");
+        if (group.finished && group.status === "error") cls.push("is-error");
         if (isOpen) cls.push("is-open");
 
         var label = h("span", { class: "bq-index-label", html: parseMsgPartsHtml(indexGroupLabel(group)) });
@@ -3127,11 +3223,11 @@ import {
             tabindex: "0",
             "aria-expanded": isOpen ? "true" : "false",
             title: isOpen ? "Hide indexing steps" : "Show indexing steps",
-            onclick: function () { toggleIndexGroup(group.runKey); },
+            onclick: function () { toggleIndexGroup(group.key); },
             onkeydown: function (e) {
                 if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
                 e.preventDefault();
-                toggleIndexGroup(group.runKey);
+                toggleIndexGroup(group.key);
             },
         },
             h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
@@ -3147,10 +3243,14 @@ import {
                 text: "Could not stop this file: " + group.cancelError,
             }));
         }
+        // "Scroll up to load them" is an instruction, so it must not be given while
+        // the loading it asks for is already in flight: following it does nothing the
+        // row is not doing, and reads as the row not having noticed.
         if (isOpen && group.mayHaveOlder) {
             el.appendChild(h("div", {
                 class: "bq-index-note",
-                text: "Earlier passes of this file are further back in the conversation. Scroll up to load them.",
+                text: "Earlier passes of this file are further back in the conversation. "
+                    + (group.resolvingReason === "history" ? "Loading them now." : "Scroll up to load them."),
             }));
         }
         return el;
@@ -3283,10 +3383,20 @@ import {
         // Rows, not raw messages: a file's many background-indexing turns collapse
         // into one status row. An expanded row's own turns are emitted as ordinary
         // message rows right after it, so buildMessageEl stays the single source.
-        var rows = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+        var liveIndex = session.getLiveIndexState();
+        var rows = buildChatDisplayList(CS.messages, {
+            hasMoreHistory: !CS.historyEndOfList,
+            // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
+            // per-request flag: the viewport fill is many pages and that flag drops
+            // to false between every one of them, which is once per page of flicker
+            // on any row rendered off it.
+            loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
+            liveIndexKeys: liveIndex.keys,
+            liveIndexChecked: liveIndex.checked,
+        });
         rows.forEach(function (row) {
             if (row.kind === "indexing") {
-                var isOpen = !!CS.indexGroupsOpen[row.group.runKey];
+                var isOpen = !!CS.indexGroupsOpen[row.group.key];
                 var groupEl = buildIndexGroupEl(row.group, isOpen);
                 // The group's own key: it survives passes joining the group and
                 // the row relocating to the file's newest turn. data-row-pos says
@@ -3299,13 +3409,38 @@ import {
                 groupEl.setAttribute("data-row-pos", indexGroupAnchorId(row.group));
                 CS.messagesBox.appendChild(groupEl);
                 if (!isOpen) return;
-                row.group.members.forEach(function (member) {
+                // visibleMembers, not members: a CONTINUE pass's request bubble only
+                // repeats the row's own header, and the running placeholder is
+                // superseded by the group's own loader below. members stays the full
+                // list for every count/status/cancel/anchor decision.
+                row.group.visibleMembers.forEach(function (member) {
                     var pass = buildMessageEl(member.msg, member.index);
                     pass.classList.add("bq-index-pass");
                     pass.setAttribute("data-row-key", rowAnchorKey(member.msg, member.index));
                     CS.messageEls[member.index] = pass;
                     CS.messagesBox.appendChild(pass);
                 });
+                // Still working, or we cannot confirm otherwise. Carries NO
+                // data-row-key: the scroll anchor picks its target by that attribute
+                // and a keyed element with no data-row-pos would be preferred over the
+                // real rows. aria-hidden because the state is already on the row head.
+                //
+                // NOT while resolving, for the same reason the head refuses to spin
+                // there: an animated rail under an open row is the "work is happening
+                // here" signal, and this state exists to withhold exactly that claim.
+                // It also has nothing to point at — the passes a 'history' wait is
+                // missing are EARLIER ones, which arrive above the row, not below it.
+                //
+                // Cancelled is tested here for the same reason indexGroupIcon tests it
+                // first: a stop is final whatever else is true. The engine does already
+                // force `finished` on a cancelled run, so this can never fire — but the
+                // head does not lean on that and neither should the tail, which is the
+                // whole point of the two being one claim made twice.
+                if (!row.group.finished && !row.group.resolving && row.group.status !== "cancelled") {
+                    CS.messagesBox.appendChild(h("div", {
+                        class: "bq-index-pass bq-index-tail", "aria-hidden": "true",
+                    }, h("span", { class: "bq-loader" })));
+                }
                 return;
             }
             var el = buildMessageEl(row.msg, row.index);
@@ -3314,6 +3449,9 @@ import {
             CS.messagesBox.appendChild(el);
         });
         restoreScrollAnchor(anchor);
+        // Synchronous, so a preview whose url is already cached gets its src in
+        // this same block and a full re-render never blanks a loaded image.
+        hydrateMessageImagePreviews();
     }
 
     function refreshMessageBubble(idx) {
@@ -3326,10 +3464,14 @@ import {
         if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
         oldEl.parentNode.replaceChild(newEl, oldEl);
         CS.messageEls[idx] = newEl;
+        hydrateMessageImagePreviews();
     }
 
     function renderChat() {
         // reset transient chat state on (re)entry
+        // Preview urls are keyed by project, and an identity-blind cache is how
+        // one project's content has reached another project's chat before.
+        clearImagePreviewCache(S.serviceId || "default");
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";

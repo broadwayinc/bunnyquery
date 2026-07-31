@@ -4,7 +4,7 @@
  * formatIndexingLabel callback) so the engine touches neither localStorage nor
  * view-specific display formatting. serviceId is passed for link sanitization.
  */
-import { extractClaudeText, extractOpenAIText } from './requests';
+import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
 import { sanitizeAttachmentLinksForHistory } from './links';
 
@@ -103,6 +103,21 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		var userText = extractLastUserTextFromRequest(requestBody);
 		var assistantText = isPending ? '' : ((extractAssistantText(response) || '').trim() || '');
 		var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
+		// Record the completion marker, then STRIP it — both, and in that order.
+		// Recording gives the display layer a structured signal instead of a substring
+		// search over model prose. Stripping matches the live resolution path: without
+		// it the literal token rendered inside the bubble on every history load, which
+		// is not a post-reload curiosity — a first-page load REPLACES the live bubbles,
+		// and those responses are now on screen far more often than they used to be.
+		//
+		// Gated on _isBgTask: only an INDEXING pass has a protocol token to hide. An
+		// ordinary reply that merely mentions it keeps its own words.
+		var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText &&
+			assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+		if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join('').trim();
+		// Server's own "this was the run's last pass". Read defensively: it is absent
+		// until the backend stamps it, and absent must read as "not known".
+		var reportedFinal = !!(item && (item as any).index_final);
 		var serverItemId = item && typeof item.id === 'string' && item.id ? item.id : undefined;
 		// A USER bubble shows when the request was made (`created`); an ASSISTANT
 		// bubble shows when its response landed (`updated`). Fall back to the other
@@ -163,13 +178,19 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			if (replyTs !== undefined) em._ts = replyTs;
 			mapped.push(em);
-		} else if (assistantText) {
+		// `|| reportedComplete`: a pass whose ENTIRE answer was the completion token
+		// strips down to an empty string, and the plain `assistantText` guard then
+		// emitted no bubble at all — while the live path emitted one. The run read as
+		// finished live and unfinished after a reload, so the row's loader came back.
+		} else if (assistantText || reportedComplete) {
 			// Safe db-only sanitize (forAssistant) so a volatile db url the model
 			// emitted renders as a re-mintable `_expired_.url` link, not a dead one.
-			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
+			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) || EMPTY_INDEXING_REPLY };
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
+			if (reportedComplete) okm._indexComplete = true;
+			if (reportedFinal) okm._indexFinal = true;
 			mapped.push(okm);
 		}
 	});

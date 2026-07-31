@@ -565,6 +565,33 @@ declare function repairUrlEntities(href: string): string;
  * `src::a/b.pdf).` -> `src::a/b.pdf`, while a balanced `file (v2).pdf` is kept.
  */
 declare function normalizeTrailingInlineToken(value: string): string;
+/**
+ * Extensions a BROWSER can paint in an <img>, mapped to the content type the
+ * presign must declare.
+ *
+ * The content type is not optional here. get_signed_url only sets
+ * ResponseContentType when the caller passes `contentType`, and otherwise falls
+ * back to application/octet-stream, which a new tab DOWNLOADS instead of
+ * displaying. Since the whole point of the preview is that clicking it shows the
+ * picture, the mint has to name the real type.
+ *
+ * Deliberately narrower than the extraction/vision lists elsewhere in the repo:
+ *   heic/heif out: Safari paints them, Chrome and Firefox show a broken image,
+ *                  and it is the format every iPhone photo arrives in, so the
+ *                  failure would be common and would read as a bug.
+ *   tif/wmf/emf out: no mainstream browser paints them.
+ *   svg        out: inside an <img> an SVG is script-disabled and safe, but this
+ *                  feature's click target is a TOP-LEVEL navigation, where an
+ *                  SVG executes its own <script> in the serving origin with that
+ *                  origin's cookies, from user-uploaded content. A preview is an
+ *                  invitation to click exactly that.
+ */
+declare var PREVIEWABLE_IMAGE_CONTENT_TYPES: Record<string, string>;
+/** Extension of a path or url, query and fragment stripped, '' when none. */
+declare function previewableExtOf(nameOrPath: string | null | undefined): string;
+declare function isPreviewableImagePath(nameOrPath: string | null | undefined): boolean;
+/** Content type to hand the presign so a new tab displays rather than downloads. */
+declare function previewImageContentType(nameOrPath: string | null | undefined): string | null;
 /** A link the view renders. `expired` means the href is the `_expired_.url`
  *  placeholder and a click must mint a fresh one from `remotePath`. */
 interface InlineLinkPart {
@@ -575,6 +602,15 @@ interface InlineLinkPart {
     expired: boolean;
     expiredHref?: string;
     remotePath?: string;
+    /**
+     * Set only for a file WE host whose PATH says a browser can paint it. Its
+     * presence IS the "render a preview" decision, so a view never re-tests the
+     * label and never tests `href` (which is the _expired_.url placeholder).
+     */
+    image?: {
+        ext: string;
+        contentType: string;
+    };
 }
 interface InlineLinkContext {
     /** Current project id: the leading segment to strip off a db url. */
@@ -602,6 +638,118 @@ declare function classifyInlineLink(full: string, groups: Array<string | undefin
     tail?: string;
 } | null;
 declare function truncateLabelForDisplay(label: string): string;
+
+/**
+ * The chip / preview markup for one classified inline link.
+ *
+ * `classifyInlineLink` was consolidated into the engine because deciding what a
+ * link IS had drifted between the two clients and every link bug had to be found
+ * and fixed twice. The EMITTER stayed forked, byte for byte identical in
+ * agent.vue and the widget. The image preview is the first behaviour that would
+ * have had to be written twice, so the emitter moves here too.
+ *
+ * Pure string in, pure string out: no DOM, no globals, nothing reactive. That is
+ * what lets agent.vue keep memoizing parseMsgParts on the message text alone.
+ */
+/** Neither client sanitizes bubble HTML (no DOMPurify, no marked sanitize), so
+ *  everything interpolated here is escaped at the point of interpolation. */
+declare function escapeInlineHtml(v: string | null | undefined): string;
+/**
+ * Previews per MESSAGE. Each one costs a presign call and an image download the
+ * moment it is hydrated, and a reply listing a folder can name dozens. Past this
+ * many the link renders as the ordinary text chip.
+ */
+declare var IMAGE_PREVIEWS_PER_MESSAGE: number;
+/** Widened so each client's local link-part type is assignable. */
+interface RenderableInlineLink {
+    label: string;
+    fullLabel?: string;
+    href: string;
+    expired: boolean;
+    expiredHref?: string;
+    remotePath?: string;
+    image?: {
+        ext: string;
+        contentType: string;
+    };
+}
+interface InlineLinkMarkupOptions {
+    /** The view's own "a mint is in flight for this href" flag. */
+    refreshing?: boolean;
+    /** False once the caller has spent its per-message preview budget. */
+    allowImagePreview?: boolean;
+}
+declare function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLinkMarkupOptions): string;
+
+/**
+ * Give a rendered preview <img> a real src.
+ *
+ * Why this is not part of the parse: every stored file classifies as
+ * `expired: true` with the _expired_.url placeholder as its href, so the url an
+ * <img> needs does not exist until something mints it. agent.vue memoizes its
+ * parse on the raw message text and drops that cache whenever its link maps
+ * change, so minting THROUGH those maps would clear the whole cache once per
+ * image and re-run marked over the entire conversation each time. The mint
+ * therefore lives here, in a cache that is not reactive and is never read by the
+ * parse, and the src is written straight onto the element after render.
+ *
+ * DOM-free like the rest of the engine: the element type is structural, so a
+ * real HTMLImageElement satisfies it while this file imports nothing from
+ * lib.dom and touches no global.
+ */
+interface PreviewImageEl {
+    getAttribute(name: string): string | null;
+    setAttribute(name: string, value: string): void;
+    removeAttribute(name: string): void;
+    addEventListener(type: string, cb: () => void): void;
+}
+interface ImagePreviewContext {
+    /** Project id. Namespaces the cache, see clearImagePreviewCache. */
+    scope: string;
+    /**
+     * Mint a directly loadable url for a storage path.
+     *
+     * `contentType` is not advisory. get_signed_url only sets
+     * ResponseContentType when the caller passes one and otherwise falls back to
+     * application/octet-stream, which a new tab DOWNLOADS instead of displaying.
+     * An implementation that drops this argument still paints the preview (an
+     * <img> sniffs the bytes) but silently breaks the click.
+     */
+    mint: (remotePath: string, contentType: string) => Promise<string>;
+    /** An image finished painting. Views use it to re-pin the scroll. */
+    onLoad?: (remotePath: string) => void;
+    /** A preview gave up. The caption chip is now the whole answer. */
+    onError?: (remotePath: string, err: unknown) => void;
+}
+/**
+ * Drop cached preview urls, for one project or all of them.
+ *
+ * The key carries the project because an identity-blind cache is how one
+ * project's content has reached another project's chat before. Call on project
+ * switch and on sign-out.
+ */
+declare function clearImagePreviewCache(scope?: string): void;
+/**
+ * A url we already hold that is still comfortably alive, or null.
+ *
+ * Synchronous on purpose. Both views rebuild bubble DOM constantly (the widget
+ * tears down and re-creates every node in renderMessages; Vue re-patches v-html
+ * whenever the string changes), so an async-only assignment would blank every
+ * visible image for a frame on each re-render. Called before paint, this makes a
+ * re-render invisible.
+ */
+declare function peekImagePreviewUrl(ctx: ImagePreviewContext, remotePath: string): string | null;
+/** Deduped, TTL-bounded mint for one path. */
+declare function resolveImagePreviewUrl(ctx: ImagePreviewContext, remotePath: string, contentType: string): Promise<string>;
+/**
+ * Hydrate every un-claimed preview <img> in the given list.
+ *
+ * Idempotent: an element is claimed by its own data-bq-img-state, so a full
+ * re-render, a Vue patch, or two calls in one frame cannot mint twice. The
+ * caller decides WHICH elements to pass, so a view can move from
+ * querySelectorAll to an IntersectionObserver without an engine change.
+ */
+declare function hydrateImagePreviews(imgs: ArrayLike<PreviewImageEl>, ctx: ImagePreviewContext): void;
 
 /**
  * Chat timestamp formatting, shared so agent.vue and the widget render an
@@ -772,7 +920,29 @@ declare function fillHistoryViewport(opts: FillHistoryViewportOptions): Promise<
  * the loop then keeps paging until EVERY caller is satisfied. Predicates that
  * come true are dropped as it goes, so the cost stays flat.
  */
-declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isSatisfied'>): {
+declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isSatisfied'> & {
+    /** Fired when the loop starts FETCHING and when it stops, and only on a real
+     *  change.
+     *
+     *  This — not the caller's own per-request `isLoading` — is what "older
+     *  history is still coming in" means to a view. A fill is many pages, and
+     *  `isLoading` drops to false between every one of them, so anything
+     *  rendered off it flickers once per page for the whole loop. A collapsed
+     *  indexing row whose run begins above the loaded window renders exactly
+     *  that ("still loading this run" vs a status it cannot know yet), which is
+     *  why the loop has to publish its own span.
+     *
+     *  Fetching, NOT requested. Most fills fetch nothing: they are fired on every
+     *  window resize, every row a user collapses, and every first-page load, and
+     *  the overwhelmingly common outcome is `isSatisfied` returning true on the
+     *  first look. Announcing at request time published a true/false pair for
+     *  each of those, and the widget's own satisfied-check spans two animation
+     *  frames — long enough for the browser to PAINT the intermediate state. Every
+     *  collapsed row strobed through "loading" on every resize tick. So the span
+     *  opens at the first actual page request, which is also the first moment the
+     *  claim is true. */
+    onRunningChange?: (running: boolean) => void;
+}): {
     fill: (isSatisfied: () => boolean | Promise<boolean>) => Promise<void>;
     isRunning: () => boolean;
 };
@@ -912,6 +1082,8 @@ type BgTaskEntry = {
      *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
     stageId?: string;
 };
+declare const INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+declare const EMPTY_INDEXING_REPLY = "Finished reading this file.";
 /**
  * `queue` narrows the fetch to one processing chain; `status` narrows it to items
  * in one state. Passing both is how the client asks "is there still unresolved
@@ -1003,6 +1175,22 @@ interface ChatMessage {
     isBackgroundTask?: boolean;
     /** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
     _indexFile?: IndexingFileRef;
+    /** Set on a background-indexing RESPONSE bubble whose raw answer carried the
+     *  INDEXING_COMPLETE marker. Stamped before the marker is stripped for display,
+     *  in every path that builds one (live resolution and both history mappers), so
+     *  a run reads the same before and after a reload.
+     *
+     *  Meaningful ONLY for a client-driven chain, where it is the very signal
+     *  maybeResumeIndexing stops on. The worker-driven paths (PDF vision, windowed
+     *  reads) advance off the renderer's page count and their prompt deliberately
+     *  never asks for the marker, so a model that emits one there is guessing —
+     *  which is how an 88-page file once "finished" at page 15. */
+    _indexComplete?: boolean;
+    /** Set on a background-indexing RESPONSE bubble the SERVER marked as its run's
+     *  last pass. The only completion fact a worker-driven chain can state, and the
+     *  only one that survives a reload. Absent until the backend stamps it; the
+     *  display layer treats absence as "not known", never as "not finished". */
+    _indexFinal?: boolean;
     _useBgQueue?: boolean;
     /** Local id of a turn STAGED at Send time while its attachments upload. The
      *  bubble exists before any server request does, so it is never matched by
@@ -1047,6 +1235,16 @@ interface ChatState {
     historyStartKeyHistory: string[];
     historyRequestToken: number;
     gateRefreshToken: number;
+    /** Files the SERVER still has unresolved indexing work for, by the key a
+     *  collapsed row uses (storage path, else filename). Lives on the state rather
+     *  than privately so a reactive consumer re-renders when it changes. */
+    liveIndexKeys: {
+        [fileKey: string]: boolean;
+    };
+    /** Whether `liveIndexKeys` has been answered at least once for this chat. False
+     *  means "we have not found out", which the display layer reads as still
+     *  working — never as an all-clear. */
+    liveIndexChecked: boolean;
 }
 interface ChatHost {
     /** Read live (platform/model/name can change between sends). */
@@ -1100,6 +1298,16 @@ interface ChatHost {
      *  through to a plain re-index. Implementations must be best-effort (swallow
      *  "not found" / permission errors so indexing still proceeds). */
     deleteExistingFileRecord?(storagePath: string): Promise<any>;
+    /**
+     * Create the file's "src::<storagePath>" record before indexing starts, so every pass has a
+     * reference target that exists. Optional: a host without it keeps the old behaviour, where
+     * whichever pass got there first created the record and the others hoped it had.
+     */
+    ensureFileIndexRecord?(storagePath: string, meta?: {
+        name?: string;
+        mime?: string;
+        size?: number;
+    }): Promise<any>;
     /** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
     storagePathFor(relPath: string): string;
     getMimeType(name: string): string | null;
@@ -1157,6 +1365,13 @@ interface ChatHost {
  * failed), how many passes are currently loaded, and `mayHaveOlder` when the
  * file's first pass is not among them.
  *
+ * For the same reason it also reports NOT KNOWING. A run whose start is still
+ * being paged in, and a worker-driven run whose queue state has not been asked
+ * for yet, are both rows whose state is a moving target — and on a chatbox that
+ * was just opened, that is most of them. `resolving` marks those, so the view can
+ * say which wait it is waiting on rather than committing to "indexing" or
+ * "indexed" on a fraction of the evidence.
+ *
  * Pure and view-agnostic: agent.vue and the BunnyQuery widget both render from
  * this, so the two stay identical.
  */
@@ -1166,7 +1381,16 @@ type IndexingGroup = {
     /** The FILE this row is about: storage path when known (a file can be
      *  re-uploaded under a name that already exists elsewhere), else name. Shared
      *  by every run of that file, and what ChatSession.cancelIndexingGroup and
-     *  _indexKeyOf match on — never use it as a render key. */
+     *  _indexKeyOf match on — never use it as a render key.
+     *
+     *  It IS the key for persistent view state, above all the expansion state. That
+     *  used to be keyed by runKey, which is renamed the moment a run's true first
+     *  pass loads (see below) — so a row the user had opened silently closed itself
+     *  mid-indexing, every time a pass arrived ahead of the earlier ones. This never
+     *  changes for the life of a file. The cost is that two runs OF THE SAME FILE
+     *  (an index and a later re-index) open and close together, which is a fair
+     *  reading of "show me this file's steps" and is not a state the user can be
+     *  surprised out of. */
     key: string;
     /** Identity of this ROW: one indexing RUN of that file. A file indexed on
      *  Monday and re-indexed on Wednesday is two runs, and collapsing them into
@@ -1174,8 +1398,13 @@ type IndexingGroup = {
      *  its passes for Wednesday, and let Monday's failure be overwritten by
      *  Wednesday's success. Named after the run's FIRST loaded pass (see where it
      *  is assigned below), so passes appended to the run and other runs appearing
-     *  on either side of it never rename a row already on screen. This is the
-     *  render key and the expansion key. */
+     *  on either side of it never rename a row already on screen.
+     *
+     *  This is the RENDER key, and only that. It is renamed when the run's true
+     *  first pass finally loads — routine while a worker-driven chain is running,
+     *  since a pass adopted from the queue can reach the client before the earlier
+     *  ones are paged in — and a rename is exactly right for a DOM key (the row did
+     *  change identity) but wrong for anything the USER set. Key that on `key`. */
     runKey: string;
     name: string;
     path?: string;
@@ -1214,6 +1443,74 @@ type IndexingGroup = {
      *  must not re-derive it from `members`: which member the row renders at is
      *  this module's decision, and the two silently disagreed once already. */
     anchorId: string;
+    /** `members` minus the turns an EXPANDED row should not show: every CONTINUE
+     *  request, and the running pass's empty placeholder.
+     *
+     *  A continuation's request bubble says "Indexing (continuing) <file>" and
+     *  nothing else — it repeats the row's own header once per pass, so a long file
+     *  read as the same line over and over with the actual findings buried between
+     *  them. The pass is still represented, by its RESPONSE. The placeholder goes
+     *  for a different reason: the row now carries one loader of its own for as long
+     *  as work remains, and two spinners in one open row is noise.
+     *
+     *  Additive. `members` is untouched and is still what every count, status,
+     *  cancel and anchor decision reads — several of them are only correct on the
+     *  full list (a `mayHaveOlder` run's members[0] IS a continuation). */
+    visibleMembers: {
+        msg: ChatMessage;
+        index: number;
+    }[];
+    /** Who advances this file's chain, which decides what can confirm it is over:
+     *  'single' one pass and done; 'client' this client dispatches each CONTINUE
+     *  pass and stops on the model's completion marker; 'worker' the server advances
+     *  the loop off the renderer's page count and the client is only a spectator. */
+    driver: 'single' | 'client' | 'worker';
+    /** Positively established that no further indexing work will happen for this
+     *  run. NOT "the file was fully read" — a cap-out, a failure and a stop are all
+     *  finished, and the row's own status says which.
+     *
+     *  False means "not established", which includes "still running" AND "we have
+     *  not been able to find out". The view shows a loader for both, deliberately:
+     *  the alternative default is the failure this exists to prevent, a row that
+     *  reads "Indexed" between two passes of a file still being read. */
+    finished: boolean;
+    /** This row cannot honestly claim a state yet, because something it is derived
+     *  FROM is still being fetched. Both `status` and `finished` are read off the
+     *  passes that happen to be LOADED, and on a freshly opened chatbox that is a
+     *  moving target: history pages newest-first, so a long run arrives as a tail
+     *  of CONTINUE passes while its beginning is still being paged in. The row was
+     *  picking a side through that window — a spinner reading "Indexing" for a file
+     *  that finished last week, or a green "Indexed" for one still being read — and
+     *  both are verdicts drawn from a fraction of the run.
+     *
+     *  Only ever set from status 'done'. A loaded pending pass PROVES the run is
+     *  live, and an error or a stop is the newest pass's own outcome, which
+     *  newest-first paging always has in hand — none of those is a guess, and
+     *  hiding any of them behind a loader would lose something the user needs.
+     *
+     *  For the 'history' reason this means "a fetch is IN FLIGHT", not "the picture
+     *  is incomplete". Older history is paged in by explicit triggers only (the
+     *  viewport fill, the user scrolling to the top) and nothing auto-fetches on a
+     *  row's behalf, so a run whose start is still unloaded once the paging stops
+     *  has to go back to reporting what it does know — `mayHaveOlder` and the `+` on
+     *  the pass count carry the rest. A "loading..." that never ends is the same lie
+     *  pointing the other way.
+     *
+     *  The 'status' reason is weaker on purpose: "the queue has not answered", which
+     *  a permanently failing query never resolves. That is deliberate, because it is
+     *  the SAME question as what the row should say when it cannot find out, and
+     *  every alternative is worse: a grey clock reading "checking" claims less than
+     *  the yellow spinner reading "Indexing" that it replaced. It also self-heals in
+     *  practice — the answer is re-sought on every first-page history load and every
+     *  settling pass — and gating it on an in-flight query instead would mean
+     *  threading a second liveness flag through a retry ladder with nine exit
+     *  points, i.e. trading this for a flag that can stick in the other direction. */
+    resolving: boolean;
+    /** Which wait, so the row can name it instead of just spinning. 'history':
+     *  older pages are being fetched and this run's first pass is not among the
+     *  loaded ones. 'status': the queue has not yet said whether this file is still
+     *  being worked on, which is the only thing that can end a worker-driven run. */
+    resolvingReason?: 'history' | 'status';
 };
 type DisplayEntry = {
     kind: 'message';
@@ -1228,6 +1525,26 @@ type BuildDisplayListOptions = {
     /** True while older history remains unpaged, which is what makes a group
      *  with no first pass genuinely incomplete rather than merely odd. */
     hasMoreHistory?: boolean;
+    /** An OLDER-history fetch is in flight right now — a single page, or the whole
+     *  viewport-fill loop (createHistoryFiller's onRunningChange, which spans the
+     *  pages between which a per-request flag keeps dropping to false).
+     *
+     *  Older specifically. A first-page refresh cannot bring in a run's earlier
+     *  passes, so counting it here would flip every incomplete row to "still
+     *  loading" for the length of a poll that could never have answered it. */
+    loadingOlderHistory?: boolean;
+    /** Files the SERVER still has unresolved indexing work for, keyed exactly like
+     *  IndexingGroup.key (ChatSession.getLiveIndexState). */
+    liveIndexKeys?: {
+        [fileKey: string]: boolean;
+    };
+    /** Whether `liveIndexKeys` has been answered at least once for this chat. False
+     *  is "we do not know", and a worker-driven run stays unfinished on it. */
+    liveIndexChecked?: boolean;
+    /** Whether the WORKER drives the windowed text/grid loop (chatEngineConfig's
+     *  windowedIndexing). Passed in rather than read from config so this stays a
+     *  pure function of its inputs and can be exercised for both settings. */
+    windowedIndexing?: boolean;
 };
 declare function parseIndexingLabel(content: string): {
     name: string;
@@ -1311,7 +1628,75 @@ declare class ChatSession {
      *  waiters are normal — the composer stays live, so a second send can be
      *  uploading while the first waits. */
     private _drainNudges;
+    /** Stages whose upload/dispatch chain is still running in THIS page. Lives and
+     *  dies with those chains, so it is what tells a staged bubble restored from the
+     *  history cache whether anything is still working on it (see
+     *  settleDeadStagedMessages). Today the cache dies with the page too and every
+     *  restored stage is live; this stays correct if that ever changes. */
+    private _liveStages;
+    /** Files the SERVER currently has unresolved indexing work for, by the same key
+     *  a collapsed row uses (storage path, else filename), and whether we have asked
+     *  even once for this chat.
+     *
+     *  This is the only thing that can tell a WORKER-driven run (a PDF's page loop, a
+     *  windowed read) that it is over. Those chains are advanced inside the worker off
+     *  the renderer's page count; the client sees passes appear and settle and can
+     *  never tell "between passes" from "finished" by looking at them. Asking the
+     *  queue is how it finds out. Until it has asked, `checked` is false and the view
+     *  says "still working", which is the honest reading of not knowing — and the one
+     *  that does not repeat the bug where a row claimed "Indexed" mid-run. */
+    /** The chat the live-index snapshot (state.liveIndexKeys) was taken for, so a
+     *  project switch drops it. */
+    private _liveIndexKey;
     constructor(host: ChatHost);
+    /** What the display layer needs to decide whether a run is finished. `keys` holds
+     *  every file the server still has indexing work for; `checked` is false until the
+     *  first answer for this chat, and false means "we do not know yet". */
+    getLiveIndexState(): {
+        keys: {
+            [fileKey: string]: boolean;
+        };
+        checked: boolean;
+    };
+    /**
+     * Replace the live-index snapshot from a queue query's raw items.
+     *
+     * Whole-snapshot, never incremental: the query returns everything unresolved on
+     * the queue, so a file MISSING from it is precisely the fact we are after. Merging
+     * would make a finished file impossible to observe.
+     */
+    private _recordLiveIndexKeys;
+    /** Forget the snapshot: it describes ONE chat's queue, and the answer for the
+     *  project the user just switched to is unknown until it is asked for again. */
+    private _resetLiveIndexKeys;
+    /**
+     * Ask the queue what is still indexing, once, for the chat that is on screen.
+     *
+     * Seeds the snapshot on a history load. Without it a reloaded chat has no way to
+     * learn that a run it can see is over: the adopt ladder that normally answers this
+     * only fires when a pass SETTLES, and after a reload there is no pass left to
+     * settle — so every finished worker-driven row would spin forever.
+     *
+     * Best-effort: a failure leaves `checked` false, which reads as "still working"
+     * rather than as a false all-clear.
+     *
+     * Delegates to the adopt ladder rather than asking once. A single empty look is
+     * exactly what that ladder exists to distrust — the worker writes pass N+1 a few
+     * milliseconds AFTER flipping pass N to resolved, so a query landing in that gap
+     * sees an empty queue for a chain that is very much alive. One look would turn
+     * that into a confident "Indexed" with a green check, on the one scenario this
+     * whole feature is for, and nothing would ever re-ask: the ladder is normally
+     * triggered by a pass SETTLING, and after a reload there is no pass left to
+     * settle. The ladder re-asks at 0/2s/6s, records each answer, and as a bonus
+     * adopts and polls any live pass it finds, which makes the row genuinely active
+     * instead of merely unconfirmed.
+     */
+    refreshLiveIndexState(): void;
+    /** Forget what we know about which files are indexing. For a consumer whose
+     *  history loading is its own fork and so never reaches loadHistory's reset —
+     *  a snapshot describes ONE chat's queue, and carrying it into another project
+     *  would let a row there claim to be finished on someone else's evidence. */
+    resetLiveIndexState(): void;
     /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
      *  live work from the moment it is sent, not from the moment it is acked. */
     trackIndexDispatch<T>(p: Promise<T>): Promise<T>;
@@ -1408,6 +1793,20 @@ declare class ChatSession {
      * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
      */
     stageOutgoingMessage(displayText: string): string;
+    /** Is anything in this page still uploading/dispatching for this stage? */
+    isLiveStage(stageId?: string): boolean;
+    /**
+     * Settle any staged bubble in `list` whose chain no longer exists, and return the
+     * list (a new array only if something changed).
+     *
+     * The caller is a cache restore. A staged bubble is the one kind of message whose
+     * resolution lives entirely in page memory — no server request stands behind it
+     * yet — so a copy that outlives its upload would render "(Uploading files...)"
+     * forever with nothing left to finish it. Today nothing can: this cache dies with
+     * the page, so every restored stage is still live and this is a no-op. It exists
+     * so that stops being a silent assumption.
+     */
+    settleDeadStagedMessages(list: ChatMessage[]): ChatMessage[];
     private _stageIndex;
     /**
      * Staged turn, phase 2: its files are up and it is now waiting for the whole
@@ -1620,4 +2019,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, type ParsedAiAgent, type PinnedDispatchContext, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };

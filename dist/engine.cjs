@@ -322,9 +322,12 @@ function buildIndexingSystemPrompt(params) {
 - BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). For big spreadsheets and big text/data files READ THE FILE WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
 - PDFs (scanned or not): you do NOT read a PDF with a tool or a URL. Its pages are RENDERED and embedded directly in the user message as IMAGE blocks, a WINDOW of pages at a time. LOOK at the embedded page images and datafy every one. The note beside them tells you whether MORE pages remain: if so, save this window's records and stop (a follow-up pass shows the next window automatically); only when the note says it was the LAST window is the PDF fully seen. Do NOT call readFileContent or web_fetch for a PDF.
 - VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
+- TRANSCRIBE, DO NOT DESCRIBE. When an image contains ANY text - a label, tag, stamp, form field, serial/part number, handwriting - your FIRST job is to read the characters out and store them VERBATIM, not to describe the scene. A record saying "a red inspection tag with handwritten markings" is worthless: it is unsearchable and every such photo produces the same sentence. Put the characters you can actually read into these EXACT fields, not variations of them: "printed_text" (the pre-printed wording), "handwritten_text" (what a person wrote by hand), and, when you can resolve one, "part_no", "tag_id" and "date". Same reason as the fixed table names: a field called photo_text in one pass and visible_text_notes in the next cannot be queried together. Read PARTIAL values rather than skipping: "500.7402.52__" beats nothing. Only when a character is genuinely unreadable, leave that field null or mark the unreadable span - do NOT invent it, and do NOT replace the whole transcription with a description of what the object looks like. A scene description is a nice extra AFTER the text, never instead of it.
 - Whatever the file type, use the file's storage path (the "storage path" metadata line) as the "src::" unique_id - never the inline content or a temporary URL.
-- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a dedicated table (e.g. "spreadsheet_rows"). Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, paging through it with readFileContent when it is large. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. ALSO save one file-level summary record (file name, sheet name(s), column headers, total row count, overall summary) - this is the record that carries the file's "src::" unique_id - and link EVERY per-row record to it via reference (set each row record's reference to that src:: file record; the row records themselves do NOT carry a src:: unique_id). The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed.
-- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in a dedicated table (e.g. "book_chapters") - never collapse the whole book into a single record. Each chapter record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO save one book-level record (title, author, language, overall summary, chapter list / table of contents, genre/subjects) and link each chapter record to it via reference. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
+- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, paging through it with readFileContent when it is large. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed.
+- ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
+- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "spreadsheet_photos" for a record describing an embedded photo/image, "book_chapters" for a chapter record, and "file_summaries" for the file-level record. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (image_observations / photo_instances / spreadsheet_row_photos / photo_inspection are four names for what is one table).
+- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in the table "book_chapters" - never collapse the whole book into a single record. Each chapter record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO save one book-level record (title, author, language, overall summary, chapter list / table of contents, genre/subjects) and link each chapter record to it via reference. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
 - This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Always use the MCP tools to save what you learn - be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. Never store raw or binary bytes (base64, blobs); describe them in human-readable text instead.
 - COMPLETION SIGNAL: only when you have fully read and saved the ENTIRE file (for readFileContent files: reached "END OF FILE"; for PDFs: the embedded page-image note said it was the LAST window - with all rows/pages/items saved), end your final message with the token INDEXING_COMPLETE on its own line. If you did NOT finish the whole file (more rows/pages remain), do NOT write that token - leaving it out is how the system knows to run another pass to continue.
 - Only AFTER every save is done, send exactly ONE final message summarizing what you indexed - never just "Indexing complete", and never a raw/base64/binary value or a large pasted dump. Keep it to a few factual sentences or a short markdown bullet list covering: the file name, its content type, each table you wrote to with its record/row count and the key columns/fields or topics captured, and anything that could not be extracted. Follow this shape - Indexed <file name> (<content type>): saved <N> records to <table(s)> capturing <key columns/fields or topics>; could not extract: <gaps, or none>.`;
@@ -669,6 +672,31 @@ function normalizeTrailingInlineToken(value) {
   out = out.replace(/[`'"*>]+$/, "");
   return out;
 }
+var PREVIEWABLE_IMAGE_CONTENT_TYPES = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp"
+};
+function previewableExtOf(nameOrPath) {
+  var v = String(nameOrPath || "");
+  var cut = v.search(/[?#]/);
+  if (cut !== -1) v = v.slice(0, cut);
+  v = v.replace(/[\\/]+$/, "");
+  var dot = v.lastIndexOf(".");
+  if (dot <= 0) return "";
+  var ext = v.slice(dot + 1).trim().toLowerCase();
+  return /^[a-z0-9]+$/.test(ext) ? ext : "";
+}
+function isPreviewableImagePath(nameOrPath) {
+  return !!PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)];
+}
+function previewImageContentType(nameOrPath) {
+  return PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)] || null;
+}
 function classifyInlineLink(full, groups, ctx) {
   var g1 = groups[0], g2 = groups[1], g3 = groups[2], g4 = groups[3], g5 = groups[4], g6 = groups[5];
   var dbHostPrefix = (ctx.dbHostPrefix || "").toLowerCase();
@@ -682,17 +710,19 @@ function classifyInlineLink(full, groups, ctx) {
     if (!remotePath2) return null;
     var expiredHref = buildDisplayExpiredAttachmentHref(remotePath2, label);
     var cached = fresh(expiredHref);
-    return {
-      part: {
-        type: "link",
-        label: truncateLabelForDisplay(label),
-        fullLabel: label,
-        href: cached || expiredHref,
-        expired: !cached,
-        expiredHref,
-        remotePath: remotePath2
-      }
+    var part = {
+      type: "link",
+      label: truncateLabelForDisplay(label),
+      fullLabel: label,
+      href: cached || expiredHref,
+      expired: !cached,
+      expiredHref,
+      remotePath: remotePath2
     };
+    var ext = previewableExtOf(remotePath2);
+    var ct = PREVIEWABLE_IMAGE_CONTENT_TYPES[ext];
+    if (ct) part.image = { ext, contentType: ct };
+    return { part };
   };
   if (g1) {
     var rawPath = normalizeTrailingInlineToken(g1);
@@ -1049,6 +1079,127 @@ function prepareDownloadText(filename, body) {
   };
 }
 
+// src/engine/link_markup.ts
+function escapeInlineHtml(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, function(ch) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+  });
+}
+var IMAGE_PREVIEWS_PER_MESSAGE = 8;
+function renderInlineLinkHtml(link, opts) {
+  var o = opts || {};
+  var refreshing = !!o.refreshing;
+  var full = link.fullLabel || link.label;
+  var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false;
+  var cls = ["bq-link-button"];
+  if (link.expired) cls.push("is-expired");
+  if (refreshing) cls.push("is-refreshing");
+  if (preview) cls.push("is-image-preview");
+  var labelText = "\u2197 " + link.label + (refreshing ? " (fetching...)" : "");
+  var attrs = [
+    'class="' + cls.join(" ") + '"',
+    'href="' + escapeInlineHtml(link.href) + '"',
+    'target="_blank"',
+    'rel="noopener noreferrer"',
+    'title="' + escapeInlineHtml(full) + '"'
+  ];
+  if (!preview) attrs.push('download="' + escapeInlineHtml(full) + '"');
+  attrs.push('data-bq-link="1"');
+  if (link.expired) attrs.push('data-bq-expired="1"');
+  if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
+  if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
+  if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
+  if (!preview) return "<a " + attrs.join(" ") + ">" + escapeInlineHtml(labelText) + "</a>";
+  return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" loading="lazy" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + "</span></a>";
+}
+
+// src/engine/image_preview.ts
+var previewUrlCache = /* @__PURE__ */ Object.create(null);
+var previewInFlight = /* @__PURE__ */ Object.create(null);
+function cacheKey(scope, path) {
+  return scope + "\0" + path;
+}
+function clearImagePreviewCache(scope) {
+  if (!scope) {
+    previewUrlCache = /* @__PURE__ */ Object.create(null);
+    previewInFlight = /* @__PURE__ */ Object.create(null);
+    return;
+  }
+  var prefix = scope + "\0";
+  for (var k in previewUrlCache) if (k.indexOf(prefix) === 0) delete previewUrlCache[k];
+  for (var f in previewInFlight) if (f.indexOf(prefix) === 0) delete previewInFlight[f];
+}
+function peekImagePreviewUrl(ctx, remotePath) {
+  var hit = previewUrlCache[cacheKey(ctx.scope, remotePath)];
+  if (hit && Date.now() - hit.at < LINK_REFRESH_WINDOW_MS) return hit.url;
+  return null;
+}
+function resolveImagePreviewUrl(ctx, remotePath, contentType) {
+  var warm = peekImagePreviewUrl(ctx, remotePath);
+  if (warm) return Promise.resolve(warm);
+  var key = cacheKey(ctx.scope, remotePath);
+  var flight = previewInFlight[key];
+  if (flight) return flight;
+  var run = ctx.mint(remotePath, contentType).then(function(url) {
+    previewUrlCache[key] = { url, at: Date.now() };
+    delete previewInFlight[key];
+    return url;
+  }, function(e) {
+    delete previewInFlight[key];
+    throw e;
+  });
+  previewInFlight[key] = run;
+  return run;
+}
+function hydrateImagePreviews(imgs, ctx) {
+  for (var i = 0; i < imgs.length; i++) hydrateOne(imgs[i], ctx);
+}
+function hydrateOne(img, ctx) {
+  if (img.getAttribute("data-bq-img-state")) return;
+  var path = img.getAttribute("data-bq-img-path");
+  var type = img.getAttribute("data-bq-img-type") || "";
+  if (!path) {
+    img.setAttribute("data-bq-img-state", "error");
+    return;
+  }
+  img.setAttribute("data-bq-img-state", "loading");
+  img.addEventListener("load", function() {
+    img.setAttribute("data-bq-img-state", "ready");
+    if (ctx.onLoad) ctx.onLoad(path);
+  });
+  img.addEventListener("error", function() {
+    onImageError(img, ctx, path, type);
+  });
+  var warm = peekImagePreviewUrl(ctx, path);
+  if (warm) {
+    img.setAttribute("src", warm);
+    return;
+  }
+  resolveImagePreviewUrl(ctx, path, type).then(function(url) {
+    if (img.getAttribute("data-bq-img-state") !== "loading") return;
+    img.setAttribute("src", url);
+  }, function(e) {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, e);
+  });
+}
+function onImageError(img, ctx, path, type) {
+  if (img.getAttribute("data-bq-img-retry") === "1") {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, new Error("image preview failed to load"));
+    return;
+  }
+  img.setAttribute("data-bq-img-retry", "1");
+  delete previewUrlCache[cacheKey(ctx.scope, path)];
+  img.removeAttribute("src");
+  resolveImagePreviewUrl(ctx, path, type).then(function(url) {
+    img.setAttribute("src", url);
+  }, function(e) {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, e);
+  });
+}
+
 // src/engine/time.ts
 function wallClockNow() {
   return Date.now();
@@ -1124,6 +1275,24 @@ var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
 var VARIANT_IMAGE_DETAIL = "original";
+var VARIANT_TEXT_VERBOSITY = "high";
+var VARIANT_REASONING_EFFORT = "low";
+var isOpenAINano = (model) => {
+  const normalized = (model).trim().toLowerCase();
+  if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+  const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = match[2] === void 0 ? null : Number(match[2]);
+  return major > 5 || major === 5 && minor !== null && minor >= 4;
+};
+var variantIndexingOptions = (model) => {
+  if (!isOpenAINano(model)) return {};
+  return {
+    ...{ text: { verbosity: VARIANT_TEXT_VERBOSITY } } ,
+    ...{ reasoning: { effort: VARIANT_REASONING_EFFORT } } 
+  };
+};
 var getOpenAIImageDetail = (model) => {
   const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
   const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -1456,6 +1625,8 @@ async function notifyAgentSaveAttachment(info) {
       data: {
         model: resolvedModel2,
         max_output_tokens: MAX_TOKENS,
+        // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
+        ...variantIndexingOptions(resolvedModel2),
         ...skapiExtract,
         ...skapiRender,
         ...skapiWindow,
@@ -1612,7 +1783,9 @@ function isBgIndexingQueue(queueName) {
   return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
 }
 var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+var EMPTY_INDEXING_REPLY = "Finished reading this file.";
 var MAX_INDEXING_RESUME_PASSES = 6;
+var CHAT_HISTORY_PAGE_LIMIT = 100;
 async function getChatHistory(params, fetchOptions) {
   const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
   const p = Object.assign(
@@ -1626,7 +1799,7 @@ async function getChatHistory(params, fetchOptions) {
   );
   return chatEngineConfig().clientSecretRequestHistory(
     p,
-    Object.assign({ ascending: false }, fetchOptions)
+    Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
   );
 }
 
@@ -1693,6 +1866,9 @@ function mapHistoryListToMessages(list, platform, opts) {
     var userText = extractLastUserTextFromRequest(requestBody);
     var assistantText = isPending ? "" : (extractAssistantText(response) || "").trim() || "";
     var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
+    var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+    if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
+    var reportedFinal = !!(item && item.index_final);
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
     var createdTs = Number(item && item.created);
     var updatedTs = Number(item && item.updated);
@@ -1744,11 +1920,13 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
       if (replyTs !== void 0) em._ts = replyTs;
       mapped.push(em);
-    } else if (assistantText) {
-      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
+    } else if (assistantText || reportedComplete) {
+      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) || EMPTY_INDEXING_REPLY };
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
+      if (reportedComplete) okm._indexComplete = true;
+      if (reportedFinal) okm._indexFinal = true;
       mapped.push(okm);
     }
   });
@@ -1807,6 +1985,16 @@ async function fillHistoryViewport(opts) {
 function createHistoryFiller(base) {
   var pending = [];
   var running = false;
+  var fetching = false;
+  function announce(next) {
+    if (fetching === next) return;
+    fetching = next;
+    if (!base.onRunningChange) return;
+    try {
+      base.onRunningChange(next);
+    } catch (e) {
+    }
+  }
   async function allSatisfied() {
     var next = [];
     for (var i = 0; i < pending.length; i++) {
@@ -1816,23 +2004,33 @@ function createHistoryFiller(base) {
     return pending.length === 0;
   }
   return {
+    // The published fact, so a view and `isRunning()` can never disagree about
+    // what they are showing. A fill that never fetches is not something anyone
+    // outside this module has any use for knowing about.
     isRunning: function() {
-      return running;
+      return fetching;
     },
     fill: function(isSatisfied) {
       pending.push(isSatisfied);
       if (running) return Promise.resolve();
       running = true;
       var done = function() {
-        running = false;
         pending = [];
+        running = false;
+        announce(false);
       };
       return fillHistoryViewport({
         isSatisfied: allSatisfied,
         isEndOfList: base.isEndOfList,
         isLoading: base.isLoading,
         messageCount: base.messageCount,
-        fetchOlder: base.fetchOlder,
+        // The span opens HERE, at the first real page request: past
+        // isEndOfList, past isStale, past isSatisfied. Everything before this
+        // point is a fill that concluded there was nothing to do.
+        fetchOlder: function() {
+          announce(true);
+          return base.fetchOlder();
+        },
         isStale: base.isStale,
         maxPages: base.maxPages
       }).then(done, done);
@@ -1911,7 +2109,9 @@ var ChatSession = class {
       historyEndOfList: false,
       historyStartKeyHistory: [],
       historyRequestToken: 0,
-      gateRefreshToken: 0
+      gateRefreshToken: 0,
+      liveIndexKeys: {},
+      liveIndexChecked: false
     };
     this.bgTaskQueue = [];
     this.cancelledServerIds = /* @__PURE__ */ new Set();
@@ -1926,6 +2126,102 @@ var ChatSession = class {
     this._uploadBatches = 0;
     this._indexDispatchesInFlight = 0;
     this._drainNudges = [];
+    this._liveStages = {};
+    this._liveIndexKey = "";
+  }
+  /** What the display layer needs to decide whether a run is finished. `keys` holds
+   *  every file the server still has indexing work for; `checked` is false until the
+   *  first answer for this chat, and false means "we do not know yet". */
+  getLiveIndexState() {
+    return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+  }
+  /**
+   * Replace the live-index snapshot from a queue query's raw items.
+   *
+   * Whole-snapshot, never incremental: the query returns everything unresolved on
+   * the queue, so a file MISSING from it is precisely the fact we are after. Merging
+   * would make a finished file impossible to observe.
+   */
+  _recordLiveIndexKeys(lists) {
+    var next = {};
+    var truncated = false;
+    var settledIds = {};
+    this.state.messages.forEach(function(m) {
+      if (!m._serverItemId) return;
+      if (m.isPending || m.isPendingInProcess || m.isPendingQueued) return;
+      settledIds[m._serverItemId] = true;
+    });
+    for (var li = 0; li < lists.length; li++) {
+      var list = lists[li] && Array.isArray(lists[li].list) ? lists[li].list : [];
+      if (list.length >= WORKER_PASS_ADOPT_LIMIT) truncated = true;
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        if (!item || item.status !== "pending" && item.status !== "running") continue;
+        if (item.id && settledIds[item.id]) continue;
+        var text = extractLastUserTextFromRequest(item.request_body);
+        if (!isIndexingRequestText(text)) continue;
+        var ref = parseIndexingRequestText(text);
+        if (!ref) continue;
+        if (ref.path) next[ref.path] = true;
+        if (ref.name) next[ref.name] = true;
+      }
+    }
+    var nowChecked = !truncated;
+    var was = this.state.liveIndexKeys, changed = this.state.liveIndexChecked !== nowChecked;
+    if (!changed) {
+      for (var k in next) if (!was[k]) {
+        changed = true;
+        break;
+      }
+      if (!changed) {
+        for (var k2 in was) if (!next[k2]) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    this.state.liveIndexKeys = next;
+    this.state.liveIndexChecked = nowChecked;
+    if (changed) this.host.notify();
+  }
+  /** Forget the snapshot: it describes ONE chat's queue, and the answer for the
+   *  project the user just switched to is unknown until it is asked for again. */
+  _resetLiveIndexKeys() {
+    this.state.liveIndexKeys = {};
+    this.state.liveIndexChecked = false;
+  }
+  /**
+   * Ask the queue what is still indexing, once, for the chat that is on screen.
+   *
+   * Seeds the snapshot on a history load. Without it a reloaded chat has no way to
+   * learn that a run it can see is over: the adopt ladder that normally answers this
+   * only fires when a pass SETTLES, and after a reload there is no pass left to
+   * settle — so every finished worker-driven row would spin forever.
+   *
+   * Best-effort: a failure leaves `checked` false, which reads as "still working"
+   * rather than as a false all-clear.
+   *
+   * Delegates to the adopt ladder rather than asking once. A single empty look is
+   * exactly what that ladder exists to distrust — the worker writes pass N+1 a few
+   * milliseconds AFTER flipping pass N to resolved, so a query landing in that gap
+   * sees an empty queue for a chain that is very much alive. One look would turn
+   * that into a confident "Indexed" with a green check, on the one scenario this
+   * whole feature is for, and nothing would ever re-ask: the ladder is normally
+   * triggered by a pass SETTLING, and after a reload there is no pass left to
+   * settle. The ladder re-asks at 0/2s/6s, records each answer, and as a bonus
+   * adopts and polls any live pass it finds, which makes the row genuinely active
+   * instead of merely unconfirmed.
+   */
+  refreshLiveIndexState() {
+    this._adoptWorkerIndexingPasses(0);
+  }
+  /** Forget what we know about which files are indexing. For a consumer whose
+   *  history loading is its own fork and so never reaches loadHistory's reset —
+   *  a snapshot describes ONE chat's queue, and carrying it into another project
+   *  would let a row there claim to be finished on someone else's evidence. */
+  resetLiveIndexState() {
+    this._liveIndexKey = "";
+    this._resetLiveIndexKeys();
   }
   /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
    *  live work from the moment it is sent, not from the moment it is acked. */
@@ -2072,7 +2368,6 @@ var ChatSession = class {
     if (!key) return;
     this.aiChatHistoryCache[key] = {
       messages: this.state.messages.filter(function(m) {
-        if (m._stageId) return false;
         return m._ownerKey === void 0 || m._ownerKey === key;
       }),
       endOfList: this.state.historyEndOfList,
@@ -2119,6 +2414,7 @@ var ChatSession = class {
     for (var j = 0; j < msgs.length; j++) {
       var u = msgs[j];
       if (!u || u.role !== "user" || u.isBackgroundTask) continue;
+      if (u._stageId) continue;
       if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
       if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
       var settled = { role: "user", content: u.content };
@@ -2249,10 +2545,47 @@ var ChatSession = class {
       _ts: wallClockNow()
     };
     if (key) staged._ownerKey = key;
+    this._liveStages[stageId] = true;
     this.state.messages.push(staged);
     this.host.notify();
     this.host.scrollToBottom(true);
     return stageId;
+  }
+  /** Is anything in this page still uploading/dispatching for this stage? */
+  isLiveStage(stageId) {
+    return !!stageId && !!this._liveStages[stageId];
+  }
+  /**
+   * Settle any staged bubble in `list` whose chain no longer exists, and return the
+   * list (a new array only if something changed).
+   *
+   * The caller is a cache restore. A staged bubble is the one kind of message whose
+   * resolution lives entirely in page memory — no server request stands behind it
+   * yet — so a copy that outlives its upload would render "(Uploading files...)"
+   * forever with nothing left to finish it. Today nothing can: this cache dies with
+   * the page, so every restored stage is still live and this is a no-op. It exists
+   * so that stops being a silent assumption.
+   */
+  settleDeadStagedMessages(list) {
+    if (!Array.isArray(list)) return list;
+    var self = this;
+    var dead = false;
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m && m._stageId && !self._liveStages[m._stageId]) {
+        dead = true;
+        break;
+      }
+    }
+    if (!dead) return list;
+    return list.map(function(m2) {
+      if (!m2 || !m2._stageId || self._liveStages[m2._stageId]) return m2;
+      var settled = { role: "user", content: m2.content };
+      if (m2._ownerKey !== void 0) settled._ownerKey = m2._ownerKey;
+      if (m2._ts !== void 0) settled._ts = m2._ts;
+      if (m2._localId !== void 0) settled._localId = m2._localId;
+      return settled;
+    });
   }
   _stageIndex(list, stageId) {
     if (!stageId) return -1;
@@ -2443,6 +2776,7 @@ var ChatSession = class {
    * failure separately.
    */
   settleStagedMessage(stageId) {
+    delete this._liveStages[stageId];
     var idx = this._stageIndex(this.state.messages, stageId);
     if (idx === -1) return;
     var ex = this.state.messages[idx];
@@ -2469,6 +2803,7 @@ var ChatSession = class {
       if (stageId) this.settleStagedMessage(stageId);
       return;
     }
+    if (stageId) delete this._liveStages[stageId];
     var llmComposed = composedForLlm || composed;
     var key = !id.serviceId ? "" : id.serviceId + "#" + id.platform;
     var offChat = !!key && key !== this.getHistoryCacheKey();
@@ -2499,8 +2834,16 @@ var ChatSession = class {
         this.state.messages.splice(offStage, 1);
         this.host.notify();
       }
+      var offCached = offExisting.messages;
+      if (stageId) {
+        offCached = offCached.filter(function(m) {
+          if (m._stageId !== stageId) return true;
+          if (offStage === -1 && m._ts !== void 0) offUser._ts = m._ts;
+          return false;
+        });
+      }
       this.aiChatHistoryCache[key] = {
-        messages: offExisting.messages.concat([
+        messages: offCached.concat([
           offUser,
           { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
         ]),
@@ -3259,7 +3602,10 @@ var ChatSession = class {
     this.historyItemPolls.delete(itemId);
     var isErr = isErrorResponseBody(response);
     var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
-    if (!isErr && answer) answer = answer.split(INDEXING_COMPLETE_MARKER).join("").trim();
+    var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+    var stripMarker = function(t) {
+      return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join("").trim() : t;
+    };
     var idx = this.state.messages.findIndex(function(m) {
       return m.isPending && m._serverItemId === itemId;
     });
@@ -3275,7 +3621,7 @@ var ChatSession = class {
       }
       var text = answer || "No text response received from AI provider.";
       if (wasBgTask) {
-        this.state.messages[idx] = { role: "assistant", content: text, isBackgroundTask: true, _serverItemId: itemId };
+        this.state.messages[idx] = { role: "assistant", content: stripMarker(text) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} };
         this.host.notify();
         this.updateHistoryCache();
         return;
@@ -3308,7 +3654,7 @@ var ChatSession = class {
     }
     var text2 = answer || "No text response received from AI provider.";
     if (ex.isBackgroundTask) {
-      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: text2, isBackgroundTask: true, _serverItemId: itemId });
+      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: stripMarker(text2) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} });
       this.host.notify();
       this.updateHistoryCache();
       return;
@@ -3420,6 +3766,7 @@ var ChatSession = class {
       var now = self.host.getIdentity();
       if (now.serviceId !== svcId || now.platform !== platform) return;
       if (!self.host.isViewMounted()) return;
+      if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
       var adoptedIds = [];
       for (var ri = 0; ri < results.length; ri++) {
         var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
@@ -3724,6 +4071,10 @@ var ChatSession = class {
     }
     this.state.historyRequestToken = token;
     this.state.loadingHistory = true;
+    if (!fetchMore && loadKey !== this._liveIndexKey) {
+      this._liveIndexKey = loadKey;
+      this._resetLiveIndexKeys();
+    }
     if (fetchMore) this.state.loadingOlderHistory = true;
     this.host.notify();
     var platform = id.platform;
@@ -3916,6 +4267,7 @@ var ChatSession = class {
         });
         self.drainBgTaskQueue();
       }
+      if (!fetchMore) self.refreshLiveIndexState();
       if (!fetchMore) return self.host.scrollToBottomIfSticky();
     }).catch(function(err) {
       console.warn("[chat-engine] getChatHistory failed", err);
@@ -4002,6 +4354,15 @@ var ChatSession = class {
           var mime = member.file.type || self.host.getMimeType(member.file.name);
           var preIndex = existedBefore && typeof self.host.deleteExistingFileRecord === "function" ? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
           }) : Promise.resolve();
+          preIndex = preIndex.then(function() {
+            if (typeof self.host.ensureFileIndexRecord !== "function") return;
+            return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
+              name: member.file.name,
+              mime: mime || void 0,
+              size: member.file.size
+            })).catch(function() {
+            });
+          });
           return preIndex.then(function() {
             return parseAttachmentContent(member.file, member.file.name, mime || void 0);
           }).then(function(parsedContent) {
@@ -4186,9 +4547,21 @@ function readFileRef(msg) {
 function isPendingMsg(m) {
   return !!(m.isPending || m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
 }
+function isHiddenPass(m) {
+  if (m.role === "user") {
+    if (m.isCancelled) return false;
+    var ref = readFileRef(m);
+    return !!(ref && ref.continued);
+  }
+  return !!m.isPending;
+}
 function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
+  var liveIndexKeys = opts && opts.liveIndexKeys || {};
+  var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+  var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
   var hasMoreHistory = !!(opts && opts.hasMoreHistory);
+  var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
   var groups = {};
   var order = [];
   var runOfIndex = new Array(list.length);
@@ -4240,7 +4613,12 @@ function buildChatDisplayList(messages, opts) {
         // The run's first loaded pass, and never re-stamped: see the file
         // docstring. `anchorId` is filled in once every member is known.
         anchorIndex: i,
-        anchorId: ""
+        anchorId: "",
+        // All five are derived once every member is known, below.
+        visibleMembers: [],
+        driver: "single",
+        finished: false,
+        resolving: false
       };
       order.push(runId);
     }
@@ -4257,6 +4635,11 @@ function buildChatDisplayList(messages, opts) {
     runOfIndex[i] = runId;
     if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
     if (ref && ref.name) keyByName[ref.name] = g.key;
+  }
+  var newestRunOfKey = {};
+  for (var nk in runsOfKey) {
+    var nrs = runsOfKey[nk];
+    if (nrs.length) newestRunOfKey[nrs[nrs.length - 1]] = true;
   }
   for (var rk in runsOfKey) {
     var runIds = runsOfKey[rk];
@@ -4318,6 +4701,36 @@ function buildChatDisplayList(messages, opts) {
     var anchor = grp.members[0];
     grp.anchorIndex = anchor.index;
     grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
+    var sawComplete = false, sawFinal = false;
+    for (var vi = 0; vi < grp.members.length; vi++) {
+      var vm = grp.members[vi];
+      if (vm.msg._indexComplete) sawComplete = true;
+      if (vm.msg._indexFinal) sawFinal = true;
+      if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+    }
+    grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
+    if (grp.status === "active") {
+      grp.finished = false;
+    } else if (grp.status === "cancelled") {
+      grp.finished = true;
+    } else if (grp.driver === "single") {
+      grp.finished = true;
+    } else if (grp.driver === "client") {
+      grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
+    } else {
+      grp.finished = sawFinal || !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+    }
+    if (grp.status !== "done") {
+      grp.resolving = false;
+    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !sawFinal && newestRunOfKey[order[oi]]) {
+      grp.resolving = true;
+      grp.resolvingReason = "history";
+    } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
+      grp.resolving = true;
+      grp.resolvingReason = "status";
+    } else {
+      grp.resolving = false;
+    }
   }
   var out = [];
   for (var j = 0; j < list.length; j++) {
@@ -4341,6 +4754,7 @@ exports.CONTEXT_WINDOW_DEFAULT = CONTEXT_WINDOW_DEFAULT;
 exports.ChatSession = ChatSession;
 exports.DEFAULT_CLAUDE_MODEL = DEFAULT_CLAUDE_MODEL;
 exports.DEFAULT_OPENAI_MODEL = DEFAULT_OPENAI_MODEL;
+exports.EMPTY_INDEXING_REPLY = EMPTY_INDEXING_REPLY;
 exports.EXPIRED_ATTACHMENT_URL_HOST = EXPIRED_ATTACHMENT_URL_HOST;
 exports.EXPIRED_ATTACHMENT_URL_ORIGIN = EXPIRED_ATTACHMENT_URL_ORIGIN;
 exports.EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
@@ -4350,6 +4764,8 @@ exports.HISTORY_FILL_SLACK_PX = HISTORY_FILL_SLACK_PX;
 exports.HISTORY_TOKEN_BUDGET = HISTORY_TOKEN_BUDGET;
 exports.HTML_EXTS = HTML_EXTS;
 exports.HTML_HEAD_WINDOW = HTML_HEAD_WINDOW;
+exports.IMAGE_PREVIEWS_PER_MESSAGE = IMAGE_PREVIEWS_PER_MESSAGE;
+exports.INDEXING_COMPLETE_MARKER = INDEXING_COMPLETE_MARKER;
 exports.LINK_LABEL_MAX_DISPLAY_CHARS = LINK_LABEL_MAX_DISPLAY_CHARS;
 exports.LINK_REFRESH_WINDOW_MS = LINK_REFRESH_WINDOW_MS;
 exports.MAX_HISTORY_FILL_PAGES = MAX_HISTORY_FILL_PAGES;
@@ -4359,6 +4775,7 @@ exports.MCP_NAME = MCP_NAME;
 exports.MIN_INPUT_TOKEN_BUDGET = MIN_INPUT_TOKEN_BUDGET;
 exports.OUTPUT_TOKEN_RESERVE = OUTPUT_TOKEN_RESERVE;
 exports.POLL_INTERVAL = POLL_INTERVAL;
+exports.PREVIEWABLE_IMAGE_CONTENT_TYPES = PREVIEWABLE_IMAGE_CONTENT_TYPES;
 exports.RENDER_FROM_TOKEN = RENDER_FROM_TOKEN;
 exports.RTF_EXTS = RTF_EXTS;
 exports.TOOL_AND_RESPONSE_BUFFER = TOOL_AND_RESPONSE_BUFFER;
@@ -4382,6 +4799,7 @@ exports.callOpenAIWithPublicMcp = callOpenAIWithPublicMcp;
 exports.chatEngineConfig = chatEngineConfig;
 exports.classifyInlineLink = classifyInlineLink;
 exports.clearAttachmentParsers = clearAttachmentParsers;
+exports.clearImagePreviewCache = clearImagePreviewCache;
 exports.composeUserMessage = composeUserMessage;
 exports.configureChatEngine = configureChatEngine;
 exports.contentTypeForExt = contentTypeForExt;
@@ -4391,6 +4809,7 @@ exports.encodePathSegments = encodePathSegments;
 exports.encodingClassForExt = encodingClassForExt;
 exports.ensureHtmlCharset = ensureHtmlCharset;
 exports.ensureXmlEncoding = ensureXmlEncoding;
+exports.escapeInlineHtml = escapeInlineHtml;
 exports.escapeRtfNonAscii = escapeRtfNonAscii;
 exports.estimateMessageTokens = estimateMessageTokens;
 exports.estimateTextTokens = estimateTextTokens;
@@ -4411,6 +4830,7 @@ exports.getExpiredAttachmentVisiblePath = getExpiredAttachmentVisiblePath;
 exports.getProjectContextWindow = getProjectContextWindow;
 exports.groupAttachmentFailures = groupAttachmentFailures;
 exports.hasBom = hasBom;
+exports.hydrateImagePreviews = hydrateImagePreviews;
 exports.isAuthExpiredError = isAuthExpiredError;
 exports.isBgIndexingQueue = isBgIndexingQueue;
 exports.isErrorResponseBody = isErrorResponseBody;
@@ -4418,6 +4838,7 @@ exports.isHttpUrlLike = isHttpUrlLike;
 exports.isIndexingRequestText = isIndexingRequestText;
 exports.isNonRetryableRequestError = isNonRetryableRequestError;
 exports.isOfficeFile = isOfficeFile;
+exports.isPreviewableImagePath = isPreviewableImagePath;
 exports.isServerExtractable = isServerExtractable;
 exports.isServiceDbAttachmentHref = isServiceDbAttachmentHref;
 exports.listClaudeModels = listClaudeModels;
@@ -4435,12 +4856,17 @@ exports.parseAiAgentValue = parseAiAgentValue;
 exports.parseAttachmentContent = parseAttachmentContent;
 exports.parseIndexingLabel = parseIndexingLabel;
 exports.parseIndexingRequestText = parseIndexingRequestText;
+exports.peekImagePreviewUrl = peekImagePreviewUrl;
 exports.prepareDownloadText = prepareDownloadText;
+exports.previewImageContentType = previewImageContentType;
+exports.previewableExtOf = previewableExtOf;
 exports.readExpiredAttachmentHref = readExpiredAttachmentHref;
 exports.registerAttachmentParser = registerAttachmentParser;
 exports.registerModelContextWindows = registerModelContextWindows;
+exports.renderInlineLinkHtml = renderInlineLinkHtml;
 exports.repairUrlEntities = repairUrlEntities;
 exports.repairUrlWhitespace = repairUrlWhitespace;
+exports.resolveImagePreviewUrl = resolveImagePreviewUrl;
 exports.safeDecodeURIComponent = safeDecodeURIComponent;
 exports.sanitizeAttachmentLinksForHistory = sanitizeAttachmentLinksForHistory;
 exports.setProjectContextWindow = setProjectContextWindow;

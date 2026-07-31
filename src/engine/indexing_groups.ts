@@ -42,10 +42,20 @@
  * failed), how many passes are currently loaded, and `mayHaveOlder` when the
  * file's first pass is not among them.
  *
+ * For the same reason it also reports NOT KNOWING. A run whose start is still
+ * being paged in, and a worker-driven run whose queue state has not been asked
+ * for yet, are both rows whose state is a moving target — and on a chatbox that
+ * was just opened, that is most of them. `resolving` marks those, so the view can
+ * say which wait it is waiting on rather than committing to "indexing" or
+ * "indexed" on a fraction of the evidence.
+ *
  * Pure and view-agnostic: agent.vue and the BunnyQuery widget both render from
  * this, so the two stay identical.
  */
 import type { ChatMessage, IndexingFileRef } from './host';
+import { isPagedReadFile, isImageVisionFile } from './office';
+import { windowedIndexingEnabled } from './config';
+import { MAX_INDEXING_RESUME_PASSES } from './requests';
 
 export type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
 
@@ -53,7 +63,16 @@ export type IndexingGroup = {
 	/** The FILE this row is about: storage path when known (a file can be
 	 *  re-uploaded under a name that already exists elsewhere), else name. Shared
 	 *  by every run of that file, and what ChatSession.cancelIndexingGroup and
-	 *  _indexKeyOf match on — never use it as a render key. */
+	 *  _indexKeyOf match on — never use it as a render key.
+	 *
+	 *  It IS the key for persistent view state, above all the expansion state. That
+	 *  used to be keyed by runKey, which is renamed the moment a run's true first
+	 *  pass loads (see below) — so a row the user had opened silently closed itself
+	 *  mid-indexing, every time a pass arrived ahead of the earlier ones. This never
+	 *  changes for the life of a file. The cost is that two runs OF THE SAME FILE
+	 *  (an index and a later re-index) open and close together, which is a fair
+	 *  reading of "show me this file's steps" and is not a state the user can be
+	 *  surprised out of. */
 	key: string;
 	/** Identity of this ROW: one indexing RUN of that file. A file indexed on
 	 *  Monday and re-indexed on Wednesday is two runs, and collapsing them into
@@ -61,8 +80,13 @@ export type IndexingGroup = {
 	 *  its passes for Wednesday, and let Monday's failure be overwritten by
 	 *  Wednesday's success. Named after the run's FIRST loaded pass (see where it
 	 *  is assigned below), so passes appended to the run and other runs appearing
-	 *  on either side of it never rename a row already on screen. This is the
-	 *  render key and the expansion key. */
+	 *  on either side of it never rename a row already on screen.
+	 *
+	 *  This is the RENDER key, and only that. It is renamed when the run's true
+	 *  first pass finally loads — routine while a worker-driven chain is running,
+	 *  since a pass adopted from the queue can reach the client before the earlier
+	 *  ones are paged in — and a rename is exactly right for a DOM key (the row did
+	 *  change identity) but wrong for anything the USER set. Key that on `key`. */
 	runKey: string;
 	name: string;
 	path?: string;
@@ -98,6 +122,71 @@ export type IndexingGroup = {
 	 *  must not re-derive it from `members`: which member the row renders at is
 	 *  this module's decision, and the two silently disagreed once already. */
 	anchorId: string;
+	/** `members` minus the turns an EXPANDED row should not show: every CONTINUE
+	 *  request, and the running pass's empty placeholder.
+	 *
+	 *  A continuation's request bubble says "Indexing (continuing) <file>" and
+	 *  nothing else — it repeats the row's own header once per pass, so a long file
+	 *  read as the same line over and over with the actual findings buried between
+	 *  them. The pass is still represented, by its RESPONSE. The placeholder goes
+	 *  for a different reason: the row now carries one loader of its own for as long
+	 *  as work remains, and two spinners in one open row is noise.
+	 *
+	 *  Additive. `members` is untouched and is still what every count, status,
+	 *  cancel and anchor decision reads — several of them are only correct on the
+	 *  full list (a `mayHaveOlder` run's members[0] IS a continuation). */
+	visibleMembers: { msg: ChatMessage; index: number }[];
+	/** Who advances this file's chain, which decides what can confirm it is over:
+	 *  'single' one pass and done; 'client' this client dispatches each CONTINUE
+	 *  pass and stops on the model's completion marker; 'worker' the server advances
+	 *  the loop off the renderer's page count and the client is only a spectator. */
+	driver: 'single' | 'client' | 'worker';
+	/** Positively established that no further indexing work will happen for this
+	 *  run. NOT "the file was fully read" — a cap-out, a failure and a stop are all
+	 *  finished, and the row's own status says which.
+	 *
+	 *  False means "not established", which includes "still running" AND "we have
+	 *  not been able to find out". The view shows a loader for both, deliberately:
+	 *  the alternative default is the failure this exists to prevent, a row that
+	 *  reads "Indexed" between two passes of a file still being read. */
+	finished: boolean;
+	/** This row cannot honestly claim a state yet, because something it is derived
+	 *  FROM is still being fetched. Both `status` and `finished` are read off the
+	 *  passes that happen to be LOADED, and on a freshly opened chatbox that is a
+	 *  moving target: history pages newest-first, so a long run arrives as a tail
+	 *  of CONTINUE passes while its beginning is still being paged in. The row was
+	 *  picking a side through that window — a spinner reading "Indexing" for a file
+	 *  that finished last week, or a green "Indexed" for one still being read — and
+	 *  both are verdicts drawn from a fraction of the run.
+	 *
+	 *  Only ever set from status 'done'. A loaded pending pass PROVES the run is
+	 *  live, and an error or a stop is the newest pass's own outcome, which
+	 *  newest-first paging always has in hand — none of those is a guess, and
+	 *  hiding any of them behind a loader would lose something the user needs.
+	 *
+	 *  For the 'history' reason this means "a fetch is IN FLIGHT", not "the picture
+	 *  is incomplete". Older history is paged in by explicit triggers only (the
+	 *  viewport fill, the user scrolling to the top) and nothing auto-fetches on a
+	 *  row's behalf, so a run whose start is still unloaded once the paging stops
+	 *  has to go back to reporting what it does know — `mayHaveOlder` and the `+` on
+	 *  the pass count carry the rest. A "loading..." that never ends is the same lie
+	 *  pointing the other way.
+	 *
+	 *  The 'status' reason is weaker on purpose: "the queue has not answered", which
+	 *  a permanently failing query never resolves. That is deliberate, because it is
+	 *  the SAME question as what the row should say when it cannot find out, and
+	 *  every alternative is worse: a grey clock reading "checking" claims less than
+	 *  the yellow spinner reading "Indexing" that it replaced. It also self-heals in
+	 *  practice — the answer is re-sought on every first-page history load and every
+	 *  settling pass — and gating it on an in-flight query instead would mean
+	 *  threading a second liveness flag through a retry ladder with nine exit
+	 *  points, i.e. trading this for a flag that can stick in the other direction. */
+	resolving: boolean;
+	/** Which wait, so the row can name it instead of just spinning. 'history':
+	 *  older pages are being fetched and this run's first pass is not among the
+	 *  loaded ones. 'status': the queue has not yet said whether this file is still
+	 *  being worked on, which is the only thing that can end a worker-driven run. */
+	resolvingReason?: 'history' | 'status';
 };
 
 export type DisplayEntry =
@@ -108,6 +197,24 @@ export type BuildDisplayListOptions = {
 	/** True while older history remains unpaged, which is what makes a group
 	 *  with no first pass genuinely incomplete rather than merely odd. */
 	hasMoreHistory?: boolean;
+	/** An OLDER-history fetch is in flight right now — a single page, or the whole
+	 *  viewport-fill loop (createHistoryFiller's onRunningChange, which spans the
+	 *  pages between which a per-request flag keeps dropping to false).
+	 *
+	 *  Older specifically. A first-page refresh cannot bring in a run's earlier
+	 *  passes, so counting it here would flip every incomplete row to "still
+	 *  loading" for the length of a poll that could never have answered it. */
+	loadingOlderHistory?: boolean;
+	/** Files the SERVER still has unresolved indexing work for, keyed exactly like
+	 *  IndexingGroup.key (ChatSession.getLiveIndexState). */
+	liveIndexKeys?: { [fileKey: string]: boolean };
+	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
+	 *  is "we do not know", and a worker-driven run stays unfinished on it. */
+	liveIndexChecked?: boolean;
+	/** Whether the WORKER drives the windowed text/grid loop (chatEngineConfig's
+	 *  windowedIndexing). Passed in rather than read from config so this stays a
+	 *  pure function of its inputs and can be exercised for both settings. */
+	windowedIndexing?: boolean;
 };
 
 // The indexing label is view-formatted (formatIndexingLabel), so parsing it is
@@ -170,6 +277,24 @@ function isPendingMsg(m: ChatMessage): boolean {
 }
 
 /**
+ * A member an EXPANDED row should not render. See IndexingGroup.visibleMembers.
+ *
+ * A CANCELLED continuation is an exception and stays: a cancelled item is given no
+ * response bubble at all, so hiding its request would erase the only evidence that
+ * the pass existed. A user bubble we cannot classify (it joined the run by server
+ * id, not by a label we could parse) also stays — showing an unexpected turn is a
+ * far smaller error than silently dropping one.
+ */
+function isHiddenPass(m: ChatMessage): boolean {
+	if (m.role === 'user') {
+		if (m.isCancelled) return false;
+		var ref = readFileRef(m);
+		return !!(ref && ref.continued);
+	}
+	return !!m.isPending;
+}
+
+/**
  * Collapse background-indexing turns into per-file groups.
  *
  * Messages that are not background-indexing pass through untouched, at their
@@ -180,7 +305,13 @@ export function buildChatDisplayList(
 	opts?: BuildDisplayListOptions,
 ): DisplayEntry[] {
 	var list = Array.isArray(messages) ? messages : [];
+	var liveIndexKeys = (opts && opts.liveIndexKeys) || {};
+	var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+	var windowedIndexing = opts && opts.windowedIndexing !== undefined
+		? !!opts.windowedIndexing
+		: windowedIndexingEnabled();
 	var hasMoreHistory = !!(opts && opts.hasMoreHistory);
+	var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
 
 	// One entry per RUN (see IndexingGroup.runKey), addressed by an internal id
 	// while the list is being walked; runKey is assigned at the end, once the
@@ -265,6 +396,11 @@ export function buildChatDisplayList(
 				// docstring. `anchorId` is filled in once every member is known.
 				anchorIndex: i,
 				anchorId: '',
+				// All five are derived once every member is known, below.
+				visibleMembers: [],
+				driver: 'single',
+				finished: false,
+				resolving: false,
 			};
 			order.push(runId);
 		}
@@ -292,6 +428,15 @@ export function buildChatDisplayList(
 	// as a run appears at that end, which silently moves the user's expansion to
 	// a row they never opened.) The one thing that changes it is the run's own
 	// true first pass finally paging in, which happens at most once per run.
+	// Whether a run is the NEWEST of its file. Only that one can still be running:
+	// `liveIndexKeys` is keyed by FILE, shared by every run of it, so without this a
+	// re-index left last week's finished row spinning for the whole of this week's
+	// run — one file, two rows, both claiming to be working.
+	var newestRunOfKey: { [runId: string]: boolean } = {};
+	for (var nk in runsOfKey) {
+		var nrs = runsOfKey[nk];
+		if (nrs.length) newestRunOfKey[nrs[nrs.length - 1]] = true;
+	}
 	for (var rk in runsOfKey) {
 		var runIds = runsOfKey[rk];
 		for (var ri = 0; ri < runIds.length; ri++) {
@@ -373,6 +518,110 @@ export function buildChatDisplayList(
 		var anchor = grp.members[0];
 		grp.anchorIndex = anchor.index;
 		grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || '';
+
+		// --- what an expanded row renders, and whether the run is over -------------
+		var sawComplete = false, sawFinal = false;
+		for (var vi = 0; vi < grp.members.length; vi++) {
+			var vm = grp.members[vi];
+			if (vm.msg._indexComplete) sawComplete = true;
+			if (vm.msg._indexFinal) sawFinal = true;
+			if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+		}
+		// Mirrors ChatSession.maybeResumeIndexing's own routing, which is what makes
+		// the answer match who will actually dispatch the next pass.
+		grp.driver = !isPagedReadFile(grp.name, grp.mime) ? 'single'
+			: isImageVisionFile(grp.name, grp.mime) ? 'worker'
+				: (windowedIndexing ? 'worker' : 'client');
+		if (grp.status === 'active') {
+			grp.finished = false;
+		} else if (grp.status === 'cancelled') {
+			// The user stopped it. Nothing more will run, by construction.
+			grp.finished = true;
+		} else if (grp.driver === 'single') {
+			// One pass is the whole job: nothing continues a file that is not a paged
+			// read, so a settled pass IS the end. Exact, and survives a reload.
+			grp.finished = true;
+		} else if (grp.driver === 'client') {
+			// The three branches this client itself stops dispatching on. Using the
+			// same rule means the row cannot disagree with the pipeline: if the client
+			// will send no more passes, the run is over whether or not the file was
+			// fully read.
+			grp.finished = sawComplete || grp.status === 'error' ||
+				grp.passCount >= MAX_INDEXING_RESUME_PASSES;
+		} else {
+			// WORKER-driven, and the interesting case. Nothing in the messages can
+			// settle it: the loop is advanced inside the worker off the renderer's page
+			// count, the client only ever sees passes appear and settle, and the prompt
+			// for these paths deliberately never asks for a completion marker — a model
+			// that volunteers one is guessing, which is how an 88-page file once
+			// "finished" at page 15. So sawComplete is deliberately NOT consulted here.
+			// Either the server said this was the last pass, or the queue has been
+			// asked and holds nothing for this file.
+			//
+			// A run that is NOT the newest of its file is over by construction: a newer
+			// run exists, so this one's chain ended when that one began, and the
+			// file-keyed queue answer describes the newer run, not this one.
+			grp.finished = sawFinal || !newestRunOfKey[order[oi]] ||
+				(liveIndexChecked && !liveIndexKeys[grp.key]);
+		}
+
+		// --- is any of that knowable YET? ------------------------------------------
+		// See IndexingGroup.resolving. Both answers above are read off the passes
+		// that happen to be loaded, and while a fetch that would change WHICH passes
+		// those are is still running, the row states the wait instead of picking a
+		// side. Two waits, checked in that order because the first subsumes the
+		// second: a run whose start has not arrived cannot be judged by any queue
+		// answer either.
+		if (grp.status !== 'done') {
+			// 'active' is proof the run is live; 'error' and 'cancelled' are the
+			// newest pass's own outcome, and newest-first paging always has that pass.
+			grp.resolving = false;
+		} else if (grp.mayHaveOlder && loadingOlderHistory &&
+			!liveIndexKeys[grp.key] && !sawFinal && newestRunOfKey[order[oi]]) {
+			// The line this draws, and it is the same line the 'status' branch draws:
+			// withhold what is UNKNOWN, and what is only INFERRED settled. Never
+			// withhold what is PROVEN, in either direction. Three proofs, and an older
+			// page can revise none of them:
+			//   liveIndexKeys hit — the server just said this file is on the queue RIGHT
+			//     NOW. Yellow and spinning, and no amount of older history makes that
+			//     untrue. (Survives an unanswered `checked` for the reason above: only
+			//     ABSENCE needs the truncation guard.)
+			//   sawFinal — the server marked a loaded pass as the last one. A prepend
+			//     cannot unmark it.
+			//   not the newest run of this file — a LATER run exists in the loaded
+			//     messages, so this run's chain ended when that one began. Prepending
+			//     adds OLDER messages, so it can never add a run after this one.
+			//
+			// What is deliberately NOT proof here: `finished` as a whole. Its remaining
+			// source is `liveIndexChecked && !liveIndexKeys[key]`, which is an inference
+			// from ABSENCE and is exactly what the user asked to stop reading as a green
+			// "Indexed" mid-fetch. And a blanket `!grp.finished` would be wrong for a
+			// second reason: driver 'single' also yields finished, and THAT verdict an
+			// older page really can revise — the first pass is what carries the mime, so
+			// a page bringing it in re-classifies the file as paged and hands the
+			// question back to the queue.
+			grp.resolving = true;
+			grp.resolvingReason = 'history';
+		} else if (!grp.finished && grp.driver === 'worker' && !liveIndexChecked && !liveIndexKeys[grp.key]) {
+			// Worker-driven and the queue has not answered. `finished` is already
+			// false here and the row would spin "Indexing" on the strength of nothing
+			// — the same false claim, one round trip long, on every chatbox open of a
+			// file that finished days ago. A 'client' run in the same shape is NOT
+			// resolving: no answer is being waited for, this client is the one that
+			// dispatches the next pass, so "Indexing" is a statement about its own
+			// intent and is true.
+			//
+			// A POSITIVE key survives `!liveIndexChecked`, and must. `checked` is set
+			// from `!truncated`: a capped page suppresses the whole answer, which is
+			// right for ABSENCE (an omitted file would otherwise read as finished) and
+			// wrong for PRESENCE, because an item the query did return is proof the
+			// file is live. Hiding that behind "checking..." would withhold the one
+			// thing here that is actually known.
+			grp.resolving = true;
+			grp.resolvingReason = 'status';
+		} else {
+			grp.resolving = false;
+		}
 	}
 
 	var out: DisplayEntry[] = [];
