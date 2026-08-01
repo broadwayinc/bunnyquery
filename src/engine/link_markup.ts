@@ -26,6 +26,16 @@ export function escapeInlineHtml(v: string | null | undefined): string {
  */
 export var IMAGE_PREVIEWS_PER_MESSAGE = 8;
 
+/**
+ * The glyph IS the promise: ↗ says "click this and the file opens". When the
+ * client could not get a url for the file, keeping that glyph on a chip it knows
+ * is dead is the bug: the click either opens a tab on a 403/404 or, once the
+ * href is gone, does nothing at all with no explanation. ✕ says what happened.
+ */
+export var INLINE_LINK_GLYPH = '↗';
+export var INLINE_LINK_UNAVAILABLE_GLYPH = '✕';
+export var INLINE_LINK_UNAVAILABLE_SUFFIX = ' (unavailable)';
+
 /** Widened so each client's local link-part type is assignable. */
 export interface RenderableInlineLink {
 	label: string;
@@ -42,31 +52,49 @@ export interface InlineLinkMarkupOptions {
 	refreshing?: boolean;
 	/** False once the caller has spent its per-message preview budget. */
 	allowImagePreview?: boolean;
+	/**
+	 * The view already tried to get a url for this file and failed (see
+	 * isLinkUnavailable). Renders a dead chip: ✕, greyed, no href.
+	 */
+	unavailable?: boolean;
 }
 
 export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLinkMarkupOptions): string {
 	var o = opts || {};
-	var refreshing = !!o.refreshing;
+	var unavailable = !!o.unavailable;
+	// A dead chip is never also "fetching...": the mint that would have cleared
+	// that state is the one that failed.
+	var refreshing = !unavailable && !!o.refreshing;
 	var full = link.fullLabel || link.label;
-	var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false;
+	// No preview either. The <img> hides itself when its url fails, but a
+	// re-render emits a FRESH element with no state, so leaving the preview in
+	// would re-mint and re-fail once per render for the rest of the session.
+	var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false && !unavailable;
 
 	var cls = ['bq-link-button'];
 	if (link.expired) cls.push('is-expired');
 	if (refreshing) cls.push('is-refreshing');
+	if (unavailable) cls.push('is-unavailable');
 	if (preview) cls.push('is-image-preview');
 
-	var labelText = '↗ ' + link.label + (refreshing ? ' (fetching...)' : '');
-	var attrs = [
-		'class="' + cls.join(' ') + '"', 'href="' + escapeInlineHtml(link.href) + '"',
-		'target="_blank"', 'rel="noopener noreferrer"',
-		'title="' + escapeInlineHtml(full) + '"',
-	];
+	var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + ' ' + link.label
+		+ (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? ' (fetching...)' : '');
+	var attrs = ['class="' + cls.join(' ') + '"'];
+	// NO href when the file is unavailable. That is what disables the click:
+	// an anchor with no href does not navigate, is not a tab stop and takes the
+	// default cursor, so nothing else has to remember to swallow the event.
+	if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
+	else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
+	attrs.push('title="' + escapeInlineHtml(unavailable ? full + INLINE_LINK_UNAVAILABLE_SUFFIX : full) + '"');
 	// `download` is ignored cross-origin and forces a save same-origin. On a
 	// preview it states the wrong intent: the user clicked a picture to LOOK at
 	// it. Every other chip keeps the attribute exactly where it was.
-	if (!preview) attrs.push('download="' + escapeInlineHtml(full) + '"');
+	if (!preview && !unavailable) attrs.push('download="' + escapeInlineHtml(full) + '"');
 	attrs.push('data-bq-link="1"');
-	if (link.expired) attrs.push('data-bq-expired="1"');
+	// Deliberately NOT marked expired: `data-bq-expired` is what tells the
+	// delegated click handler to mint a fresh url, and this is the chip whose
+	// mint just failed.
+	if (link.expired && !unavailable) attrs.push('data-bq-expired="1"');
 	if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
 	if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
 	if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');

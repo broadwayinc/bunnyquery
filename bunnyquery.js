@@ -548,6 +548,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
   var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
   var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+  var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
   var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
   function createInlineLinkRegex() {
     return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -785,6 +786,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return withTail({
       part: { type: "link", label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false }
     });
+  }
+  function linkUnavailableKeyForPath(remotePath) {
+    return "path:" + (remotePath || "");
+  }
+  function linkUnavailableKeyForHref(href) {
+    return "href:" + (href || "");
+  }
+  function isLinkUnavailable(link, map) {
+    if (!link || !map) return false;
+    if (link.remotePath && map[linkUnavailableKeyForPath(link.remotePath)]) return true;
+    if (link.expiredHref && map[linkUnavailableKeyForHref(link.expiredHref)]) return true;
+    if (link.href && map[linkUnavailableKeyForHref(link.href)]) return true;
+    return false;
   }
   function truncateLabelForDisplay(label) {
     if (!label) return label;
@@ -1060,26 +1074,28 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     });
   }
   var IMAGE_PREVIEWS_PER_MESSAGE = 8;
+  var INLINE_LINK_GLYPH = "\u2197";
+  var INLINE_LINK_UNAVAILABLE_GLYPH = "\u2715";
+  var INLINE_LINK_UNAVAILABLE_SUFFIX = " (unavailable)";
   function renderInlineLinkHtml(link, opts) {
     var o = opts || {};
-    var refreshing = !!o.refreshing;
+    var unavailable = !!o.unavailable;
+    var refreshing = !unavailable && !!o.refreshing;
     var full = link.fullLabel || link.label;
-    var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false;
+    var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false && !unavailable;
     var cls = ["bq-link-button"];
     if (link.expired) cls.push("is-expired");
     if (refreshing) cls.push("is-refreshing");
+    if (unavailable) cls.push("is-unavailable");
     if (preview) cls.push("is-image-preview");
-    var labelText = "\u2197 " + link.label + (refreshing ? " (fetching...)" : "");
-    var attrs = [
-      'class="' + cls.join(" ") + '"',
-      'href="' + escapeInlineHtml(link.href) + '"',
-      'target="_blank"',
-      'rel="noopener noreferrer"',
-      'title="' + escapeInlineHtml(full) + '"'
-    ];
-    if (!preview) attrs.push('download="' + escapeInlineHtml(full) + '"');
+    var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + " " + link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : "");
+    var attrs = ['class="' + cls.join(" ") + '"'];
+    if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
+    else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
+    attrs.push('title="' + escapeInlineHtml(unavailable ? full + INLINE_LINK_UNAVAILABLE_SUFFIX : full) + '"');
+    if (!preview && !unavailable) attrs.push('download="' + escapeInlineHtml(full) + '"');
     attrs.push('data-bq-link="1"');
-    if (link.expired) attrs.push('data-bq-expired="1"');
+    if (link.expired && !unavailable) attrs.push('data-bq-expired="1"');
     if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
     if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
     if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
@@ -1350,6 +1366,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     });
   }
   var POLL_INTERVAL = 3e3;
+  var MAX_CONCURRENT_BG_POLLS = 6;
   async function callClaudeWithMcp({
     prompt,
     messages,
@@ -1801,7 +1818,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
       var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
       if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
-      var reportedFinal = !!(item && item.index_final);
       var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
       var createdTs = Number(item && item.created);
       var updatedTs = Number(item && item.updated);
@@ -1859,7 +1875,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (serverItemId !== void 0) okm._serverItemId = serverItemId;
         if (replyTs !== void 0) okm._ts = replyTs;
         if (reportedComplete) okm._indexComplete = true;
-        if (reportedFinal) okm._indexFinal = true;
         mapped.push(okm);
       }
     });
@@ -2211,6 +2226,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       this.historyItemPolls.set(id, { kind, stop });
       return p;
+    }
+    /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
+     *  Counts the registry rather than a separate tally so it cannot drift: every
+     *  attach goes through _trackPoll and every detach deletes the entry. Note an
+     *  entry left behind by pausePolling on an older skapi-js (no stop handle)
+     *  still counts, which is correct — that poll really is still running. */
+    _countBgPolls() {
+      var n = 0;
+      this.historyItemPolls.forEach(function(handle) {
+        if (handle && handle.kind === "bg") n++;
+      });
+      return n;
     }
     /**
      * Stop and forget one item's poll. Used after a cancel: the row is either gone
@@ -3518,6 +3545,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var indexRef = this._indexRefOfItem(itemId);
       this.applyHistoryItemResolution(itemId, response, platform);
       this.promoteNextBgQueuedToRunning();
+      this.drainBgTaskQueue();
       if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
     }
     /** The file an already-rendered background pass is about, off its request
@@ -3817,6 +3845,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (e.serviceId !== svcId || e.platform !== plat) continue;
         if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
       }
+      var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+      var injectedAny = false;
       this.bgTaskQueue.forEach(function(entry) {
         if (entry.serviceId !== svcId || entry.platform !== plat) return;
         if (!presentIds[entry.id]) {
@@ -3850,11 +3880,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             self.state.messages.splice(stageAt, 0, userBubble);
           }
           presentIds[entry.id] = true;
-          self.host.notify();
-          self.updateHistoryCache();
-          self.host.scrollToBottomIfSticky(false);
+          injectedAny = true;
         }
-        if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+        if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+          bgPollBudget--;
           var capturedId = entry.id, capturedPlat = plat;
           var capturedEntry = entry;
           var wasStopped = false;
@@ -3896,9 +3925,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               return q.id === capturedId;
             });
             if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+            self.drainBgTaskQueue();
           });
         }
       });
+      if (injectedAny) {
+        this.host.notify();
+        this.updateHistoryCache();
+        this.host.scrollToBottomIfSticky(false);
+      }
       this.promoteNextBgQueuedToRunning();
     }
     // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
@@ -4141,12 +4176,26 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         self.updateHistoryCache();
         self.host.notify();
         if (!fetchMore) {
+          var bgAllow = {};
+          var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
+          if (bgHistBudget > 0) {
+            var bgIds = chatList.filter(function(it) {
+              if (it.status !== "running" && it.status !== "pending") return false;
+              if (!it.poll || !it.id) return false;
+              if (!(it._isBgTask || it._isOnBgQueue)) return false;
+              return !self.historyItemPolls.has(it.id);
+            }).map(function(it) {
+              return it.id;
+            }).sort();
+            for (var ba = 0; ba < bgIds.length && ba < bgHistBudget; ba++) bgAllow[bgIds[ba]] = true;
+          }
           chatList.forEach(function(item) {
             if (item.status !== "running" && item.status !== "pending") return;
             if (!item.poll || !item.id) return;
             if (self.historyItemPolls.has(item.id)) return;
             if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
             if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
+            if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
             var capturedId = item.id;
             var pp = item.poll({
               latency: POLL_INTERVAL,
@@ -4634,11 +4683,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var anchor = grp.members[0];
       grp.anchorIndex = anchor.index;
       grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
-      var sawComplete = false, sawFinal = false;
+      var sawComplete = false;
       for (var vi = 0; vi < grp.members.length; vi++) {
         var vm = grp.members[vi];
         if (vm.msg._indexComplete) sawComplete = true;
-        if (vm.msg._indexFinal) sawFinal = true;
         if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
       }
       grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
@@ -4651,11 +4699,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (grp.driver === "client") {
         grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
       } else {
-        grp.finished = sawFinal || !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+        grp.finished = !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
       }
       if (grp.status !== "done") {
         grp.resolving = false;
-      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !sawFinal && newestRunOfKey[order[oi]]) {
+      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
         grp.resolving = true;
         grp.resolvingReason = "history";
       } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
@@ -6315,6 +6363,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var refreshingLinkMap = {};
     var refreshedExpiredLinkMap = {};
     var refreshingLinkPromises = /* @__PURE__ */ new Map();
+    var unavailableLinkMap = {};
     var fileBlobCache = /* @__PURE__ */ new Map();
     var markedReady = null;
     function currentIdentity() {
@@ -6631,7 +6680,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function linkToAnchorHtml(link, allowImagePreview) {
       return renderInlineLinkHtml(link, {
         refreshing: !!refreshingLinkMap[link.expiredHref || link.href],
-        allowImagePreview
+        allowImagePreview,
+        unavailable: isLinkUnavailable(link, unavailableLinkMap)
       });
     }
     function buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6) {
@@ -6785,7 +6835,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return S.skapi.deleteRecords({ service: S.serviceId, unique_id: "src::" + storagePath }).catch(function() {
       });
     }
-    function getTemporaryUrlDb(path, expires, cdn, contentType) {
+    function getTemporaryUrlDb(path, expires, cdn, contentType, cdnWindow) {
       var body = {
         service: S.serviceId,
         owner: S.owner,
@@ -6794,7 +6844,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
         contentType: contentType || mimeGetType(path) || "application/octet-stream"
       };
-      if (cdn !== false) body.generate_temporary_cdn_url = true;
+      if (cdn !== false) {
+        body.generate_temporary_cdn_url = true;
+        if (cdnWindow) body.cdn_url_window = cdnWindow;
+      }
       return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function(res) {
         var u = typeof res === "string" ? res : res && res.url;
         if (!u) throw new Error("No temporary URL returned.");
@@ -7298,19 +7351,35 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!remotePath) return Promise.reject(new Error("Missing attachment path."));
       return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false);
     }
+    var unavailableRepaintQueued = false;
+    function markLinkUnavailable(key) {
+      if (!key || unavailableLinkMap[key]) return;
+      unavailableLinkMap[key] = true;
+      if (!refreshedLinkExpiryTimer) scheduleNextLinkExpiryBoundary();
+      if (unavailableRepaintQueued) return;
+      unavailableRepaintQueued = true;
+      setTimeout(function() {
+        unavailableRepaintQueued = false;
+        renderMessages();
+      }, 0);
+    }
     function imagePreviewCtx() {
       return {
         scope: S.serviceId || "default",
         mint: function(remotePath, contentType) {
-          return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType);
+          return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, true, contentType, CDN_PREVIEW_WINDOW_SECONDS);
         },
         // An image arriving late pushes the conversation down under the
         // viewport. Re-pin only if the user was already at the bottom.
         onLoad: function() {
           scrollToBottomIfSticky(false);
         },
+        // The mint was refused, or the url it minted would not load. Either
+        // way there is no url for this file, so the caption chip left behind
+        // must not keep offering a click that opens a dead tab.
         onError: function(path, err) {
           console.warn("[bunnyquery] image preview failed", path, err);
+          markLinkUnavailable(linkUnavailableKeyForPath(path));
         }
       };
     }
@@ -7326,6 +7395,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var refreshedLinkExpiryTimer = null;
     function expireAllRefreshedLinks() {
       for (var k in refreshedExpiredLinkMap) delete refreshedExpiredLinkMap[k];
+      for (var u in unavailableLinkMap) delete unavailableLinkMap[u];
     }
     function scheduleNextLinkExpiryBoundary() {
       if (refreshedLinkExpiryTimer) clearTimeout(refreshedLinkExpiryTimer);
@@ -7371,6 +7441,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!target) return;
       var anchor = target.closest ? target.closest("a[data-bq-link]") : null;
       if (!anchor) return;
+      if (anchor.dataset.bqUnavailable === "1") {
+        e.preventDefault();
+        return;
+      }
       if (anchor.dataset.bqExpired !== "1") return;
       e.preventDefault();
       var originalHref = anchor.dataset.bqExpiredHref || anchor.href;
@@ -7388,7 +7462,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         anchor.click();
       }).catch(function(err) {
         console.error("[bunnyquery] expired link refresh failed", err);
-        alert(err && err.message || "Failed to refresh this expired link.");
+        markLinkUnavailable(linkUnavailableKeyForHref(originalHref));
+        if (anchor.dataset.bqRemotePath) markLinkUnavailable(linkUnavailableKeyForPath(anchor.dataset.bqRemotePath));
       });
     }
     function getClearHistoryStorageKey() {
@@ -7900,6 +7975,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function renderChat() {
       clearImagePreviewCache(S.serviceId || "default");
+      for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
       CS.messages = [];
       CS.messageEls = [];
       CS.indexGroupsOpen = {};

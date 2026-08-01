@@ -554,6 +554,7 @@ var EXPIRED_ATTACHMENT_URL_HOST = "_expired_.url";
 var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
 var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
 var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
 function createInlineLinkRegex() {
   return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -797,6 +798,19 @@ function classifyInlineLink(full, groups, ctx) {
   return withTail({
     part: { type: "link", label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false }
   });
+}
+function linkUnavailableKeyForPath(remotePath) {
+  return "path:" + (remotePath || "");
+}
+function linkUnavailableKeyForHref(href) {
+  return "href:" + (href || "");
+}
+function isLinkUnavailable(link, map) {
+  if (!link || !map) return false;
+  if (link.remotePath && map[linkUnavailableKeyForPath(link.remotePath)]) return true;
+  if (link.expiredHref && map[linkUnavailableKeyForHref(link.expiredHref)]) return true;
+  if (link.href && map[linkUnavailableKeyForHref(link.href)]) return true;
+  return false;
 }
 function truncateLabelForDisplay(label) {
   if (!label) return label;
@@ -1086,26 +1100,28 @@ function escapeInlineHtml(v) {
   });
 }
 var IMAGE_PREVIEWS_PER_MESSAGE = 8;
+var INLINE_LINK_GLYPH = "\u2197";
+var INLINE_LINK_UNAVAILABLE_GLYPH = "\u2715";
+var INLINE_LINK_UNAVAILABLE_SUFFIX = " (unavailable)";
 function renderInlineLinkHtml(link, opts) {
   var o = opts || {};
-  var refreshing = !!o.refreshing;
+  var unavailable = !!o.unavailable;
+  var refreshing = !unavailable && !!o.refreshing;
   var full = link.fullLabel || link.label;
-  var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false;
+  var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false && !unavailable;
   var cls = ["bq-link-button"];
   if (link.expired) cls.push("is-expired");
   if (refreshing) cls.push("is-refreshing");
+  if (unavailable) cls.push("is-unavailable");
   if (preview) cls.push("is-image-preview");
-  var labelText = "\u2197 " + link.label + (refreshing ? " (fetching...)" : "");
-  var attrs = [
-    'class="' + cls.join(" ") + '"',
-    'href="' + escapeInlineHtml(link.href) + '"',
-    'target="_blank"',
-    'rel="noopener noreferrer"',
-    'title="' + escapeInlineHtml(full) + '"'
-  ];
-  if (!preview) attrs.push('download="' + escapeInlineHtml(full) + '"');
+  var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + " " + link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : "");
+  var attrs = ['class="' + cls.join(" ") + '"'];
+  if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
+  else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
+  attrs.push('title="' + escapeInlineHtml(unavailable ? full + INLINE_LINK_UNAVAILABLE_SUFFIX : full) + '"');
+  if (!preview && !unavailable) attrs.push('download="' + escapeInlineHtml(full) + '"');
   attrs.push('data-bq-link="1"');
-  if (link.expired) attrs.push('data-bq-expired="1"');
+  if (link.expired && !unavailable) attrs.push('data-bq-expired="1"');
   if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
   if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
   if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
@@ -1392,6 +1408,7 @@ function applyHistoryCacheBreakpoint(messages) {
   });
 }
 var POLL_INTERVAL = 3e3;
+var MAX_CONCURRENT_BG_POLLS = 6;
 async function callClaudeWithMcp({
   prompt,
   messages,
@@ -1868,7 +1885,6 @@ function mapHistoryListToMessages(list, platform, opts) {
     var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
     var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
     if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
-    var reportedFinal = !!(item && item.index_final);
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
     var createdTs = Number(item && item.created);
     var updatedTs = Number(item && item.updated);
@@ -1926,7 +1942,6 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
       if (reportedComplete) okm._indexComplete = true;
-      if (reportedFinal) okm._indexFinal = true;
       mapped.push(okm);
     }
   });
@@ -2278,6 +2293,18 @@ var ChatSession = class {
     }
     this.historyItemPolls.set(id, { kind, stop });
     return p;
+  }
+  /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
+   *  Counts the registry rather than a separate tally so it cannot drift: every
+   *  attach goes through _trackPoll and every detach deletes the entry. Note an
+   *  entry left behind by pausePolling on an older skapi-js (no stop handle)
+   *  still counts, which is correct — that poll really is still running. */
+  _countBgPolls() {
+    var n = 0;
+    this.historyItemPolls.forEach(function(handle) {
+      if (handle && handle.kind === "bg") n++;
+    });
+    return n;
   }
   /**
    * Stop and forget one item's poll. Used after a cancel: the row is either gone
@@ -3585,6 +3612,7 @@ var ChatSession = class {
     var indexRef = this._indexRefOfItem(itemId);
     this.applyHistoryItemResolution(itemId, response, platform);
     this.promoteNextBgQueuedToRunning();
+    this.drainBgTaskQueue();
     if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
   }
   /** The file an already-rendered background pass is about, off its request
@@ -3884,6 +3912,8 @@ var ChatSession = class {
       if (e.serviceId !== svcId || e.platform !== plat) continue;
       if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
     }
+    var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+    var injectedAny = false;
     this.bgTaskQueue.forEach(function(entry) {
       if (entry.serviceId !== svcId || entry.platform !== plat) return;
       if (!presentIds[entry.id]) {
@@ -3917,11 +3947,10 @@ var ChatSession = class {
           self.state.messages.splice(stageAt, 0, userBubble);
         }
         presentIds[entry.id] = true;
-        self.host.notify();
-        self.updateHistoryCache();
-        self.host.scrollToBottomIfSticky(false);
+        injectedAny = true;
       }
-      if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+      if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+        bgPollBudget--;
         var capturedId = entry.id, capturedPlat = plat;
         var capturedEntry = entry;
         var wasStopped = false;
@@ -3963,9 +3992,15 @@ var ChatSession = class {
             return q.id === capturedId;
           });
           if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+          self.drainBgTaskQueue();
         });
       }
     });
+    if (injectedAny) {
+      this.host.notify();
+      this.updateHistoryCache();
+      this.host.scrollToBottomIfSticky(false);
+    }
     this.promoteNextBgQueuedToRunning();
   }
   // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
@@ -4208,12 +4243,26 @@ var ChatSession = class {
       self.updateHistoryCache();
       self.host.notify();
       if (!fetchMore) {
+        var bgAllow = {};
+        var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
+        if (bgHistBudget > 0) {
+          var bgIds = chatList.filter(function(it) {
+            if (it.status !== "running" && it.status !== "pending") return false;
+            if (!it.poll || !it.id) return false;
+            if (!(it._isBgTask || it._isOnBgQueue)) return false;
+            return !self.historyItemPolls.has(it.id);
+          }).map(function(it) {
+            return it.id;
+          }).sort();
+          for (var ba = 0; ba < bgIds.length && ba < bgHistBudget; ba++) bgAllow[bgIds[ba]] = true;
+        }
         chatList.forEach(function(item) {
           if (item.status !== "running" && item.status !== "pending") return;
           if (!item.poll || !item.id) return;
           if (self.historyItemPolls.has(item.id)) return;
           if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
           if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
+          if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
           var capturedId = item.id;
           var pp = item.poll({
             latency: POLL_INTERVAL,
@@ -4701,11 +4750,10 @@ function buildChatDisplayList(messages, opts) {
     var anchor = grp.members[0];
     grp.anchorIndex = anchor.index;
     grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
-    var sawComplete = false, sawFinal = false;
+    var sawComplete = false;
     for (var vi = 0; vi < grp.members.length; vi++) {
       var vm = grp.members[vi];
       if (vm.msg._indexComplete) sawComplete = true;
-      if (vm.msg._indexFinal) sawFinal = true;
       if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
     }
     grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
@@ -4718,11 +4766,11 @@ function buildChatDisplayList(messages, opts) {
     } else if (grp.driver === "client") {
       grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
     } else {
-      grp.finished = sawFinal || !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+      grp.finished = !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
     }
     if (grp.status !== "done") {
       grp.resolving = false;
-    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !sawFinal && newestRunOfKey[order[oi]]) {
+    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
       grp.resolving = true;
       grp.resolvingReason = "history";
     } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
@@ -4747,6 +4795,7 @@ function buildChatDisplayList(messages, opts) {
 exports.BG_INDEXING_QUEUE_SUFFIX = BG_INDEXING_QUEUE_SUFFIX;
 exports.BOM = BOM;
 exports.BOM_EXTS = BOM_EXTS;
+exports.CDN_PREVIEW_WINDOW_SECONDS = CDN_PREVIEW_WINDOW_SECONDS;
 exports.CLAUDE_INPUT_CAP_RATIO = CLAUDE_INPUT_CAP_RATIO;
 exports.CLAUDE_PER_REQUEST_INPUT_CAP = CLAUDE_PER_REQUEST_INPUT_CAP;
 exports.CONTEXT_WINDOW_BY_MODEL = CONTEXT_WINDOW_BY_MODEL;
@@ -4766,8 +4815,12 @@ exports.HTML_EXTS = HTML_EXTS;
 exports.HTML_HEAD_WINDOW = HTML_HEAD_WINDOW;
 exports.IMAGE_PREVIEWS_PER_MESSAGE = IMAGE_PREVIEWS_PER_MESSAGE;
 exports.INDEXING_COMPLETE_MARKER = INDEXING_COMPLETE_MARKER;
+exports.INLINE_LINK_GLYPH = INLINE_LINK_GLYPH;
+exports.INLINE_LINK_UNAVAILABLE_GLYPH = INLINE_LINK_UNAVAILABLE_GLYPH;
+exports.INLINE_LINK_UNAVAILABLE_SUFFIX = INLINE_LINK_UNAVAILABLE_SUFFIX;
 exports.LINK_LABEL_MAX_DISPLAY_CHARS = LINK_LABEL_MAX_DISPLAY_CHARS;
 exports.LINK_REFRESH_WINDOW_MS = LINK_REFRESH_WINDOW_MS;
+exports.MAX_CONCURRENT_BG_POLLS = MAX_CONCURRENT_BG_POLLS;
 exports.MAX_HISTORY_FILL_PAGES = MAX_HISTORY_FILL_PAGES;
 exports.MAX_HISTORY_MESSAGES = MAX_HISTORY_MESSAGES;
 exports.MAX_PARSED_CONTENT_CHARS = MAX_PARSED_CONTENT_CHARS;
@@ -4836,11 +4889,14 @@ exports.isBgIndexingQueue = isBgIndexingQueue;
 exports.isErrorResponseBody = isErrorResponseBody;
 exports.isHttpUrlLike = isHttpUrlLike;
 exports.isIndexingRequestText = isIndexingRequestText;
+exports.isLinkUnavailable = isLinkUnavailable;
 exports.isNonRetryableRequestError = isNonRetryableRequestError;
 exports.isOfficeFile = isOfficeFile;
 exports.isPreviewableImagePath = isPreviewableImagePath;
 exports.isServerExtractable = isServerExtractable;
 exports.isServiceDbAttachmentHref = isServiceDbAttachmentHref;
+exports.linkUnavailableKeyForHref = linkUnavailableKeyForHref;
+exports.linkUnavailableKeyForPath = linkUnavailableKeyForPath;
 exports.listClaudeModels = listClaudeModels;
 exports.listOpenAIModels = listOpenAIModels;
 exports.looksLikeRtf = looksLikeRtf;

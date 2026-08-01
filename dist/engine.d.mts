@@ -481,13 +481,35 @@ declare var LINK_LABEL_MAX_DISPLAY_CHARS: number;
 /**
  * Lifetime of the url minted when a user clicks an expired attachment chip.
  *
- * Mint it as a PLAIN get-db presign, never with generate_temporary_cdn_url: the
- * cdn branch ignores `expires` entirely and hands back a url good for the rest of
- * the current UTC day plus the next one, so a "20 minute" link would in fact live
- * 24 to 48 hours. The dashboard has always done this correctly and the widget did
- * not, which is precisely the kind of divergence a shared constant exists to stop.
+ * Mint it as a PLAIN get-db presign. The cdn branch ignores `expires` and lives
+ * for its WINDOW instead, and its default window is a day, so a "20 minute" link
+ * would in fact live 24 to 48 hours. The dashboard has always done this correctly
+ * and the widget did not, which is precisely the kind of divergence a shared
+ * constant exists to stop.
+ *
+ * A presign is also the only branch that honours `contentType`, which is what
+ * decides whether the click DISPLAYS the file or downloads it.
  */
 declare var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS: number;
+/**
+ * Window to mint a browser-facing temporary CDN url against (`cdn_url_window`).
+ *
+ * Why previews use the cdn branch and clicks do not: a presign is signed with the
+ * backend Lambda's STS credentials, and every execution environment holds a
+ * different session token, so the same file yields a DIFFERENT url on every mint.
+ * The browser therefore re-downloads every image on every reload. A cdn url is a
+ * pure function of (service, path, window), so it is byte-identical for the whole
+ * window and the browser reuses its cached copy. Clicks stay on the presign
+ * because only that branch honours `contentType`; an <img> sniffs the bytes and
+ * does not need it.
+ *
+ * MUST be a window get_signed_url allowlists (see TEMPORARY_CDN_WINDOWS) or the
+ * mint is rejected outright. It deliberately equals the presign TTL above, so the
+ * floor on a cdn url's life is the same 20 minutes, which keeps the one invariant
+ * that matters: the window has to outlast LINK_REFRESH_WINDOW_MS below, or a
+ * cached href outlives the url it points at.
+ */
+declare var CDN_PREVIEW_WINDOW_SECONDS: number;
 /**
  * How long a client may keep serving an href it already minted before dropping
  * back to the placeholder and re-minting.
@@ -637,6 +659,28 @@ declare function classifyInlineLink(full: string, groups: Array<string | undefin
     part: InlineLinkPart;
     tail?: string;
 } | null;
+/**
+ * "We asked for a url for this file and did not get one."
+ *
+ * A chip the client cannot mint a url for is not a link: the ↗ is a promise it
+ * already knows it cannot keep, and clicking it opens a dead tab or nothing at
+ * all. Both views therefore keep a map of failures and render those chips
+ * unavailable (renderInlineLinkHtml's `unavailable` option): greyed, ✕ instead
+ * of ↗, no href.
+ *
+ * The MAP lives in the view (agent.vue has to re-render when it changes, and
+ * that means a ref), so only the keys are here. A failure is reported with
+ * exactly one identifier (an image preview knows the storage path, a click knows
+ * the placeholder href), so marking writes one key and the lookup tries all of
+ * them.
+ */
+declare function linkUnavailableKeyForPath(remotePath: string): string;
+declare function linkUnavailableKeyForHref(href: string): string;
+declare function isLinkUnavailable(link: {
+    href?: string;
+    expiredHref?: string;
+    remotePath?: string;
+} | null | undefined, map: Record<string, boolean | undefined> | null | undefined): boolean;
 declare function truncateLabelForDisplay(label: string): string;
 
 /**
@@ -660,6 +704,15 @@ declare function escapeInlineHtml(v: string | null | undefined): string;
  * many the link renders as the ordinary text chip.
  */
 declare var IMAGE_PREVIEWS_PER_MESSAGE: number;
+/**
+ * The glyph IS the promise: ↗ says "click this and the file opens". When the
+ * client could not get a url for the file, keeping that glyph on a chip it knows
+ * is dead is the bug: the click either opens a tab on a 403/404 or, once the
+ * href is gone, does nothing at all with no explanation. ✕ says what happened.
+ */
+declare var INLINE_LINK_GLYPH: string;
+declare var INLINE_LINK_UNAVAILABLE_GLYPH: string;
+declare var INLINE_LINK_UNAVAILABLE_SUFFIX: string;
 /** Widened so each client's local link-part type is assignable. */
 interface RenderableInlineLink {
     label: string;
@@ -678,6 +731,11 @@ interface InlineLinkMarkupOptions {
     refreshing?: boolean;
     /** False once the caller has spent its per-message preview budget. */
     allowImagePreview?: boolean;
+    /**
+     * The view already tried to get a url for this file and failed (see
+     * isLinkUnavailable). Renders a dead chip: ✕, greyed, no href.
+     */
+    unavailable?: boolean;
 }
 declare function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLinkMarkupOptions): string;
 
@@ -988,6 +1046,7 @@ type CallClaudeWithMcpParams = {
     onError?: (err: any) => void;
 };
 declare const POLL_INTERVAL = 3000;
+declare const MAX_CONCURRENT_BG_POLLS = 6;
 declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, }: CallClaudeWithMcpParams): Promise<any>;
 declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void): Promise<any>;
 declare function callOpenAIWithPublicMcp(prompt: string, service: string, owner: string, messages?: OpenAIMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void): Promise<any>;
@@ -1186,11 +1245,6 @@ interface ChatMessage {
      *  never asks for the marker, so a model that emits one there is guessing —
      *  which is how an 88-page file once "finished" at page 15. */
     _indexComplete?: boolean;
-    /** Set on a background-indexing RESPONSE bubble the SERVER marked as its run's
-     *  last pass. The only completion fact a worker-driven chain can state, and the
-     *  only one that survives a reload. Absent until the backend stamps it; the
-     *  display layer treats absence as "not known", never as "not finished". */
-    _indexFinal?: boolean;
     _useBgQueue?: boolean;
     /** Local id of a turn STAGED at Send time while its attachments upload. The
      *  bubble exists before any server request does, so it is never matched by
@@ -1724,6 +1778,12 @@ declare class ChatSession {
      * poll simply cannot be stopped and is left running — see pausePolling.
      */
     private _trackPoll;
+    /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
+     *  Counts the registry rather than a separate tally so it cannot drift: every
+     *  attach goes through _trackPoll and every detach deletes the entry. Note an
+     *  entry left behind by pausePolling on an older skapi-js (no stop handle)
+     *  still counts, which is correct — that poll really is still running. */
+    private _countBgPolls;
     /**
      * Stop and forget one item's poll. Used after a cancel: the row is either gone
      * (cancelled while queued) or flagged cancelled (cancelled while running), so
@@ -2019,4 +2079,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CDN_PREVIEW_WINDOW_SECONDS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };

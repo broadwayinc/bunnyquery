@@ -115,9 +115,6 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText &&
 			assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
 		if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join('').trim();
-		// Server's own "this was the run's last pass". Read defensively: it is absent
-		// until the backend stamps it, and absent must read as "not known".
-		var reportedFinal = !!(item && (item as any).index_final);
 		var serverItemId = item && typeof item.id === 'string' && item.id ? item.id : undefined;
 		// A USER bubble shows when the request was made (`created`); an ASSISTANT
 		// bubble shows when its response landed (`updated`). Fall back to the other
@@ -190,7 +187,6 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
 			if (reportedComplete) okm._indexComplete = true;
-			if (reportedFinal) okm._indexFinal = true;
 			mapped.push(okm);
 		}
 	});

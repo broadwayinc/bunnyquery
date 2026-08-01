@@ -88,11 +88,6 @@ export interface ChatMessage {
 	 *  never asks for the marker, so a model that emits one there is guessing —
 	 *  which is how an 88-page file once "finished" at page 15. */
 	_indexComplete?: boolean;
-	/** Set on a background-indexing RESPONSE bubble the SERVER marked as its run's
-	 *  last pass. The only completion fact a worker-driven chain can state, and the
-	 *  only one that survives a reload. Absent until the backend stamps it; the
-	 *  display layer treats absence as "not known", never as "not finished". */
-	_indexFinal?: boolean;
 	_useBgQueue?: boolean;
 	/** Local id of a turn STAGED at Send time while its attachments upload. The
 	 *  bubble exists before any server request does, so it is never matched by

@@ -1297,6 +1297,17 @@
 /* While the temporary URL is being re-resolved the click is swallowed — show a
    busy cursor and dim it so it reads as "working, don't click again". */
 .bq-link-button.is-refreshing { cursor: progress; opacity: 0.6; }
+/* The client asked for a url for this file and did not get one, so the chip is
+   emitted with NO href (it cannot navigate) and with ✕ in place of ↗. Paint it
+   as the dead text it now is: muted, no underline, default cursor, and no hover
+   response, since the base rule above still fires on hover and would otherwise
+   promising a link. */
+.bq-link-button.is-unavailable,
+.bq-link-button.is-unavailable:hover {
+    color: var(--bq-muted);
+    text-decoration: none;
+    cursor: default;
+}
 
 /* ---- inline image previews ----------------------------------------------*/
 /* The anchor IS the preview: picture on top, the ordinary chip underneath as a

@@ -29,6 +29,7 @@ import {
 	extractOpenAIText,
 	getChatHistory,
 	POLL_INTERVAL,
+	MAX_CONCURRENT_BG_POLLS,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
 	ANTHROPIC_MESSAGES_API_URL,
@@ -387,6 +388,19 @@ export class ChatSession {
 		}
 		this.historyItemPolls.set(id, { kind: kind, stop: stop });
 		return p;
+	}
+
+	/** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
+	 *  Counts the registry rather than a separate tally so it cannot drift: every
+	 *  attach goes through _trackPoll and every detach deletes the entry. Note an
+	 *  entry left behind by pausePolling on an older skapi-js (no stop handle)
+	 *  still counts, which is correct — that poll really is still running. */
+	private _countBgPolls(): number {
+		var n = 0;
+		this.historyItemPolls.forEach(function (handle) {
+			if (handle && handle.kind === 'bg') n++;
+		});
+		return n;
 	}
 
 	/**
@@ -1886,6 +1900,11 @@ export class ChatSession {
 		var indexRef = this._indexRefOfItem(itemId);
 		this.applyHistoryItemResolution(itemId, response, platform);
 		this.promoteNextBgQueuedToRunning();
+		// applyHistoryItemResolution just released this item's poll slot. Under
+		// MAX_CONCURRENT_BG_POLLS that slot is what the next-oldest unpolled entry
+		// is waiting for, and every settling turn funnels through here — including
+		// the history poll, whose resolution has no other path back to the drain.
+		this.drainBgTaskQueue();
 		// A worker-driven chain has no client-side record of its next pass, so a
 		// settling pass is the only moment there is to go looking for one.
 		if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
@@ -2286,6 +2305,15 @@ export class ChatSession {
 			if (e.serviceId !== svcId || e.platform !== plat) continue;
 			if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
 		}
+		// Poll budget for this drain (see MAX_CONCURRENT_BG_POLLS). bgTaskQueue is
+		// in push order, i.e. oldest first, which is also the order the server
+		// settles them in — so spending the budget from the front spends it on the
+		// only entries that can resolve next. Bubbles are still injected for EVERY
+		// entry; only the polling is rationed, and an unpolled entry picks up a
+		// poll on the drain that follows the next resolution.
+		var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+		// Set by the injection branch; drives the single render/cache/scroll below.
+		var injectedAny = false;
 		this.bgTaskQueue.forEach(function (entry) {
 			if (entry.serviceId !== svcId || entry.platform !== plat) return;
 			// Bubble injection and poll attachment are INDEPENDENT. An entry whose bubble
@@ -2343,9 +2371,18 @@ export class ChatSession {
 				self.state.messages.splice(stageAt, 0, userBubble);
 			}
 			presentIds[entry.id] = true; // keep the index consistent with the pushed bubbles
-			self.host.notify(); self.updateHistoryCache(); self.host.scrollToBottomIfSticky(false);
+			// Render/cache/scroll are hoisted OUT of this loop (see injectedAny below).
+			// They used to run per injected entry, and updateHistoryCache filters the
+			// whole of state.messages into a fresh array each call — so a bulk upload
+			// injecting one bubble per file did O(files x messages) element visits and
+			// left one throwaway array per file for the GC. In the widget it was worse
+			// still: its notify() is a full DOM re-render of the message list. The end
+			// state is identical either way; only the discarded intermediate renders
+			// are gone.
+			injectedAny = true;
 			}
-			if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
+			if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
+				bgPollBudget--;
 				var capturedId = entry.id, capturedPlat = plat;
 				var capturedEntry = entry;
 				var wasStopped = false;
@@ -2398,9 +2435,23 @@ export class ChatSession {
 					if (wasStopped) return;
 					var qi = self.bgTaskQueue.findIndex(function (q) { return q.id === capturedId; });
 					if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+					// This resolution freed a slot in the MAX_CONCURRENT_BG_POLLS budget,
+					// so hand it to the next-oldest unpolled entry. Load-bearing under the
+					// cap: with thousands of entries queued, only the handful holding
+					// polls can ever settle, and without this re-drain the remaining
+					// entries would sit unpolled forever. Not left to a host-side watcher
+					// on bgTaskQueue — agent.vue has one, the widget does not.
+					self.drainBgTaskQueue();
 				});
 			}
 		});
+		// One render, one cache write, one scroll for the whole drain — however many
+		// bubbles it injected. See the injectedAny comment above.
+		if (injectedAny) {
+			this.host.notify();
+			this.updateHistoryCache();
+			this.host.scrollToBottomIfSticky(false);
+		}
 		this.promoteNextBgQueuedToRunning();
 	}
 
@@ -2688,6 +2739,25 @@ export class ChatSession {
 			self.host.notify();
 
 			if (!fetchMore) {
+				// Ration BACKGROUND polls here exactly as the drain does (see
+				// MAX_CONCURRENT_BG_POLLS); foreground items — a reply the user is
+				// waiting on — are never rationed. The allow-set is taken from the
+				// OLDEST bg items: ids sort with newest largest (the same ordering the
+				// older-page merge above relies on) and the server settles a queue
+				// FIFO, so the oldest are the only ones that can resolve next. Taking
+				// the newest instead would wedge the batch — they cannot settle until
+				// everything ahead of them has, and nothing ahead would hold a poll.
+				var bgAllow: { [id: string]: boolean } = {};
+				var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
+				if (bgHistBudget > 0) {
+					var bgIds = chatList.filter(function (it: any) {
+						if (it.status !== 'running' && it.status !== 'pending') return false;
+						if (!it.poll || !it.id) return false;
+						if (!(it._isBgTask || it._isOnBgQueue)) return false;
+						return !self.historyItemPolls.has(it.id);
+					}).map(function (it: any) { return it.id as string; }).sort();
+					for (var ba = 0; ba < bgIds.length && ba < bgHistBudget; ba++) bgAllow[bgIds[ba]] = true;
+				}
 				chatList.forEach(function (item: any) {
 					if (item.status !== 'running' && item.status !== 'pending') return;
 					if (!item.poll || !item.id) return;
@@ -2716,6 +2786,9 @@ export class ChatSession {
 					// Background indexing polls are suppressed while paused; foreground
 					// replies the user is waiting on are not.
 					if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
+					// Over the bg poll budget: leave this one unpolled. The drain picks
+					// it up once an attached poll settles and frees a slot.
+					if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
 					var capturedId = item.id;
 					var pp = item.poll({
 						latency: POLL_INTERVAL,

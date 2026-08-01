@@ -300,6 +300,28 @@ export type CallClaudeWithMcpParams = {
 // engine's own poll sites and imported by agent.vue; the widget carries its own
 // copy in src/index.js that must be kept in step.
 export const POLL_INTERVAL = 3000;
+// Ceiling on how many BACKGROUND indexing polls may be attached at once, across
+// every poll site (the engine's drain, the engine's history load, and each
+// client's own fallback poller).
+//
+// Every unresolved bg item used to get its own poll, and a poll is a
+// POLL_INTERVAL setInterval firing one request per tick. A bulk upload from the
+// db-files page enqueues one indexing pass per FILE, so uploading 10,000 files
+// attached 10,000 concurrent intervals: ~3,300 requests/second against a browser
+// that opens six connections per host. The resulting request backlog starved the
+// uploads themselves, which is the "frozen tab that eventually finishes" users
+// reported.
+//
+// Capping costs nothing, because the server settles one queue's passes in FIFO
+// order (a single SQS MessageGroupId per `<user>-bg` queue). A pass cannot
+// finish before the ones ahead of it, so asking about the newest 9,994 is pure
+// waste. Each resolution frees a slot, which the next-OLDEST unpolled entry
+// takes on the drain that follows. Spending the budget oldest-first is
+// load-bearing: spend it on the newest and the batch wedges, since those cannot
+// settle until the ones ahead of them do and nothing ahead would hold a poll.
+//
+// FOREGROUND polls (a reply the user is actively waiting on) are never capped.
+export const MAX_CONCURRENT_BG_POLLS = 6;
 export async function callClaudeWithMcp({
 	prompt,
 	messages,

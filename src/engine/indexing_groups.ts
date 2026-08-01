@@ -520,11 +520,10 @@ export function buildChatDisplayList(
 		grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || '';
 
 		// --- what an expanded row renders, and whether the run is over -------------
-		var sawComplete = false, sawFinal = false;
+		var sawComplete = false;
 		for (var vi = 0; vi < grp.members.length; vi++) {
 			var vm = grp.members[vi];
 			if (vm.msg._indexComplete) sawComplete = true;
-			if (vm.msg._indexFinal) sawFinal = true;
 			if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
 		}
 		// Mirrors ChatSession.maybeResumeIndexing's own routing, which is what makes
@@ -561,7 +560,14 @@ export function buildChatDisplayList(
 			// A run that is NOT the newest of its file is over by construction: a newer
 			// run exists, so this one's chain ended when that one began, and the
 			// file-keyed queue answer describes the newer run, not this one.
-			grp.finished = sawFinal || !newestRunOfKey[order[oi]] ||
+			//
+			// There used to be a third disjunct here, a server-stamped "this was the
+			// run's last pass" (`_indexFinal`, off an `index_final` field). Nothing ever
+			// wrote that field — not the SDK's history mapper, not the worker — so it was
+			// permanently false and the two tests below were already carrying the whole
+			// decision. It is gone rather than left as a hook, so this reads as what it
+			// actually is: for a worker-driven run, ONLY the queue can say it is over.
+			grp.finished = !newestRunOfKey[order[oi]] ||
 				(liveIndexChecked && !liveIndexKeys[grp.key]);
 		}
 
@@ -577,20 +583,20 @@ export function buildChatDisplayList(
 			// newest pass's own outcome, and newest-first paging always has that pass.
 			grp.resolving = false;
 		} else if (grp.mayHaveOlder && loadingOlderHistory &&
-			!liveIndexKeys[grp.key] && !sawFinal && newestRunOfKey[order[oi]]) {
+			!liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
 			// The line this draws, and it is the same line the 'status' branch draws:
 			// withhold what is UNKNOWN, and what is only INFERRED settled. Never
-			// withhold what is PROVEN, in either direction. Three proofs, and an older
-			// page can revise none of them:
+			// withhold what is PROVEN, in either direction. Two proofs, and an older
+			// page can revise neither:
 			//   liveIndexKeys hit — the server just said this file is on the queue RIGHT
 			//     NOW. Yellow and spinning, and no amount of older history makes that
 			//     untrue. (Survives an unanswered `checked` for the reason above: only
 			//     ABSENCE needs the truncation guard.)
-			//   sawFinal — the server marked a loaded pass as the last one. A prepend
-			//     cannot unmark it.
 			//   not the newest run of this file — a LATER run exists in the loaded
 			//     messages, so this run's chain ended when that one began. Prepending
 			//     adds OLDER messages, so it can never add a run after this one.
+			// (A third proof used to sit here, a server-stamped last-pass flag, but
+			// nothing ever wrote the field it read — see `finished` above.)
 			//
 			// What is deliberately NOT proof here: `finished` as a whole. Its remaining
 			// source is `liveIndexChecked && !liveIndexKeys[key]`, which is an inference

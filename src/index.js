@@ -56,6 +56,11 @@ import {
     buildDisplayExpiredAttachmentHref,
     getExpiredAttachmentVisiblePath,
     truncateLabelForDisplay,
+    // A file whose url could not be minted: shared keys so this chip reads the
+    // same here and in agent.vue.
+    isLinkUnavailable,
+    linkUnavailableKeyForPath,
+    linkUnavailableKeyForHref,
     isHttpUrlLike,
     repairUrlWhitespace,
     classifyInlineLink,
@@ -73,6 +78,7 @@ import {
     extOf,
     EXT_CONTENT_TYPES,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
+    CDN_PREVIEW_WINDOW_SECONDS,
     LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
@@ -1616,6 +1622,11 @@ import {
     var refreshingLinkMap = {};
     var refreshedExpiredLinkMap = {};
     var refreshingLinkPromises = new Map();
+    // Files we asked for a url for and did not get one: a failed mint (click or
+    // image preview) or a preview whose minted url would not load. Keyed by the
+    // engine's linkUnavailableKeyFor* so a failure reported with a storage path
+    // and one reported with a placeholder href both find their chip.
+    var unavailableLinkMap = {};
     var fileBlobCache = new Map();
     var markedReady = null;
 
@@ -1977,6 +1988,7 @@ import {
         return renderInlineLinkHtml(link, {
             refreshing: !!refreshingLinkMap[link.expiredHref || link.href],
             allowImagePreview: allowImagePreview,
+            unavailable: isLinkUnavailable(link, unavailableLinkMap),
         });
     }
     // Classification is the ENGINE's (classifyInlineLink): what a link IS must
@@ -2164,15 +2176,21 @@ import {
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
     // https://db.<hostDomain>/.
     // `cdn` picks the branch DELIBERATELY. A generate_temporary_cdn_url url
-    // ignores `expires` entirely and lives until the end of the next UTC day
-    // (24-48h); a plain get-db presign honours `expires` to the second. Passing
-    // the flag while also passing a short `expires` is the trap: it reads as a
-    // 10 minute url and behaves as a two day one.
-    // `contentType` overrides the extension guess. It is what decides whether a
-    // new tab DISPLAYS the file or downloads it: get_signed_url only sets
-    // ResponseContentType when we pass one, and application/octet-stream always
-    // downloads. The image preview passes the type the engine classified.
-    function getTemporaryUrlDb(path, expires, cdn, contentType) {
+    // ignores `expires` and lives for its WINDOW instead; a plain get-db presign
+    // honours `expires` to the second. Passing the flag while also passing a short
+    // `expires` is the trap: with the default (day) window it reads as a 10 minute
+    // url and behaves as a two day one.
+    // `cdnWindow` (seconds) picks that window, and only a value get_signed_url
+    // allowlists is accepted: the mint FAILS on anything else rather than quietly
+    // handing back a day url. Omit it and the backend keeps the day default, which
+    // is what the attachment urls handed to the indexing queue need, since those
+    // can wait hours in the FIFO before the worker fetches them.
+    // `contentType` overrides the extension guess and applies to the PRESIGN
+    // branch only. It is what decides whether a new tab DISPLAYS the file or
+    // downloads it: get_signed_url only sets ResponseContentType when we pass one,
+    // and application/octet-stream always downloads. A cdn url has no such
+    // override and serves the object's stored type.
+    function getTemporaryUrlDb(path, expires, cdn, contentType, cdnWindow) {
         var body = {
             service: S.serviceId,
             owner: S.owner,
@@ -2181,7 +2199,10 @@ import {
             expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
             contentType: contentType || mimeGetType(path) || "application/octet-stream",
         };
-        if (cdn !== false) body.generate_temporary_cdn_url = true;
+        if (cdn !== false) {
+            body.generate_temporary_cdn_url = true;
+            if (cdnWindow) body.cdn_url_window = cdnWindow;
+        }
         return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function (res) {
             var u = typeof res === "string" ? res : (res && res.url);
             if (!u) throw new Error("No temporary URL returned.");
@@ -2670,19 +2691,50 @@ import {
         return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false);
     }
 
-    // Inline image previews. The mint is the same plain presign the link chips
-    // use, with the content type the engine classified so the url a click opens
-    // DISPLAYS the picture instead of downloading it.
+    // A url for this file could not be produced, so every chip for it stops
+    // pretending to be a link: ✕ instead of ↗, greyed, no href and no click.
+    //
+    // The re-render is coalesced because the trigger is per-IMAGE: a reply
+    // listing a folder of deleted pictures reports one failure per preview, and
+    // renderMessages rebuilds every bubble in the list. Marking is idempotent, so
+    // the repaint only happens for keys that are actually new.
+    var unavailableRepaintQueued = false;
+    function markLinkUnavailable(key) {
+        if (!key || unavailableLinkMap[key]) return;
+        unavailableLinkMap[key] = true;
+        // Nothing has necessarily minted successfully yet, so the boundary timer
+        // that clears this map may not be running.
+        if (!refreshedLinkExpiryTimer) scheduleNextLinkExpiryBoundary();
+        if (unavailableRepaintQueued) return;
+        unavailableRepaintQueued = true;
+        setTimeout(function () { unavailableRepaintQueued = false; renderMessages(); }, 0);
+    }
+
+    // Inline image previews. Unlike the link chips, these mint a WINDOWED CDN url:
+    // a presign is signed with the backend Lambda's per-container STS credentials,
+    // so every mint returns a different url and the browser re-downloads every
+    // image on every reload. A cdn url is byte-identical for its whole window, so
+    // the cache actually hits. See CDN_PREVIEW_WINDOW_SECONDS.
+    //
+    // contentType is still passed for the presign fallback path, but a cdn url
+    // serves the object's STORED content type. That is fine for an <img>, which
+    // sniffs the bytes; the chip underneath still opens through the presign.
     function imagePreviewCtx() {
         return {
             scope: S.serviceId || "default",
             mint: function (remotePath, contentType) {
-                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType);
+                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, true, contentType, CDN_PREVIEW_WINDOW_SECONDS);
             },
             // An image arriving late pushes the conversation down under the
             // viewport. Re-pin only if the user was already at the bottom.
             onLoad: function () { scrollToBottomIfSticky(false); },
-            onError: function (path, err) { console.warn("[bunnyquery] image preview failed", path, err); },
+            // The mint was refused, or the url it minted would not load. Either
+            // way there is no url for this file, so the caption chip left behind
+            // must not keep offering a click that opens a dead tab.
+            onError: function (path, err) {
+                console.warn("[bunnyquery] image preview failed", path, err);
+                markLinkUnavailable(linkUnavailableKeyForPath(path));
+            },
         };
     }
     function hydrateMessageImagePreviews() {
@@ -2703,6 +2755,11 @@ import {
     var refreshedLinkExpiryTimer = null;
     function expireAllRefreshedLinks() {
         for (var k in refreshedExpiredLinkMap) delete refreshedExpiredLinkMap[k];
+        // Failures expire on the same boundary. A mint can fail because the file
+        // is gone, but it can also fail because the network blinked, and a chip
+        // greyed out by a five-second outage that stays grey for the life of the
+        // page is its own bug. The boundary already re-renders.
+        for (var u in unavailableLinkMap) delete unavailableLinkMap[u];
     }
     function scheduleNextLinkExpiryBoundary() {
         if (refreshedLinkExpiryTimer) clearTimeout(refreshedLinkExpiryTimer);
@@ -2738,6 +2795,10 @@ import {
         if (!target) return;
         var anchor = target.closest ? target.closest("a[data-bq-link]") : null;
         if (!anchor) return;
+        // A chip we already failed to mint a url for carries no href and no
+        // `data-bq-expired`, so it cannot navigate and cannot ask for another
+        // mint. Swallowing the click keeps a stray listener from reviving it.
+        if (anchor.dataset.bqUnavailable === "1") { e.preventDefault(); return; }
         if (anchor.dataset.bqExpired !== "1") return;
         e.preventDefault();
         var originalHref = anchor.dataset.bqExpiredHref || anchor.href;
@@ -2752,7 +2813,11 @@ import {
             anchor.href = fresh; anchor.dataset.bqExpired = "0"; anchor.click();
         }).catch(function (err) {
             console.error("[bunnyquery] expired link refresh failed", err);
-            alert((err && err.message) || "Failed to refresh this expired link.");
+            // The chip itself is the message now: it turns grey and takes a ✕,
+            // which survives past the moment an alert would have been dismissed
+            // and does not interrupt whatever else the user was doing.
+            markLinkUnavailable(linkUnavailableKeyForHref(originalHref));
+            if (anchor.dataset.bqRemotePath) markLinkUnavailable(linkUnavailableKeyForPath(anchor.dataset.bqRemotePath));
         });
     }
 
@@ -3472,6 +3537,9 @@ import {
         // Preview urls are keyed by project, and an identity-blind cache is how
         // one project's content has reached another project's chat before.
         clearImagePreviewCache(S.serviceId || "default");
+        // Same reason, and the same blast radius: a "this file has no url" mark
+        // is keyed by a project-relative storage path.
+        for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";

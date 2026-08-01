@@ -13,13 +13,36 @@ export var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 /**
  * Lifetime of the url minted when a user clicks an expired attachment chip.
  *
- * Mint it as a PLAIN get-db presign, never with generate_temporary_cdn_url: the
- * cdn branch ignores `expires` entirely and hands back a url good for the rest of
- * the current UTC day plus the next one, so a "20 minute" link would in fact live
- * 24 to 48 hours. The dashboard has always done this correctly and the widget did
- * not, which is precisely the kind of divergence a shared constant exists to stop.
+ * Mint it as a PLAIN get-db presign. The cdn branch ignores `expires` and lives
+ * for its WINDOW instead, and its default window is a day, so a "20 minute" link
+ * would in fact live 24 to 48 hours. The dashboard has always done this correctly
+ * and the widget did not, which is precisely the kind of divergence a shared
+ * constant exists to stop.
+ *
+ * A presign is also the only branch that honours `contentType`, which is what
+ * decides whether the click DISPLAYS the file or downloads it.
  */
 export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+
+/**
+ * Window to mint a browser-facing temporary CDN url against (`cdn_url_window`).
+ *
+ * Why previews use the cdn branch and clicks do not: a presign is signed with the
+ * backend Lambda's STS credentials, and every execution environment holds a
+ * different session token, so the same file yields a DIFFERENT url on every mint.
+ * The browser therefore re-downloads every image on every reload. A cdn url is a
+ * pure function of (service, path, window), so it is byte-identical for the whole
+ * window and the browser reuses its cached copy. Clicks stay on the presign
+ * because only that branch honours `contentType`; an <img> sniffs the bytes and
+ * does not need it.
+ *
+ * MUST be a window get_signed_url allowlists (see TEMPORARY_CDN_WINDOWS) or the
+ * mint is rejected outright. It deliberately equals the presign TTL above, so the
+ * floor on a cdn url's life is the same 20 minutes, which keeps the one invariant
+ * that matters: the window has to outlast LINK_REFRESH_WINDOW_MS below, or a
+ * cached href outlives the url it points at.
+ */
+export var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
 
 /**
  * How long a client may keep serving an href it already minted before dropping
@@ -485,6 +508,40 @@ export function classifyInlineLink(
 	return withTail({
 		part: { type: 'link', label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false },
 	});
+}
+
+/**
+ * "We asked for a url for this file and did not get one."
+ *
+ * A chip the client cannot mint a url for is not a link: the ↗ is a promise it
+ * already knows it cannot keep, and clicking it opens a dead tab or nothing at
+ * all. Both views therefore keep a map of failures and render those chips
+ * unavailable (renderInlineLinkHtml's `unavailable` option): greyed, ✕ instead
+ * of ↗, no href.
+ *
+ * The MAP lives in the view (agent.vue has to re-render when it changes, and
+ * that means a ref), so only the keys are here. A failure is reported with
+ * exactly one identifier (an image preview knows the storage path, a click knows
+ * the placeholder href), so marking writes one key and the lookup tries all of
+ * them.
+ */
+export function linkUnavailableKeyForPath(remotePath: string): string {
+	return 'path:' + (remotePath || '');
+}
+
+export function linkUnavailableKeyForHref(href: string): string {
+	return 'href:' + (href || '');
+}
+
+export function isLinkUnavailable(
+	link: { href?: string; expiredHref?: string; remotePath?: string } | null | undefined,
+	map: Record<string, boolean | undefined> | null | undefined,
+): boolean {
+	if (!link || !map) return false;
+	if (link.remotePath && map[linkUnavailableKeyForPath(link.remotePath)]) return true;
+	if (link.expiredHref && map[linkUnavailableKeyForHref(link.expiredHref)]) return true;
+	if (link.href && map[linkUnavailableKeyForHref(link.href)]) return true;
+	return false;
 }
 
 export function truncateLabelForDisplay(label: string): string {
