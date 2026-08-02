@@ -41,6 +41,7 @@ import { windowedIndexingEnabled } from './config';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
+import { markImagePreviewStale } from './image_preview';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
@@ -2917,7 +2918,16 @@ export class ChatSession {
 					var isExists = code === 'EXISTS' || (msg && /exist/i.test(msg));
 					if (!isExists) throw err; // a member upload failed → whole attachment fails (red)
 					return self.host.promptOverwrite(member.file.name).then(function (choice) {
-						if (choice === 'overwrite') { existedBefore = true; return doMemberUpload(false); } // replace the existing file
+						if (choice === 'overwrite') {
+							existedBefore = true;
+							// The bytes at this path are about to change while the
+							// path itself does not, so the browser-cached mint for
+							// it would keep handing back the old signed url and the
+							// old cached body. This is the one place that knows,
+							// so it marks the path for a refreshed mint.
+							markImagePreviewStale(self.host.getIdentity().serviceId || 'default', member.storagePath);
+							return doMemberUpload(false); // replace the existing file
+						}
 						if (choice === 'skip') { skipped = true; return; } // leave it untouched; no upload/index
 						hadExists = true; existedBefore = true; // keep it; Reindex
 					});

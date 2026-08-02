@@ -13,36 +13,34 @@ export var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 /**
  * Lifetime of the url minted when a user clicks an expired attachment chip.
  *
- * Mint it as a PLAIN get-db presign. The cdn branch ignores `expires` and lives
- * for its WINDOW instead, and its default window is a day, so a "20 minute" link
- * would in fact live 24 to 48 hours. The dashboard has always done this correctly
- * and the widget did not, which is precisely the kind of divergence a shared
- * constant exists to stop.
- *
- * A presign is also the only branch that honours `contentType`, which is what
- * decides whether the click DISPLAYS the file or downloads it.
+ * Mint it as a PLAIN get-db presign, never with generate_temporary_cdn_url: the
+ * cdn branch ignores `expires` entirely and hands back a url good for the rest of
+ * the current UTC day plus the next one, so a "20 minute" link would in fact live
+ * 24 to 48 hours. The dashboard has always done this correctly and the widget did
+ * not, which is precisely the kind of divergence a shared constant exists to stop.
  */
 export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
 
 /**
- * Window to mint a browser-facing temporary CDN url against (`cdn_url_window`).
+ * Seconds the browser may reuse a minted preview url (`browser_cache`).
  *
- * Why previews use the cdn branch and clicks do not: a presign is signed with the
- * backend Lambda's STS credentials, and every execution environment holds a
- * different session token, so the same file yields a DIFFERENT url on every mint.
- * The browser therefore re-downloads every image on every reload. A cdn url is a
- * pure function of (service, path, window), so it is byte-identical for the whole
- * window and the browser reuses its cached copy. Clicks stay on the presign
- * because only that branch honours `contentType`; an <img> sniffs the bytes and
- * does not need it.
+ * A presigned url is a fresh SigV4 query string on every mint, so it can never
+ * be a browser cache key on its own and every reload re-downloads every image.
+ * Asking for the MINT with a cacheable GET fixes it from the other end: the same
+ * url comes back out of the browser cache, so the body already on disk stays
+ * addressable.
  *
- * MUST be a window get_signed_url allowlists (see TEMPORARY_CDN_WINDOWS) or the
- * mint is rejected outright. It deliberately equals the presign TTL above, so the
- * floor on a cdn url's life is the same 20 minutes, which keeps the one invariant
- * that matters: the window has to outlast LINK_REFRESH_WINDOW_MS below, or a
- * cached href outlives the url it points at.
+ * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
+ * that is the whole trick: the url is short-lived while the file stays available
+ * locally for a day. What keeps an image painting is the cached BODY, not a live
+ * url. Once the browser evicts that body it refetches with a url that has since
+ * expired, gets a 403, and the error path re-mints with `refresh`. That path is
+ * therefore load-bearing, not a rare fallback.
+ *
+ * Applies to previews only. A CLICK must open a live url, so the chip refresh
+ * stays on an uncached POST mint.
  */
-export var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
+export var PREVIEW_BROWSER_CACHE_SECONDS = 24 * 60 * 60;
 
 /**
  * How long a client may keep serving an href it already minted before dropping

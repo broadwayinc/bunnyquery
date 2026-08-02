@@ -548,7 +548,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
   var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
   var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
-  var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
+  var PREVIEW_BROWSER_CACHE_SECONDS = 24 * 60 * 60;
   var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
   function createInlineLinkRegex() {
     return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -1113,29 +1113,47 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var prefix = scope + "\0";
     for (var k in previewUrlCache) if (k.indexOf(prefix) === 0) delete previewUrlCache[k];
     for (var f in previewInFlight) if (f.indexOf(prefix) === 0) delete previewInFlight[f];
+    for (var s in staleImagePreviews) if (s.indexOf(prefix) === 0) delete staleImagePreviews[s];
   }
   function peekImagePreviewUrl(ctx, remotePath) {
     var hit = previewUrlCache[cacheKey(ctx.scope, remotePath)];
     if (hit && Date.now() - hit.at < LINK_REFRESH_WINDOW_MS) return hit.url;
     return null;
   }
-  function resolveImagePreviewUrl(ctx, remotePath, contentType) {
-    var warm = peekImagePreviewUrl(ctx, remotePath);
-    if (warm) return Promise.resolve(warm);
+  function resolveImagePreviewUrl(ctx, remotePath, contentType, refresh) {
     var key = cacheKey(ctx.scope, remotePath);
-    var flight = previewInFlight[key];
-    if (flight) return flight;
-    var run = ctx.mint(remotePath, contentType).then(function(url) {
-      previewUrlCache[key] = { url, at: Date.now() };
+    if (staleImagePreviews[key]) {
+      delete staleImagePreviews[key];
+      refresh = true;
+    }
+    if (refresh) {
+      delete previewUrlCache[key];
       delete previewInFlight[key];
+    } else {
+      var warm = peekImagePreviewUrl(ctx, remotePath);
+      if (warm) return Promise.resolve(warm);
+      var flight = previewInFlight[key];
+      if (flight) return flight;
+    }
+    var run = ctx.mint(remotePath, contentType, refresh).then(function(url) {
+      if (previewInFlight[key] === run) {
+        previewUrlCache[key] = { url, at: Date.now() };
+        delete previewInFlight[key];
+      }
       return url;
     }, function(e) {
-      delete previewInFlight[key];
+      if (previewInFlight[key] === run) delete previewInFlight[key];
       throw e;
     });
     previewInFlight[key] = run;
     return run;
   }
+  function markImagePreviewStale(scope, remotePath) {
+    if (!remotePath) return;
+    staleImagePreviews[cacheKey(scope, remotePath)] = true;
+    delete previewUrlCache[cacheKey(scope, remotePath)];
+  }
+  var staleImagePreviews = /* @__PURE__ */ Object.create(null);
   function hydrateImagePreviews(imgs, ctx) {
     for (var i = 0; i < imgs.length; i++) hydrateOne(imgs[i], ctx);
   }
@@ -1175,9 +1193,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return;
     }
     img.setAttribute("data-bq-img-retry", "1");
-    delete previewUrlCache[cacheKey(ctx.scope, path)];
     img.removeAttribute("src");
-    resolveImagePreviewUrl(ctx, path, type).then(function(url) {
+    resolveImagePreviewUrl(ctx, path, type, true).then(function(url) {
       img.setAttribute("src", url);
     }, function(e) {
       img.setAttribute("data-bq-img-state", "error");
@@ -4314,6 +4331,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             return self.host.promptOverwrite(member.file.name).then(function(choice) {
               if (choice === "overwrite") {
                 existedBefore = true;
+                markImagePreviewStale(self.host.getIdentity().serviceId || "default", member.storagePath);
                 return doMemberUpload(false);
               }
               if (choice === "skip") {
@@ -6835,7 +6853,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return S.skapi.deleteRecords({ service: S.serviceId, unique_id: "src::" + storagePath }).catch(function() {
       });
     }
-    function getTemporaryUrlDb(path, expires, cdn, contentType, cdnWindow) {
+    function getTemporaryUrlDb(path, expires, cdn, contentType, opts) {
+      opts = opts || {};
       var body = {
         service: S.serviceId,
         owner: S.owner,
@@ -6844,13 +6863,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
         contentType: contentType || mimeGetType(path) || "application/octet-stream"
       };
-      if (cdn !== false) {
-        body.generate_temporary_cdn_url = true;
-        if (cdnWindow) body.cdn_url_window = cdnWindow;
+      if (cdn !== false) body.generate_temporary_cdn_url = true;
+      var reqOpts = { auth: true, method: "post" };
+      if (cdn === false && opts.browserCache) {
+        reqOpts.method = "get";
+        body.browser_cache = opts.browserCache;
+        var uid = S.user && S.user.user_id;
+        if (uid) body.uid = uid;
+        if (opts.refresh) body.nocache = Date.now();
       }
-      return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function(res) {
+      return S.skapi.util.request("get-signed-url", body, reqOpts).then(function(res) {
         var u = typeof res === "string" ? res : res && res.url;
         if (!u) throw new Error("No temporary URL returned.");
+        if (/^https?:\/\//i.test(u)) return u;
         return "https://db." + hostDomain() + "/" + u;
       });
     }
@@ -7366,8 +7391,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function imagePreviewCtx() {
       return {
         scope: S.serviceId || "default",
-        mint: function(remotePath, contentType) {
-          return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, true, contentType, CDN_PREVIEW_WINDOW_SECONDS);
+        mint: function(remotePath, contentType, refresh) {
+          return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType, {
+            browserCache: PREVIEW_BROWSER_CACHE_SECONDS,
+            refresh
+          });
         },
         // An image arriving late pushes the conversation down under the
         // viewport. Re-pin only if the user was already at the bottom.

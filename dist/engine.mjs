@@ -552,7 +552,7 @@ var EXPIRED_ATTACHMENT_URL_HOST = "_expired_.url";
 var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
 var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
-var CDN_PREVIEW_WINDOW_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
+var PREVIEW_BROWSER_CACHE_SECONDS = 24 * 60 * 60;
 var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
 function createInlineLinkRegex() {
   return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -1137,34 +1137,53 @@ function clearImagePreviewCache(scope) {
   if (!scope) {
     previewUrlCache = /* @__PURE__ */ Object.create(null);
     previewInFlight = /* @__PURE__ */ Object.create(null);
+    staleImagePreviews = /* @__PURE__ */ Object.create(null);
     return;
   }
   var prefix = scope + "\0";
   for (var k in previewUrlCache) if (k.indexOf(prefix) === 0) delete previewUrlCache[k];
   for (var f in previewInFlight) if (f.indexOf(prefix) === 0) delete previewInFlight[f];
+  for (var s in staleImagePreviews) if (s.indexOf(prefix) === 0) delete staleImagePreviews[s];
 }
 function peekImagePreviewUrl(ctx, remotePath) {
   var hit = previewUrlCache[cacheKey(ctx.scope, remotePath)];
   if (hit && Date.now() - hit.at < LINK_REFRESH_WINDOW_MS) return hit.url;
   return null;
 }
-function resolveImagePreviewUrl(ctx, remotePath, contentType) {
-  var warm = peekImagePreviewUrl(ctx, remotePath);
-  if (warm) return Promise.resolve(warm);
+function resolveImagePreviewUrl(ctx, remotePath, contentType, refresh) {
   var key = cacheKey(ctx.scope, remotePath);
-  var flight = previewInFlight[key];
-  if (flight) return flight;
-  var run = ctx.mint(remotePath, contentType).then(function(url) {
-    previewUrlCache[key] = { url, at: Date.now() };
+  if (staleImagePreviews[key]) {
+    delete staleImagePreviews[key];
+    refresh = true;
+  }
+  if (refresh) {
+    delete previewUrlCache[key];
     delete previewInFlight[key];
+  } else {
+    var warm = peekImagePreviewUrl(ctx, remotePath);
+    if (warm) return Promise.resolve(warm);
+    var flight = previewInFlight[key];
+    if (flight) return flight;
+  }
+  var run = ctx.mint(remotePath, contentType, refresh).then(function(url) {
+    if (previewInFlight[key] === run) {
+      previewUrlCache[key] = { url, at: Date.now() };
+      delete previewInFlight[key];
+    }
     return url;
   }, function(e) {
-    delete previewInFlight[key];
+    if (previewInFlight[key] === run) delete previewInFlight[key];
     throw e;
   });
   previewInFlight[key] = run;
   return run;
 }
+function markImagePreviewStale(scope, remotePath) {
+  if (!scope || !remotePath) return;
+  staleImagePreviews[cacheKey(scope, remotePath)] = true;
+  delete previewUrlCache[cacheKey(scope, remotePath)];
+}
+var staleImagePreviews = /* @__PURE__ */ Object.create(null);
 function hydrateImagePreviews(imgs, ctx) {
   for (var i = 0; i < imgs.length; i++) hydrateOne(imgs[i], ctx);
 }
@@ -1204,9 +1223,8 @@ function onImageError(img, ctx, path, type) {
     return;
   }
   img.setAttribute("data-bq-img-retry", "1");
-  delete previewUrlCache[cacheKey(ctx.scope, path)];
   img.removeAttribute("src");
-  resolveImagePreviewUrl(ctx, path, type).then(function(url) {
+  resolveImagePreviewUrl(ctx, path, type, true).then(function(url) {
     img.setAttribute("src", url);
   }, function(e) {
     img.setAttribute("data-bq-img-state", "error");
@@ -4379,6 +4397,7 @@ var ChatSession = class {
           return self.host.promptOverwrite(member.file.name).then(function(choice) {
             if (choice === "overwrite") {
               existedBefore = true;
+              markImagePreviewStale(self.host.getIdentity().serviceId || "default", member.storagePath);
               return doMemberUpload(false);
             }
             if (choice === "skip") {
@@ -4790,6 +4809,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CDN_PREVIEW_WINDOW_SECONDS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

@@ -78,7 +78,7 @@ import {
     extOf,
     EXT_CONTENT_TYPES,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
-    CDN_PREVIEW_WINDOW_SECONDS,
+    PREVIEW_BROWSER_CACHE_SECONDS,
     LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
@@ -2176,21 +2176,20 @@ import {
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
     // https://db.<hostDomain>/.
     // `cdn` picks the branch DELIBERATELY. A generate_temporary_cdn_url url
-    // ignores `expires` and lives for its WINDOW instead; a plain get-db presign
-    // honours `expires` to the second. Passing the flag while also passing a short
-    // `expires` is the trap: with the default (day) window it reads as a 10 minute
-    // url and behaves as a two day one.
-    // `cdnWindow` (seconds) picks that window, and only a value get_signed_url
-    // allowlists is accepted: the mint FAILS on anything else rather than quietly
-    // handing back a day url. Omit it and the backend keeps the day default, which
-    // is what the attachment urls handed to the indexing queue need, since those
-    // can wait hours in the FIFO before the worker fetches them.
-    // `contentType` overrides the extension guess and applies to the PRESIGN
-    // branch only. It is what decides whether a new tab DISPLAYS the file or
-    // downloads it: get_signed_url only sets ResponseContentType when we pass one,
-    // and application/octet-stream always downloads. A cdn url has no such
-    // override and serves the object's stored type.
-    function getTemporaryUrlDb(path, expires, cdn, contentType, cdnWindow) {
+    // ignores `expires` entirely and lives until the end of the next UTC day
+    // (24-48h); a plain get-db presign honours `expires` to the second. Passing
+    // the flag while also passing a short `expires` is the trap: it reads as a
+    // 10 minute url and behaves as a two day one.
+    // `contentType` overrides the extension guess. It is what decides whether a
+    // new tab DISPLAYS the file or downloads it: get_signed_url only sets
+    // ResponseContentType when we pass one, and application/octet-stream always
+    // downloads. The image preview passes the type the engine classified.
+    // `opts.browserCache` (seconds) mints through a CACHEABLE GET instead of a
+    // POST, so the same url comes back out of the browser cache and the body it
+    // already downloaded stays addressable. `opts.refresh` bypasses that cache.
+    // Neither applies to the cdn branch, whose url is stable by construction.
+    function getTemporaryUrlDb(path, expires, cdn, contentType, opts) {
+        opts = opts || {};
         var body = {
             service: S.serviceId,
             owner: S.owner,
@@ -2199,13 +2198,32 @@ import {
             expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
             contentType: contentType || mimeGetType(path) || "application/octet-stream",
         };
-        if (cdn !== false) {
-            body.generate_temporary_cdn_url = true;
-            if (cdnWindow) body.cdn_url_window = cdnWindow;
+        if (cdn !== false) body.generate_temporary_cdn_url = true;
+
+        var reqOpts = { auth: true, method: "post" };
+        if (cdn === false && opts.browserCache) {
+            reqOpts.method = "get";
+            body.browser_cache = opts.browserCache;
+            // Partitions the browser cache per user: a cache is keyed by url
+            // alone and shared by everyone using the profile, so without this a
+            // second user signing in here would be handed the first user's
+            // signed urls. The backend rejects a uid that is not the caller.
+            var uid = S.user && S.user.user_id;
+            if (uid) body.uid = uid;
+            // Only ever set on an explicit refresh, so ordinary mints stay on
+            // one cache key. The backend never reads it.
+            if (opts.refresh) body.nocache = Date.now();
         }
-        return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function (res) {
+
+        return S.skapi.util.request("get-signed-url", body, reqOpts).then(function (res) {
             var u = typeof res === "string" ? res : (res && res.url);
             if (!u) throw new Error("No temporary URL returned.");
+            // ONLY the cdn branch returns a bare path to prepend the db host to.
+            // A presign is already absolute, and prefixing it produced
+            // "https://db.<host>/https://<bucket>.s3..." — a url that resolves to
+            // the db CDN, fails signature validation and 401s. That is why every
+            // cdn:false mint (image previews, expired-chip clicks) was dead.
+            if (/^https?:\/\//i.test(u)) return u;
             return "https://db." + hostDomain() + "/" + u;
         });
     }
@@ -2710,20 +2728,20 @@ import {
         setTimeout(function () { unavailableRepaintQueued = false; renderMessages(); }, 0);
     }
 
-    // Inline image previews. Unlike the link chips, these mint a WINDOWED CDN url:
-    // a presign is signed with the backend Lambda's per-container STS credentials,
-    // so every mint returns a different url and the browser re-downloads every
-    // image on every reload. A cdn url is byte-identical for its whole window, so
-    // the cache actually hits. See CDN_PREVIEW_WINDOW_SECONDS.
-    //
-    // contentType is still passed for the presign fallback path, but a cdn url
-    // serves the object's STORED content type. That is fine for an <img>, which
-    // sniffs the bytes; the chip underneath still opens through the presign.
+    // Inline image previews. The same plain presign the link chips use, with the
+    // content type the engine classified, but minted through a CACHEABLE GET:
+    // without it every reload re-mints a fresh SigV4 url, which is a fresh cache
+    // key, so every visible image downloads again. See
+    // PREVIEW_BROWSER_CACHE_SECONDS. `refresh` is how the error path escapes
+    // that cache when the url it cached has since expired.
     function imagePreviewCtx() {
         return {
             scope: S.serviceId || "default",
-            mint: function (remotePath, contentType) {
-                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, true, contentType, CDN_PREVIEW_WINDOW_SECONDS);
+            mint: function (remotePath, contentType, refresh) {
+                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType, {
+                    browserCache: PREVIEW_BROWSER_CACHE_SECONDS,
+                    refresh: refresh,
+                });
             },
             // An image arriving late pushes the conversation down under the
             // viewport. Re-pin only if the user was already at the bottom.
