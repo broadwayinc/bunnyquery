@@ -56,6 +56,11 @@ function sleep(ms: number): Promise<void> {
 // queue is FIFO per user, so a healthy chain has one running plus at most a
 // couple queued; the cap only bounds a pathological backlog.
 const WORKER_PASS_ADOPT_LIMIT = 20;
+// How stale the "which files are indexing" snapshot may be when it is used to
+// refuse a DUPLICATE index dispatch. Short, because the answer decides whether a
+// file gets indexed at all; long enough that one upload batch asks once, not once
+// per file.
+const LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5000;
 // Delays before each look (the first is immediate). More than one because the
 // worker writes the next pass's row a few milliseconds AFTER it resolves the
 // current one, so a look that wins that race sees an empty queue for a chain
@@ -187,6 +192,9 @@ export class ChatSession {
 	/** The chat the live-index snapshot (state.liveIndexKeys) was taken for, so a
 	 *  project switch drops it. */
 	private _liveIndexKey: string;
+	/** When the snapshot was last published (wall clock ms), so a caller that needs
+	 *  a CURRENT answer can tell whether to re-ask. 0 = never. */
+	private _liveIndexAt: number;
 
 	constructor(host: ChatHost) {
 		this.host = host;
@@ -205,6 +213,7 @@ export class ChatSession {
 			gateRefreshToken: 0,
 			liveIndexKeys: {},
 			liveIndexChecked: false,
+			stoppedIndexIds: {},
 		};
 		this.bgTaskQueue = [];
 		this.cancelledServerIds = new Set();
@@ -221,6 +230,7 @@ export class ChatSession {
 		this._drainNudges = [];
 		this._liveStages = {};
 		this._liveIndexKey = '';
+		this._liveIndexAt = 0;
 	}
 
 	/** What the display layer needs to decide whether a run is finished. `keys` holds
@@ -228,6 +238,98 @@ export class ChatSession {
 	 *  first answer for this chat, and false means "we do not know yet". */
 	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean } {
 		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+	}
+
+	/** Passes that were on a row when the user stopped it, so the display layer can
+	 *  still tell that this run was stopped once the stop has left no other trace.
+	 *  See cancelIndexingGroup, which fills it, and buildChatDisplayList, which is
+	 *  the only reader. */
+	getStoppedIndexIds(): { [serverItemId: string]: boolean } {
+		return this.state.stoppedIndexIds;
+	}
+
+	/**
+	 * Is this file ALREADY being indexed by this client?
+	 *
+	 * One live run per file, and the reason is what a second one looks like: the
+	 * conversation grows a SECOND collapsed row for the same file (a run is opened
+	 * by every FIRST pass, so two of them are two rows), the same document is read
+	 * twice at full provider cost, and the two chains fight over the same records —
+	 * the delete-then-repost that starts run 2 wipes what run 1 has saved so far.
+	 *
+	 * Asked of this client's own live work, so it cannot be wrong in the dangerous
+	 * direction: a queued/running pass keeps its bgTaskQueue entry until its bubble
+	 * settles, and a settled run answers false, which is what a genuine later
+	 * re-index needs.
+	 *
+	 * The retry that made this necessary: a chip whose INDEX request failed is
+	 * handed back to the composer to be retried on the next send, and an index
+	 * request can fail from the client's side (a lost ack, an expired token on the
+	 * response) while the server has already queued the pass. The retry then indexes
+	 * a file that was never not being indexed.
+	 */
+	hasLiveIndexRun(storagePath?: string): boolean {
+		if (!storagePath) return false;
+		var id = this.host.getIdentity();
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.storagePath === storagePath && e.serviceId === id.serviceId && e.platform === id.platform) return true;
+		}
+		return this.state.messages.some(function (m) {
+			if (!m.isBackgroundTask || m.role !== 'user' || m.isCancelled) return false;
+			if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
+			return !!m._indexFile && m._indexFile.path === storagePath;
+		});
+	}
+
+	/**
+	 * The same question, asked of the SERVER when this page cannot answer it.
+	 *
+	 * hasLiveIndexRun only knows what this page did. That is not enough for the
+	 * case duplicates actually come from: the first run was started before a
+	 * reload, or in another tab, or its bubble has since been paged out of the
+	 * loaded window — and then the retry finds nothing locally and starts a second
+	 * run of a file that is still being indexed. The queue is the one place that
+	 * knows, and it is already asked for exactly this list.
+	 *
+	 * Only a POSITIVE answer is used. Absence proves nothing here (the query is
+	 * capped, and `liveIndexChecked` records that), so an unanswerable question
+	 * falls back to dispatching — the cost of a wrong "no" is the duplicate this
+	 * exists to prevent, and the cost of a wrong "yes" is a file that never gets
+	 * indexed at all. Only one of those is recoverable by the user.
+	 */
+	isIndexRunLive(storagePath?: string): Promise<boolean> {
+		var self = this;
+		if (!storagePath) return Promise.resolve(false);
+		if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(true);
+		return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS)
+			.then(function () { return !!self.state.liveIndexKeys[storagePath]; })
+			.catch(function () { return false; });
+	}
+
+	/** Re-ask the queue which files are still being indexed, unless the answer we
+	 *  have is younger than `maxAgeMs`. Shared by every caller that needs a current
+	 *  one; the display layer's own refresh path is the adopt ladder. */
+	private _refreshLiveIndexKeys(maxAgeMs: number): Promise<void> {
+		var self = this;
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!id.serviceId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve();
+		if (this._liveIndexKey === this.getHistoryCacheKey() && nowMs() - this._liveIndexAt < maxAgeMs) {
+			return Promise.resolve();
+		}
+		var queue = bgIndexingQueueName(id.userId, id.serviceId);
+		var ask = function (status: 'pending' | 'running') {
+			return Promise.resolve(getChatHistory(
+				{ service: id.serviceId, owner: id.owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
+				{ limit: WORKER_PASS_ADOPT_LIMIT },
+			)).catch(function () { return null; });
+		};
+		return Promise.all([ask('pending'), ask('running')]).then(function (results) {
+			if (results[0] === null || results[1] === null) return;
+			self._liveIndexKey = self.getHistoryCacheKey();
+			self._recordLiveIndexKeys(results);
+		});
 	}
 
 	/**
@@ -286,6 +388,7 @@ export class ChatSession {
 		}
 		this.state.liveIndexKeys = next;
 		this.state.liveIndexChecked = nowChecked;
+		this._liveIndexAt = nowMs();
 		if (changed) this.host.notify();
 	}
 
@@ -294,6 +397,7 @@ export class ChatSession {
 	private _resetLiveIndexKeys(): void {
 		this.state.liveIndexKeys = {};
 		this.state.liveIndexChecked = false;
+		this._liveIndexAt = 0;
 	}
 
 	/**
@@ -1594,7 +1698,10 @@ export class ChatSession {
 	 *   2. the file is remembered in cancelledIndexKeys, so the client-driven
 	 *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
 	 *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
-	 *      drain rather than surfacing a fresh "Indexing…" bubble.
+	 *      drain rather than surfacing a fresh "Indexing…" bubble; and
+	 *   4. the RUN is remembered (state.stoppedIndexIds), because none of the above
+	 *      necessarily leaves a mark on the conversation — see below — and without
+	 *      it the collapsed row reported the stopped file as finished.
 	 *
 	 * Records already written by the passes that DID run are kept — this stops the
 	 * work, it does not undo it.
@@ -1606,6 +1713,51 @@ export class ChatSession {
 		// _indexKeyOf scopes a queued task's.
 		var scoped = this.getHistoryCacheKey() + '|' + group.key;
 		this.cancelledIndexKeys.add(scoped);
+		// Remember WHICH RUN was stopped, by the ids of the passes it is made of.
+		// Everything else here stops the work without leaving any mark on the
+		// conversation: a running pass cannot be un-run (it finishes and writes an
+		// ordinary answer), and a queued continuation is dropped before it is ever
+		// surfaced — so a stopped run's newest bubble is routinely a successful pass,
+		// and the row read "Indexed" over a file the user had just stopped. Ids, not
+		// the file key, so a re-upload or Reindex of the same path is a new run with
+		// new ids and starts clean; and on the reactive state so the row updates the
+		// moment this is recorded, since a stop with nothing left to cancel changes
+		// no message at all.
+		//
+		// Not for a run that is already OVER, though — you cannot stop what has
+		// finished, and marking it stopped would relabel a fully-indexed file as
+		// cancelled on the strength of a click that arrived too late. (`finished` is
+		// only ever positively established: "still running" and "we have not found
+		// out" both read as false here, so the doubt goes to recording the stop.)
+		if (!group.finished) {
+			var stoppedIds: { [id: string]: boolean } = {};
+			for (var sk in this.state.stoppedIndexIds) stoppedIds[sk] = true;
+			(group.members || []).forEach(function (m) {
+				var sid = m && m.msg && m.msg._serverItemId;
+				if (sid) stoppedIds[sid] = true;
+			});
+			// The queue's own view of this file, which is not always the row's: an
+			// entry can be waiting for its bubble, and the FIRST pass's entry outlives
+			// the moment its bubble settles. _applyIndexCancellations reads this to
+			// tell a pass that existed when the user hit Stop from a genuinely new
+			// indexing request, and only the latter is allowed to lift the stop.
+			this.bgTaskQueue.forEach(function (e) {
+				if (e && e.id && self._indexKeyOf(e) === scoped) stoppedIds[e.id] = true;
+			});
+			this.state.stoppedIndexIds = stoppedIds;
+		}
+		// Ask the QUEUE what else is live for this file, and cancel that too.
+		//
+		// The ids above are the passes THIS client knows about, and for a
+		// worker-driven file that is routinely none of them: the worker mints the
+		// next window itself and the client only learns its id on a later look. A
+		// stop that reaches no server row at all is a stop that dies with the tab —
+		// the chain keeps running, and the only record of the stop is this page's
+		// memory. The adopt ladder is the existing machinery for exactly this
+		// question; anything it turns up for a stopped file is dropped and
+		// server-cancelled by _applyIndexCancellations on the next drain, which is
+		// also what makes the worker stop enqueueing windows.
+		this._adoptWorkerIndexingPasses(0);
 		var ids = group.cancellableIds || [];
 		if (!ids.length) { this.host.notify(); return; }
 		ids.forEach(function (serverId) {
@@ -1923,8 +2075,67 @@ export class ChatSession {
 		return null;
 	}
 
+	/**
+	 * Settle a turn the server reports as cancelled: the request bubble goes to its
+	 * cancelled form and the "Thinking..." placeholder goes away. The same shape
+	 * cancelQueuedMessage produces locally, so a cancel this client made and one it
+	 * merely found out about render identically — and an indexing pass keeps the
+	 * markers that hold it in its file's collapsed row.
+	 */
+	private _settleCancelledItem(itemId: string): void {
+		var uIdx = this.state.messages.findIndex(function (m) {
+			return m.role === 'user' && m._serverItemId === itemId && !m.isCancelled;
+		});
+		if (uIdx !== -1) {
+			var u = this.state.messages[uIdx];
+			var cancelled: ChatMessage = { role: 'user', content: u.content, isCancelled: true, _serverItemId: itemId };
+			if (u.isBackgroundTask) cancelled.isBackgroundTask = true;
+			if (u._indexFile) cancelled._indexFile = u._indexFile;
+			if (u._useBgQueue) cancelled._useBgQueue = true;
+			if (u._ownerKey !== undefined) cancelled._ownerKey = u._ownerKey;
+			if (u._ts !== undefined) cancelled._ts = u._ts;
+			this.state.messages[uIdx] = cancelled;
+		}
+		var pIdx = this.state.messages.findIndex(function (m) {
+			return m.isPending && m.role === 'assistant' && m._serverItemId === itemId;
+		});
+		if (pIdx !== -1) this.state.messages.splice(pIdx, 1);
+		this.cancelledServerIds.delete(itemId);
+		this._removeStrayPendingAssistants();
+		this.host.notify();
+		this.updateHistoryCache();
+	}
+
+	/**
+	 * A poll that came back saying the request was CANCELLED, rather than with an
+	 * answer.
+	 *
+	 * The server keeps a cancelled request as a terminal row instead of deleting it
+	 * (that row is the durable record of the stop, and the chat history it belongs
+	 * to), so a poll still running when the cancel lands now RESOLVES on it. It used
+	 * to reject with NOT_EXISTS, and the resolution path below reads a status object
+	 * as an answer with no text — which would stamp "No text response received from
+	 * AI provider" over a turn the user had just stopped.
+	 *
+	 * Reachable whenever the poll was not stopped by whoever cancelled: another tab,
+	 * another device, or the row being cancelled server-side by the file's own stop.
+	 */
+	private _isCancelledPollResult(response: any): boolean {
+		if (!response || typeof response !== 'object' || response.status !== 'cancelled') return false;
+		// The POLL's own shape (id + queue fields, no provider payload), not a
+		// provider body that happens to carry a `status` — OpenAI's Responses API
+		// has a "cancelled" status of its own, and that one is an answer to render,
+		// not a row that was removed from the queue.
+		if (response.content !== undefined || response.output !== undefined) return false;
+		return response.queue_name !== undefined || response.in_queue !== undefined;
+	}
+
 	applyHistoryItemResolution(itemId: string, response: any, platform: string): void {
 		this.historyItemPolls.delete(itemId);
+		if (this._isCancelledPollResult(response)) {
+			this._settleCancelledItem(itemId);
+			return;
+		}
 		var isErr = isErrorResponseBody(response);
 		var answer = isErr ? getErrorMessage(response)
 			: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim();
@@ -2035,14 +2246,38 @@ export class ChatSession {
 	 * path, and without this an earlier cancel would silently kill every future
 	 * index of the same path. A continuation of a stopped file is dropped instead,
 	 * covering the pass that was dispatched in the moment before the cancel landed.
+	 *
+	 * "Fresh" is the load-bearing word, and it used to be missing. A run's OWN first
+	 * pass sits in this queue for as long as it runs (entries are only dropped once
+	 * their bubble settles), so stopping a file during its first pass — which is
+	 * exactly when a user who has just uploaded it does — met that first-pass entry
+	 * on the very next drain and lifted the stop the user had just asked for. The
+	 * chain then carried on, one worker-minted window after another, with nothing
+	 * client-side left to suppress it. The ids recorded at stop time are what tells
+	 * the two apart: a pass that was already there when the user hit Stop cannot be
+	 * the new request that lifts it.
 	 */
 	private _applyIndexCancellations(): void {
 		if (!this.cancelledIndexKeys.size) return;
+		// Passes already on screen. Dropping the queue entry for one of those kills
+		// its poll and leaves the bubble pending forever — a row stuck on "Indexing"
+		// with no way to ever settle. _sweepCancelledIndexing (which runs straight
+		// after this, on the same drain) cancels those properly, rebuilding the bubble
+		// as cancelled; the splice below is only right for an entry with no bubble yet.
+		var surfaced: { [id: string]: boolean } = {};
+		this.state.messages.forEach(function (m) {
+			if (!m._serverItemId) return;
+			if (m.isPending || m.isPendingQueued || m.isPendingInProcess) surfaced[m._serverItemId] = true;
+		});
 		for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
 			var entry = this.bgTaskQueue[i];
 			var key = this._indexKeyOf(entry);
 			if (!key || !this.cancelledIndexKeys.has(key)) continue;
-			if (!entry.resumePass) { this.cancelledIndexKeys.delete(key); continue; }
+			if (!entry.resumePass && !this.state.stoppedIndexIds[entry.id]) {
+				this.cancelledIndexKeys.delete(key);
+				continue;
+			}
+			if (surfaced[entry.id]) continue;
 			this.bgTaskQueue.splice(i, 1);
 			this._stopPoll(entry.id);
 			this._cancelServerItem(entry.id);
@@ -2953,10 +3188,24 @@ export class ChatSession {
 					// separate model turn that cannot know whether an earlier one created it, so
 					// guaranteeing it here is what stops the backend rejecting whole windows with
 					// NOT_EXISTS on reference.unique_id.
-					var preIndex = (existedBefore && typeof self.host.deleteExistingFileRecord === 'function')
-						? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { })
-						: Promise.resolve();
+					// Already being indexed: a second run would open a second collapsed row
+					// for the same file and re-read the whole document. Decided BEFORE the
+					// delete-then-repost, which would otherwise wipe the records the LIVE
+					// run has already written and then not re-index them. Asked of the
+					// QUEUE, not just this page — see isIndexRunLive.
+					var alreadyIndexing = false;
+					var preIndex = self.isIndexRunLive(member.storagePath).then(function (live) {
+						alreadyIndexing = live;
+						if (live) {
+							console.log('[chat-engine] skipping a duplicate index request for', member.storagePath);
+							return;
+						}
+						if (existedBefore && typeof self.host.deleteExistingFileRecord === 'function') {
+							return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { });
+						}
+					});
 					preIndex = preIndex.then(function () {
+						if (alreadyIndexing) return;
 						if (typeof self.host.ensureFileIndexRecord !== 'function') return;
 						return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
 							name: member.file.name,
@@ -2970,6 +3219,7 @@ export class ChatSession {
 					return preIndex.then(function () {
 						return parseAttachmentContent(member.file, member.file.name, mime || undefined);
 					}).then(function (parsedContent: string | null) {
+					if (alreadyIndexing) return;
 					// Tracked so a chat waiting on awaitIndexingDrained cannot be sent
 					// in the window between this call and the queue accepting it.
 					return self.trackIndexDispatch(notifyAgentSaveAttachment({

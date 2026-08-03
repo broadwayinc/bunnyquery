@@ -147,6 +147,16 @@ export interface ChatState {
 	 *  means "we have not found out", which the display layer reads as still
 	 *  working — never as an all-clear. */
 	liveIndexChecked: boolean;
+	/** Server item ids of the indexing passes that existed — on the row, or on the
+	 *  bg queue — when the user STOPPED that file. Two readers, one fact:
+	 *  buildChatDisplayList reports the run as stopped when it holds any of them
+	 *  (a stop routinely leaves no other trace), and _applyIndexCancellations
+	 *  refuses to let one of them lift the stop the way a genuinely new indexing
+	 *  request does. Ids, not file keys: they name the RUN that was stopped, so a
+	 *  later re-index of the same file cannot inherit it. On the state, like
+	 *  liveIndexKeys, so a reactive consumer re-renders the moment a stop is
+	 *  recorded — a stop with nothing left to cancel changes no message at all. */
+	stoppedIndexIds: { [serverItemId: string]: boolean };
 }
 
 export interface ChatHost {

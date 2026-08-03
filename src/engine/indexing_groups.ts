@@ -105,8 +105,19 @@ export type IndexingGroup = {
 	 *  when nothing is cancellable — a finished file, or a live pass whose server
 	 *  id has not come back yet. */
 	cancellableIds: string[];
-	/** A cancel request is in flight for one of the passes. */
+	/** This row is in the middle of stopping: a cancel request is in flight for one
+	 *  of its passes, or the user stopped the run and a pass is still running. Both
+	 *  mean the same thing to a view — the Stop has been spent, so the button reads
+	 *  "Stopping..." and is not offered again. */
 	cancelling: boolean;
+	/** The user stopped this run.
+	 *
+	 *  NOT the same as `status === 'cancelled'`, and the difference is the whole
+	 *  reason it exists: a stop landing on a pass that is already RUNNING cannot
+	 *  un-run it, so the row stays `active` until that pass settles. `status` then
+	 *  describes the work (something is still running) and this describes the user's
+	 *  decision (no more of it will be started). */
+	stopped: boolean;
 	/** Why the last cancel attempt failed (e.g. the pass had already finished). */
 	cancelError?: string;
 	/** The file's first pass is not among the loaded messages, so earlier passes
@@ -211,6 +222,12 @@ export type BuildDisplayListOptions = {
 	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
 	 *  is "we do not know", and a worker-driven run stays unfinished on it. */
 	liveIndexChecked?: boolean;
+	/** Server item ids of passes that were on a row when the user STOPPED it
+	 *  (ChatSession.state.stoppedIndexIds). A run holding any of them is a run the
+	 *  user stopped — see the status derivation for why a stop usually leaves no
+	 *  other trace in the messages. Ids rather than a file key on purpose: they name
+	 *  one RUN, so a later re-index of the same file cannot inherit the stop. */
+	stoppedIndexIds?: { [serverItemId: string]: boolean };
 	/** Whether the WORKER drives the windowed text/grid loop (chatEngineConfig's
 	 *  windowedIndexing). Passed in rather than read from config so this stays a
 	 *  pure function of its inputs and can be exercised for both settings. */
@@ -307,6 +324,7 @@ export function buildChatDisplayList(
 	var list = Array.isArray(messages) ? messages : [];
 	var liveIndexKeys = (opts && opts.liveIndexKeys) || {};
 	var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+	var stoppedIndexIds = (opts && opts.stoppedIndexIds) || {};
 	var windowedIndexing = opts && opts.windowedIndexing !== undefined
 		? !!opts.windowedIndexing
 		: windowedIndexingEnabled();
@@ -391,6 +409,7 @@ export function buildChatDisplayList(
 				status: 'done',
 				cancellableIds: [],
 				cancelling: false,
+				stopped: false,
 				mayHaveOlder: false,
 				// The run's first loaded pass, and never re-stamped: see the file
 				// docstring. `anchorId` is filled in once every member is known.
@@ -468,6 +487,35 @@ export function buildChatDisplayList(
 		for (var mi = lastSettled + 1; mi < grp.members.length; mi++) {
 			if (isPendingMsg(grp.members[mi].msg)) { active = true; break; }
 		}
+		// Did the user STOP this run? Asked of the WHOLE run, because a stop routinely
+		// leaves nothing behind at the end of it:
+		//   - only a QUEUED pass can be removed from the queue, and that is the one
+		//     case that produces a cancelled bubble. The pass that is actually running
+		//     cannot be un-run — it is flagged cancelled server-side, which is what
+		//     stops the worker enqueueing the next window, and then finishes its own
+		//     provider call and writes an ordinary, successful answer;
+		//   - a PDF (or any worker-driven file) usually has exactly ONE pass live, so
+		//     that running pass is normally all a stop has to act on;
+		//   - continuations still sitting in bgTaskQueue are dropped by
+		//     _applyIndexCancellations before they are ever surfaced, so they leave no
+		//     bubble either.
+		// The messages of a stopped run therefore END in a successful pass, and reading
+		// the status off the last member alone reported the stop as a green "Indexed"
+		// over a file that was only partly read — with the newest pass's own text still
+		// saying "More pages remain" right underneath it.
+		//
+		// Two witnesses, both scoped to one RUN so a later re-index of the same file
+		// can never inherit a stop: a cancelled member (durable — it comes back from
+		// history), and the ids ChatSession recorded when the user hit Stop (this
+		// page's memory only, which is what covers the run that has no cancelled
+		// member at all).
+		var stopped = false;
+		for (var ki = 0; ki < grp.members.length; ki++) {
+			var km = grp.members[ki].msg;
+			if (km.isCancelled) { stopped = true; break; }
+			if (km._serverItemId && stoppedIndexIds[km._serverItemId]) { stopped = true; break; }
+		}
+		grp.stopped = stopped;
 		// What a stop button would act on: the REQUEST bubble of every pass that is
 		// still queued or running server-side. The assistant placeholder shares its
 		// pass's server id, so ids are de-duplicated. A pass mid-cancel is left out
@@ -485,7 +533,14 @@ export function buildChatDisplayList(
 			// went on to finish normally kept describing a one-off transient failure
 			// as a permanent property of the file, until a full history refresh
 			// rebuilt the bubbles.
-			if (cm._cancelError && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
+			//
+			// And never for a run that IS stopped, which is the case the message gets
+			// wrong: the only thing that failed there is removing the pass already in
+			// flight (it cannot be un-run — it finishes and answers), while the stop
+			// itself holds. The row says "Stopping..." and then "Indexing cancelled",
+			// which is the accurate account; "Could not stop this file" beside it is
+			// not.
+			if (cm._cancelError && !stopped && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
 			if (cm.role !== 'user' || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
 			if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
 			// Same staleness rule: never offer to stop a pass a later one outlived.
@@ -495,12 +550,19 @@ export function buildChatDisplayList(
 			grp.cancellableIds.push(cm._serverItemId);
 		}
 		if (active) {
+			// A pass IS still running, and a row that claimed otherwise would hide work
+			// the user can still see the effects of. The stop is reported as `cancelling`
+			// instead — "Stopping...", Stop spent — and the row settles to 'cancelled'
+			// when that last pass lands.
 			grp.status = 'active';
+			if (stopped) grp.cancelling = true;
+		} else if (stopped) {
+			grp.status = 'cancelled';
 		} else {
 			// The newest loaded outcome is the file's state: an early pass may have
 			// errored and a later one succeeded.
 			var last = grp.members[grp.members.length - 1].msg;
-			grp.status = last.isError ? 'error' : last.isCancelled ? 'cancelled' : 'done';
+			grp.status = last.isError ? 'error' : 'done';
 		}
 		// A group whose passes are ALL continuations began before the loaded
 		// window; its earlier passes arrive when older history is paged in.

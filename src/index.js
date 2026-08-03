@@ -2203,6 +2203,16 @@ import {
         var reqOpts = { auth: true, method: "post" };
         if (cdn === false && opts.browserCache) {
             reqOpts.method = "get";
+            // PIN THE HOST. This dest routes through the record gateway's round
+            // robin, which alternates between record_private and record_private_2
+            // — two urls for one mint, so the browser stores two entries holding
+            // two different signed urls and downloads the same image twice. The
+            // dashboard never had this because it passes a full endpoint url.
+            reqOpts.stableGateway = true;
+            // REPLACE the cached mint rather than route around it: a `nocache`
+            // query param is a different url, so the poisoned entry survives and
+            // keeps answering every ordinary mint for the rest of the week.
+            if (opts.refresh) reqOpts.revalidate = true;
             body.browser_cache = opts.browserCache;
             // Partitions the browser cache per user: a cache is keyed by url
             // alone and shared by everyone using the profile, so without this a
@@ -2210,9 +2220,6 @@ import {
             // signed urls. The backend rejects a uid that is not the caller.
             var uid = S.user && S.user.user_id;
             if (uid) body.uid = uid;
-            // Only ever set on an explicit refresh, so ordinary mints stay on
-            // one cache key. The backend never reads it.
-            if (opts.refresh) body.nocache = Date.now();
         }
 
         return S.skapi.util.request("get-signed-url", body, reqOpts).then(function (res) {
@@ -3144,6 +3151,28 @@ import {
         return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
 
+    // Everything buildChatDisplayList needs to state a row's case, in ONE place:
+    // renderMessages draws the rows from it and the stop dialog re-resolves its
+    // target from it, and the two asking different questions is a bug the dialog
+    // already had (see findCancellableIndexGroup).
+    function displayListOptions() {
+        var liveIndex = session.getLiveIndexState();
+        return {
+            hasMoreHistory: !CS.historyEndOfList,
+            // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
+            // per-request flag: the viewport fill is many pages and that flag drops
+            // to false between every one of them, which is once per page of flicker
+            // on any row rendered off it.
+            loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
+            liveIndexKeys: liveIndex.keys,
+            liveIndexChecked: liveIndex.checked,
+            // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
+            // cancelled bubble behind (that pass finishes and answers normally), so
+            // without this the row reports the stop as a finished "Indexed".
+            stoppedIndexIds: session.getStoppedIndexIds(),
+        };
+    }
+
     /* ---- stop-indexing confirmation ----------------------------------------
      * The row's Stop only ASKS. Cancelling is not resumable from the row (the
      * queued passes are dropped, not paused, so finishing the file means
@@ -3157,19 +3186,38 @@ import {
      * the cancellableIds we would then cancel. */
     var stopIndexState = { runKey: "", fileKey: "", handle: null };
 
-    // The live group the open dialog is about, or null once it stops being
-    // cancellable. Rows are matched by runKey; the FILE key is the fallback for
-    // the one thing that renames a run under an open dialog — an older history
-    // page arriving with the run's true first pass, which the run is named after.
-    // Without it the confirm would silently cancel nothing.
+    // Is there still work to stop? NOT "does the row have a cancellable pass right
+    // now", which is what this used to ask. A worker-driven file (any PDF, and every
+    // windowed read) has no pass in this client between two passes: the worker mints
+    // the next one itself and the client only learns about it a beat later. That gap
+    // is seconds long, happens once per pass, and is the most likely moment for a
+    // user to be looking at the row — so keying the button and the dialog off a live
+    // pass made both blink out mid-run, and a confirm that landed in the gap
+    // cancelled nothing at all while the worker carried on. `finished` is the
+    // question actually being asked, and for a worker run it is answered by the
+    // queue; `resolving` keeps it from being asked before anything is known.
+    // agent.vue's indexGroupStoppable is the same predicate.
+    function indexGroupStoppable(group) {
+        return !!group && !group.finished && !group.resolving && !group.stopped && !group.cancelling;
+    }
+
+    // The group the open dialog is about, or null once there is nothing left to
+    // stop. Rows are matched by runKey; the FILE key is the fallback for the one
+    // thing that renames a run under an open dialog — an older history page arriving
+    // with the run's true first pass, which the run is named after. Without it the
+    // confirm would silently cancel nothing.
     function findCancellableIndexGroup(runKey, fileKey) {
         if (!runKey) return null;
-        var list = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+        // The SAME options renderMessages builds the rows from. Anything less and
+        // this asks a different question than the row the user clicked: without
+        // liveIndexKeys, `finished` is false for every worker-driven run, so a file
+        // the queue has confirmed is over would still look stoppable here.
+        var list = buildChatDisplayList(CS.messages, displayListOptions());
         var byFile = null;
         for (var i = 0; i < list.length; i++) {
             var row = list[i];
             if (row.kind !== "indexing") continue;
-            var live = row.group.cancellableIds.length && !row.group.cancelling ? row.group : null;
+            var live = indexGroupStoppable(row.group) ? row.group : null;
             if (row.group.runKey === runKey) return live;
             if (!byFile && live && fileKey && row.group.key === fileKey) byFile = row.group;
         }
@@ -3206,7 +3254,7 @@ import {
     }
 
     function openStopIndexModal(group) {
-        if (!group || group.cancelling) return;
+        if (!indexGroupStoppable(group)) return;
         closeStopIndexModal();
         stopIndexState.runKey = group.runKey;
         stopIndexState.fileKey = group.key;
@@ -3281,8 +3329,11 @@ import {
         // Stop indexing this file: cancels every queued/running pass and keeps the
         // client from dispatching the next one. Sits in the head so it is reachable
         // without expanding the row; its click must not toggle that row.
+        // Offered while there is work left to stop, not while a pass happens to be
+        // live in THIS client: a worker-driven file has none between passes and the
+        // button used to blink out for the whole gap. See indexGroupStoppable.
         var cancelBtn = null;
-        if (group.cancellableIds.length || group.cancelling) {
+        if (indexGroupStoppable(group) || group.cancelling) {
             cancelBtn = h("button", {
                 class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
                 type: "button",
@@ -3466,17 +3517,7 @@ import {
         // Rows, not raw messages: a file's many background-indexing turns collapse
         // into one status row. An expanded row's own turns are emitted as ordinary
         // message rows right after it, so buildMessageEl stays the single source.
-        var liveIndex = session.getLiveIndexState();
-        var rows = buildChatDisplayList(CS.messages, {
-            hasMoreHistory: !CS.historyEndOfList,
-            // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
-            // per-request flag: the viewport fill is many pages and that flag drops
-            // to false between every one of them, which is once per page of flicker
-            // on any row rendered off it.
-            loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
-            liveIndexKeys: liveIndex.keys,
-            liveIndexChecked: liveIndex.checked,
-        });
+        var rows = buildChatDisplayList(CS.messages, displayListOptions());
         rows.forEach(function (row) {
             if (row.kind === "indexing") {
                 var isOpen = !!CS.indexGroupsOpen[row.group.key];

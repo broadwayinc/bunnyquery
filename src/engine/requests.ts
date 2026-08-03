@@ -78,12 +78,28 @@ const VARIANT_IMAGE_DETAIL = 'original';
 // Effort was OFF, and the measurement that turned it on: across one nano run's photo records, only
 // 5 of 28 image text fields carried a concrete identifier read off the tag (a part number, a tag id).
 // The other 23 held a generic scene description. Reading small handwriting off a photographed label
-// is exactly the kind of work a moment of deliberation buys, so it is now on at the LOWEST setting:
-// enough to help the transcription, small enough that it does not eat the record budget that point 2
-// warns about. Raise it to 'medium' only alongside MAX_TOKENS, and re-measure that 5-of-28 ratio
-// rather than assuming; set it back to null to remove the field entirely.
+// is exactly the kind of work a moment of deliberation buys, so it went on at the LOWEST setting.
+//
+// It stays 'low' for a nano that already transcribes correctly (5.6-nano), because effort is
+// billed against the same budget as the records and buying it where it is not needed can only
+// truncate them.
+//
+// OLDEST_NANO_REASONING_EFFORT raises it for gpt-5.4-nano and below ONLY, which is the tier that
+// actually reads dense scans badly. It is 'high', and what makes that affordable is not one change
+// but two:
+//   - that tier's render window is SMALL_TIER_PAGES_PER_WINDOW pages, not five, so the same cap is
+//     divided between far fewer pages to begin with; and
+//   - the worker now DETECTS a pass that ran out of output budget (_output_truncation_reason) and
+//     re-runs that window at half the page count instead of advancing past it.
+// Before the detector, over-buying reasoning was unsafe in a way that did not show up: a truncated
+// pass still returned 200, so the page loop moved on and the rest of that window's records were
+// lost silently. With it, spending too much on reasoning costs an extra pass instead of data.
+//
+// Still the first knob to lower if the logs start showing repeated truncation retries, and
+// re-measure that 5-of-28 ratio rather than assuming. null removes the field entirely.
 const VARIANT_TEXT_VERBOSITY: string | null = 'high';
 const VARIANT_REASONING_EFFORT: string | null = 'low';
+const OLDEST_NANO_REASONING_EFFORT: string | null = 'high';
 
 /**
  * True only for a NANO model, including a dated nano snapshot. NOT mini, not a base model, and not
@@ -105,12 +121,20 @@ const isOpenAINano = (model?: string) => {
 	return major > 5 || (major === 5 && minor !== null && minor >= 4);
 };
 
-/** The nano-only indexing knobs, as body fields. Empty for every other model, or when switched off. */
+/**
+ * The indexing-only body knobs, for the ONE tier that needs them: gpt-5.4-nano.
+ *
+ * Both conditions are load-bearing and mean different things. isOpenAINano is the gpt-5.4
+ * FLOOR - below it these fields are rejected rather than ignored, and one 400 kills every
+ * indexing pass. isOldestNano is the CEILING - 5.5-nano and 5.6-nano transcribe correctly
+ * on their own, so they are left on the provider's defaults exactly like mini and the base
+ * models. Every other model gets an empty object, i.e. no `text` and no `reasoning` at all.
+ */
 const variantIndexingOptions = (model?: string) => {
-	if (!isOpenAINano(model)) return {};
+	if (!isOpenAINano(model) || !isOldestNano(model)) return {};
 	return {
 		...(VARIANT_TEXT_VERBOSITY ? { text: { verbosity: VARIANT_TEXT_VERBOSITY } } : {}),
-		...(VARIANT_REASONING_EFFORT ? { reasoning: { effort: VARIANT_REASONING_EFFORT } } : {}),
+		...(OLDEST_NANO_REASONING_EFFORT ? { reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } : {}),
 	};
 };
 const getOpenAIImageDetail = (model?: string) => {
@@ -144,6 +168,103 @@ const getRenderImageDetail = (model?: string) => {
 	const detail = getOpenAIImageDetail(model);
 	return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? 'high' : detail;
 };
+
+/**
+ * A nano at gpt-5.4 or OLDER.
+ *
+ * This is the observed quality boundary, not a guessed one: gpt-5.4-nano and below
+ * transcribe dense scans poorly, while mini, the base models and every gpt-5.6 model
+ * (5.6-nano included) read the same documents correctly. So only this tier gets
+ * compensated, and everything above it is left exactly as it was — on 'original' detail
+ * and a full window, because nothing about it needs fixing and every compensation costs
+ * either passes or output budget.
+ */
+/** The id parses as a gpt version we can reason about. An id that does NOT (o3,
+ *  chatgpt-4o-latest, any custom name) is left entirely alone: we cannot tell what it is,
+ *  and every compensation here is either a body field that can 400 or a change to how many
+ *  images it receives. Unknown means untouched. */
+const OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
+const isRecognisedOpenAIVersion = (model?: string) =>
+	OPENAI_VERSIONED_ID.test((model || DEFAULT_OPENAI_MODEL).trim().toLowerCase());
+
+const isOldestNano = (model?: string) => {
+	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+	if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+	// Called "nano" but not a naming we recognise: treat it as the weak tier. It also
+	// fails the 'original' gate, so it is caught by the downsampled branch first anyway.
+	if (!match) return true;
+	const major = Number(match[1]);
+	const minor = match[2] === undefined ? null : Number(match[2]);
+	if (major < 5) return true;
+	if (major > 5) return false;
+	return minor === null || minor <= 4;
+};
+
+// Pages in one render window for a SMALL tier, against RENDER_PAGES_PER_WINDOW (5) for a
+// full one.
+//
+// This is the lever that does not risk a 400. The output budget is one number for the whole
+// pass (MAX_TOKENS, and reasoning is billed against it), so a window of 5 dense pages leaves
+// a small model a couple of thousand tokens per page and it starts sampling rows instead of
+// transcribing them - which is exactly the "saved 5 line items" on a page holding twenty.
+// Halving the window does not raise the cap, it just stops dividing it so many ways, and the
+// worker's page loop already runs as many windows as a file needs.
+const SMALL_TIER_PAGES_PER_WINDOW = 2;
+
+// Horizontal bands per page for a tier whose images the API DOWNSAMPLES before the model
+// sees them ('high' resamples onto a 512px tile grid). For those models the render DPI is
+// irrelevant - the pixels are thrown away upstream - so the only way to hand them more
+// readable text is to make each image cover less of the page. Two bands doubles the
+// resolution the model effectively gets, at the cost of one extra image per page.
+//
+// Bands are horizontal so a table row is never cut down its middle, and they overlap
+// slightly so a line landing on the seam appears whole in one of them.
+const DOWNSAMPLED_TIER_TILE = 2;
+
+/** How a given model should be shown a rendered document. */
+export type VisionProfile = {
+	/** Per-image `detail` (OpenAI only). */
+	detail: string;
+	/** Pages the worker renders into one window. */
+	pagesPerWindow: number;
+	/** Horizontal bands per page; 1 renders the whole page as one image. */
+	tile: number;
+};
+
+/**
+ * Resolve the render profile for a model.
+ *
+ * Three tiers, and they fail for different reasons, which is why one set of knobs cannot
+ * serve all of them:
+ *   - full: everything ABOVE gpt-5.4-nano - the base models, mini, and every gpt-5.6
+ *     including 5.6-nano. These already transcribe dense scans correctly, so they get
+ *     'original' detail and are otherwise untouched.
+ *   - gpt-5.4-nano: also gets 'original', so it sees exactly the SAME pixels as the full
+ *     tier. Its gap therefore is not resolution, and tiling would do nothing for it. What
+ *     it lacks is room: a smaller window leaves the same output budget divided between
+ *     fewer pages.
+ *   - downsampled (below the 'original' floor: gpt-5.3-nano, gpt-5-nano, gpt-4.1-nano):
+ *     capped at 'high', which resamples the page onto a 512px grid no matter what DPI it
+ *     was rendered at. Render resolution is wasted on these entirely; the only way to give
+ *     them readable text is to make each image cover less of the page, which is `tile`.
+ */
+export function getVisionProfile(model?: string): VisionProfile {
+	const detail = getRenderImageDetail(model);
+	// An id we cannot parse is left exactly as it was: full window, no tiling. Treating
+	// "unknown" as "weak" would quietly change how much work every custom or aliased model
+	// does, on no evidence at all.
+	if (!isRecognisedOpenAIVersion(model)) {
+		return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+	}
+	if (detail !== 'original') {
+		return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
+	}
+	if (isOldestNano(model)) {
+		return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
+	}
+	return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+}
 
 export type ClaudeRole = 'user' | 'assistant';
 
@@ -612,12 +733,19 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	// (substituting the window's 1-based start page for RENDER_FROM_TOKEN) and enqueues it
 	// itself. That is what makes a 500-page document index end-to-end — the loop no longer
 	// depends on the tab staying open, nor on the model correctly declaring itself unfinished.
+	// Window size and per-page tiling are resolved from the MODEL, not fixed: see
+	// getVisionProfile. Claude keeps the full window (renderDetail is OpenAI-only, and its
+	// own resizing behaviour is a separate question this does not try to answer).
+	const visionProfile: VisionProfile = platform === 'openai'
+		? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL)
+		: { detail: '', pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
 	const skapiRender = visionFile && renderPlaceholder
 		? {
 			_skapi_render: [
 				{
-					path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW,
+					path: attachment.storagePath, from: renderFrom, count: visionProfile.pagesPerWindow,
 					placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime, detail: renderDetail,
+					tile: visionProfile.tile,
 					auto_continue: true,
 					continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder),
 				},

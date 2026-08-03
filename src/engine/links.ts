@@ -32,15 +32,22 @@ export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
  *
  * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
  * that is the whole trick: the url is short-lived while the file stays available
- * locally for a day. What keeps an image painting is the cached BODY, not a live
+ * locally for a WEEK. What keeps an image painting is the cached BODY, not a live
  * url. Once the browser evicts that body it refetches with a url that has since
  * expired, gets a 403, and the error path re-mints with `refresh`. That path is
  * therefore load-bearing, not a rare fallback.
  *
+ * A week is the platform default for reading a private file, not a number chosen
+ * here: skapi-js reads every private record file with
+ * PRIVATE_FILE_BROWSER_CACHE_SECONDS = 7 days against the same 20-minute url, and
+ * get_signed_url caps the header at BROWSER_CACHE_MAX_SECONDS = 7 days. A chat
+ * that asked for a day was re-downloading images the rest of the product would
+ * have served from disk.
+ *
  * Applies to previews only. A CLICK must open a live url, so the chip refresh
  * stays on an uncached POST mint.
  */
-export var PREVIEW_BROWSER_CACHE_SECONDS = 24 * 60 * 60;
+export var PREVIEW_BROWSER_CACHE_SECONDS = 7 * 24 * 60 * 60;
 
 /**
  * How long a client may keep serving an href it already minted before dropping

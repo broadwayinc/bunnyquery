@@ -499,10 +499,17 @@ declare var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS: number;
  *
  * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
  * that is the whole trick: the url is short-lived while the file stays available
- * locally for a day. What keeps an image painting is the cached BODY, not a live
+ * locally for a WEEK. What keeps an image painting is the cached BODY, not a live
  * url. Once the browser evicts that body it refetches with a url that has since
  * expired, gets a 403, and the error path re-mints with `refresh`. That path is
  * therefore load-bearing, not a rare fallback.
+ *
+ * A week is the platform default for reading a private file, not a number chosen
+ * here: skapi-js reads every private record file with
+ * PRIVATE_FILE_BROWSER_CACHE_SECONDS = 7 days against the same 20-minute url, and
+ * get_signed_url caps the header at BROWSER_CACHE_MAX_SECONDS = 7 days. A chat
+ * that asked for a day was re-downloading images the rest of the product would
+ * have served from disk.
  *
  * Applies to previews only. A CLICK must open a live url, so the chip refresh
  * stays on an uncached POST mint.
@@ -1032,6 +1039,33 @@ declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isS
 declare const MCP_NAME = "BunnyQuery";
 declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
 declare const DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
+/** How a given model should be shown a rendered document. */
+type VisionProfile = {
+    /** Per-image `detail` (OpenAI only). */
+    detail: string;
+    /** Pages the worker renders into one window. */
+    pagesPerWindow: number;
+    /** Horizontal bands per page; 1 renders the whole page as one image. */
+    tile: number;
+};
+/**
+ * Resolve the render profile for a model.
+ *
+ * Three tiers, and they fail for different reasons, which is why one set of knobs cannot
+ * serve all of them:
+ *   - full: everything ABOVE gpt-5.4-nano - the base models, mini, and every gpt-5.6
+ *     including 5.6-nano. These already transcribe dense scans correctly, so they get
+ *     'original' detail and are otherwise untouched.
+ *   - gpt-5.4-nano: also gets 'original', so it sees exactly the SAME pixels as the full
+ *     tier. Its gap therefore is not resolution, and tiling would do nothing for it. What
+ *     it lacks is room: a smaller window leaves the same output budget divided between
+ *     fewer pages.
+ *   - downsampled (below the 'original' floor: gpt-5.3-nano, gpt-5-nano, gpt-4.1-nano):
+ *     capped at 'high', which resamples the page onto a 512px grid no matter what DPI it
+ *     was rendered at. Render resolution is wasted on these entirely; the only way to give
+ *     them readable text is to make each image cover less of the page, which is `tile`.
+ */
+declare function getVisionProfile(model?: string): VisionProfile;
 type ClaudeRole = 'user' | 'assistant';
 type ClaudeMessage = {
     role: ClaudeRole;
@@ -1323,6 +1357,18 @@ interface ChatState {
      *  means "we have not found out", which the display layer reads as still
      *  working — never as an all-clear. */
     liveIndexChecked: boolean;
+    /** Server item ids of the indexing passes that existed — on the row, or on the
+     *  bg queue — when the user STOPPED that file. Two readers, one fact:
+     *  buildChatDisplayList reports the run as stopped when it holds any of them
+     *  (a stop routinely leaves no other trace), and _applyIndexCancellations
+     *  refuses to let one of them lift the stop the way a genuinely new indexing
+     *  request does. Ids, not file keys: they name the RUN that was stopped, so a
+     *  later re-index of the same file cannot inherit it. On the state, like
+     *  liveIndexKeys, so a reactive consumer re-renders the moment a stop is
+     *  recorded — a stop with nothing left to cancel changes no message at all. */
+    stoppedIndexIds: {
+        [serverItemId: string]: boolean;
+    };
 }
 interface ChatHost {
     /** Read live (platform/model/name can change between sends). */
@@ -1504,8 +1550,19 @@ type IndexingGroup = {
      *  when nothing is cancellable — a finished file, or a live pass whose server
      *  id has not come back yet. */
     cancellableIds: string[];
-    /** A cancel request is in flight for one of the passes. */
+    /** This row is in the middle of stopping: a cancel request is in flight for one
+     *  of its passes, or the user stopped the run and a pass is still running. Both
+     *  mean the same thing to a view — the Stop has been spent, so the button reads
+     *  "Stopping..." and is not offered again. */
     cancelling: boolean;
+    /** The user stopped this run.
+     *
+     *  NOT the same as `status === 'cancelled'`, and the difference is the whole
+     *  reason it exists: a stop landing on a pass that is already RUNNING cannot
+     *  un-run it, so the row stays `active` until that pass settles. `status` then
+     *  describes the work (something is still running) and this describes the user's
+     *  decision (no more of it will be started). */
+    stopped: boolean;
     /** Why the last cancel attempt failed (e.g. the pass had already finished). */
     cancelError?: string;
     /** The file's first pass is not among the loaded messages, so earlier passes
@@ -1619,6 +1676,14 @@ type BuildDisplayListOptions = {
     /** Whether `liveIndexKeys` has been answered at least once for this chat. False
      *  is "we do not know", and a worker-driven run stays unfinished on it. */
     liveIndexChecked?: boolean;
+    /** Server item ids of passes that were on a row when the user STOPPED it
+     *  (ChatSession.state.stoppedIndexIds). A run holding any of them is a run the
+     *  user stopped — see the status derivation for why a stop usually leaves no
+     *  other trace in the messages. Ids rather than a file key on purpose: they name
+     *  one RUN, so a later re-index of the same file cannot inherit the stop. */
+    stoppedIndexIds?: {
+        [serverItemId: string]: boolean;
+    };
     /** Whether the WORKER drives the windowed text/grid loop (chatEngineConfig's
      *  windowedIndexing). Passed in rather than read from config so this stays a
      *  pure function of its inputs and can be exercised for both settings. */
@@ -1726,6 +1791,9 @@ declare class ChatSession {
     /** The chat the live-index snapshot (state.liveIndexKeys) was taken for, so a
      *  project switch drops it. */
     private _liveIndexKey;
+    /** When the snapshot was last published (wall clock ms), so a caller that needs
+     *  a CURRENT answer can tell whether to re-ask. 0 = never. */
+    private _liveIndexAt;
     constructor(host: ChatHost);
     /** What the display layer needs to decide whether a run is finished. `keys` holds
      *  every file the server still has indexing work for; `checked` is false until the
@@ -1736,6 +1804,55 @@ declare class ChatSession {
         };
         checked: boolean;
     };
+    /** Passes that were on a row when the user stopped it, so the display layer can
+     *  still tell that this run was stopped once the stop has left no other trace.
+     *  See cancelIndexingGroup, which fills it, and buildChatDisplayList, which is
+     *  the only reader. */
+    getStoppedIndexIds(): {
+        [serverItemId: string]: boolean;
+    };
+    /**
+     * Is this file ALREADY being indexed by this client?
+     *
+     * One live run per file, and the reason is what a second one looks like: the
+     * conversation grows a SECOND collapsed row for the same file (a run is opened
+     * by every FIRST pass, so two of them are two rows), the same document is read
+     * twice at full provider cost, and the two chains fight over the same records —
+     * the delete-then-repost that starts run 2 wipes what run 1 has saved so far.
+     *
+     * Asked of this client's own live work, so it cannot be wrong in the dangerous
+     * direction: a queued/running pass keeps its bgTaskQueue entry until its bubble
+     * settles, and a settled run answers false, which is what a genuine later
+     * re-index needs.
+     *
+     * The retry that made this necessary: a chip whose INDEX request failed is
+     * handed back to the composer to be retried on the next send, and an index
+     * request can fail from the client's side (a lost ack, an expired token on the
+     * response) while the server has already queued the pass. The retry then indexes
+     * a file that was never not being indexed.
+     */
+    hasLiveIndexRun(storagePath?: string): boolean;
+    /**
+     * The same question, asked of the SERVER when this page cannot answer it.
+     *
+     * hasLiveIndexRun only knows what this page did. That is not enough for the
+     * case duplicates actually come from: the first run was started before a
+     * reload, or in another tab, or its bubble has since been paged out of the
+     * loaded window — and then the retry finds nothing locally and starts a second
+     * run of a file that is still being indexed. The queue is the one place that
+     * knows, and it is already asked for exactly this list.
+     *
+     * Only a POSITIVE answer is used. Absence proves nothing here (the query is
+     * capped, and `liveIndexChecked` records that), so an unanswerable question
+     * falls back to dispatching — the cost of a wrong "no" is the duplicate this
+     * exists to prevent, and the cost of a wrong "yes" is a file that never gets
+     * indexed at all. Only one of those is recoverable by the user.
+     */
+    isIndexRunLive(storagePath?: string): Promise<boolean>;
+    /** Re-ask the queue which files are still being indexed, unless the answer we
+     *  have is younger than `maxAgeMs`. Shared by every caller that needs a current
+     *  one; the display layer's own refresh path is the adopt ladder. */
+    private _refreshLiveIndexKeys;
     /**
      * Replace the live-index snapshot from a queue query's raw items.
      *
@@ -1979,7 +2096,10 @@ declare class ChatSession {
      *   2. the file is remembered in cancelledIndexKeys, so the client-driven
      *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
      *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
-     *      drain rather than surfacing a fresh "Indexing…" bubble.
+     *      drain rather than surfacing a fresh "Indexing…" bubble; and
+     *   4. the RUN is remembered (state.stoppedIndexIds), because none of the above
+     *      necessarily leaves a mark on the conversation — see below — and without
+     *      it the collapsed row reported the stopped file as finished.
      *
      * Records already written by the passes that DID run are kept — this stops the
      * work, it does not undo it.
@@ -2009,6 +2129,29 @@ declare class ChatSession {
     /** The file an already-rendered background pass is about, off its request
      *  bubble. Null for an ordinary turn, which is most of them. */
     private _indexRefOfItem;
+    /**
+     * Settle a turn the server reports as cancelled: the request bubble goes to its
+     * cancelled form and the "Thinking..." placeholder goes away. The same shape
+     * cancelQueuedMessage produces locally, so a cancel this client made and one it
+     * merely found out about render identically — and an indexing pass keeps the
+     * markers that hold it in its file's collapsed row.
+     */
+    private _settleCancelledItem;
+    /**
+     * A poll that came back saying the request was CANCELLED, rather than with an
+     * answer.
+     *
+     * The server keeps a cancelled request as a terminal row instead of deleting it
+     * (that row is the durable record of the stop, and the chat history it belongs
+     * to), so a poll still running when the cancel lands now RESOLVES on it. It used
+     * to reject with NOT_EXISTS, and the resolution path below reads a status object
+     * as an answer with no text — which would stamp "No text response received from
+     * AI provider" over a turn the user had just stopped.
+     *
+     * Reachable whenever the poll was not stopped by whoever cancelled: another tab,
+     * another device, or the row being cancelled server-side by the file's own stop.
+     */
+    private _isCancelledPollResult;
     applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
     /** How a bg task maps onto a collapsed row: the row's own key (storage path
      *  when known, else the filename), scoped to the chat it belongs to. A storage
@@ -2024,6 +2167,16 @@ declare class ChatSession {
      * path, and without this an earlier cancel would silently kill every future
      * index of the same path. A continuation of a stopped file is dropped instead,
      * covering the pass that was dispatched in the moment before the cancel landed.
+     *
+     * "Fresh" is the load-bearing word, and it used to be missing. A run's OWN first
+     * pass sits in this queue for as long as it runs (entries are only dropped once
+     * their bubble settles), so stopping a file during its first pass — which is
+     * exactly when a user who has just uploaded it does — met that first-pass entry
+     * on the very next drain and lifted the stop the user had just asked for. The
+     * chain then carried on, one worker-minted window after another, with nothing
+     * client-side left to suppress it. The ids recorded at stop time are what tells
+     * the two apart: a pass that was already there when the user hit Stop cannot be
+     * the new request that lifts it.
      */
     private _applyIndexCancellations;
     /**
@@ -2103,4 +2256,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };

@@ -187,6 +187,16 @@ function buildRenderDatafy(placeholder: string): string {
 		`call postRecords and save records - one record per row / table entry / line item visible on the page ` +
 		`(or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables ` +
 		`cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.\n\n` +
+		`Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - ` +
+		`use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own ` +
+		`numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). ` +
+		`Whether a page is one you have already saved is stated in the note above the images - decide from that, ` +
+		`never from a printed page number.\n\n` +
+		`Transcribe COMPLETELY, not representatively. A table with twenty rows gets twenty records, not a sample ` +
+		`of the first few - if a page has more rows than you can save comfortably, still save them all rather than ` +
+		`summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the ` +
+		`exact text and should be preferred over reading the pixels, with the image used for layout, tables, ` +
+		`stamps and handwriting.\n\n` +
 		`Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read ` +
 		`the rest of the file and do NOT worry about the pages after this window: if any remain, the next window ` +
 		`is rendered and sent to you automatically. Report only the pages you were actually shown - never imply ` +

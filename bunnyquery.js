@@ -291,6 +291,7 @@ File attachments: When a user message contains an "Attached files:" section with
 Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files, but be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
 File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
 File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
+Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen \u2014 you do not have to describe it, attach it, or apologise for not being able to display it. So: never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
 File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
 item,qty,total
@@ -397,6 +398,10 @@ Records for the earlier pages are ALREADY saved (they reference "${src}"). The N
 ${placeholder}
 
 LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
+
+Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). Whether a page is one you have already saved is stated in the note above the images - decide from that, never from a printed page number.
+
+Transcribe COMPLETELY, not representatively. A table with twenty rows gets twenty records, not a sample of the first few - if a page has more rows than you can save comfortably, still save them all rather than summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the exact text and should be preferred over reading the pixels, with the image used for layout, tables, stamps and handwriting.
 
 Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
   }
@@ -548,7 +553,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
   var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
   var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
-  var PREVIEW_BROWSER_CACHE_SECONDS = 24 * 60 * 60;
+  var PREVIEW_BROWSER_CACHE_SECONDS = 7 * 24 * 60 * 60;
   var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
   function createInlineLinkRegex() {
     return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -1267,7 +1272,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
   var VARIANT_IMAGE_DETAIL = "original";
   var VARIANT_TEXT_VERBOSITY = "high";
-  var VARIANT_REASONING_EFFORT = "low";
+  var OLDEST_NANO_REASONING_EFFORT = "high";
   var isOpenAINano = (model) => {
     const normalized = (model).trim().toLowerCase();
     if (!/(^|-)nano(-|$)/.test(normalized)) return false;
@@ -1278,10 +1283,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return major > 5 || major === 5 && minor !== null && minor >= 4;
   };
   var variantIndexingOptions = (model) => {
-    if (!isOpenAINano(model)) return {};
+    if (!isOpenAINano(model) || !isOldestNano(model)) return {};
     return {
       ...{ text: { verbosity: VARIANT_TEXT_VERBOSITY } } ,
-      ...{ reasoning: { effort: VARIANT_REASONING_EFFORT } } 
+      ...{ reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } 
     };
   };
   var getOpenAIImageDetail = (model) => {
@@ -1303,6 +1308,34 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const detail = getOpenAIImageDetail(model);
     return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? "high" : detail;
   };
+  var OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
+  var isRecognisedOpenAIVersion = (model) => OPENAI_VERSIONED_ID.test((model).trim().toLowerCase());
+  var isOldestNano = (model) => {
+    const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+    if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+    if (!match) return true;
+    const major = Number(match[1]);
+    const minor = match[2] === void 0 ? null : Number(match[2]);
+    if (major < 5) return true;
+    if (major > 5) return false;
+    return minor === null || minor <= 4;
+  };
+  var SMALL_TIER_PAGES_PER_WINDOW = 2;
+  var DOWNSAMPLED_TIER_TILE = 2;
+  function getVisionProfile(model) {
+    const detail = getRenderImageDetail(model);
+    if (!isRecognisedOpenAIVersion(model)) {
+      return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+    }
+    if (detail !== "original") {
+      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
+    }
+    if (isOldestNano(model)) {
+      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
+    }
+    return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+  }
   var IMAGE_URL_REGEX = /\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
   function transformContentWithImages(content) {
     if (typeof content !== "string" || !content) {
@@ -1548,16 +1581,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const renderFrom = Math.max(0, info.renderFrom || 0);
     const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
     const renderDetail = platform === "openai" ? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
+    const visionProfile = platform === "openai" ? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL) : { pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
     const skapiRender = visionFile && renderPlaceholder ? {
       _skapi_render: [
         {
           path: attachment.storagePath,
           from: renderFrom,
-          count: RENDER_PAGES_PER_WINDOW,
+          count: visionProfile.pagesPerWindow,
           placeholder: renderPlaceholder,
           name: attachment.name,
           mime: attachment.mime,
           detail: renderDetail,
+          tile: visionProfile.tile,
           auto_continue: true,
           continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder)
         }
@@ -2005,6 +2040,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
 
   // src/engine/session.ts
   var WORKER_PASS_ADOPT_LIMIT = 20;
+  var LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5e3;
   var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
   var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
   var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -2076,7 +2112,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         historyRequestToken: 0,
         gateRefreshToken: 0,
         liveIndexKeys: {},
-        liveIndexChecked: false
+        liveIndexChecked: false,
+        stoppedIndexIds: {}
       };
       this.bgTaskQueue = [];
       this.cancelledServerIds = /* @__PURE__ */ new Set();
@@ -2093,12 +2130,105 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this._drainNudges = [];
       this._liveStages = {};
       this._liveIndexKey = "";
+      this._liveIndexAt = 0;
     }
     /** What the display layer needs to decide whether a run is finished. `keys` holds
      *  every file the server still has indexing work for; `checked` is false until the
      *  first answer for this chat, and false means "we do not know yet". */
     getLiveIndexState() {
       return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+    }
+    /** Passes that were on a row when the user stopped it, so the display layer can
+     *  still tell that this run was stopped once the stop has left no other trace.
+     *  See cancelIndexingGroup, which fills it, and buildChatDisplayList, which is
+     *  the only reader. */
+    getStoppedIndexIds() {
+      return this.state.stoppedIndexIds;
+    }
+    /**
+     * Is this file ALREADY being indexed by this client?
+     *
+     * One live run per file, and the reason is what a second one looks like: the
+     * conversation grows a SECOND collapsed row for the same file (a run is opened
+     * by every FIRST pass, so two of them are two rows), the same document is read
+     * twice at full provider cost, and the two chains fight over the same records —
+     * the delete-then-repost that starts run 2 wipes what run 1 has saved so far.
+     *
+     * Asked of this client's own live work, so it cannot be wrong in the dangerous
+     * direction: a queued/running pass keeps its bgTaskQueue entry until its bubble
+     * settles, and a settled run answers false, which is what a genuine later
+     * re-index needs.
+     *
+     * The retry that made this necessary: a chip whose INDEX request failed is
+     * handed back to the composer to be retried on the next send, and an index
+     * request can fail from the client's side (a lost ack, an expired token on the
+     * response) while the server has already queued the pass. The retry then indexes
+     * a file that was never not being indexed.
+     */
+    hasLiveIndexRun(storagePath) {
+      if (!storagePath) return false;
+      var id = this.host.getIdentity();
+      for (var i = 0; i < this.bgTaskQueue.length; i++) {
+        var e = this.bgTaskQueue[i];
+        if (e && e.storagePath === storagePath && e.serviceId === id.serviceId && e.platform === id.platform) return true;
+      }
+      return this.state.messages.some(function(m) {
+        if (!m.isBackgroundTask || m.role !== "user" || m.isCancelled) return false;
+        if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
+        return !!m._indexFile && m._indexFile.path === storagePath;
+      });
+    }
+    /**
+     * The same question, asked of the SERVER when this page cannot answer it.
+     *
+     * hasLiveIndexRun only knows what this page did. That is not enough for the
+     * case duplicates actually come from: the first run was started before a
+     * reload, or in another tab, or its bubble has since been paged out of the
+     * loaded window — and then the retry finds nothing locally and starts a second
+     * run of a file that is still being indexed. The queue is the one place that
+     * knows, and it is already asked for exactly this list.
+     *
+     * Only a POSITIVE answer is used. Absence proves nothing here (the query is
+     * capped, and `liveIndexChecked` records that), so an unanswerable question
+     * falls back to dispatching — the cost of a wrong "no" is the duplicate this
+     * exists to prevent, and the cost of a wrong "yes" is a file that never gets
+     * indexed at all. Only one of those is recoverable by the user.
+     */
+    isIndexRunLive(storagePath) {
+      var self = this;
+      if (!storagePath) return Promise.resolve(false);
+      if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(true);
+      return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS).then(function() {
+        return !!self.state.liveIndexKeys[storagePath];
+      }).catch(function() {
+        return false;
+      });
+    }
+    /** Re-ask the queue which files are still being indexed, unless the answer we
+     *  have is younger than `maxAgeMs`. Shared by every caller that needs a current
+     *  one; the display layer's own refresh path is the adopt ladder. */
+    _refreshLiveIndexKeys(maxAgeMs) {
+      var self = this;
+      var id = this.host.getIdentity();
+      var platform = id.platform;
+      if (!id.serviceId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+      if (this._liveIndexKey === this.getHistoryCacheKey() && nowMs() - this._liveIndexAt < maxAgeMs) {
+        return Promise.resolve();
+      }
+      var queue = bgIndexingQueueName(id.userId, id.serviceId);
+      var ask = function(status) {
+        return Promise.resolve(getChatHistory(
+          { service: id.serviceId, owner: id.owner, platform, queue, status },
+          { limit: WORKER_PASS_ADOPT_LIMIT }
+        )).catch(function() {
+          return null;
+        });
+      };
+      return Promise.all([ask("pending"), ask("running")]).then(function(results) {
+        if (results[0] === null || results[1] === null) return;
+        self._liveIndexKey = self.getHistoryCacheKey();
+        self._recordLiveIndexKeys(results);
+      });
     }
     /**
      * Replace the live-index snapshot from a queue query's raw items.
@@ -2147,6 +2277,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       this.state.liveIndexKeys = next;
       this.state.liveIndexChecked = nowChecked;
+      this._liveIndexAt = nowMs();
       if (changed) this.host.notify();
     }
     /** Forget the snapshot: it describes ONE chat's queue, and the answer for the
@@ -2154,6 +2285,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     _resetLiveIndexKeys() {
       this.state.liveIndexKeys = {};
       this.state.liveIndexChecked = false;
+      this._liveIndexAt = 0;
     }
     /**
      * Ask the queue what is still indexing, once, for the chat that is on screen.
@@ -3269,7 +3401,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *   2. the file is remembered in cancelledIndexKeys, so the client-driven
      *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
      *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
-     *      drain rather than surfacing a fresh "Indexing…" bubble.
+     *      drain rather than surfacing a fresh "Indexing…" bubble; and
+     *   4. the RUN is remembered (state.stoppedIndexIds), because none of the above
+     *      necessarily leaves a mark on the conversation — see below — and without
+     *      it the collapsed row reported the stopped file as finished.
      *
      * Records already written by the passes that DID run are kept — this stops the
      * work, it does not undo it.
@@ -3279,6 +3414,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!group || !group.key) return;
       var scoped = this.getHistoryCacheKey() + "|" + group.key;
       this.cancelledIndexKeys.add(scoped);
+      if (!group.finished) {
+        var stoppedIds = {};
+        for (var sk in this.state.stoppedIndexIds) stoppedIds[sk] = true;
+        (group.members || []).forEach(function(m) {
+          var sid = m && m.msg && m.msg._serverItemId;
+          if (sid) stoppedIds[sid] = true;
+        });
+        this.bgTaskQueue.forEach(function(e) {
+          if (e && e.id && self._indexKeyOf(e) === scoped) stoppedIds[e.id] = true;
+        });
+        this.state.stoppedIndexIds = stoppedIds;
+      }
+      this._adoptWorkerIndexingPasses(0);
       var ids = group.cancellableIds || [];
       if (!ids.length) {
         this.host.notify();
@@ -3576,8 +3724,61 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return null;
     }
+    /**
+     * Settle a turn the server reports as cancelled: the request bubble goes to its
+     * cancelled form and the "Thinking..." placeholder goes away. The same shape
+     * cancelQueuedMessage produces locally, so a cancel this client made and one it
+     * merely found out about render identically — and an indexing pass keeps the
+     * markers that hold it in its file's collapsed row.
+     */
+    _settleCancelledItem(itemId) {
+      var uIdx = this.state.messages.findIndex(function(m) {
+        return m.role === "user" && m._serverItemId === itemId && !m.isCancelled;
+      });
+      if (uIdx !== -1) {
+        var u = this.state.messages[uIdx];
+        var cancelled = { role: "user", content: u.content, isCancelled: true, _serverItemId: itemId };
+        if (u.isBackgroundTask) cancelled.isBackgroundTask = true;
+        if (u._indexFile) cancelled._indexFile = u._indexFile;
+        if (u._useBgQueue) cancelled._useBgQueue = true;
+        if (u._ownerKey !== void 0) cancelled._ownerKey = u._ownerKey;
+        if (u._ts !== void 0) cancelled._ts = u._ts;
+        this.state.messages[uIdx] = cancelled;
+      }
+      var pIdx = this.state.messages.findIndex(function(m) {
+        return m.isPending && m.role === "assistant" && m._serverItemId === itemId;
+      });
+      if (pIdx !== -1) this.state.messages.splice(pIdx, 1);
+      this.cancelledServerIds.delete(itemId);
+      this._removeStrayPendingAssistants();
+      this.host.notify();
+      this.updateHistoryCache();
+    }
+    /**
+     * A poll that came back saying the request was CANCELLED, rather than with an
+     * answer.
+     *
+     * The server keeps a cancelled request as a terminal row instead of deleting it
+     * (that row is the durable record of the stop, and the chat history it belongs
+     * to), so a poll still running when the cancel lands now RESOLVES on it. It used
+     * to reject with NOT_EXISTS, and the resolution path below reads a status object
+     * as an answer with no text — which would stamp "No text response received from
+     * AI provider" over a turn the user had just stopped.
+     *
+     * Reachable whenever the poll was not stopped by whoever cancelled: another tab,
+     * another device, or the row being cancelled server-side by the file's own stop.
+     */
+    _isCancelledPollResult(response) {
+      if (!response || typeof response !== "object" || response.status !== "cancelled") return false;
+      if (response.content !== void 0 || response.output !== void 0) return false;
+      return response.queue_name !== void 0 || response.in_queue !== void 0;
+    }
     applyHistoryItemResolution(itemId, response, platform) {
       this.historyItemPolls.delete(itemId);
+      if (this._isCancelledPollResult(response)) {
+        this._settleCancelledItem(itemId);
+        return;
+      }
       var isErr = isErrorResponseBody(response);
       var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
       var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
@@ -3663,17 +3864,33 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * path, and without this an earlier cancel would silently kill every future
      * index of the same path. A continuation of a stopped file is dropped instead,
      * covering the pass that was dispatched in the moment before the cancel landed.
+     *
+     * "Fresh" is the load-bearing word, and it used to be missing. A run's OWN first
+     * pass sits in this queue for as long as it runs (entries are only dropped once
+     * their bubble settles), so stopping a file during its first pass — which is
+     * exactly when a user who has just uploaded it does — met that first-pass entry
+     * on the very next drain and lifted the stop the user had just asked for. The
+     * chain then carried on, one worker-minted window after another, with nothing
+     * client-side left to suppress it. The ids recorded at stop time are what tells
+     * the two apart: a pass that was already there when the user hit Stop cannot be
+     * the new request that lifts it.
      */
     _applyIndexCancellations() {
       if (!this.cancelledIndexKeys.size) return;
+      var surfaced = {};
+      this.state.messages.forEach(function(m) {
+        if (!m._serverItemId) return;
+        if (m.isPending || m.isPendingQueued || m.isPendingInProcess) surfaced[m._serverItemId] = true;
+      });
       for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
         var entry = this.bgTaskQueue[i];
         var key = this._indexKeyOf(entry);
         if (!key || !this.cancelledIndexKeys.has(key)) continue;
-        if (!entry.resumePass) {
+        if (!entry.resumePass && !this.state.stoppedIndexIds[entry.id]) {
           this.cancelledIndexKeys.delete(key);
           continue;
         }
+        if (surfaced[entry.id]) continue;
         this.bgTaskQueue.splice(i, 1);
         this._stopPoll(entry.id);
         this._cancelServerItem(entry.id);
@@ -4352,9 +4569,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               att.storagePath = member.storagePath;
             }
             var mime = member.file.type || self.host.getMimeType(member.file.name);
-            var preIndex = existedBefore && typeof self.host.deleteExistingFileRecord === "function" ? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
-            }) : Promise.resolve();
+            var alreadyIndexing = false;
+            var preIndex = self.isIndexRunLive(member.storagePath).then(function(live) {
+              alreadyIndexing = live;
+              if (live) {
+                console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
+                return;
+              }
+              if (existedBefore && typeof self.host.deleteExistingFileRecord === "function") {
+                return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+                });
+              }
+            });
             preIndex = preIndex.then(function() {
+              if (alreadyIndexing) return;
               if (typeof self.host.ensureFileIndexRecord !== "function") return;
               return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
                 name: member.file.name,
@@ -4366,6 +4594,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             return preIndex.then(function() {
               return parseAttachmentContent(member.file, member.file.name, mime || void 0);
             }).then(function(parsedContent) {
+              if (alreadyIndexing) return;
               return self.trackIndexDispatch(notifyAgentSaveAttachment({
                 platform: id.platform,
                 model: id.model,
@@ -4559,6 +4788,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var list = Array.isArray(messages) ? messages : [];
     var liveIndexKeys = opts && opts.liveIndexKeys || {};
     var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+    var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
     var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
     var hasMoreHistory = !!(opts && opts.hasMoreHistory);
     var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
@@ -4609,6 +4839,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           status: "done",
           cancellableIds: [],
           cancelling: false,
+          stopped: false,
           mayHaveOlder: false,
           // The run's first loaded pass, and never re-stamped: see the file
           // docstring. `anchorId` is filled in once every member is known.
@@ -4664,6 +4895,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           break;
         }
       }
+      var stopped = false;
+      for (var ki = 0; ki < grp.members.length; ki++) {
+        var km = grp.members[ki].msg;
+        if (km.isCancelled) {
+          stopped = true;
+          break;
+        }
+        if (km._serverItemId && stoppedIndexIds[km._serverItemId]) {
+          stopped = true;
+          break;
+        }
+      }
+      grp.stopped = stopped;
       for (var xi = 0; xi < grp.members.length; xi++) {
         if (grp.members[xi].msg._cancelling) {
           grp.cancelling = true;
@@ -4673,7 +4917,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var seenIds = {};
       for (var ci = 0; ci < grp.members.length; ci++) {
         var cm = grp.members[ci].msg;
-        if (cm._cancelError && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
+        if (cm._cancelError && !stopped && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
         if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
         if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
         if (ci < lastSettled) continue;
@@ -4683,9 +4927,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       if (active) {
         grp.status = "active";
+        if (stopped) grp.cancelling = true;
+      } else if (stopped) {
+        grp.status = "cancelled";
       } else {
         var last = grp.members[grp.members.length - 1].msg;
-        grp.status = last.isError ? "error" : last.isCancelled ? "cancelled" : "done";
+        grp.status = last.isError ? "error" : "done";
       }
       var sawFirstPass = false;
       for (var pi = 0; pi < grp.members.length; pi++) {
@@ -6867,10 +7114,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var reqOpts = { auth: true, method: "post" };
       if (cdn === false && opts.browserCache) {
         reqOpts.method = "get";
+        reqOpts.stableGateway = true;
+        if (opts.refresh) reqOpts.revalidate = true;
         body.browser_cache = opts.browserCache;
         var uid = S.user && S.user.user_id;
         if (uid) body.uid = uid;
-        if (opts.refresh) body.nocache = Date.now();
       }
       return S.skapi.util.request("get-signed-url", body, reqOpts).then(function(res) {
         var u = typeof res === "string" ? res : res && res.url;
@@ -7716,15 +7964,35 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (group.passCount <= 1 && !group.mayHaveOlder) return "";
       return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
+    function displayListOptions() {
+      var liveIndex = session.getLiveIndexState();
+      return {
+        hasMoreHistory: !CS.historyEndOfList,
+        // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
+        // per-request flag: the viewport fill is many pages and that flag drops
+        // to false between every one of them, which is once per page of flicker
+        // on any row rendered off it.
+        loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
+        liveIndexKeys: liveIndex.keys,
+        liveIndexChecked: liveIndex.checked,
+        // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
+        // cancelled bubble behind (that pass finishes and answers normally), so
+        // without this the row reports the stop as a finished "Indexed".
+        stoppedIndexIds: session.getStoppedIndexIds()
+      };
+    }
     var stopIndexState = { runKey: "", fileKey: "", handle: null };
+    function indexGroupStoppable(group) {
+      return !!group && !group.finished && !group.resolving && !group.stopped && !group.cancelling;
+    }
     function findCancellableIndexGroup(runKey, fileKey) {
       if (!runKey) return null;
-      var list = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+      var list = buildChatDisplayList(CS.messages, displayListOptions());
       var byFile = null;
       for (var i = 0; i < list.length; i++) {
         var row = list[i];
         if (row.kind !== "indexing") continue;
-        var live = row.group.cancellableIds.length && !row.group.cancelling ? row.group : null;
+        var live = indexGroupStoppable(row.group) ? row.group : null;
         if (row.group.runKey === runKey) return live;
         if (!byFile && live && fileKey && row.group.key === fileKey) byFile = row.group;
       }
@@ -7750,7 +8018,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)) closeStopIndexModal();
     }
     function openStopIndexModal(group) {
-      if (!group || group.cancelling) return;
+      if (!indexGroupStoppable(group)) return;
       closeStopIndexModal();
       stopIndexState.runKey = group.runKey;
       stopIndexState.fileKey = group.key;
@@ -7811,7 +8079,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         onBubbleLinkClick(e);
       });
       var cancelBtn = null;
-      if (group.cancellableIds.length || group.cancelling) {
+      if (indexGroupStoppable(group) || group.cancelling) {
         cancelBtn = h("button", {
           class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
           type: "button",
@@ -7949,17 +8217,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.messagesBox.appendChild(greet);
         return;
       }
-      var liveIndex = session.getLiveIndexState();
-      var rows = buildChatDisplayList(CS.messages, {
-        hasMoreHistory: !CS.historyEndOfList,
-        // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
-        // per-request flag: the viewport fill is many pages and that flag drops
-        // to false between every one of them, which is once per page of flicker
-        // on any row rendered off it.
-        loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
-        liveIndexKeys: liveIndex.keys,
-        liveIndexChecked: liveIndex.checked
-      });
+      var rows = buildChatDisplayList(CS.messages, displayListOptions());
       rows.forEach(function(row) {
         if (row.kind === "indexing") {
           var isOpen = !!CS.indexGroupsOpen[row.group.key];

@@ -100,6 +100,8 @@ export {
 	// constants
 	POLL_INTERVAL,
 	MAX_CONCURRENT_BG_POLLS,
+	getVisionProfile,
+	type VisionProfile,
 	BG_INDEXING_QUEUE_SUFFIX,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
