@@ -1794,6 +1794,9 @@ declare class ChatSession {
     /** When the snapshot was last published (wall clock ms), so a caller that needs
      *  a CURRENT answer can tell whether to re-ask. 0 = never. */
     private _liveIndexAt;
+    /** Files this client has an index dispatch in flight for, by scoped path ->
+     *  wall clock. See claimIndexRun. */
+    private _indexClaims;
     constructor(host: ChatHost);
     /** What the display layer needs to decide whether a run is finished. `keys` holds
      *  every file the server still has indexing work for; `checked` is false until the
@@ -1832,6 +1835,25 @@ declare class ChatSession {
      * a file that was never not being indexed.
      */
     hasLiveIndexRun(storagePath?: string): boolean;
+    /** Storage paths are project-relative, and one ChatSession serves every
+     *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
+    private _indexClaimKey;
+    /**
+     * Take this file's indexing slot, or report that someone already has it.
+     *
+     * The check-and-CLAIM is what makes it safe against a second caller arriving
+     * mid-flight: the claim is written SYNCHRONOUSLY, before the first await, so a
+     * concurrent caller sees it even though no request has completed and no queue
+     * has admitted anything. Ask-then-dispatch could not do that — every source it
+     * consults only learns about a dispatch after the ack.
+     *
+     * Returns true when the caller owns the slot and should dispatch. A caller that
+     * then fails to dispatch MUST releaseIndexRun, or the file waits out the claim
+     * (a few minutes) before it can be retried.
+     */
+    claimIndexRun(storagePath?: string): Promise<boolean>;
+    /** Give the slot back — the dispatch failed, or was abandoned. */
+    releaseIndexRun(storagePath?: string): void;
     /**
      * The same question, asked of the SERVER when this page cannot answer it.
      *

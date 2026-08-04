@@ -285,7 +285,7 @@ function buildChatSystemPrompt(params) {
 You are a dedicated assistant for the project ID: "${formattedServiceId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
-Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records that usually share a table. So a question about the data almost always spans many records across several files. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY relevant table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset.
+Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its photos in a third, and the indexer often invents a differently-named table on each pass. Every query filter (reference, index, tags) matches inside ONE table only, so a query against a single table returns a FRACTION of the file and gives no hint that the rest exists. Therefore: call getTables FIRST, then run your query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
 Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index and tag filters match only exact values or leading prefixes, not substrings, so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
@@ -296,6 +296,10 @@ Stored files and readFileContent: for a file ALREADY in this project's storage, 
 File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
 File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
 Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen \u2014 you do not have to describe it, attach it, or apologise for not being able to display it. So: never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
+Media inside a document is extracted into real files: every picture, photo, diagram or other embedded media file inside an uploaded document (xlsx, docx, pptx, pdf) is pulled out at upload time and saved as its OWN permanent file in this project's storage, in the folder "__MEDIA__/<the document's storage path>/". It is NOT trapped inside the source document, so NEVER answer that it exists only inside the spreadsheet, that no separate file was saved, or that there is nothing to open. Never hand back a link to the source .xlsx or .pdf when the user asked for something inside it - that is the document, not the picture.
+Finding an extracted media file: they are INDEXED, in the table named exactly "__MEDIA__". Query them like any other record - getRecords with table_name "__MEDIA__", access_group "authorized", and either reference "src::<the document's storage path>" for everything extracted from one document, or a tag for a specific one (the tags carry the source file name, the anchor, and the identifiers visible in the picture such as part numbers and tag ids). Each record's data.path is the file's exact storage path. Link it VERBATIM as [caption](db:<data.path>) and the client paints the picture inline. Never rewrite, re-derive or url-encode that path.
+So "show me the photo of part X" is one query: getRecords table_name "__MEDIA__" with the part number as the tag, then link data.path. Do not go looking in file storage, do not reconstruct a filename from a cell or page number, and do not ask the user for anything. A row record may also carry the same path in a "photo_path" field, which is a valid shortcut when you already have that record in hand.
+Older documents were indexed before the "__MEDIA__" table existed, so a file may have no record. Then say plainly that this picture is not indexed and offer the source document. Never answer that a picture exists only inside the spreadsheet, that no separate image file was saved, or that you cannot show pictures at all - those are wrong, and one missing record is not evidence that photos are not stored.
 File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
 item,qty,total
@@ -2107,6 +2111,7 @@ function createHistoryFiller(base) {
 // src/engine/session.ts
 var WORKER_PASS_ADOPT_LIMIT = 20;
 var LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5e3;
+var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
 var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -2197,6 +2202,7 @@ var ChatSession = class {
     this._liveStages = {};
     this._liveIndexKey = "";
     this._liveIndexAt = 0;
+    this._indexClaims = {};
   }
   /** What the display layer needs to decide whether a run is finished. `keys` holds
    *  every file the server still has indexing work for; `checked` is false until the
@@ -2233,6 +2239,8 @@ var ChatSession = class {
    */
   hasLiveIndexRun(storagePath) {
     if (!storagePath) return false;
+    var claimed = this._indexClaims[this._indexClaimKey(storagePath)];
+    if (claimed && nowMs() - claimed < INDEX_DISPATCH_CLAIM_MS) return true;
     var id = this.host.getIdentity();
     for (var i = 0; i < this.bgTaskQueue.length; i++) {
       var e = this.bgTaskQueue[i];
@@ -2243,6 +2251,41 @@ var ChatSession = class {
       if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
       return !!m._indexFile && m._indexFile.path === storagePath;
     });
+  }
+  /** Storage paths are project-relative, and one ChatSession serves every
+   *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
+  _indexClaimKey(storagePath) {
+    return this.getHistoryCacheKey() + "|" + storagePath;
+  }
+  /**
+   * Take this file's indexing slot, or report that someone already has it.
+   *
+   * The check-and-CLAIM is what makes it safe against a second caller arriving
+   * mid-flight: the claim is written SYNCHRONOUSLY, before the first await, so a
+   * concurrent caller sees it even though no request has completed and no queue
+   * has admitted anything. Ask-then-dispatch could not do that — every source it
+   * consults only learns about a dispatch after the ack.
+   *
+   * Returns true when the caller owns the slot and should dispatch. A caller that
+   * then fails to dispatch MUST releaseIndexRun, or the file waits out the claim
+   * (a few minutes) before it can be retried.
+   */
+  claimIndexRun(storagePath) {
+    var self = this;
+    if (!storagePath) return Promise.resolve(true);
+    if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(false);
+    this._indexClaims[this._indexClaimKey(storagePath)] = nowMs();
+    return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS).then(function() {
+      if (!self.state.liveIndexKeys[storagePath]) return true;
+      self.releaseIndexRun(storagePath);
+      return false;
+    }).catch(function() {
+      return true;
+    });
+  }
+  /** Give the slot back — the dispatch failed, or was abandoned. */
+  releaseIndexRun(storagePath) {
+    if (storagePath) delete this._indexClaims[this._indexClaimKey(storagePath)];
   }
   /**
    * The same question, asked of the SERVER when this page cannot answer it.
@@ -4636,9 +4679,9 @@ var ChatSession = class {
           }
           var mime = member.file.type || self.host.getMimeType(member.file.name);
           var alreadyIndexing = false;
-          var preIndex = self.isIndexRunLive(member.storagePath).then(function(live) {
-            alreadyIndexing = live;
-            if (live) {
+          var preIndex = self.claimIndexRun(member.storagePath).then(function(claimed) {
+            alreadyIndexing = !claimed;
+            if (alreadyIndexing) {
               console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
               return;
             }
@@ -4699,6 +4742,7 @@ var ChatSession = class {
               }
             }, function(e) {
               console.error("[chat-engine] indexing request failed", e);
+              self.releaseIndexRun(member.storagePath);
               anyIndexFailed = true;
               if (!att.errorCode && !att.errorDetail) {
                 att.errorCode = e && (e.code || e.body && e.body.code) || "";

@@ -61,6 +61,12 @@ const WORKER_PASS_ADOPT_LIMIT = 20;
 // file gets indexed at all; long enough that one upload batch asks once, not once
 // per file.
 const LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5000;
+// How long a client holds a file's indexing slot from the moment it decides to
+// dispatch. It only has to outlive the gap between that decision and the queue
+// admitting the pass (a request, plus the status index catching up); after that
+// the bgTaskQueue entry and the pass's own bubble carry the fact. Bounded so a
+// dispatch that died without releasing cannot lock a file out for the session.
+const INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1000;
 // Delays before each look (the first is immediate). More than one because the
 // worker writes the next pass's row a few milliseconds AFTER it resolves the
 // current one, so a look that wins that race sees an empty queue for a chain
@@ -195,6 +201,9 @@ export class ChatSession {
 	/** When the snapshot was last published (wall clock ms), so a caller that needs
 	 *  a CURRENT answer can tell whether to re-ask. 0 = never. */
 	private _liveIndexAt: number;
+	/** Files this client has an index dispatch in flight for, by scoped path ->
+	 *  wall clock. See claimIndexRun. */
+	private _indexClaims: { [scopedPath: string]: number };
 
 	constructor(host: ChatHost) {
 		this.host = host;
@@ -231,6 +240,7 @@ export class ChatSession {
 		this._liveStages = {};
 		this._liveIndexKey = '';
 		this._liveIndexAt = 0;
+		this._indexClaims = {};
 	}
 
 	/** What the display layer needs to decide whether a run is finished. `keys` holds
@@ -270,6 +280,17 @@ export class ChatSession {
 	 */
 	hasLiveIndexRun(storagePath?: string): boolean {
 		if (!storagePath) return false;
+		// A dispatch this client has STARTED but not yet heard back about. Nothing
+		// else can see one: a bgTaskQueue entry exists only once the ack lands, the
+		// bubble only once the drain runs after that, and the server's own status
+		// index is eventually consistent — the adopt ladder retries at 0/2s/6s
+		// precisely because a row created seconds ago can be missing from it. So
+		// between deciding to index a file and the queue admitting it, EVERY source
+		// of truth says "not indexing", and a second dispatch in that window is
+		// exactly the duplicate this guard exists to stop. Observed live: two first
+		// passes four seconds apart, two collapsed rows.
+		var claimed = this._indexClaims[this._indexClaimKey(storagePath)];
+		if (claimed && nowMs() - claimed < INDEX_DISPATCH_CLAIM_MS) return true;
 		var id = this.host.getIdentity();
 		for (var i = 0; i < this.bgTaskQueue.length; i++) {
 			var e = this.bgTaskQueue[i];
@@ -280,6 +301,44 @@ export class ChatSession {
 			if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
 			return !!m._indexFile && m._indexFile.path === storagePath;
 		});
+	}
+
+	/** Storage paths are project-relative, and one ChatSession serves every
+	 *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
+	private _indexClaimKey(storagePath: string): string {
+		return this.getHistoryCacheKey() + '|' + storagePath;
+	}
+
+	/**
+	 * Take this file's indexing slot, or report that someone already has it.
+	 *
+	 * The check-and-CLAIM is what makes it safe against a second caller arriving
+	 * mid-flight: the claim is written SYNCHRONOUSLY, before the first await, so a
+	 * concurrent caller sees it even though no request has completed and no queue
+	 * has admitted anything. Ask-then-dispatch could not do that — every source it
+	 * consults only learns about a dispatch after the ack.
+	 *
+	 * Returns true when the caller owns the slot and should dispatch. A caller that
+	 * then fails to dispatch MUST releaseIndexRun, or the file waits out the claim
+	 * (a few minutes) before it can be retried.
+	 */
+	claimIndexRun(storagePath?: string): Promise<boolean> {
+		var self = this;
+		if (!storagePath) return Promise.resolve(true);
+		if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(false);
+		this._indexClaims[this._indexClaimKey(storagePath)] = nowMs();
+		return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS)
+			.then(function () {
+				if (!self.state.liveIndexKeys[storagePath]) return true;
+				self.releaseIndexRun(storagePath);
+				return false;
+			})
+			.catch(function () { return true; });
+	}
+
+	/** Give the slot back — the dispatch failed, or was abandoned. */
+	releaseIndexRun(storagePath?: string): void {
+		if (storagePath) delete this._indexClaims[this._indexClaimKey(storagePath)];
 	}
 
 	/**
@@ -3194,9 +3253,9 @@ export class ChatSession {
 					// run has already written and then not re-index them. Asked of the
 					// QUEUE, not just this page — see isIndexRunLive.
 					var alreadyIndexing = false;
-					var preIndex = self.isIndexRunLive(member.storagePath).then(function (live) {
-						alreadyIndexing = live;
-						if (live) {
+					var preIndex = self.claimIndexRun(member.storagePath).then(function (claimed) {
+						alreadyIndexing = !claimed;
+						if (alreadyIndexing) {
 							console.log('[chat-engine] skipping a duplicate index request for', member.storagePath);
 							return;
 						}
@@ -3255,6 +3314,10 @@ export class ChatSession {
 						}
 					}, function (e: any) {
 						console.error('[chat-engine] indexing request failed', e);
+						// Nothing was queued, so hand the slot back: the retry (a later
+						// send of the same chip) must not be refused by this client's own
+						// claim. See claimIndexRun.
+						self.releaseIndexRun(member.storagePath);
 						anyIndexFailed = true; // uploaded but not indexed → yellow
 						// Record the first index error's code/message for the report dialog.
 						if (!att.errorCode && !att.errorDetail) {
