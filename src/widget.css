@@ -592,6 +592,30 @@
     white-space: nowrap;
 }
 
+/* landing-style brand header on the chat view: [bunny] BunnyQuery · project */
+.bq-brand {
+    min-width: 0;
+    font-size: 0.8rem;
+    color: var(--bq-muted);
+}
+.bq-brand-icon {
+    width: 1.1rem;
+    height: 1.1rem;
+    object-fit: contain;
+    flex: 0 0 auto;
+}
+.bq-brand-name,
+.bq-brand-sep {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+.bq-brand-project {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 /* header icon buttons (theme, clear, account) */
 .bq-icon-btn {
     display: inline-flex;
