@@ -294,7 +294,7 @@ export class ChatSession {
 		var id = this.host.getIdentity();
 		for (var i = 0; i < this.bgTaskQueue.length; i++) {
 			var e = this.bgTaskQueue[i];
-			if (e && e.storagePath === storagePath && e.serviceId === id.serviceId && e.platform === id.platform) return true;
+			if (e && e.storagePath === storagePath && e.projectId === id.projectId && e.platform === id.platform) return true;
 		}
 		return this.state.messages.some(function (m) {
 			if (!m.isBackgroundTask || m.role !== 'user' || m.isCancelled) return false;
@@ -373,20 +373,27 @@ export class ChatSession {
 		var self = this;
 		var id = this.host.getIdentity();
 		var platform = id.platform;
-		if (!id.serviceId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve();
-		if (this._liveIndexKey === this.getHistoryCacheKey() && nowMs() - this._liveIndexAt < maxAgeMs) {
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve();
+		// The chat this query is FOR, snapshotted before the round trip. The record
+		// below is gated on it still being the chat on screen: the adopt ladder makes
+		// the same resolve-time identity check, and without it a project switch inside
+		// this query's RTT published chat A's queue answer as chat B's snapshot —
+		// where absence reads as a green "Indexed" for files B is indexing right now.
+		var askedKey = this.getHistoryCacheKey();
+		if (this._liveIndexKey === askedKey && nowMs() - this._liveIndexAt < maxAgeMs) {
 			return Promise.resolve();
 		}
-		var queue = bgIndexingQueueName(id.userId, id.serviceId);
+		var queue = bgIndexingQueueName(id.userId, id.projectId);
 		var ask = function (status: 'pending' | 'running') {
 			return Promise.resolve(getChatHistory(
-				{ service: id.serviceId, owner: id.owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
+				{ service: id.projectId, owner: id.owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
 				{ limit: WORKER_PASS_ADOPT_LIMIT },
 			)).catch(function () { return null; });
 		};
 		return Promise.all([ask('pending'), ask('running')]).then(function (results) {
 			if (results[0] === null || results[1] === null) return;
-			self._liveIndexKey = self.getHistoryCacheKey();
+			if (self.getHistoryCacheKey() !== askedKey) return;
+			self._liveIndexKey = askedKey;
 			self._recordLiveIndexKeys(results);
 		});
 	}
@@ -448,6 +455,17 @@ export class ChatSession {
 		this.state.liveIndexKeys = next;
 		this.state.liveIndexChecked = nowChecked;
 		this._liveIndexAt = nowMs();
+		// Claim the snapshot for the CURRENT chat. Both callers verify identity before
+		// recording, so this is always true - but only _refreshLiveIndexKeys used to say
+		// so, and the adopt ladder (the path every plain page load actually seeds
+		// through) never did. _liveIndexKey then stayed '', and the first-page reset in
+		// loadHistory ('loadKey !== _liveIndexKey') fired on EVERY load - including every
+		// tab refocus - wiping checked/keys and flipping every settled indexing row back
+		// to the grey "checking status" until the queue answered again. With the claim,
+		// that reset fires only on a genuine project/platform switch; a refocus keeps
+		// showing the last known state (green/yellow) and the re-poll that follows
+		// replaces the snapshot atomically when its answer lands.
+		this._liveIndexKey = this.getHistoryCacheKey();
 		if (changed) this.host.notify();
 	}
 
@@ -485,12 +503,27 @@ export class ChatSession {
 		this._adoptWorkerIndexingPasses(0);
 	}
 
-	/** Forget what we know about which files are indexing. For a consumer whose
-	 *  history loading is its own fork and so never reaches loadHistory's reset —
-	 *  a snapshot describes ONE chat's queue, and carrying it into another project
-	 *  would let a row there claim to be finished on someone else's evidence. */
+	/** Forget what we know about which files are indexing — but ONLY when the
+	 *  snapshot was taken for a different chat than the one on screen now. For a
+	 *  consumer whose history loading is its own fork and so never reaches
+	 *  loadHistory's reset — a snapshot describes ONE chat's queue, and carrying it
+	 *  into another project would let a row there claim to be finished on someone
+	 *  else's evidence.
+	 *
+	 *  Conditional for the same reason loadHistory's own reset is (the
+	 *  `loadKey !== _liveIndexKey` gate): the view calls this on every mount, and
+	 *  an unconditional wipe turned every re-entry to the chat into a grey
+	 *  "Checking status:" sweep across rows whose state was already known. A
+	 *  RE-entry keeps showing the last answer (green/yellow) while the first-page
+	 *  refresh re-asks quietly; only a genuine project/platform switch starts from
+	 *  "not known yet". Claiming `_liveIndexKey` here (before any answer) is the
+	 *  same fudge loadHistory makes: it marks WHOSE chat the empty snapshot is
+	 *  for, so repeated calls do not re-wipe, and _recordLiveIndexKeys re-claims
+	 *  it when the real answer lands. */
 	resetLiveIndexState(): void {
-		this._liveIndexKey = '';
+		var key = this.getHistoryCacheKey();
+		if (key === this._liveIndexKey) return;
+		this._liveIndexKey = key;
 		this._resetLiveIndexKeys();
 	}
 
@@ -651,8 +684,8 @@ export class ChatSession {
 
 	getHistoryCacheKey(): string {
 		var id = this.host.getIdentity();
-		if (!id.serviceId || id.platform === 'none') return '';
-		return id.serviceId + '#' + id.platform;
+		if (!id.projectId || id.platform === 'none') return '';
+		return id.projectId + '#' + id.platform;
 	}
 
 	updateHistoryCache(): void {
@@ -758,21 +791,21 @@ export class ChatSession {
 	}
 
 	/**
-	 * serviceId/owner are passed explicitly by every caller: a request can be
+	 * projectId/owner are passed explicitly by every caller: a request can be
 	 * dispatched after the user moved to another project, and re-reading the live
 	 * identity here would silently send the turn to THAT project instead of the
 	 * one it was composed for. Falls back to the live read only when a caller
 	 * omits them.
 	 */
-	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any, serviceId?: string, owner?: string) {
-		if (serviceId === undefined || owner === undefined) {
+	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any, projectId?: string, owner?: string) {
+		if (projectId === undefined || owner === undefined) {
 			var id = this.host.getIdentity();
-			if (serviceId === undefined) serviceId = id.serviceId;
+			if (projectId === undefined) projectId = id.projectId;
 			if (owner === undefined) owner = id.owner;
 		}
 		return platform === 'openai'
-			? callOpenAIWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls)
-			: callClaudeWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls);
+			? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls)
+			: callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls);
 	}
 
 	dispatchAgentRequest(params: any) {
@@ -786,7 +819,7 @@ export class ChatSession {
 		var dispatchItemId: string | undefined;
 		var sendAndPoll = function () {
 			return Promise.resolve(
-				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.serviceId, params.owner)
+				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner)
 			).then(function (initial: any) {
 				if (initial && initial.poll && (initial.status === 'pending' || initial.status === 'running')) {
 					if (initial.id) {
@@ -1013,7 +1046,7 @@ export class ChatSession {
 	 */
 	awaitIndexingDrained(identity: ChatIdentity): Promise<'drained' | 'timedout' | 'skipped'> {
 		var self = this;
-		var svcId = identity && identity.serviceId;
+		var svcId = identity && identity.projectId;
 		var platform = identity && identity.platform;
 		if (!svcId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve('skipped' as const);
 		var owner = identity.owner;
@@ -1172,8 +1205,8 @@ export class ChatSession {
 		// bubble is stamped with it so a project switch (which flips
 		// getIdentity()/getHistoryCacheKey() to the new project) can't
 		// misattribute this turn's bubbles to that project.
-		// (platform === 'none' already returned above, so serviceId is the only gate)
-		var key = !id.serviceId ? '' : id.serviceId + '#' + id.platform;
+		// (platform === 'none' already returned above, so projectId is the only gate)
+		var key = !id.projectId ? '' : id.projectId + '#' + id.platform;
 		// True when the pinned chat is NOT the one currently on screen. Then
 		// state.messages belongs to a different project and MUST NOT be touched:
 		// the turn is staged in the pinned chat's cache instead and shows up when
@@ -1187,7 +1220,7 @@ export class ChatSession {
 		var aiPlatform = id.platform;
 		var aiModel = id.model || undefined;
 		var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
-		var userId = id.userId || id.serviceId;
+		var userId = id.userId || id.projectId;
 		// Same string the indexing passes are enqueued under (bgIndexingQueueName),
 		// which is the whole reason this turn ends up behind them: the backend runs
 		// different queue names in parallel and only serialises a shared one.
@@ -1207,7 +1240,7 @@ export class ChatSession {
 					!m.isCancelled && !m.isBackgroundTask && !m.isError;
 			});
 			var offBounded = buildBoundedChatMessages({
-				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
+				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, projectId: id.projectId,
 				history: offHistory.concat([{ role: 'user', content: llmComposed }]),
 			});
 			var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
@@ -1246,7 +1279,7 @@ export class ChatSession {
 				startKeyHistory: offExisting.startKeyHistory,
 			};
 			this.dispatchAgentRequest({
-				key: key, serviceId: id.serviceId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
+				key: key, projectId: id.projectId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 				systemPrompt: systemPrompt, text: composed, boundedMessages: offBounded.messages, userId: chatQueue,
 				extractContent: extractContent, fileUrls: fileUrls,
 			});
@@ -1259,7 +1292,7 @@ export class ChatSession {
 					!m.isCancelled && !m.isBackgroundTask && !m.isError;
 			});
 			var boundedQ = buildBoundedChatMessages({
-				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
+				platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, projectId: id.projectId,
 				history: resolvedHistory.concat([{ role: 'user', content: llmComposed }]),
 			});
 			// _localId for the same reason as immediateUser below: a queued turn can be
@@ -1290,7 +1323,7 @@ export class ChatSession {
 			this.host.notify(); this.updateHistoryCache(); this.host.scrollToBottom(true);
 
 			var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
-			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner))
+			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner))
 				.then(function (result: any) {
 					// Only ack a bubble that belongs to THIS chat — the search is
 					// positional, so on another project it would stamp this turn's
@@ -1383,11 +1416,11 @@ export class ChatSession {
 		});
 		historyForLlm.push({ role: 'user', content: llmComposed });
 		var bounded = buildBoundedChatMessages({
-			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, serviceId: id.serviceId,
+			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, projectId: id.projectId,
 			history: historyForLlm,
 		});
 		var run = this.dispatchAgentRequest({
-			key: key, serviceId: id.serviceId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
+			key: key, projectId: id.projectId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 			systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,
 			extractContent: extractContent, fileUrls: fileUrls,
 		});
@@ -1673,7 +1706,7 @@ export class ChatSession {
 		var platform = id.platform;
 		if (platform !== 'claude' && platform !== 'openai') return;
 		var url = platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
-		var queueBase = id.userId || id.serviceId;
+		var queueBase = id.userId || id.projectId;
 		var queue = (msg.isBackgroundTask || msg._useBgQueue) ? bgIndexingQueueName(queueBase) : queueBase;
 		// `idx` is the index the VIEW rendered this bubble at, and the list can have
 		// moved under it since: indexing rows are inserted above the turn they belong
@@ -1696,7 +1729,7 @@ export class ChatSession {
 		}
 		this.host.notify();
 		Promise.resolve(this.host.cancelRequest({
-			url: url, method: 'POST', id: serverId, queue: queue, service: id.serviceId, owner: id.owner,
+			url: url, method: 'POST', id: serverId, queue: queue, service: id.projectId, owner: id.owner,
 		})).then(function (result: any) {
 			if (result && result.removed) {
 				self.cancelledServerIds.add(serverId as string);
@@ -2294,7 +2327,7 @@ export class ChatSession {
 		if (!entry) return '';
 		var file = entry.storagePath || entry.filename;
 		if (!file) return '';
-		return entry.serviceId + '#' + entry.platform + '|' + file;
+		return entry.projectId + '#' + entry.platform + '|' + file;
 	}
 
 	/**
@@ -2423,10 +2456,10 @@ export class ChatSession {
 		if (this._adoptingWorkerPasses) return;
 		var id = this.host.getIdentity();
 		var platform = id.platform;
-		if (!id.serviceId || (platform !== 'claude' && platform !== 'openai')) return;
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return;
 		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
-		var svcId = id.serviceId, owner = id.owner;
-		var queue = bgIndexingQueueName(id.userId, id.serviceId);
+		var svcId = id.projectId, owner = id.owner;
+		var queue = bgIndexingQueueName(id.userId, id.projectId);
 		var ask = function (status: 'pending' | 'running') {
 			return Promise.resolve(getChatHistory(
 				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
@@ -2439,7 +2472,7 @@ export class ChatSession {
 			// The chat may have changed under the query; adopting into another
 			// project's session is the cross-project bubble leak all over again.
 			var now = self.host.getIdentity();
-			if (now.serviceId !== svcId || now.platform !== platform) return;
+			if (now.projectId !== svcId || now.platform !== platform) return;
 			if (!self.host.isViewMounted()) return;
 			// Free: this is already the whole-queue snapshot the display layer needs to
 			// tell a worker-driven run's "between passes" from its "finished".
@@ -2481,7 +2514,7 @@ export class ChatSession {
 			}
 			setTimeout(function () {
 				var later = self.host.getIdentity();
-				if (later.serviceId !== svcId || later.platform !== platform) return;
+				if (later.projectId !== svcId || later.platform !== platform) return;
 				if (self.isPollingPaused() || !self.host.isViewMounted()) return;
 				self._adoptWorkerIndexingPasses(attempt + 1);
 			}, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
@@ -2536,7 +2569,7 @@ export class ChatSession {
 		// chain's passes — which is the cap that stops it running forever.
 		if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
 		this.bgTaskQueue.push({
-			serviceId: svcId,
+			projectId: svcId,
 			platform: platform,
 			id: item.id,
 			filename: ref.name,
@@ -2567,8 +2600,8 @@ export class ChatSession {
 		var url = id.platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
 		Promise.resolve(this.host.cancelRequest({
 			url: url, method: 'POST', id: serverId,
-			queue: bgIndexingQueueName(id.userId, id.serviceId),
-			service: id.serviceId, owner: id.owner,
+			queue: bgIndexingQueueName(id.userId, id.projectId),
+			service: id.projectId, owner: id.owner,
 		})).catch(function () { /* the pass may already have finished; nothing to do */ });
 	}
 
@@ -2576,7 +2609,7 @@ export class ChatSession {
 	drainBgTaskQueue(): void {
 		var self = this;
 		var id = this.host.getIdentity();
-		var svcId = id.serviceId, plat = id.platform;
+		var svcId = id.projectId, plat = id.platform;
 		if (!svcId || plat === 'none' || !this.host.isViewMounted()) return;
 		// Before anything is surfaced: drop continuations of files the user stopped
 		// (and let a fresh first pass lift the stop), then cancel any worker-queued
@@ -2597,7 +2630,7 @@ export class ChatSession {
 		});
 		for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
 			var e = this.bgTaskQueue[i];
-			if (e.serviceId !== svcId || e.platform !== plat) continue;
+			if (e.projectId !== svcId || e.platform !== plat) continue;
 			if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
 		}
 		// Poll budget for this drain (see MAX_CONCURRENT_BG_POLLS). bgTaskQueue is
@@ -2610,7 +2643,7 @@ export class ChatSession {
 		// Set by the injection branch; drives the single render/cache/scroll below.
 		var injectedAny = false;
 		this.bgTaskQueue.forEach(function (entry) {
-			if (entry.serviceId !== svcId || entry.platform !== plat) return;
+			if (entry.projectId !== svcId || entry.platform !== plat) return;
 			// Bubble injection and poll attachment are INDEPENDENT. An entry whose bubble
 			// already exists may still need a poll — that is exactly the state a paused
 			// drain leaves behind, and returning early here stranded it as a permanent
@@ -2792,16 +2825,21 @@ export class ChatSession {
 			var pass = (entry.resumePass || 0) + 1;
 			if (pass > MAX_INDEXING_RESUME_PASSES) { endOfClientChain(); return; } // give up after the cap
 			var id = this.host.getIdentity();
-			if (!id || id.platform === 'none' || id.serviceId !== entry.serviceId) return;
+			if (!id || id.platform === 'none' || id.projectId !== entry.projectId) return;
 			// Counted as live work from here, not from the ack: awaitIndexingDrained
 			// asks the SERVER what is queued, and this pass is not queued until the
 			// call below returns. Without it a chat can slip in between two passes.
 			this.trackIndexDispatch(notifyAgentContinueIndexing({
 				platform: id.platform as 'claude' | 'openai',
 				model: id.model,
-				service: id.serviceId,
+				service: id.projectId,
+				// Without this the resume pass rebuilds its system prompt from the RAW
+				// regional id (requests.ts falls back to `service`), and the model copies
+				// that id verbatim into project_id tool calls, which the MCP schema
+				// pattern rejects - the whole continue pass saves nothing.
+				publicProjectId: id.publicProjectId,
 				owner: id.owner,
-				userId: id.userId || id.serviceId,
+				userId: id.userId || id.projectId,
 				serviceName: id.serviceName,
 				serviceDescription: id.serviceDescription,
 				attachment: {
@@ -2814,7 +2852,7 @@ export class ChatSession {
 			}).then(function (ack: any) {
 				if (ack && typeof ack.id === 'string') {
 					self.bgTaskQueue.push({
-						serviceId: id.serviceId, platform: id.platform as 'claude' | 'openai', id: ack.id,
+						projectId: id.projectId, platform: id.platform as 'claude' | 'openai', id: ack.id,
 						filename: entry.filename, storagePath: entry.storagePath,
 						isReindex: entry.isReindex, mime: entry.mime, size: entry.size,
 						status: ack.status === 'running' ? 'running' : 'pending',
@@ -2846,9 +2884,9 @@ export class ChatSession {
 		// request is built from. The rescue below compares against this rather
 		// than a live getHistoryCacheKey(), so a project switch mid-fetch can't
 		// make another chat's in-flight bubbles look local.
-		var loadKey = (!id.serviceId || id.platform === 'none') ? '' : id.serviceId + '#' + id.platform;
+		var loadKey = (!id.projectId || id.platform === 'none') ? '' : id.projectId + '#' + id.platform;
 		if (token === undefined) token = this.state.gateRefreshToken;
-		if ((this.state.loadingHistory && this.state.historyRequestToken === token) || id.platform === 'none' || !id.serviceId) {
+		if ((this.state.loadingHistory && this.state.historyRequestToken === token) || id.platform === 'none' || !id.projectId) {
 			return Promise.resolve();
 		}
 		this.state.historyRequestToken = token;
@@ -2864,11 +2902,11 @@ export class ChatSession {
 		if (fetchMore) this.state.loadingOlderHistory = true;
 		this.host.notify(); // surface "Fetching history..." while it loads
 		var platform = id.platform as 'claude' | 'openai';
-		var serviceId = id.serviceId, owner = id.owner;
+		var projectId = id.projectId, owner = id.owner;
 		var options: any = { fetchMore: fetchMore };
 		if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
 
-		var fetchHistory = function () { return getChatHistory({ service: serviceId, owner: owner, platform: platform }, options); };
+		var fetchHistory = function () { return getChatHistory({ service: projectId, owner: owner, platform: platform }, options); };
 
 		return Promise.resolve().then(fetchHistory).catch(function (err: any) {
 			if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -2888,7 +2926,7 @@ export class ChatSession {
 			});
 			var mapped = mapHistoryListToMessages(list, platform, {
 				clearedAt: self.host.getClearedAt(),
-				serviceId: id.serviceId,
+				projectId: id.projectId,
 				formatIndexingLabel: self.host.formatIndexingLabel,
 			}).messages;
 
@@ -3219,7 +3257,7 @@ export class ChatSession {
 							// it would keep handing back the old signed url and the
 							// old cached body. This is the one place that knows,
 							// so it marks the path for a refreshed mint.
-							markImagePreviewStale(self.host.getIdentity().serviceId || 'default', member.storagePath);
+							markImagePreviewStale(self.host.getIdentity().projectId || 'default', member.storagePath);
 							return doMemberUpload(false); // replace the existing file
 						}
 						if (choice === 'skip') { skipped = true; return; } // leave it untouched; no upload/index
@@ -3284,9 +3322,10 @@ export class ChatSession {
 					return self.trackIndexDispatch(notifyAgentSaveAttachment({
 						platform: id.platform as 'claude' | 'openai',
 						model: id.model,
-						service: id.serviceId,
+						service: id.projectId,
+						publicProjectId: id.publicProjectId,
 						owner: id.owner,
-						userId: id.userId || id.serviceId,
+						userId: id.userId || id.projectId,
 						serviceName: id.serviceName,
 						serviceDescription: id.serviceDescription,
 						attachment: {
@@ -3297,7 +3336,7 @@ export class ChatSession {
 					}).then(function (ack: any) {
 						if (ack && typeof ack.id === 'string') {
 							self.bgTaskQueue.push({
-								serviceId: id.serviceId, platform: id.platform as 'claude' | 'openai', id: ack.id,
+								projectId: id.projectId, platform: id.platform as 'claude' | 'openai', id: ack.id,
 								filename: member.file.name,
 								storagePath: member.storagePath,
 								isReindex: hadExists,

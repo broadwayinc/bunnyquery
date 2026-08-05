@@ -2,7 +2,7 @@
  * History mapping (pure). Moved verbatim from the chatbox. The clear-horizon
  * timestamp and the "Indexing: …" display label are INJECTED (clearedAt param,
  * formatIndexingLabel callback) so the engine touches neither localStorage nor
- * view-specific display formatting. serviceId is passed for link sanitization.
+ * view-specific display formatting. projectId is passed for link sanitization.
  */
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
@@ -82,7 +82,7 @@ export function parseIndexingRequestText(userText: any): IndexingRequestRef | nu
 
 export type MapHistoryOptions = {
 	clearedAt: number;
-	serviceId: string;
+	projectId: string;
 	/** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
 	formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
@@ -149,7 +149,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 					displayContent = userText;
 				}
 			} else {
-				displayContent = sanitizeAttachmentLinksForHistory(userText, opts.serviceId);
+				displayContent = sanitizeAttachmentLinksForHistory(userText, opts.projectId);
 			}
 			var userMsg: any = { role: 'user', content: displayContent };
 			if (isInProcess) userMsg.isPendingInProcess = true;
@@ -182,7 +182,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		} else if (assistantText || reportedComplete) {
 			// Safe db-only sanitize (forAssistant) so a volatile db url the model
 			// emitted renders as a re-mintable `_expired_.url` link, not a dead one.
-			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) || EMPTY_INDEXING_REPLY };
+			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;

@@ -657,16 +657,18 @@ export type AttachmentSaveInfo = {
 	platform: 'claude' | 'openai';
 	model?: string;
 	service: string;
+	/** The PUBLIC project ID (formatted token, skapi.project_id). Shown to the model; falls back to `service`. */
+	publicProjectId?: string;
 	owner: string;
 	/**
 	 * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
 	 * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
-	 * `id.userId || id.serviceId`) — the backend serialises requests that share a
+	 * `id.userId || id.projectId`) — the backend serialises requests that share a
 	 * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
 	 * different base does not hold the chat back at all. It was optional once,
 	 * defaulting to `service`; the chatbox omitted it, and its files were indexed
-	 * on "<serviceId>-bg" while its question ran on "<userId>-bg" — the question
-	 * was answered from a file nothing had read yet. Pass `userId || serviceId`.
+	 * on "<projectId>-bg" while its question ran on "<userId>-bg" — the question
+	 * was answered from a file nothing had read yet. Pass `userId || projectId`.
 	 */
 	userId: string;
 	serviceName?: string;
@@ -799,7 +801,20 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }]
 			: undefined;
 	const skapiExtract =
-		extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
+		extractContent && extractContent.length
+			? {
+				_skapi_extract: extractContent.map((d) => ({
+					...d,
+					// FIRST pass of an INDEXING run only: tells the worker to also pull the
+					// file's embedded pictures into __MEDIA__ and register their records.
+					// Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
+					// never sets this, so merely ATTACHING a file to a chat message cannot
+					// write media records; a CONTINUE pass skips it because the first pass
+					// already saved (the save is whole-file, not windowed).
+					save_media: !continuing,
+				})),
+			}
+			: {};
 
 	const userMessage = (visionFile && renderPlaceholder)
 		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
@@ -819,7 +834,10 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			);
 
 	const systemPrompt = buildIndexingSystemPrompt({
-		service,
+		// The model copies this id verbatim into project_id tool calls, so it must be
+		// the PUBLIC token whenever the host supplied one; the raw code is rejected
+		// by the tools' schema pattern.
+		projectId: info.publicProjectId || service,
 		serviceName: info.serviceName,
 		serviceDescription: info.serviceDescription,
 	});
@@ -1052,7 +1070,7 @@ export function isBgIndexingQueue(queueName?: string): boolean {
 // (a Vue `reactive([])` in agent.vue, a plain array in bunnyquery) is app-level
 // state owned by the consumer — only the TYPE lives in the engine.
 export type BgTaskEntry = {
-	serviceId: string;
+	projectId: string;
 	platform: 'claude' | 'openai';
 	id: string;
 	filename: string;
@@ -1097,7 +1115,14 @@ export const MAX_INDEXING_RESUME_PASSES = 6;
 // short page leaves the box unfilled and forces the viewport-fill loop to page
 // again immediately. Callers that want a narrower page (the queue/status probes in
 // ChatSession) pass their own `limit`, which wins over this default.
-export const CHAT_HISTORY_PAGE_LIMIT = 100;
+// 500, up from 100: an indexing run is dozens of rows that collapse into ONE visible
+// row, so a screenful of history behind a few indexed files took 5+ sequential
+// round trips to assemble (cursor paging cannot be parallelised - each page's
+// startKey comes from the previous response). The number is a CAP, not a payload
+// size: DynamoDB stops a page at 1MB regardless and hands back a cursor, and the
+// backend passes the limit through without looping, so heavy indexing rows page at
+// the same bytes per trip as before while light chat rows now arrive 500 at a time.
+export const CHAT_HISTORY_PAGE_LIMIT = 500;
 
 /**
  * `queue` narrows the fetch to one processing chain; `status` narrows it to items

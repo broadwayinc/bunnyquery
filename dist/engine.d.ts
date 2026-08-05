@@ -173,19 +173,19 @@ interface AttachmentFailureGroup {
 declare function groupAttachmentFailures(attachments: any[]): AttachmentFailureGroup[];
 
 /**
- * BASE PROMPT — Chat assistant
+ * BASE PROMPT - Chat assistant
  * ============================================================================
  * System prompt sent on every chat turn. Rebuilt fresh on every send because
  * the project name/description can change at any time.
  *
  * The `${...}` placeholders are filled from the live project (service):
- *   formattedServiceId  -> the project ID the assistant is scoped to
- *   serviceName         -> project display name   (only added if a description exists)
- *   serviceDescription  -> project description     (only added if present)
+ *   projectId  -> the project ID the assistant is scoped to
+ *   serviceName -> project display name   (only added if a description exists)
+ *   serviceDescription -> project description     (only added if present)
  */
 type ChatSystemPromptParams = {
     /** The project/service ID this assistant is scoped to (formatted form). */
-    formattedServiceId: string;
+    projectId: string;
     /** Project display name. Only appended when a description is also present. */
     serviceName?: string;
     /** Project description. When present, name + description are appended. */
@@ -194,7 +194,7 @@ type ChatSystemPromptParams = {
 declare function buildChatSystemPrompt(params: ChatSystemPromptParams): string;
 
 /**
- * BASE PROMPT — Background file-indexing agent (system prompt)
+ * BASE PROMPT - Background file-indexing agent (system prompt)
  * ============================================================================
  * System prompt for the BACKGROUND indexing agent (notifyAgentSaveAttachment).
  * Its only job is to read the freshly uploaded file and persist what it learns
@@ -202,8 +202,8 @@ declare function buildChatSystemPrompt(params: ChatSystemPromptParams): string;
  * user-message template in ./indexing_user_message.ts.
  */
 type IndexingSystemPromptParams = {
-    /** The project/service ID being indexed into. */
-    service: string;
+    /** The PUBLIC project ID being indexed into (formatted token; the form the MCP tools accept). */
+    projectId: string;
     /** Project display name. Only appended when a description is also present. */
     serviceName?: string;
     /** Project description. When present, name + description are appended. */
@@ -212,14 +212,14 @@ type IndexingSystemPromptParams = {
 declare function buildIndexingSystemPrompt(params: IndexingSystemPromptParams): string;
 
 /**
- * BASE PROMPT — Background file-indexing agent (user message)
+ * BASE PROMPT - Background file-indexing agent (user message)
  * ============================================================================
  * USER-role message paired with the indexing system prompt. Sent by
  * notifyAgentSaveAttachment() each time a file is uploaded or re-indexed.
  *
  * NOTE: the leading line "A new file has just been uploaded. Index it now." and
  * the "- name: ..." line are also what the chat client parses to build the
- * "Indexing: <name>" history bubble — keep those fields on their own lines.
+ * "Indexing: <name>" history bubble - keep those fields on their own lines.
  */
 type IndexingAttachmentInfo = {
     /** Original file name. */
@@ -235,15 +235,15 @@ type IndexingAttachmentInfo = {
 };
 type BuildIndexingUserMessageOptions = {
     /**
-     * For office files (.docx/.xlsx/.pptx) the model can't read the binary via
+     * For files with no paged reader (.epub/.hwp/.doc/.rtf, source code) the model can't read the binary via
      * web_fetch, so the proxy worker extracts the text server-side and replaces
      * this exact token with it. When provided, the message embeds the token (and
-     * drops the temporary-URL line — there is nothing for the model to fetch).
+     * drops the temporary-URL line - there is nothing for the model to fetch).
      */
     inlineContentPlaceholder?: string;
     /**
      * Actual file content parsed CLIENT-SIDE by an attachment-parser plugin (e.g.
-     * an .hwp parser). Embedded inline verbatim — no server extraction and no
+     * an .hwp parser). Embedded inline verbatim - no server extraction and no
      * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
      */
     inlineContent?: string;
@@ -321,8 +321,8 @@ declare function registerModelContextWindows(models: Array<{
     id?: string;
     max_input_tokens?: number;
 }> | null | undefined): void;
-declare function setProjectContextWindow(serviceId: string, tokens: number | null | undefined): void;
-declare function getProjectContextWindow(serviceId: string): number | null;
+declare function setProjectContextWindow(projectId: string, tokens: number | null | undefined): void;
+declare function getProjectContextWindow(projectId: string): number | null;
 declare var OUTPUT_TOKEN_RESERVE: number;
 declare var TOOL_AND_RESPONSE_BUFFER: number;
 declare var MIN_INPUT_TOKEN_BUDGET: number;
@@ -349,7 +349,7 @@ declare function estimateMessageTokens(msg: {
  * such as 'claude-opus-4-7-20260101' resolves via 'claude-opus-4-7'. The walk
  * stops at the first hit, so a more specific entry always wins over its family.
  */
-declare function getContextWindow(platform: string, model?: string, serviceId?: string): number;
+declare function getContextWindow(platform: string, model?: string, projectId?: string): number;
 declare function stripFileBlocksFromHistory(content: string): string;
 type BoundedChatOptions = {
     platform: string;
@@ -360,7 +360,7 @@ type BoundedChatOptions = {
         content: string;
     }>;
     /** Used to strip/rewrite expired attachment links in older user turns. */
-    serviceId: string;
+    projectId: string;
 };
 declare function buildBoundedChatMessages(options: BoundedChatOptions): {
     messages: {
@@ -470,7 +470,7 @@ declare function prepareDownloadText(filename: string, body: string): {
 
 /**
  * Pure link/path helpers (no DOM, no marked). Moved verbatim from the chatbox.
- * `serviceId` is passed as a PARAMETER (the original read it from a global) so
+ * `projectId` is passed as a PARAMETER (the original read it from a global) so
  * the engine stays consumer-agnostic. The HTML-emitting helpers
  * (buildLinkPartFromGroups, linkToAnchorHtml, fileToAnchorHtml, parseMsgParts*)
  * stay in each VIEW — only these pure pieces move here.
@@ -529,10 +529,10 @@ declare function createInlineLinkRegex(): RegExp;
 declare function safeDecodeURIComponent(v: string): string;
 declare function encodePathSegments(path: string): string;
 declare function normalizeAttachmentPathCandidate(value: string): string;
-declare function extractRemotePathFromAttachmentHref(href: string, serviceId: string): string | null;
+declare function extractRemotePathFromAttachmentHref(href: string, projectId: string): string | null;
 declare function getExpiredAttachmentVisiblePath(remotePath: string, fallback?: string): string;
 declare function buildDisplayExpiredAttachmentHref(remotePath: string, fallback?: string): string;
-declare function isServiceDbAttachmentHref(href: string, serviceId: string): boolean;
+declare function isServiceDbAttachmentHref(href: string, projectId: string): boolean;
 /**
  * Read the storage path back out of an `_expired_.url` placeholder.
  *
@@ -542,7 +542,7 @@ declare function isServiceDbAttachmentHref(href: string, serviceId: string): boo
  * way back in. Returns null for anything that is not the carrier.
  */
 declare function readExpiredAttachmentHref(href: string): string | null;
-declare function sanitizeAttachmentLinksForHistory(content: string, serviceId: string, forAssistant?: boolean): string;
+declare function sanitizeAttachmentLinksForHistory(content: string, projectId: string, forAssistant?: boolean): string;
 /**
  * Is this markdown link target a URL rather than a db storage path?
  *
@@ -641,7 +641,7 @@ interface InlineLinkPart {
 }
 interface InlineLinkContext {
     /** Current project id: the leading segment to strip off a db url. */
-    serviceId: string;
+    projectId: string;
     /** `https://db.<hostDomain>` for this deployment. */
     dbHostPrefix: string;
     /** A fresh url already minted for this placeholder, if the view cached one. */
@@ -914,7 +914,7 @@ type IndexingRequestRef = {
 declare function parseIndexingRequestText(userText: any): IndexingRequestRef | null;
 type MapHistoryOptions = {
     clearedAt: number;
-    serviceId: string;
+    projectId: string;
     /** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
     formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
@@ -1112,16 +1112,18 @@ type AttachmentSaveInfo = {
     platform: 'claude' | 'openai';
     model?: string;
     service: string;
+    /** The PUBLIC project ID (formatted token, skapi.project_id). Shown to the model; falls back to `service`. */
+    publicProjectId?: string;
     owner: string;
     /**
      * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
      * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
-     * `id.userId || id.serviceId`) — the backend serialises requests that share a
+     * `id.userId || id.projectId`) — the backend serialises requests that share a
      * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
      * different base does not hold the chat back at all. It was optional once,
      * defaulting to `service`; the chatbox omitted it, and its files were indexed
-     * on "<serviceId>-bg" while its question ran on "<userId>-bg" — the question
-     * was answered from a file nothing had read yet. Pass `userId || serviceId`.
+     * on "<projectId>-bg" while its question ran on "<userId>-bg" — the question
+     * was answered from a file nothing had read yet. Pass `userId || projectId`.
      */
     userId: string;
     serviceName?: string;
@@ -1177,7 +1179,7 @@ declare function bgIndexingQueueName(userId?: string, service?: string): string;
  */
 declare function isBgIndexingQueue(queueName?: string): boolean;
 type BgTaskEntry = {
-    serviceId: string;
+    projectId: string;
     platform: 'claude' | 'openai';
     id: string;
     filename: string;
@@ -1226,9 +1228,17 @@ declare function getChatHistory(params: {
  * otherwise touch the DOM or a framework goes through a host hook.
  */
 interface ChatIdentity {
-    serviceId: string;
+    projectId: string;
+    /**
+     * The PUBLIC project ID: the formatted two-segment token (skapi.project_id).
+     * projectId above is the RAW regional code the wire endpoints take; the public
+     * token is what MCP tools accept and what prompts must show the model, since the
+     * model copies it verbatim into tool calls. Optional for older hosts; prompts
+     * fall back to the raw code when absent.
+     */
+    publicProjectId?: string;
     owner: string;
-    /** Per-user queue name (falls back to serviceId). */
+    /** Per-user queue name (falls back to projectId). */
     userId: string;
     platform: 'claude' | 'openai' | 'none';
     model?: string;
@@ -1909,10 +1919,23 @@ declare class ChatSession {
      * instead of merely unconfirmed.
      */
     refreshLiveIndexState(): void;
-    /** Forget what we know about which files are indexing. For a consumer whose
-     *  history loading is its own fork and so never reaches loadHistory's reset —
-     *  a snapshot describes ONE chat's queue, and carrying it into another project
-     *  would let a row there claim to be finished on someone else's evidence. */
+    /** Forget what we know about which files are indexing — but ONLY when the
+     *  snapshot was taken for a different chat than the one on screen now. For a
+     *  consumer whose history loading is its own fork and so never reaches
+     *  loadHistory's reset — a snapshot describes ONE chat's queue, and carrying it
+     *  into another project would let a row there claim to be finished on someone
+     *  else's evidence.
+     *
+     *  Conditional for the same reason loadHistory's own reset is (the
+     *  `loadKey !== _liveIndexKey` gate): the view calls this on every mount, and
+     *  an unconditional wipe turned every re-entry to the chat into a grey
+     *  "Checking status:" sweep across rows whose state was already known. A
+     *  RE-entry keeps showing the last answer (green/yellow) while the first-page
+     *  refresh re-asks quietly; only a genuine project/platform switch starts from
+     *  "not known yet". Claiming `_liveIndexKey` here (before any answer) is the
+     *  same fudge loadHistory makes: it marks WHOSE chat the empty snapshot is
+     *  for, so repeated calls do not re-wipe, and _recordLiveIndexKeys re-claims
+     *  it when the real answer lands. */
     resetLiveIndexState(): void;
     /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
      *  live work from the moment it is sent, not from the moment it is acked. */
@@ -1992,7 +2015,7 @@ declare class ChatSession {
      */
     private _applyReplyToCache;
     /**
-     * serviceId/owner are passed explicitly by every caller: a request can be
+     * projectId/owner are passed explicitly by every caller: a request can be
      * dispatched after the user moved to another project, and re-reading the live
      * identity here would silently send the turn to THAT project instead of the
      * one it was composed for. Falls back to the live read only when a caller

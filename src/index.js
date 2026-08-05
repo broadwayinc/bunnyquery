@@ -283,7 +283,7 @@ import {
         booted: false,
         user: null,        // current UserProfile or null
         service: null,     // resolved service info ({ ai_agent, name, ... })
-        serviceId: null,
+        projectId: null,
         owner: null,
         theme: null,
         // agent config (read-only, admin-provided)
@@ -297,7 +297,7 @@ import {
 
     // Per-service storage key helper
     function skey(base) {
-        return base + ":" + (S.serviceId || "default");
+        return base + ":" + (S.projectId || "default");
     }
 
     /* ========================================================================
@@ -306,7 +306,7 @@ import {
 
     function loadTheme() {
         // Fixed key (NOT per-service): theme is a global UI preference, and at
-        // init() serviceId isn't known yet — a per-service key would save/load
+        // init() projectId isn't known yet — a per-service key would save/load
         // under different names and never persist.
         var stored = lsGet(SK.theme);
         if (stored === "dark" || stored === "light") return stored;
@@ -366,7 +366,7 @@ import {
     // Pull the service info (so we can read the admin-configured ai_agent).
     // The Skapi connection object carries the service record once resolved.
     function loadServiceInfo() {
-        S.serviceId = (S.skapi && (S.skapi.service || (S.skapi.connection && S.skapi.connection.service))) || S.serviceId;
+        S.projectId = (S.skapi && (S.skapi.service || (S.skapi.connection && S.skapi.connection.service))) || S.projectId;
         S.owner = (S.skapi && (S.skapi.owner || (S.skapi.connection && S.skapi.connection.owner))) || S.owner;
         return Promise.resolve()
             .then(function () {
@@ -376,7 +376,7 @@ import {
             .then(function (conn) {
                 if (S.opts && S.opts.dev) console.log("[bunnyquery] loadServiceInfo", conn);
                 if (conn) {
-                    S.serviceId = conn.service || S.serviceId;
+                    S.projectId = conn.service || S.projectId;
                     S.owner = conn.owner || S.owner;
                 }
                 return conn;
@@ -1557,7 +1557,7 @@ import {
      * CHAT ENGINE
      * Ported from agent.vue + ai_agent.ts. Vue reactivity → explicit
      * renderMessages()/refreshMessageBubble() calls. `currentService.value`
-     * → S.serviceId/S.owner/S.serviceName/S.serviceDescription.
+     * → S.projectId/S.owner/S.serviceName/S.serviceDescription.
      * Attachments + expired-link refresh are stubbed (next phase).
      * ======================================================================*/
 
@@ -1647,8 +1647,22 @@ import {
     // it was asked of, not whatever is selected when the upload finishes.
     function currentIdentity() {
         return {
-            serviceId: S.serviceId, owner: S.owner,
-            userId: (S.user && S.user.user_id) || S.serviceId,
+            projectId: S.projectId,
+            // Prefer the SDK's formatted token. The widget takes the page's own
+            // skapi-js <script> pin, and builds older than 1.8.4 have no .project_id;
+            // compose the formatted token exactly as buildSystemPrompt does, because
+            // the raw regional id must never reach the indexing prompt - the model
+            // copies it verbatim into project_id tool calls, which the MCP schema
+            // pattern rejects.
+            publicProjectId: (S.skapi && S.skapi.project_id) || (function () {
+                if (S.projectId && S.owner && S.skapi && S.skapi.util && typeof S.skapi.util.formatServiceId === "function") {
+                    try { return S.skapi.util.formatServiceId(S.projectId, S.owner); }
+                    catch (e) { /* no public compound form; leave undefined */ }
+                }
+                return undefined;
+            })(),
+            owner: S.owner,
+            userId: (S.user && S.user.user_id) || S.projectId,
             platform: S.aiPlatform, model: S.aiModel || undefined,
             serviceName: S.serviceName, serviceDescription: S.serviceDescription,
         };
@@ -1678,6 +1692,7 @@ import {
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
         deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
+        ensureFileIndexRecord: function (path, meta) { return ensureFileIndexRecordDb(path, meta); },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
@@ -1746,11 +1761,18 @@ import {
 
     /* ---- system prompt (agent.vue buildSystemPrompt) --------------------- */
     function buildSystemPrompt() {
-        // The chat system prompt now lives in @skapi/chat-engine (shared with the
-        // agent.vue chatbox so the two can't drift). bunnyquery has no "formatted"
-        // service id, so the raw serviceId is used directly.
+        // The chat system prompt now lives in the shared engine (same as the
+        // agent.vue chatbox so the two can't drift). The prompt must carry the
+        // FORMATTED project id (the public two-segment token the MCP tools accept
+        // and tell the model to copy verbatim) - S.projectId is the RAW regional
+        // code the SDK decoded at construction, which the tools reject.
+        var promptProjectId = S.projectId || "";
+        if (S.projectId && S.owner && S.skapi && S.skapi.util && typeof S.skapi.util.formatServiceId === "function") {
+            try { promptProjectId = S.skapi.util.formatServiceId(S.projectId, S.owner); }
+            catch (e) { /* keep the raw id rather than an empty prompt */ }
+        }
         return buildChatSystemPrompt({
-            formattedServiceId: S.serviceId || "",
+            projectId: promptProjectId,
             serviceName: S.serviceName,
             serviceDescription: S.serviceDescription,
         });
@@ -1996,7 +2018,7 @@ import {
     // only what is local to it and renders whatever comes back.
     function buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6) {
         return classifyInlineLink(full, [g1, g2, g3, g4, g5, g6], {
-            serviceId: S.serviceId,
+            projectId: S.projectId,
             dbHostPrefix: "https://db." + hostDomain(),
             resolveFreshHref: function (expiredHref) { return refreshedExpiredLinkMap[expiredHref]; },
         });
@@ -2145,7 +2167,7 @@ import {
         if (checkExistence === undefined) checkExistence = true;
         var params = {
             reserved_key: uploadReservedKey(),
-            service: S.serviceId,
+            service: S.projectId,
             owner: S.owner,
             request: "db",
             key: storagePath,
@@ -2169,8 +2191,32 @@ import {
     // unique_id) or a permission error must not block indexing.
     function deleteFileIndexRecordDb(storagePath) {
         if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
-        return S.skapi.deleteRecords({ service: S.serviceId, unique_id: "src::" + storagePath })
+        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
             .catch(function () { });
+    }
+    // Create the file's "src::<storagePath>" record BEFORE any indexing pass runs, so every
+    // pass has a reference target that is guaranteed to exist (mirrors ai_agent.ts). Without
+    // it the backend rejected every referencing record - including the pipeline's own
+    // "__MEDIA__" media-index writes, which land while window 1 is still being BUILT, before
+    // the model's first turn could create anything. Best-effort: losing the guarantee must
+    // not lose the upload.
+    function ensureFileIndexRecordDb(storagePath, meta) {
+        if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
+        return Promise.resolve(S.skapi.postRecord(null, {
+            service: S.projectId,
+            unique_id: "src::" + storagePath,
+            table: { name: "file_summaries", access_group: "authorized" },
+            // Deleting the file record must cascade to every record referencing it.
+            source: { can_remove_referencing_records: true },
+            data: {
+                file_name: (meta && meta.name) || storagePath.split("/").pop() || storagePath,
+                storage_path: storagePath,
+                mime_type: (meta && meta.mime) || null,
+                size_bytes: (meta && typeof meta.size === "number") ? meta.size : null,
+                indexed_at: Date.now(),
+                note: "File-level record created at upload. The indexing agent enriches this with sheet names, column headers and row counts."
+            }
+        })).catch(function () { });
     }
     // Mint a temporary CDN url for a db file (request:'get-db'), matching
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
@@ -2191,7 +2237,7 @@ import {
     function getTemporaryUrlDb(path, expires, cdn, contentType, opts) {
         opts = opts || {};
         var body = {
-            service: S.serviceId,
+            service: S.projectId,
             owner: S.owner,
             request: "get-db",
             key: path,
@@ -2617,6 +2663,13 @@ import {
     // hide the attach affordances (clip button + drag-drop) below that. The flag
     // lives under ConnectionInfo.conf (S.service = getConnectionInfo() result).
     function uploadsFrozenForUser() {
+        // ANONYMOUS SESSIONS CANNOT UPLOAD, ever. The whole indexing chain runs as the
+        // uploading user, and the backend forbids anonymous users from setting unique_ids,
+        // so an anon upload would store a file whose records (the "src::" file record and
+        // every "__MEDIA__" media record) are all rejected: an unsearchable orphan. The
+        // MCP rejects the writes server-side too; hiding the affordance here means the
+        // user never hits that wall.
+        if (!S.user) return true;
         var conf = (S.service && S.service.conf) || {};
         if (!conf.freeze_database) return false;
         var ag = (S.user && typeof S.user.access_group === "number") ? S.user.access_group : 0;
@@ -2743,7 +2796,7 @@ import {
     // that cache when the url it cached has since expired.
     function imagePreviewCtx() {
         return {
-            scope: S.serviceId || "default",
+            scope: S.projectId || "default",
             mint: function (remotePath, contentType, refresh) {
                 return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType, {
                     browserCache: PREVIEW_BROWSER_CACHE_SECONDS,
@@ -2803,7 +2856,7 @@ import {
         if (inFlight) return inFlight;
         var run = (function () {
             refreshingLinkMap[expiredHref] = true;
-            var resolved = remotePath || extractRemotePathFromAttachmentHref(expiredHref, S.serviceId);
+            var resolved = remotePath || extractRemotePathFromAttachmentHref(expiredHref, S.projectId);
             if (!resolved) return Promise.reject(new Error("Unable to refresh this expired attachment link."));
             return getPublicTemporaryUrl(resolved).then(function (fresh) {
                 refreshedExpiredLinkMap[expiredHref] = fresh;
@@ -2848,8 +2901,8 @@ import {
 
     /* ---- history + clear-horizon (agent.vue) ----------------------------- */
     function getClearHistoryStorageKey() {
-        if (!S.serviceId || S.aiPlatform === "none") return "";
-        return SK.clearHorizon + ":" + S.serviceId + "#" + S.aiPlatform;
+        if (!S.projectId || S.aiPlatform === "none") return "";
+        return SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
     }
     function getClearedAt() {
         var key = getClearHistoryStorageKey();
@@ -3595,7 +3648,7 @@ import {
         // reset transient chat state on (re)entry
         // Preview urls are keyed by project, and an identity-blind cache is how
         // one project's content has reached another project's chat before.
-        clearImagePreviewCache(S.serviceId || "default");
+        clearImagePreviewCache(S.projectId || "default");
         // Same reason, and the same blast radius: a "this file has no url" mark
         // is keyed by a project-relative storage path.
         for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
@@ -3823,7 +3876,7 @@ import {
         // visitors, not project owners, so it applies the setting rather than
         // offering a control. Without an override the engine keeps its fixed
         // ceilings, so this is a no-op for every project that has not set one.
-        setProjectContextWindow(S.serviceId, engineParseAiAgentValue(raw).contextWindow);
+        setProjectContextWindow(S.projectId, engineParseAiAgentValue(raw).contextWindow);
         S.serviceName = conn.service_name || "";
         S.serviceDescription = conn.service_description || "";
     }

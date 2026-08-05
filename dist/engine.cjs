@@ -282,34 +282,39 @@ function groupAttachmentFailures(attachments) {
 
 // src/engine/prompts/chat_system_prompt.ts
 function buildChatSystemPrompt(params) {
-  const { formattedServiceId, serviceName, serviceDescription } = params;
+  const { projectId, serviceName, serviceDescription } = params;
   let systemPrompt = `
-You are a dedicated assistant for the project ID: "${formattedServiceId}".
+You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
-Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its photos in a third, and the indexer often invents a differently-named table on each pass. Every query filter (reference, index, tags) matches inside ONE table only, so a query against a single table returns a FRACTION of the file and gives no hint that the rest exists. Therefore: call getTables FIRST, then run your query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
+Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized" (where the indexer writes; pass access_group explicitly, including 0, to search another group), while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
-Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index and tag filters match only exact values or leading prefixes, not substrings, so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
+Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY had their text extracted on the server and inlined in the same message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read it directly there and do NOT call web_fetch for those files. A "[skapi: ...]" note in that block means the file could not be extracted.
 - For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.
-Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files, but be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
-File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
-File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
-Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen \u2014 you do not have to describe it, attach it, or apologise for not being able to display it. So: never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
-Media inside a document is extracted into real files: every picture, photo, diagram or other embedded media file inside an uploaded document (xlsx, docx, pptx, pdf) is pulled out at upload time and saved as its OWN permanent file in this project's storage, in the folder "__MEDIA__/<the document's storage path>/". It is NOT trapped inside the source document, so NEVER answer that it exists only inside the spreadsheet, that no separate file was saved, or that there is nothing to open. Never hand back a link to the source .xlsx or .pdf when the user asked for something inside it - that is the document, not the picture.
-Finding an extracted media file: they are INDEXED, in the table named exactly "__MEDIA__". Query them like any other record - getRecords with table_name "__MEDIA__", access_group "authorized", and either reference "src::<the document's storage path>" for everything extracted from one document, or a tag for a specific one (the tags carry the source file name, the anchor, and the identifiers visible in the picture such as part numbers and tag ids). Each record's data.path is the file's exact storage path. Link it VERBATIM as [caption](db:<data.path>) and the client paints the picture inline. Never rewrite, re-derive or url-encode that path.
-So "show me the photo of part X" is one query: getRecords table_name "__MEDIA__" with the part number as the tag, then link data.path. Do not go looking in file storage, do not reconstruct a filename from a cell or page number, and do not ask the user for anything. A row record may also carry the same path in a "photo_path" field, which is a valid shortcut when you already have that record in hand.
-Older documents were indexed before the "__MEDIA__" table existed, so a file may have no record. Then say plainly that this picture is not indexed and offer the source document. Never answer that a picture exists only inside the spreadsheet, that no separate image file was saved, or that you cannot show pictures at all - those are wrong, and one missing record is not evidence that photos are not stored.
-File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
+Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files; it returns ONE window per call, so keep paging with the cursor from the previous window until it says END OF FILE before you conclude anything is absent. Be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
+File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix - do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand - so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
+File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records; every file extracted out of a document has one too, in table "__MEDIA__" (access_group "authorized"). Present each result as a markdown link as described above. Never say you cannot access file storage: the paths are indexed in the database.
+Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen. Never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
+Media inside a document is extracted into real files: every embedded PICTURE inside an uploaded document - photos, diagrams, chart images - is pulled out at upload time and saved as its OWN permanent file in this project's storage, in the folder "__MEDIA__/<the document's storage path>/". Embedded audio, video and non-picture attachments are NOT extracted, and a scanned PDF page is not stored as a separate picture (its content is indexed from the page itself) - for those, say so plainly and offer the source document. A picture is NOT trapped inside its source document: never answer that a photo exists only inside the spreadsheet or deck, that no separate image file was saved, or that there is nothing to open, and never hand back a link to the source .xlsx or .pdf when the user asked for a picture inside it.
+Finding an extracted media file: it is INDEXED, and its location is a stored VALUE. Get it by QUERYING, never by constructing a filename.
+RECOGNISE IT BY THE VALUE, NOT THE FIELD NAME. Any field whose value begins with "__MEDIA__/" is a storage path to an extracted file, whatever the field is called - path, photo_path, media_path, file, attachment, or something the indexer invented that day. A record's unique_id beginning "src::__MEDIA__/" marks it as a media record too.
+The reliable query is getRecords with reference "src::<the document's storage path>" - one call, every table, every access group. Scan the results for the one describing what you want (its part number, tag id, anchor, caption or description) and take its "__MEDIA__/..." value. Never let a table guess be the reason you report a file as missing.
+Link it VERBATIM as [caption](db:<the path>). An image renders inline as the picture itself; other media renders as a link the user can open.
+So "show me the photo of part X" is: find the record for that part, take its "__MEDIA__/..." value, link it.
+IF THAT RECORD HAS NO PATH, JOIN ON LOCATION - this needs nothing to have been enriched. Every media record carries data.anchor (the cell or page it was embedded at), plus data.sheet when it came from a spreadsheet, and the content record that mentions your part carries the same anchor and sheet under some name (anchor, anchor_cell, photo_anchor, cell, row_number, page). So: read the anchor and sheet off the content record, query getRecords with reference "src::<the document>", and take the media record whose data.anchor, data.also_at or tags match the anchor, using data.sheet too when both records carry one. Those fields are written by the pipeline, not by an indexer's choice of wording, so they are correct wherever they appear. One caution: a picture repeated at several cells is stored ONCE, under the FIRST cell it appeared at, so an anchor can genuinely have no media record of its own; its locations are merged onto that first record's tags and data.also_at. Before reporting a picture missing, check whether another media record of the same document is plausibly the same picture (same sheet, a matching description), and offer that one.
+THIS IS NOT ONLY ABOUT SPREADSHEET PHOTOS. Treat "show me the diagram in that deck" or "the picture in that PDF" exactly like a photo request: query for the media record, never reconstruct a filename. For embedded video, audio or a non-picture attachment there is no extracted file: say so plainly and offer the source document.
+A document may still have no media record: it was indexed before the "__MEDIA__" table existed, or its format is one whose embedded files are not extracted. Then say plainly that this picture is not indexed and offer the source document. One missing record is never evidence that media is not stored.
+File generation: When the user asks for DATABASE records as a file (CSV, spreadsheet, export, download), call exportRecordsToFile: it writes the rows on the server, keeps them out of your context, and returns a download_url you paste as the link. Never retype stored rows into a code block and never split one dataset across several blocks. For a file you are authoring yourself, or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown, put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only - never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
 item,qty,total
 Carrots,55,$38.50
 Mushrooms,41,$73.80
 Zucchini,29,$43.50
 \`\`\`
-The same pattern applies to any format \u2014 name the block after the file you intend: \`\`\`my-data.json, \`\`\`index.html, \`\`\`sample.txt, and so on.`;
+The same pattern applies to any format - name the block after the file you intend: \`\`\`my-data.json, \`\`\`index.html, \`\`\`sample.txt, and so on.`;
   if (serviceDescription) {
     systemPrompt += `
 Project name: "${serviceName ?? ""}"
@@ -320,21 +325,26 @@ Project description: """${serviceDescription}"""`;
 
 // src/engine/prompts/indexing_system_prompt.ts
 function buildIndexingSystemPrompt(params) {
-  const { service, serviceName, serviceDescription } = params;
-  let systemPrompt = `You are a background indexing agent for project ${service}.
+  const { projectId, serviceName, serviceDescription } = params;
+  let systemPrompt = `You are a background indexing agent for project ${projectId}.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY been extracted on the server and included inline in the user message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read that directly. If the inline content is a "[skapi: ...]" note, the file could not be extracted - index it from its metadata only.
-- BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). For big spreadsheets and big text/data files READ THE FILE WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
+- BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). UNLESS this message already embeds a window of the file (in which case the message tells you not to call readFileContent, and you must not), read big spreadsheets and big text/data files WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
 - PDFs (scanned or not): you do NOT read a PDF with a tool or a URL. Its pages are RENDERED and embedded directly in the user message as IMAGE blocks, a WINDOW of pages at a time. LOOK at the embedded page images and datafy every one. The note beside them tells you whether MORE pages remain: if so, save this window's records and stop (a follow-up pass shows the next window automatically); only when the note says it was the LAST window is the PDF fully seen. Do NOT call readFileContent or web_fetch for a PDF.
 - VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
 - TRANSCRIBE, DO NOT DESCRIBE. When an image contains ANY text - a label, tag, stamp, form field, serial/part number, handwriting - your FIRST job is to read the characters out and store them VERBATIM, not to describe the scene. A record saying "a red inspection tag with handwritten markings" is worthless: it is unsearchable and every such photo produces the same sentence. Put the characters you can actually read into these EXACT fields, not variations of them: "printed_text" (the pre-printed wording), "handwritten_text" (what a person wrote by hand), and, when you can resolve one, "part_no", "tag_id" and "date". Same reason as the fixed table names: a field called photo_text in one pass and visible_text_notes in the next cannot be queried together. Read PARTIAL values rather than skipping: "500.7402.52__" beats nothing. Only when a character is genuinely unreadable, leave that field null or mark the unreadable span - do NOT invent it, and do NOT replace the whole transcription with a description of what the object looks like. A scene description is a nice extra AFTER the text, never instead of it.
-- Whatever the file type, use the file's storage path (the "storage path" metadata line) as the "src::" unique_id - never the inline content or a temporary URL.
-- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, paging through it with readFileContent when it is large. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed.
+- IMAGE FILES uploaded as the file itself: if ANY readable character appears ANYWHERE in the image (a label, a stamp, a sign in the background) it counts as an image WITH text - transcribe it per the rule above, and also capture the layout (what appears where) and every entity named. Only a truly text-free image gets description first: a one-line caption, then the objects present with their attributes (type, color, count, condition, position). Either way, save what you extract onto the file's "src::" record with updateRecords, TAG every entity and identifier visible, and INDEX the one number the image offers (a measured value, an amount, a count).
+- Whatever the file type, this file's identity is "src::" + its storage path (the "storage path" metadata line) - never the inline content or a temporary URL. That record ALREADY EXISTS: the upload pipeline creates it in table "file_summaries" (access group "authorized") before indexing starts, so posting it again is rejected as a duplicate unique_id. Reference it from every record you write, and add what you learn to it with updateRecords. If that update unexpectedly reports the record does not exist, post it yourself ONCE with that exact "src::" unique_id (table "file_summaries", access group "authorized") and carry on; this is the ONE exception to the do-NOT-post-the-file-record rules elsewhere in these instructions, because the source identity must never be dropped just because an update failed.
+- REACHABILITY (hard rule): every record you write while indexing this file MUST be reachable from the file's "src::<storage path>" record by following reference - either reference that record directly, or reference something that already reaches it. A record with no reference, or one pointing outside this file's chain, is an ORPHAN: deleting or re-indexing the file removes the reachable records and leaves the orphan behind forever, where it keeps turning up in later answers as stale data. If you create an intermediate record that OTHER records reference (a page record that rows hang off, a sheet or section record), set source.can_remove_referencing_records to true on it; the delete cascade passes a delete through a record only when that record carries the flag OR a unique_id starting "src::" (the file record cascades because its unique_id starts with "src::"; the intermediates you create carry no "src::" id, so they need the flag), and it cascades ONE LEVEL AT A TIME, so EVERY intermediate record in a chain needs its own marker - an unmarked link stops the cascade there and everything below it survives as orphans. When in doubt, reference the file record directly and keep the chain flat.
+- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, window by window, until it ends. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed. INDEX each row record on the row's most useful NUMERIC column (named by its header) so rows sort and range-query; when the row has no numeric column, index the grid row number instead. TAG each row record with the sheet name, the file name, and the row's categorical values (a status, a category, a type) - tags are how rows are filtered without scanning the table.
 - ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
-- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "spreadsheet_photos" for a record describing an embedded photo/image, "book_chapters" for a chapter record, and "file_summaries" for the file-level record. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (image_observations / photo_instances / spreadsheet_row_photos / photo_inspection are four names for what is one table).
-- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in the table "book_chapters" - never collapse the whole book into a single record. Each chapter record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO save one book-level record (title, author, language, overall summary, chapter list / table of contents, genre/subjects) and link each chapter record to it via reference. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
-- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Always use the MCP tools to save what you learn - be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. Never store raw or binary bytes (base64, blobs); describe them in human-readable text instead.
-- COMPLETION SIGNAL: only when you have fully read and saved the ENTIRE file (for readFileContent files: reached "END OF FILE"; for PDFs: the embedded page-image note said it was the LAST window - with all rows/pages/items saved), end your final message with the token INDEXING_COMPLETE on its own line. If you did NOT finish the whole file (more rows/pages remain), do NOT write that token - leaving it out is how the system knows to run another pass to continue.
+- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "book_chapters" for a chapter record, and "file_summaries" for the file-level record (which already exists, so update it and never post it). Embedded photos and other embedded files get NO table of your choosing: their records already exist in table "__MEDIA__", see EXTRACTED MEDIA below. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (inspection_items / item_records / sheet_items / inspection_data are four names for what is one table).
+- EXTRACTED MEDIA: every PICTURE embedded in an uploaded document (photos, diagrams, chart images) is pulled out and saved as a real permanent file under "__MEDIA__/<the document's storage path>/<name>", and a record for each one ALREADY EXISTS in table "__MEDIA__" with unique_id "src::<that path>", reference "src::<the document>", and its path, anchor and sheet already in data. Do NOT create it - the unique_id is taken and your post is rejected. UPDATE it with updateRecords, addressed by that unique_id, adding what the file actually SHOWS plus TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). An update REPLACES the fields you send, so send the existing tags back with your new ones and keep every field already in data (path, anchor, sheet, source, mime, bytes). ONE FILE, ONE RECORD: never also create a photo record in another table. If the update reports that the record does not exist, create it with that same unique_id, reference and data.path - the path must never be lost. Audio and video clips and non-picture attachments are NOT extracted, so never claim a separate file or a "__MEDIA__" record exists for one of those.
+- AUDIO files: transcribe the speech, and capture speakers (named where identifiable), the topics discussed, and timestamps of key moments in the record's data. TAG the language, the audio type (call, meeting, dictation, music), each speaker and every named entity; INDEX the duration in seconds as duration_seconds. VIDEO files: everything audio gets, PLUS transcribe on-screen text verbatim (same transcription discipline as photos) and capture the visual timeline - scene changes and what each scene shows, with timestamps. Same tags as audio plus every entity visible on screen, and INDEX duration_seconds here too. These audio and video rules apply to files UPLOADED AS FILES: the transcript and timeline land on the file's own "src::" record, which already exists. Audio or video embedded inside a document is NOT extracted, so never look for or promise a "__MEDIA__" record for it.
+- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in the table "book_chapters" - never collapse the whole book into a single record. INDEX each chapter record on its chapter number (so chapters sort and range-query in order) and include the chapter title among its tags; the record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO put the book-level facts (title, author, language, overall summary, chapter list / table of contents, genre/subjects) onto the "src::" file record that ALREADY EXISTS in "file_summaries", using updateRecords. Do NOT post a second book-level record, and set every chapter record's reference to exactly "src::" + the storage path. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
+- URL SOURCES: when the source being indexed is a URL rather than an uploaded file (a temporary or signed URL that merely DELIVERS an uploaded file's bytes is not a URL source; that file keeps its storage-path identity), its identity is "src::" + the FULL URL INCLUDING the query string (the query string often selects the content, so dropping it collapses different pages into one identity). If no record with that unique_id exists, create it; if the slot is already taken, update that record or reference it - never mint a variant id. For a WEB PAGE: extract everything on it, infer the page's primary entity type when it is not obvious (product, listing, article, profile), TAG that entity type plus the entities on the page, and INDEX the ONE number every entity of that type can be compared by (a price for a product, a date for an article). Any OTHER URL (a file behind a link) is downloaded and indexed under whichever per-type rule above matches its content. When the URL's content offers more index points than one record carries, add reference-linked records reachable from its "src::" record.
+- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. NEVER store raw or encoded file bytes in ANY field: no base64, no data: URIs, no hex or blob dumps. A long opaque non-human-readable string is not data - replace it with a structured description of what it encodes. If base64 or a data: URI is all you have for something, describe it conceptually and never paste it; if nothing human-readable can be extracted at all, OMIT that record rather than saving noise.
+- COMPLETION SIGNAL: only when YOU paged the file yourself with readFileContent and it reported "END OF FILE", with every row/item saved, end your final message with the token INDEXING_COMPLETE on its own line. If more rows remain, do NOT write that token - leaving it out is how the system knows to run another pass to continue. When the file arrives INSIDE this message one window at a time (an embedded window of rows/text, or rendered PDF page images), you are NOT the one who decides it is finished: the system advances the window off the real page/row count and sends the next pass automatically, so save this window, report what you saved, and never imply you have seen the whole file.
 - Only AFTER every save is done, send exactly ONE final message summarizing what you indexed - never just "Indexing complete", and never a raw/base64/binary value or a large pasted dump. Keep it to a few factual sentences or a short markdown bullet list covering: the file name, its content type, each table you wrote to with its record/row count and the key columns/fields or topics captured, and anything that could not be extracted. Follow this shape - Indexed <file name> (<content type>): saved <N> records to <table(s)> capturing <key columns/fields or topics>; could not extract: <gaps, or none>.`;
   if (serviceDescription) {
     systemPrompt += `
@@ -356,7 +366,7 @@ File metadata:
 ` : "");
   if (options?.inlineContent) {
     return head + `
-The file's content was parsed by the client and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
+The file's content was parsed by the client and is provided inline below. Read it directly - do NOT fetch any URL for this file. Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.
 
 ----- BEGIN FILE CONTENT -----
 ${options.inlineContent}
@@ -364,7 +374,7 @@ ${options.inlineContent}
   }
   if (options?.inlineContentPlaceholder) {
     return head + `
-The file's text content was extracted on the server and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
+The file's text content was extracted on the server and is provided inline below. Read it directly - do NOT fetch any URL for this file. Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.
 
 ----- BEGIN FILE CONTENT -----
 ${options.inlineContentPlaceholder}
@@ -372,7 +382,7 @@ ${options.inlineContentPlaceholder}
   }
   if (options?.pagedRead) {
     return head + `
-Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Use the storage path above for the "src::" unique_id.` + (attachment.url ? `
+Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` + (attachment.url ? `
 (A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : "");
   }
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
@@ -407,7 +417,7 @@ function buildRenderDatafy(placeholder) {
   return `
 ${placeholder}
 
-LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
+LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.
 
 Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). Whether a page is one you have already saved is stated in the note above the images - decide from that, never from a printed page number.
 
@@ -430,9 +440,9 @@ This file is delivered to you ONE WINDOW at a time, embedded directly in this me
   return head + buildRenderMeta(attachment) + where + `
 ${placeholder}
 
-DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. Use the storage path above for the "src::" unique_id on the file-level record, and link every row/section record to it by reference.
+DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, and link every row/section record to it by reference.
 
-If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows into the record for the row it is anchored to (a \xABPHOTO A88\xBB marker in the grid text only says WHERE a picture sits - the picture itself is attached to this message). Never report that photo contents could not be extracted when images are attached here.
+If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows. A \xABPHOTO ...\xBB marker in the grid text ties a picture to its row and comes in two forms. \xABPHOTO A88 -> __MEDIA__/...\xBB means the picture at cell A88 is saved as a permanent file at exactly that storage path, and its record in table "__MEDIA__" has unique_id "src::" + that path: UPDATE that record with updateRecords, adding what the picture SHOWS and TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). Do NOT create a duplicate and do NOT add a second photo record in another table: one file, one record. If that update reports the record does not exist, create it ONCE with that same unique_id, reference "src::" + the storage path above, table "__MEDIA__", access group "authorized", and data carrying the path - the path must never be lost. A bare \xABPHOTO A88\xBB marker with no arrow is a picture with no stored path of its own in this window: usually a repeat stored under an earlier anchor, or one too small to keep. NEVER construct a storage path or unique_id for it: find its record, if any, with getRecords reference "src::" + the storage path above, matching the cell against data.anchor or tags, and enrich what you find. The row record stays about its row's cells. Never report that photo contents could not be extracted when images are attached here.
 
 Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to you automatically. Report only what you were actually shown, and never imply you have seen the whole file when the note beside the window says more remains.`;
 }
@@ -445,11 +455,10 @@ File metadata:
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + `
-Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest page/row/window already saved). Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
-  - PDF: the cursor is the NUMBER OF PAGES already read (0-based next page). If you saved up to page N, call readFileContent with cursor="N" to get page N+1 onward.
-  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
-  - Text: the cursor is the character offset already read.
-Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. Do NOT re-save windows that are already saved. Use the storage path above for the "src::" unique_id. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
+Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
+ - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
+ - Text: the cursor is the character offset already read.
+Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. A \xABPHOTO <cell>\xBB marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. Do NOT re-save windows that are already saved. Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
 }
 
 // src/engine/errors.ts
@@ -583,7 +592,7 @@ function encodePathSegments(path) {
 function normalizeAttachmentPathCandidate(value) {
   return safeDecodeURIComponent((value || "").trim()).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
 }
-function extractRemotePathFromAttachmentHref(href, serviceId) {
+function extractRemotePathFromAttachmentHref(href, projectId) {
   try {
     var parsed = new URL(href);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
@@ -591,7 +600,7 @@ function extractRemotePathFromAttachmentHref(href, serviceId) {
     var segs = path.split("/").filter(Boolean);
     if (!segs.length) return null;
     var HEX = /^[a-f0-9]{32,}$/i;
-    var sid = serviceId || "";
+    var sid = projectId || "";
     var start = 0;
     while (start < segs.length) {
       var seg = segs[start];
@@ -615,13 +624,13 @@ function getExpiredAttachmentVisiblePath(remotePath, fallback) {
 function buildDisplayExpiredAttachmentHref(remotePath, fallback) {
   return EXPIRED_ATTACHMENT_URL_ORIGIN + "/" + encodePathSegments(getExpiredAttachmentVisiblePath(remotePath, fallback));
 }
-function isServiceDbAttachmentHref(href, serviceId) {
-  if (!serviceId) return false;
+function isServiceDbAttachmentHref(href, projectId) {
+  if (!projectId) return false;
   try {
     var parsed = new URL(href);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
     var segs = normalizeAttachmentPathCandidate(parsed.pathname || "").split("/").filter(Boolean);
-    return segs.length > 0 && segs[0] === serviceId;
+    return segs.length > 0 && segs[0] === projectId;
   } catch (e) {
     return false;
   }
@@ -636,12 +645,12 @@ function readExpiredAttachmentHref(href) {
     return null;
   }
 }
-function sanitizeAttachmentLinksForHistory(content, serviceId, forAssistant) {
+function sanitizeAttachmentLinksForHistory(content, projectId, forAssistant) {
   if (!content) return content;
   if (!forAssistant && content.indexOf("Attached files:") === -1) return content;
   return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_m, label, href) {
-    if (!isServiceDbAttachmentHref(href, serviceId)) return _m;
-    var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
+    if (!isServiceDbAttachmentHref(href, projectId)) return _m;
+    var remotePath = extractRemotePathFromAttachmentHref(href, projectId);
     var fullPath = remotePath || normalizeAttachmentPathCandidate(label);
     if (!fullPath) return _m;
     return "[" + label + "](" + buildDisplayExpiredAttachmentHref(fullPath, label) + ")";
@@ -745,14 +754,15 @@ function classifyInlineLink(full, groups, ctx) {
         tail
       };
     }
-    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.serviceId) || normalizeAttachmentPathCandidate(rawPath) : normalizeAttachmentPathCandidate(rawPath));
+    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath) : rawPath.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/"));
     var srcBuilt = asStoredFile(srcPath, srcPath);
     return srcBuilt ? { part: srcBuilt.part, tail } : null;
   }
   if (g4 && g5) {
     var dbTarget = /^db:(.+)$/i.exec(g5.trim());
     if (dbTarget) {
-      var declared = asStoredFile(normalizeAttachmentPathCandidate(dbTarget[1]), g4);
+      var rawDbPath = dbTarget[1].trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+      var declared = asStoredFile(rawDbPath, g4);
       if (!declared) return null;
       declared.part.label = truncateLabelForDisplay(g4);
       declared.part.fullLabel = g4;
@@ -797,8 +807,8 @@ function classifyInlineLink(full, groups, ctx) {
       return withTail(carriedBuilt);
     }
   }
-  if (isServiceDbAttachmentHref(originalHref, ctx.serviceId)) {
-    var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.serviceId);
+  if (isServiceDbAttachmentHref(originalHref, ctx.projectId)) {
+    var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.projectId);
     if (remotePath) {
       var dbBuilt = asStoredFile(remotePath, getExpiredAttachmentVisiblePath(remotePath, urlLabel));
       if (dbBuilt) return withTail(dbBuilt);
@@ -860,15 +870,15 @@ function registerModelContextWindows(models) {
   }
 }
 var projectContextWindows = {};
-function setProjectContextWindow(serviceId, tokens) {
-  var key = (serviceId || "").trim();
+function setProjectContextWindow(projectId, tokens) {
+  var key = (projectId || "").trim();
   if (!key) return;
   var n = Number(tokens);
   if (Number.isFinite(n) && n > 0) projectContextWindows[key] = Math.floor(n);
   else delete projectContextWindows[key];
 }
-function getProjectContextWindow(serviceId) {
-  var key = (serviceId || "").trim();
+function getProjectContextWindow(projectId) {
+  var key = (projectId || "").trim();
   return key && projectContextWindows[key] ? projectContextWindows[key] : null;
 }
 var OUTPUT_TOKEN_RESERVE = 22e3;
@@ -885,8 +895,8 @@ function estimateTextTokens(text) {
 function estimateMessageTokens(msg) {
   return estimateTextTokens(msg.content) + estimateTextTokens(msg.role) + 6;
 }
-function getContextWindow(platform, model, serviceId) {
-  var override = serviceId ? getProjectContextWindow(serviceId) : null;
+function getContextWindow(platform, model, projectId) {
+  var override = projectId ? getProjectContextWindow(projectId) : null;
   if (override) return override;
   var normalized = (model || "").trim().toLowerCase();
   if (normalized) {
@@ -905,12 +915,12 @@ function stripFileBlocksFromHistory(content) {
   return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
 }
 function buildBoundedChatMessages(options) {
-  var contextWindow = getContextWindow(options.platform, options.model, options.serviceId);
+  var contextWindow = getContextWindow(options.platform, options.model, options.projectId);
   var contextBasedBudget = Math.max(
     MIN_INPUT_TOKEN_BUDGET,
     contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER
   );
-  var scaled = !!(options.serviceId && getProjectContextWindow(options.serviceId));
+  var scaled = !!(options.projectId && getProjectContextWindow(options.projectId));
   var claudeInputCap = scaled ? Math.max(CLAUDE_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * CLAUDE_INPUT_CAP_RATIO)) : CLAUDE_PER_REQUEST_INPUT_CAP;
   var availableInputBudget = options.platform === "claude" ? Math.min(contextBasedBudget, claudeInputCap) : contextBasedBudget;
   var systemCost = estimateTextTokens(options.systemPrompt) + 12;
@@ -922,7 +932,7 @@ function buildBoundedChatMessages(options) {
   var trimmed = windowed.map(function(m, i2) {
     if (i2 === latestIndex) return m;
     var stripped = stripFileBlocksFromHistory(m.content);
-    var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== "user");
+    var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.projectId, m.role !== "user");
     return Object.assign({}, m, { content: sanitized });
   });
   var bounded = [], used = 0;
@@ -1671,13 +1681,27 @@ async function notifyAgentSaveAttachment(info) {
   const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
   const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
   const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
-  const skapiExtract = extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
+  const skapiExtract = extractContent && extractContent.length ? {
+    _skapi_extract: extractContent.map((d) => ({
+      ...d,
+      // FIRST pass of an INDEXING run only: tells the worker to also pull the
+      // file's embedded pictures into __MEDIA__ and register their records.
+      // Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
+      // never sets this, so merely ATTACHING a file to a chat message cannot
+      // write media records; a CONTINUE pass skips it because the first pass
+      // already saved (the save is whole-file, not windowed).
+      save_media: !continuing
+    }))
+  } : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
   );
   const systemPrompt = buildIndexingSystemPrompt({
-    service,
+    // The model copies this id verbatim into project_id tool calls, so it must be
+    // the PUBLIC token whenever the host supplied one; the raw code is rejected
+    // by the tools' schema pattern.
+    projectId: info.publicProjectId || service,
     serviceName: info.serviceName,
     serviceDescription: info.serviceDescription
   });
@@ -1859,7 +1883,7 @@ function isBgIndexingQueue(queueName) {
 var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
 var EMPTY_INDEXING_REPLY = "Finished reading this file.";
 var MAX_INDEXING_RESUME_PASSES = 6;
-var CHAT_HISTORY_PAGE_LIMIT = 100;
+var CHAT_HISTORY_PAGE_LIMIT = 500;
 async function getChatHistory(params, fetchOptions) {
   const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
   const p = Object.assign(
@@ -1966,7 +1990,7 @@ function mapHistoryListToMessages(list, platform, opts) {
           displayContent = userText;
         }
       } else {
-        displayContent = sanitizeAttachmentLinksForHistory(userText, opts.serviceId);
+        displayContent = sanitizeAttachmentLinksForHistory(userText, opts.projectId);
       }
       var userMsg = { role: "user", content: displayContent };
       if (isInProcess) userMsg.isPendingInProcess = true;
@@ -1994,7 +2018,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (replyTs !== void 0) em._ts = replyTs;
       mapped.push(em);
     } else if (assistantText || reportedComplete) {
-      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) || EMPTY_INDEXING_REPLY };
+      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
@@ -2246,7 +2270,7 @@ var ChatSession = class {
     var id = this.host.getIdentity();
     for (var i = 0; i < this.bgTaskQueue.length; i++) {
       var e = this.bgTaskQueue[i];
-      if (e && e.storagePath === storagePath && e.serviceId === id.serviceId && e.platform === id.platform) return true;
+      if (e && e.storagePath === storagePath && e.projectId === id.projectId && e.platform === id.platform) return true;
     }
     return this.state.messages.some(function(m) {
       if (!m.isBackgroundTask || m.role !== "user" || m.isCancelled) return false;
@@ -2322,14 +2346,15 @@ var ChatSession = class {
     var self = this;
     var id = this.host.getIdentity();
     var platform = id.platform;
-    if (!id.serviceId || platform !== "claude" && platform !== "openai") return Promise.resolve();
-    if (this._liveIndexKey === this.getHistoryCacheKey() && nowMs() - this._liveIndexAt < maxAgeMs) {
+    if (!id.projectId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+    var askedKey = this.getHistoryCacheKey();
+    if (this._liveIndexKey === askedKey && nowMs() - this._liveIndexAt < maxAgeMs) {
       return Promise.resolve();
     }
-    var queue = bgIndexingQueueName(id.userId, id.serviceId);
+    var queue = bgIndexingQueueName(id.userId, id.projectId);
     var ask = function(status) {
       return Promise.resolve(getChatHistory(
-        { service: id.serviceId, owner: id.owner, platform, queue, status },
+        { service: id.projectId, owner: id.owner, platform, queue, status },
         { limit: WORKER_PASS_ADOPT_LIMIT }
       )).catch(function() {
         return null;
@@ -2337,7 +2362,8 @@ var ChatSession = class {
     };
     return Promise.all([ask("pending"), ask("running")]).then(function(results) {
       if (results[0] === null || results[1] === null) return;
-      self._liveIndexKey = self.getHistoryCacheKey();
+      if (self.getHistoryCacheKey() !== askedKey) return;
+      self._liveIndexKey = askedKey;
       self._recordLiveIndexKeys(results);
     });
   }
@@ -2389,6 +2415,7 @@ var ChatSession = class {
     this.state.liveIndexKeys = next;
     this.state.liveIndexChecked = nowChecked;
     this._liveIndexAt = nowMs();
+    this._liveIndexKey = this.getHistoryCacheKey();
     if (changed) this.host.notify();
   }
   /** Forget the snapshot: it describes ONE chat's queue, and the answer for the
@@ -2423,12 +2450,27 @@ var ChatSession = class {
   refreshLiveIndexState() {
     this._adoptWorkerIndexingPasses(0);
   }
-  /** Forget what we know about which files are indexing. For a consumer whose
-   *  history loading is its own fork and so never reaches loadHistory's reset —
-   *  a snapshot describes ONE chat's queue, and carrying it into another project
-   *  would let a row there claim to be finished on someone else's evidence. */
+  /** Forget what we know about which files are indexing — but ONLY when the
+   *  snapshot was taken for a different chat than the one on screen now. For a
+   *  consumer whose history loading is its own fork and so never reaches
+   *  loadHistory's reset — a snapshot describes ONE chat's queue, and carrying it
+   *  into another project would let a row there claim to be finished on someone
+   *  else's evidence.
+   *
+   *  Conditional for the same reason loadHistory's own reset is (the
+   *  `loadKey !== _liveIndexKey` gate): the view calls this on every mount, and
+   *  an unconditional wipe turned every re-entry to the chat into a grey
+   *  "Checking status:" sweep across rows whose state was already known. A
+   *  RE-entry keeps showing the last answer (green/yellow) while the first-page
+   *  refresh re-asks quietly; only a genuine project/platform switch starts from
+   *  "not known yet". Claiming `_liveIndexKey` here (before any answer) is the
+   *  same fudge loadHistory makes: it marks WHOSE chat the empty snapshot is
+   *  for, so repeated calls do not re-wipe, and _recordLiveIndexKeys re-claims
+   *  it when the real answer lands. */
   resetLiveIndexState() {
-    this._liveIndexKey = "";
+    var key = this.getHistoryCacheKey();
+    if (key === this._liveIndexKey) return;
+    this._liveIndexKey = key;
     this._resetLiveIndexKeys();
   }
   /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
@@ -2580,8 +2622,8 @@ var ChatSession = class {
   }
   getHistoryCacheKey() {
     var id = this.host.getIdentity();
-    if (!id.serviceId || id.platform === "none") return "";
-    return id.serviceId + "#" + id.platform;
+    if (!id.projectId || id.platform === "none") return "";
+    return id.projectId + "#" + id.platform;
   }
   updateHistoryCache() {
     var key = this.getHistoryCacheKey();
@@ -2650,26 +2692,26 @@ var ChatSession = class {
     };
   }
   /**
-   * serviceId/owner are passed explicitly by every caller: a request can be
+   * projectId/owner are passed explicitly by every caller: a request can be
    * dispatched after the user moved to another project, and re-reading the live
    * identity here would silently send the turn to THAT project instead of the
    * one it was composed for. Falls back to the live read only when a caller
    * omits them.
    */
-  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, serviceId, owner) {
-    if (serviceId === void 0 || owner === void 0) {
+  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, projectId, owner) {
+    if (projectId === void 0 || owner === void 0) {
       var id = this.host.getIdentity();
-      if (serviceId === void 0) serviceId = id.serviceId;
+      if (projectId === void 0) projectId = id.projectId;
       if (owner === void 0) owner = id.owner;
     }
-    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls);
+    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls);
   }
   dispatchAgentRequest(params) {
     var self = this;
     var dispatchItemId;
     var sendAndPoll = function() {
       return Promise.resolve(
-        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.serviceId, params.owner)
+        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
           if (initial.id) {
@@ -2881,7 +2923,7 @@ var ChatSession = class {
    */
   awaitIndexingDrained(identity) {
     var self = this;
-    var svcId = identity && identity.serviceId;
+    var svcId = identity && identity.projectId;
     var platform = identity && identity.platform;
     if (!svcId || platform !== "claude" && platform !== "openai") return Promise.resolve("skipped");
     var owner = identity.owner;
@@ -3025,7 +3067,7 @@ var ChatSession = class {
     }
     if (stageId) delete this._liveStages[stageId];
     var llmComposed = composedForLlm || composed;
-    var key = !id.serviceId ? "" : id.serviceId + "#" + id.platform;
+    var key = !id.projectId ? "" : id.projectId + "#" + id.platform;
     var offChat = !!key && key !== this.getHistoryCacheKey();
     var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function(m) {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
@@ -3033,7 +3075,7 @@ var ChatSession = class {
     var aiPlatform = id.platform;
     var aiModel = id.model || void 0;
     var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
-    var userId = id.userId || id.serviceId;
+    var userId = id.userId || id.projectId;
     var chatQueue = useBgQueue ? bgIndexingQueueName(userId) : userId;
     if (offChat) {
       var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function(m) {
@@ -3043,7 +3085,7 @@ var ChatSession = class {
         platform: aiPlatform,
         model: aiModel,
         systemPrompt,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         history: offHistory.concat([{ role: "user", content: llmComposed }])
       });
       var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
@@ -3072,7 +3114,7 @@ var ChatSession = class {
       };
       this.dispatchAgentRequest({
         key,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         owner: id.owner,
         aiPlatform,
         aiModel,
@@ -3093,7 +3135,7 @@ var ChatSession = class {
         platform: aiPlatform,
         model: aiModel,
         systemPrompt,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         history: resolvedHistory.concat([{ role: "user", content: llmComposed }])
       });
       var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _dimSending: true, _localId: this._newLocalId(), _ts: wallClockNow() };
@@ -3113,7 +3155,7 @@ var ChatSession = class {
       this.updateHistoryCache();
       this.host.scrollToBottom(true);
       var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
-      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner)).then(function(result) {
+      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner)).then(function(result) {
         var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
           return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
         });
@@ -3165,12 +3207,12 @@ var ChatSession = class {
       platform: aiPlatform,
       model: aiModel,
       systemPrompt,
-      serviceId: id.serviceId,
+      projectId: id.projectId,
       history: historyForLlm
     });
     var run = this.dispatchAgentRequest({
       key,
-      serviceId: id.serviceId,
+      projectId: id.projectId,
       owner: id.owner,
       aiPlatform,
       aiModel,
@@ -3428,7 +3470,7 @@ var ChatSession = class {
     var platform = id.platform;
     if (platform !== "claude" && platform !== "openai") return;
     var url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
-    var queueBase = id.userId || id.serviceId;
+    var queueBase = id.userId || id.projectId;
     var queue = msg.isBackgroundTask || msg._useBgQueue ? bgIndexingQueueName(queueBase) : queueBase;
     var at = this.state.messages[idx] && this.state.messages[idx]._serverItemId === serverId && this.state.messages[idx].role === msg.role ? idx : this.state.messages.findIndex(function(m) {
       return m._serverItemId === serverId && m.role === msg.role;
@@ -3442,7 +3484,7 @@ var ChatSession = class {
       method: "POST",
       id: serverId,
       queue,
-      service: id.serviceId,
+      service: id.projectId,
       owner: id.owner
     })).then(function(result) {
       if (result && result.removed) {
@@ -3965,7 +4007,7 @@ var ChatSession = class {
     if (!entry) return "";
     var file = entry.storagePath || entry.filename;
     if (!file) return "";
-    return entry.serviceId + "#" + entry.platform + "|" + file;
+    return entry.projectId + "#" + entry.platform + "|" + file;
   }
   /**
    * Reconcile the bg queue with the files the user has stopped.
@@ -4054,10 +4096,10 @@ var ChatSession = class {
     if (this._adoptingWorkerPasses) return;
     var id = this.host.getIdentity();
     var platform = id.platform;
-    if (!id.serviceId || platform !== "claude" && platform !== "openai") return;
+    if (!id.projectId || platform !== "claude" && platform !== "openai") return;
     if (this.isPollingPaused() || !this.host.isViewMounted()) return;
-    var svcId = id.serviceId, owner = id.owner;
-    var queue = bgIndexingQueueName(id.userId, id.serviceId);
+    var svcId = id.projectId, owner = id.owner;
+    var queue = bgIndexingQueueName(id.userId, id.projectId);
     var ask = function(status) {
       return Promise.resolve(getChatHistory(
         { service: svcId, owner, platform, queue, status },
@@ -4070,7 +4112,7 @@ var ChatSession = class {
     Promise.all([ask("running"), ask("pending")]).then(function(results) {
       self._adoptingWorkerPasses = false;
       var now = self.host.getIdentity();
-      if (now.serviceId !== svcId || now.platform !== platform) return;
+      if (now.projectId !== svcId || now.platform !== platform) return;
       if (!self.host.isViewMounted()) return;
       if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
       var adoptedIds = [];
@@ -4090,7 +4132,7 @@ var ChatSession = class {
       }
       setTimeout(function() {
         var later = self.host.getIdentity();
-        if (later.serviceId !== svcId || later.platform !== platform) return;
+        if (later.projectId !== svcId || later.platform !== platform) return;
         if (self.isPollingPaused() || !self.host.isViewMounted()) return;
         self._adoptWorkerIndexingPasses(attempt + 1);
       }, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
@@ -4132,7 +4174,7 @@ var ChatSession = class {
     if (!ref || !ref.name) return false;
     if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
     this.bgTaskQueue.push({
-      serviceId: svcId,
+      projectId: svcId,
       platform,
       id: item.id,
       filename: ref.name,
@@ -4163,8 +4205,8 @@ var ChatSession = class {
       url,
       method: "POST",
       id: serverId,
-      queue: bgIndexingQueueName(id.userId, id.serviceId),
-      service: id.serviceId,
+      queue: bgIndexingQueueName(id.userId, id.projectId),
+      service: id.projectId,
       owner: id.owner
     })).catch(function() {
     });
@@ -4173,7 +4215,7 @@ var ChatSession = class {
   drainBgTaskQueue() {
     var self = this;
     var id = this.host.getIdentity();
-    var svcId = id.serviceId, plat = id.platform;
+    var svcId = id.projectId, plat = id.platform;
     if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
     this._applyIndexCancellations();
     this._sweepCancelledIndexing();
@@ -4187,13 +4229,13 @@ var ChatSession = class {
     });
     for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
       var e = this.bgTaskQueue[i];
-      if (e.serviceId !== svcId || e.platform !== plat) continue;
+      if (e.projectId !== svcId || e.platform !== plat) continue;
       if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
     }
     var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
     var injectedAny = false;
     this.bgTaskQueue.forEach(function(entry) {
-      if (entry.serviceId !== svcId || entry.platform !== plat) return;
+      if (entry.projectId !== svcId || entry.platform !== plat) return;
       if (!presentIds[entry.id]) {
         var isRunning = entry.status === "running";
         var userBubble = {
@@ -4322,13 +4364,18 @@ var ChatSession = class {
         return;
       }
       var id = this.host.getIdentity();
-      if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
+      if (!id || id.platform === "none" || id.projectId !== entry.projectId) return;
       this.trackIndexDispatch(notifyAgentContinueIndexing({
         platform: id.platform,
         model: id.model,
-        service: id.serviceId,
+        service: id.projectId,
+        // Without this the resume pass rebuilds its system prompt from the RAW
+        // regional id (requests.ts falls back to `service`), and the model copies
+        // that id verbatim into project_id tool calls, which the MCP schema
+        // pattern rejects - the whole continue pass saves nothing.
+        publicProjectId: id.publicProjectId,
         owner: id.owner,
-        userId: id.userId || id.serviceId,
+        userId: id.userId || id.projectId,
         serviceName: id.serviceName,
         serviceDescription: id.serviceDescription,
         attachment: {
@@ -4341,7 +4388,7 @@ var ChatSession = class {
       }).then(function(ack) {
         if (ack && typeof ack.id === "string") {
           self.bgTaskQueue.push({
-            serviceId: id.serviceId,
+            projectId: id.projectId,
             platform: id.platform,
             id: ack.id,
             filename: entry.filename,
@@ -4377,9 +4424,9 @@ var ChatSession = class {
   loadHistory(fetchMore, token) {
     var self = this;
     var id = this.host.getIdentity();
-    var loadKey = !id.serviceId || id.platform === "none" ? "" : id.serviceId + "#" + id.platform;
+    var loadKey = !id.projectId || id.platform === "none" ? "" : id.projectId + "#" + id.platform;
     if (token === void 0) token = this.state.gateRefreshToken;
-    if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.serviceId) {
+    if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.projectId) {
       return Promise.resolve();
     }
     this.state.historyRequestToken = token;
@@ -4391,11 +4438,11 @@ var ChatSession = class {
     if (fetchMore) this.state.loadingOlderHistory = true;
     this.host.notify();
     var platform = id.platform;
-    var serviceId = id.serviceId, owner = id.owner;
+    var projectId = id.projectId, owner = id.owner;
     var options = { fetchMore };
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
     var fetchHistory = function() {
-      return getChatHistory({ service: serviceId, owner, platform }, options);
+      return getChatHistory({ service: projectId, owner, platform }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
       if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -4415,7 +4462,7 @@ var ChatSession = class {
       });
       var mapped = mapHistoryListToMessages(list, platform, {
         clearedAt: self.host.getClearedAt(),
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         formatIndexingLabel: self.host.formatIndexingLabel
       }).messages;
       var keptOlderPages = false;
@@ -4659,7 +4706,7 @@ var ChatSession = class {
           return self.host.promptOverwrite(member.file.name).then(function(choice) {
             if (choice === "overwrite") {
               existedBefore = true;
-              markImagePreviewStale(self.host.getIdentity().serviceId || "default", member.storagePath);
+              markImagePreviewStale(self.host.getIdentity().projectId || "default", member.storagePath);
               return doMemberUpload(false);
             }
             if (choice === "skip") {
@@ -4709,9 +4756,10 @@ var ChatSession = class {
             return self.trackIndexDispatch(notifyAgentSaveAttachment({
               platform: id.platform,
               model: id.model,
-              service: id.serviceId,
+              service: id.projectId,
+              publicProjectId: id.publicProjectId,
               owner: id.owner,
-              userId: id.userId || id.serviceId,
+              userId: id.userId || id.projectId,
               serviceName: id.serviceName,
               serviceDescription: id.serviceDescription,
               attachment: {
@@ -4725,7 +4773,7 @@ var ChatSession = class {
             }).then(function(ack) {
               if (ack && typeof ack.id === "string") {
                 self.bgTaskQueue.push({
-                  serviceId: id.serviceId,
+                  projectId: id.projectId,
                   platform: id.platform,
                   id: ack.id,
                   filename: member.file.name,

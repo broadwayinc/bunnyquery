@@ -8,9 +8,17 @@
  */
 
 export interface ChatIdentity {
-	serviceId: string;
+	projectId: string;
+	/**
+	 * The PUBLIC project ID: the formatted two-segment token (skapi.project_id).
+	 * projectId above is the RAW regional code the wire endpoints take; the public
+	 * token is what MCP tools accept and what prompts must show the model, since the
+	 * model copies it verbatim into tool calls. Optional for older hosts; prompts
+	 * fall back to the raw code when absent.
+	 */
+	publicProjectId?: string;
 	owner: string;
-	/** Per-user queue name (falls back to serviceId). */
+	/** Per-user queue name (falls back to projectId). */
 	userId: string;
 	platform: 'claude' | 'openai' | 'none';
 	model?: string;
@@ -115,7 +123,7 @@ export interface ChatMessage {
 	 *  it is created, then reconciled to the server value on the next history load.
 	 *  Absent while a turn is still pending, so no time shows on a "Thinking" bubble. */
 	_ts?: number;
-	// History cache key (`serviceId#platform`) this bubble was created under.
+	// History cache key (`projectId#platform`) this bubble was created under.
 	// Stamped on LOCALLY-created bubbles only (the optimistic user message and
 	// its "Thinking..." placeholder); server-mapped bubbles are identified by
 	// _serverItemId instead. The dashboard renders every project through ONE

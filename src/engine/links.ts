@@ -1,6 +1,6 @@
 /**
  * Pure link/path helpers (no DOM, no marked). Moved verbatim from the chatbox.
- * `serviceId` is passed as a PARAMETER (the original read it from a global) so
+ * `projectId` is passed as a PARAMETER (the original read it from a global) so
  * the engine stays consumer-agnostic. The HTML-emitting helpers
  * (buildLinkPartFromGroups, linkToAnchorHtml, fileToAnchorHtml, parseMsgParts*)
  * stay in each VIEW — only these pure pieces move here.
@@ -91,7 +91,7 @@ export function normalizeAttachmentPathCandidate(value: string): string {
 	return safeDecodeURIComponent((value || '').trim()).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
 }
 
-export function extractRemotePathFromAttachmentHref(href: string, serviceId: string): string | null {
+export function extractRemotePathFromAttachmentHref(href: string, projectId: string): string | null {
 	try {
 		var parsed = new URL(href);
 		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
@@ -99,7 +99,7 @@ export function extractRemotePathFromAttachmentHref(href: string, serviceId: str
 		var segs = path.split('/').filter(Boolean);
 		if (!segs.length) return null;
 		var HEX = /^[a-f0-9]{32,}$/i;
-		var sid = serviceId || '';
+		var sid = projectId || '';
 		var start = 0;
 		while (start < segs.length) {
 			var seg = segs[start];
@@ -122,16 +122,16 @@ export function buildDisplayExpiredAttachmentHref(remotePath: string, fallback?:
 }
 
 // Does `href` point at THIS service's db attachment storage? A db attachment URL's
-// path always begins with the serviceId segment (…/<serviceId>/<hash>/<path>). Used
+// path always begins with the projectId segment (…/<projectId>/<hash>/<path>). Used
 // to SAFELY sanitize assistant messages — where an arbitrary external citation URL
 // must never be rewritten, only the service's own volatile db links.
-export function isServiceDbAttachmentHref(href: string, serviceId: string): boolean {
-	if (!serviceId) return false;
+export function isServiceDbAttachmentHref(href: string, projectId: string): boolean {
+	if (!projectId) return false;
 	try {
 		var parsed = new URL(href);
 		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
 		var segs = normalizeAttachmentPathCandidate(parsed.pathname || '').split('/').filter(Boolean);
-		return segs.length > 0 && segs[0] === serviceId;
+		return segs.length > 0 && segs[0] === projectId;
 	} catch (e) { return false; }
 }
 
@@ -161,12 +161,12 @@ export function readExpiredAttachmentHref(href: string): string | null {
 // paste in the same message: it became a placeholder for a storage path that
 // never existed. We can only re-mint what we host, so we only rewrite what we
 // host.
-export function sanitizeAttachmentLinksForHistory(content: string, serviceId: string, forAssistant?: boolean): string {
+export function sanitizeAttachmentLinksForHistory(content: string, projectId: string, forAssistant?: boolean): string {
 	if (!content) return content;
 	if (!forAssistant && content.indexOf('Attached files:') === -1) return content;
 	return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function (_m: string, label: string, href: string) {
-		if (!isServiceDbAttachmentHref(href, serviceId)) return _m;
-		var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
+		if (!isServiceDbAttachmentHref(href, projectId)) return _m;
+		var remotePath = extractRemotePathFromAttachmentHref(href, projectId);
 		var fullPath = remotePath || normalizeAttachmentPathCandidate(label);
 		if (!fullPath) return _m;
 		return '[' + label + '](' + buildDisplayExpiredAttachmentHref(fullPath, label) + ')';
@@ -332,7 +332,7 @@ export interface InlineLinkPart {
 
 export interface InlineLinkContext {
 	/** Current project id: the leading segment to strip off a db url. */
-	serviceId: string;
+	projectId: string;
 	/** `https://db.<hostDomain>` for this deployment. */
 	dbHostPrefix: string;
 	/** A fresh url already minted for this placeholder, if the view cached one. */
@@ -409,8 +409,10 @@ export function classifyInlineLink(
 		}
 		var srcPath = readExpiredAttachmentHref(rawPath)
 			|| (srcIsUrl
-				? (extractRemotePathFromAttachmentHref(rawPath, ctx.serviceId) || normalizeAttachmentPathCandidate(rawPath))
-				: normalizeAttachmentPathCandidate(rawPath));
+				? (extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath))
+				// bare stored path: same NON-decoding normalize as the db: branch; only
+				// URL-derived paths genuinely arrive percent-encoded.
+				: rawPath.trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/'));
 		var srcBuilt = asStoredFile(srcPath, srcPath);
 		return srcBuilt ? { part: srcBuilt.part, tail: tail } : null;
 	}
@@ -425,7 +427,12 @@ export function classifyInlineLink(
 		// EMITTING it; until then this branch simply never fires.
 		var dbTarget = /^db:(.+)$/i.exec(g5.trim());
 		if (dbTarget) {
-			var declared = asStoredFile(normalizeAttachmentPathCandidate(dbTarget[1]), g4);
+			// NON-decoding normalize: the prompt guarantees a db: target is the path exactly
+			// as stored, NOT url-encoded, and the MCP's own key builder refuses to decode
+			// bare paths for the same corruption: percent-decoding here turned a stored name
+			// containing a literal "%20" into the wrong key.
+			var rawDbPath = dbTarget[1].trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+			var declared = asStoredFile(rawDbPath, g4);
 			if (!declared) return null;
 			declared.part.label = truncateLabelForDisplay(g4);
 			declared.part.fullLabel = g4;
@@ -497,8 +504,8 @@ export function classifyInlineLink(
 	// This project's own db url: volatile, so render it re-mintable. A db url for
 	// a DIFFERENT project is not ours to mint, so it stays an ordinary link rather
 	// than a chip that would query this project for someone else's key.
-	if (isServiceDbAttachmentHref(originalHref, ctx.serviceId)) {
-		var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.serviceId);
+	if (isServiceDbAttachmentHref(originalHref, ctx.projectId)) {
+		var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.projectId);
 		if (remotePath) {
 			var dbBuilt = asStoredFile(remotePath, getExpiredAttachmentVisiblePath(remotePath, urlLabel));
 			if (dbBuilt) return withTail(dbBuilt);
