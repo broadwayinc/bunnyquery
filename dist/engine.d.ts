@@ -1037,7 +1037,7 @@ declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isS
 };
 
 declare const MCP_NAME = "BunnyQuery";
-declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
+declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 declare const DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 /** How a given model should be shown a rendered document. */
 type VisionProfile = {

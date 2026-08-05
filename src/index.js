@@ -117,7 +117,7 @@ import {
     var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
 
     var MAX_TOKENS = 25000;
-    var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
+    var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
     var DEFAULT_OPENAI_MODEL = "gpt-5.4";
 
     // Keep in step with POLL_INTERVAL in src/engine/requests.ts (agent.vue reads
@@ -401,16 +401,25 @@ import {
     // Standalone-page parent: a padded scroll container wrapping the centered
     // .bq-settings content. (The chat view supplies its own padding on
     // .bq-messages / .bq-input-row, so page padding lives here.)
+    // [bunny] BunnyQuery · <project> — the brand row shared by the chat header
+    // and the standalone (logged-out) pages, so every view opens with the same
+    // top-left identity. The project name is the only shrinkable piece
+    // (.bq-brand-project ellipsizes); it is simply absent until known.
+    function brandTitleEl() {
+        return h("div", { class: "bq-title-left bq-brand" },
+            h("img", { class: "bq-brand-icon", src: BQ_LOGO_URI, alt: "", "aria-hidden": "true" }),
+            h("span", { class: "bq-brand-name", text: "BunnyQuery" }),
+            S.serviceName ? h("span", { class: "bq-brand-sep", text: "·" }) : null,
+            S.serviceName ? h("span", { class: "bq-brand-project", title: S.serviceName, text: S.serviceName }) : null);
+    }
     function pageRoot(content) {
         // Same top-left header the chat/settings views use (.bq-section-title >
-        // .bq-title-row > .bq-title-left), so the service badge sits flush at the
-        // widget's top-left instead of being indented into the centered content
-        // column. The scrollable .bq-page below holds the centered form + footer.
+        // .bq-title-row), so the brand sits flush at the widget's top-left
+        // instead of being indented into the centered content column. The
+        // scrollable .bq-page below holds the centered form + footer.
         return h("div", { class: "bq-meta" },
             h("div", { class: "bq-section-title" },
-                h("div", { class: "bq-title-row" },
-                    h("div", { class: "bq-title-left" },
-                        h("span", { class: "bq-agent-badge", text: agentBadgeText() })))),
+                h("div", { class: "bq-title-row" }, brandTitleEl())),
             h("div", { class: "bq-page" },
                 h("div", { class: "bq-settings" }, content),
                 pageFooter()));
@@ -1908,8 +1917,10 @@ import {
         recomputeAttachmentWarning();
         if (CS.attachmentWarning) { renderAttachmentChips(); updateComposerControls(); return; }
 
-        // Hand the composer back to the user before a single byte moves.
+        // Hand the composer back to the user before a single byte moves. The
+        // input is empty again, so Send drops back to disabled.
         if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
+        updateComposerControls();
 
         if (!hasAttachments) { session.dispatchComposedMessage(text, false); return; }
 
@@ -2690,7 +2701,15 @@ import {
         // over budget together with a chat message). The warning is only set when
         // there is chat input text (recomputeAttachmentWarning). The cap notice
         // (attachmentCapNotice) is informational and does NOT block.
-        if (CS.sendBtnEl) CS.sendBtnEl.disabled = !!CS.attachmentWarning;
+        //
+        // Also disabled while there is nothing to send — no chat text and no
+        // composer chip that still needs uploading or retrying (a chip already
+        // "done" has nothing left to do) — mirroring agent.vue's canSend.
+        if (CS.sendBtnEl) {
+            var hasText = !!(CS.inputEl && CS.inputEl.value.trim());
+            var hasSendableAttachment = composerAttachments().some(function (a) { return a.status !== "done"; });
+            CS.sendBtnEl.disabled = !!CS.attachmentWarning || (!hasText && !hasSendableAttachment);
+        }
     }
     function onAttachInputChange(inputEl) {
         if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -3688,17 +3707,11 @@ import {
                 onclick: function () { toggleChatSettings(); } });
             CS.settingsBtnEl = settingsBtn;
 
-            // Landing-style brand header: [bunny] BunnyQuery · <project>, the gear
-            // (settings) on the right. The project name is the only shrinkable
-            // piece, so a long one ellipsizes instead of pushing the gear out of
-            // the row.
+            // Landing-style brand header (brandTitleEl, shared with the
+            // logged-out pages) with the gear (settings) on the right.
             var header = h("div", { class: "bq-section-title" },
                 h("div", { class: "bq-title-row" },
-                    h("div", { class: "bq-title-left bq-brand" },
-                        h("img", { class: "bq-brand-icon", src: BQ_LOGO_URI, alt: "", "aria-hidden": "true" }),
-                        h("span", { class: "bq-brand-name", text: "BunnyQuery" }),
-                        S.serviceName ? h("span", { class: "bq-brand-sep", text: "·" }) : null,
-                        S.serviceName ? h("span", { class: "bq-brand-project", title: S.serviceName, text: S.serviceName }) : null),
+                    brandTitleEl(),
                     h("div", { class: "bq-title-right" }, settingsBtn)));
 
             var chatArea;
@@ -3728,7 +3741,10 @@ import {
                 // chat text. Re-evaluate when it crosses the empty/non-empty line.
                 var prev = CS.attachmentWarning;
                 recomputeAttachmentWarning();
-                if (CS.attachmentWarning !== prev) { renderAttachmentChips(); updateComposerControls(); scheduleAttachmentOverflowRecompute(); }
+                // Always refresh the controls: Send enables/disables as the text
+                // crosses the empty line even when the warning did not change.
+                updateComposerControls();
+                if (CS.attachmentWarning !== prev) { renderAttachmentChips(); scheduleAttachmentOverflowRecompute(); }
             });
             input.addEventListener("keydown", function (e) {
                 if (e.key === "Enter" && !e.shiftKey && !composing) { e.preventDefault(); sendMessage(); }
@@ -3765,6 +3781,8 @@ import {
 
             chatArea = h("div", { class: "bq-chat" }, box, composer);
             CS.chatEl = chatArea; CS.composerEl = composer;
+            // Fresh composer, empty input, no chips: Send starts disabled.
+            updateComposerControls();
             if (!attachDisabled) setupDragAndDrop(chatArea);
             return h("div", { class: "bq-meta" }, header, chatArea);
         });
@@ -3858,11 +3876,6 @@ import {
                 h("div", { class: "bq-modal-btns" },
                     h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Close")));
         });
-    }
-
-    function agentBadgeText() {
-        if (S.aiPlatform === "none") return "No agent configured";
-        return S.serviceName || "BunnyQuery";
     }
 
     /* ========================================================================

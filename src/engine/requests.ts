@@ -32,7 +32,7 @@ const OPENAI_WEB_SEARCH_ENABLED = true;
 const OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
 export const MCP_NAME = 'BunnyQuery';
 
-export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6';
+export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
 
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;

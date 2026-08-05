@@ -1321,7 +1321,7 @@ var MAX_TOKENS = 25e3;
 var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
 var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
 var MCP_NAME = "BunnyQuery";
-var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
+var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);

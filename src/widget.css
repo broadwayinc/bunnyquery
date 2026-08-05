@@ -565,33 +565,6 @@
     gap: 0.5rem;
 }
 
-/* read-only agent (platform + model) badge */
-.bq-agent-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45rem;
-    padding: 0.3rem 0.6rem;
-    border: 1px solid var(--bq-main);
-    background: var(--bq-main-bg);
-    font-size: 0.75rem;
-    font-family: var(--bq-mono);
-    color: var(--bq-main);
-    max-width: 100%;
-    overflow: hidden;
-}
-.bq-agent-badge-logo {
-    width: 1.1rem;
-    height: 1.1rem;
-    object-fit: contain;
-    flex: 0 0 auto;
-}
-.bq-agent-badge-model {
-    color: var(--bq-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
 /* landing-style brand header on the chat view: [bunny] BunnyQuery · project */
 .bq-brand {
     min-width: 0;

@@ -1280,7 +1280,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
   var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
   var MCP_NAME = "BunnyQuery";
-  var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
+  var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
   var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
   var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
@@ -5086,7 +5086,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.8.5" ;
+    var BQ_VERSION = "1.8.6" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -5325,6 +5325,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var node = builder();
       if (node) S.root.appendChild(node);
     }
+    function brandTitleEl() {
+      return h(
+        "div",
+        { class: "bq-title-left bq-brand" },
+        h("img", { class: "bq-brand-icon", src: BQ_LOGO_URI, alt: "", "aria-hidden": "true" }),
+        h("span", { class: "bq-brand-name", text: "BunnyQuery" }),
+        S.serviceName ? h("span", { class: "bq-brand-sep", text: "\xB7" }) : null,
+        S.serviceName ? h("span", { class: "bq-brand-project", title: S.serviceName, text: S.serviceName }) : null
+      );
+    }
     function pageRoot(content) {
       return h(
         "div",
@@ -5332,15 +5342,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         h(
           "div",
           { class: "bq-section-title" },
-          h(
-            "div",
-            { class: "bq-title-row" },
-            h(
-              "div",
-              { class: "bq-title-left" },
-              h("span", { class: "bq-agent-badge", text: agentBadgeText() })
-            )
-          )
+          h("div", { class: "bq-title-row" }, brandTitleEl())
         ),
         h(
           "div",
@@ -6993,6 +6995,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         inputEl.value = "";
         autoGrowInput(inputEl);
       }
+      updateComposerControls();
       if (!hasAttachments) {
         session.dispatchComposedMessage(text, false);
         return;
@@ -7664,7 +7667,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function updateComposerControls() {
       if (CS.attachBtnEl) CS.attachBtnEl.disabled = false;
       if (CS.inputEl) CS.inputEl.disabled = false;
-      if (CS.sendBtnEl) CS.sendBtnEl.disabled = !!CS.attachmentWarning;
+      if (CS.sendBtnEl) {
+        var hasText = !!(CS.inputEl && CS.inputEl.value.trim());
+        var hasSendableAttachment = composerAttachments().some(function(a) {
+          return a.status !== "done";
+        });
+        CS.sendBtnEl.disabled = !!CS.attachmentWarning || !hasText && !hasSendableAttachment;
+      }
     }
     function onAttachInputChange(inputEl) {
       if (inputEl && inputEl.files && inputEl.files.length) addFilesToAttachments(inputEl.files);
@@ -8449,14 +8458,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           h(
             "div",
             { class: "bq-title-row" },
-            h(
-              "div",
-              { class: "bq-title-left bq-brand" },
-              h("img", { class: "bq-brand-icon", src: BQ_LOGO_URI, alt: "", "aria-hidden": "true" }),
-              h("span", { class: "bq-brand-name", text: "BunnyQuery" }),
-              S.serviceName ? h("span", { class: "bq-brand-sep", text: "\xB7" }) : null,
-              S.serviceName ? h("span", { class: "bq-brand-project", title: S.serviceName, text: S.serviceName }) : null
-            ),
+            brandTitleEl(),
             h("div", { class: "bq-title-right" }, settingsBtn)
           )
         );
@@ -8496,9 +8498,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           autoGrowInput(input);
           var prev = CS.attachmentWarning;
           recomputeAttachmentWarning();
+          updateComposerControls();
           if (CS.attachmentWarning !== prev) {
             renderAttachmentChips();
-            updateComposerControls();
             scheduleAttachmentOverflowRecompute();
           }
         });
@@ -8543,6 +8545,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         chatArea = h("div", { class: "bq-chat" }, box, composer);
         CS.chatEl = chatArea;
         CS.composerEl = composer;
+        updateComposerControls();
         if (!attachDisabled) setupDragAndDrop(chatArea);
         return h("div", { class: "bq-meta" }, header, chatArea);
       });
@@ -8662,10 +8665,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           )
         );
       });
-    }
-    function agentBadgeText() {
-      if (S.aiPlatform === "none") return "No agent configured";
-      return S.serviceName || "BunnyQuery";
     }
     function parseAiAgentValue2(value) {
       var raw = (value || "").trim();

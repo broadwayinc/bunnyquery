@@ -1,4 +1,4 @@
-# BunnyQuery
+# BunnyQuery Widget
 
 An embeddable, dependency-free AI chat widget for [Skapi](https://www.skapi.com)-powered
 projects. Drop it into any web page and your users get a full chat experience:
