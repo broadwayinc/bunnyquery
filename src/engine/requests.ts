@@ -44,11 +44,99 @@ const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretReques
 // model silently fell through to 'auto' — i.e. the cheap tiers that most need
 // resolution were the ones getting downsampled images.
 //
-// Base models keep their exact previous behavior ('original'). A suffixed
-// variant resolves to 'high' rather than 'original': 'high' is the universally
-// supported value, and we have no way to confirm a given variant accepts
-// 'original' — sending an unsupported value would fail the whole request, which
-// is far worse than a slightly less detailed image.
+// Variants used to resolve to 'high' rather than 'original' on the reasoning that
+// 'high' is universally supported and an unsupported value would fail the whole
+// request. The cost of that caution turned out to be real: 'high' downsamples to
+// a 512px grid, so the small tiers that most need resolution were reading dense
+// scans at the lower of the two settings, and gpt-5.4-nano reports it cannot make
+// out the text where gpt-5.4 (on 'original') can. Variants now get 'original' too.
+//
+// If a variant rejects 'original' the failure is loud and immediate (a terminal
+// 400 on the whole request, no retry), so flip VARIANT_IMAGE_DETAIL back to
+// 'high' and it is undone. That is the one word to change.
+const VARIANT_IMAGE_DETAIL = 'original';
+
+// Extra Responses-API knobs for NANO models on INDEXING passes only.
+//
+// `detail` (above) governs what the model SEES; these govern how it thinks and how completely it
+// writes. Nano strips vision detail to hit its latency target and compresses layout when
+// transcribing, which is the documented reason to raise verbosity FOR IT SPECIFICALLY. mini and the
+// base/named models do not need it, so they are excluded rather than paying its output cost.
+//
+// Deliberately NOT applied to chat: high verbosity makes ordinary replies longer and worse, and the
+// chat path has no transcription job to justify it.
+//
+// Two things to keep in mind, both of which is why these are separate switches:
+//   1. An UNKNOWN body field is fatal here, not ignored. The engine already documents it for
+//      `_skapi_window`: it "reaches the provider as an unknown body field and the call fails
+//      terminally with no retry". If a field name is wrong, EVERY indexing pass dies. Set either
+//      constant to null to remove the field entirely.
+//   2. Reasoning tokens are billed against max_output_tokens on this API. An indexing pass spends
+//      its output budget emitting postRecords calls, so buying reasoning takes budget away from the
+//      records themselves and can truncate them.
+//
+// Effort was OFF, and the measurement that turned it on: across one nano run's photo records, only
+// 5 of 28 image text fields carried a concrete identifier read off the tag (a part number, a tag id).
+// The other 23 held a generic scene description. Reading small handwriting off a photographed label
+// is exactly the kind of work a moment of deliberation buys, so it went on at the LOWEST setting.
+//
+// It stays 'low' for a nano that already transcribes correctly (5.6-nano), because effort is
+// billed against the same budget as the records and buying it where it is not needed can only
+// truncate them.
+//
+// OLDEST_NANO_REASONING_EFFORT raises it for gpt-5.4-nano and below ONLY, which is the tier that
+// actually reads dense scans badly. It is 'high', and what makes that affordable is not one change
+// but two:
+//   - that tier's render window is SMALL_TIER_PAGES_PER_WINDOW pages, not five, so the same cap is
+//     divided between far fewer pages to begin with; and
+//   - the worker now DETECTS a pass that ran out of output budget (_output_truncation_reason) and
+//     re-runs that window at half the page count instead of advancing past it.
+// Before the detector, over-buying reasoning was unsafe in a way that did not show up: a truncated
+// pass still returned 200, so the page loop moved on and the rest of that window's records were
+// lost silently. With it, spending too much on reasoning costs an extra pass instead of data.
+//
+// Still the first knob to lower if the logs start showing repeated truncation retries, and
+// re-measure that 5-of-28 ratio rather than assuming. null removes the field entirely.
+const VARIANT_TEXT_VERBOSITY: string | null = 'high';
+const VARIANT_REASONING_EFFORT: string | null = 'low';
+const OLDEST_NANO_REASONING_EFFORT: string | null = 'high';
+
+/**
+ * True only for a NANO model, including a dated nano snapshot. NOT mini, not a base model, and not
+ * a named variant like gpt-5.6-luna: those transcribe faithfully on their own and do not need the
+ * knob, so paying its output cost on them would be waste.
+ */
+const isOpenAINano = (model?: string) => {
+	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+	if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+
+	// Family floor, same shape as getOpenAIImageDetail's. "Contains nano" alone also matches
+	// gpt-4.1-nano and anything else a project might name, and these are body fields an older
+	// model REJECTS rather than ignores: one 400 with no retry kills every indexing pass. Only
+	// gpt-5.4 and newer are known to take `text.verbosity` and `reasoning.effort`.
+	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = match[2] === undefined ? null : Number(match[2]);
+	return major > 5 || (major === 5 && minor !== null && minor >= 4);
+};
+
+/**
+ * The indexing-only body knobs, for the ONE tier that needs them: gpt-5.4-nano.
+ *
+ * Both conditions are load-bearing and mean different things. isOpenAINano is the gpt-5.4
+ * FLOOR - below it these fields are rejected rather than ignored, and one 400 kills every
+ * indexing pass. isOldestNano is the CEILING - 5.5-nano and 5.6-nano transcribe correctly
+ * on their own, so they are left on the provider's defaults exactly like mini and the base
+ * models. Every other model gets an empty object, i.e. no `text` and no `reasoning` at all.
+ */
+const variantIndexingOptions = (model?: string) => {
+	if (!isOpenAINano(model) || !isOldestNano(model)) return {};
+	return {
+		...(VARIANT_TEXT_VERBOSITY ? { text: { verbosity: VARIANT_TEXT_VERBOSITY } } : {}),
+		...(OLDEST_NANO_REASONING_EFFORT ? { reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } : {}),
+	};
+};
 const getOpenAIImageDetail = (model?: string) => {
 	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
 	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -65,7 +153,7 @@ const getOpenAIImageDetail = (model?: string) => {
 		return DEFAULT_OPENAI_IMAGE_DETAIL;
 	}
 
-	return isVariant ? 'high' : 'original';
+	return isVariant ? VARIANT_IMAGE_DETAIL : 'original';
 };
 
 // Per-image `detail` for WORKER-RENDERED document pages (the `_skapi_render`
@@ -80,6 +168,103 @@ const getRenderImageDetail = (model?: string) => {
 	const detail = getOpenAIImageDetail(model);
 	return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? 'high' : detail;
 };
+
+/**
+ * A nano at gpt-5.4 or OLDER.
+ *
+ * This is the observed quality boundary, not a guessed one: gpt-5.4-nano and below
+ * transcribe dense scans poorly, while mini, the base models and every gpt-5.6 model
+ * (5.6-nano included) read the same documents correctly. So only this tier gets
+ * compensated, and everything above it is left exactly as it was — on 'original' detail
+ * and a full window, because nothing about it needs fixing and every compensation costs
+ * either passes or output budget.
+ */
+/** The id parses as a gpt version we can reason about. An id that does NOT (o3,
+ *  chatgpt-4o-latest, any custom name) is left entirely alone: we cannot tell what it is,
+ *  and every compensation here is either a body field that can 400 or a change to how many
+ *  images it receives. Unknown means untouched. */
+const OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
+const isRecognisedOpenAIVersion = (model?: string) =>
+	OPENAI_VERSIONED_ID.test((model || DEFAULT_OPENAI_MODEL).trim().toLowerCase());
+
+const isOldestNano = (model?: string) => {
+	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+	if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+	// Called "nano" but not a naming we recognise: treat it as the weak tier. It also
+	// fails the 'original' gate, so it is caught by the downsampled branch first anyway.
+	if (!match) return true;
+	const major = Number(match[1]);
+	const minor = match[2] === undefined ? null : Number(match[2]);
+	if (major < 5) return true;
+	if (major > 5) return false;
+	return minor === null || minor <= 4;
+};
+
+// Pages in one render window for a SMALL tier, against RENDER_PAGES_PER_WINDOW (5) for a
+// full one.
+//
+// This is the lever that does not risk a 400. The output budget is one number for the whole
+// pass (MAX_TOKENS, and reasoning is billed against it), so a window of 5 dense pages leaves
+// a small model a couple of thousand tokens per page and it starts sampling rows instead of
+// transcribing them - which is exactly the "saved 5 line items" on a page holding twenty.
+// Halving the window does not raise the cap, it just stops dividing it so many ways, and the
+// worker's page loop already runs as many windows as a file needs.
+const SMALL_TIER_PAGES_PER_WINDOW = 2;
+
+// Horizontal bands per page for a tier whose images the API DOWNSAMPLES before the model
+// sees them ('high' resamples onto a 512px tile grid). For those models the render DPI is
+// irrelevant - the pixels are thrown away upstream - so the only way to hand them more
+// readable text is to make each image cover less of the page. Two bands doubles the
+// resolution the model effectively gets, at the cost of one extra image per page.
+//
+// Bands are horizontal so a table row is never cut down its middle, and they overlap
+// slightly so a line landing on the seam appears whole in one of them.
+const DOWNSAMPLED_TIER_TILE = 2;
+
+/** How a given model should be shown a rendered document. */
+export type VisionProfile = {
+	/** Per-image `detail` (OpenAI only). */
+	detail: string;
+	/** Pages the worker renders into one window. */
+	pagesPerWindow: number;
+	/** Horizontal bands per page; 1 renders the whole page as one image. */
+	tile: number;
+};
+
+/**
+ * Resolve the render profile for a model.
+ *
+ * Three tiers, and they fail for different reasons, which is why one set of knobs cannot
+ * serve all of them:
+ *   - full: everything ABOVE gpt-5.4-nano - the base models, mini, and every gpt-5.6
+ *     including 5.6-nano. These already transcribe dense scans correctly, so they get
+ *     'original' detail and are otherwise untouched.
+ *   - gpt-5.4-nano: also gets 'original', so it sees exactly the SAME pixels as the full
+ *     tier. Its gap therefore is not resolution, and tiling would do nothing for it. What
+ *     it lacks is room: a smaller window leaves the same output budget divided between
+ *     fewer pages.
+ *   - downsampled (below the 'original' floor: gpt-5.3-nano, gpt-5-nano, gpt-4.1-nano):
+ *     capped at 'high', which resamples the page onto a 512px grid no matter what DPI it
+ *     was rendered at. Render resolution is wasted on these entirely; the only way to give
+ *     them readable text is to make each image cover less of the page, which is `tile`.
+ */
+export function getVisionProfile(model?: string): VisionProfile {
+	const detail = getRenderImageDetail(model);
+	// An id we cannot parse is left exactly as it was: full window, no tiling. Treating
+	// "unknown" as "weak" would quietly change how much work every custom or aliased model
+	// does, on no evidence at all.
+	if (!isRecognisedOpenAIVersion(model)) {
+		return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+	}
+	if (detail !== 'original') {
+		return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
+	}
+	if (isOldestNano(model)) {
+		return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
+	}
+	return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+}
 
 export type ClaudeRole = 'user' | 'assistant';
 
@@ -236,6 +421,28 @@ export type CallClaudeWithMcpParams = {
 // engine's own poll sites and imported by agent.vue; the widget carries its own
 // copy in src/index.js that must be kept in step.
 export const POLL_INTERVAL = 3000;
+// Ceiling on how many BACKGROUND indexing polls may be attached at once, across
+// every poll site (the engine's drain, the engine's history load, and each
+// client's own fallback poller).
+//
+// Every unresolved bg item used to get its own poll, and a poll is a
+// POLL_INTERVAL setInterval firing one request per tick. A bulk upload from the
+// db-files page enqueues one indexing pass per FILE, so uploading 10,000 files
+// attached 10,000 concurrent intervals: ~3,300 requests/second against a browser
+// that opens six connections per host. The resulting request backlog starved the
+// uploads themselves, which is the "frozen tab that eventually finishes" users
+// reported.
+//
+// Capping costs nothing, because the server settles one queue's passes in FIFO
+// order (a single SQS MessageGroupId per `<user>-bg` queue). A pass cannot
+// finish before the ones ahead of it, so asking about the newest 9,994 is pure
+// waste. Each resolution frees a slot, which the next-OLDEST unpolled entry
+// takes on the drain that follows. Spending the budget oldest-first is
+// load-bearing: spend it on the newest and the batch wedges, since those cannot
+// settle until the ones ahead of them do and nothing ahead would hold a poll.
+//
+// FOREGROUND polls (a reply the user is actively waiting on) are never capped.
+export const MAX_CONCURRENT_BG_POLLS = 6;
 export async function callClaudeWithMcp({
 	prompt,
 	messages,
@@ -450,16 +657,18 @@ export type AttachmentSaveInfo = {
 	platform: 'claude' | 'openai';
 	model?: string;
 	service: string;
+	/** The PUBLIC project ID (formatted token, skapi.project_id). Shown to the model; falls back to `service`. */
+	publicProjectId?: string;
 	owner: string;
 	/**
 	 * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
 	 * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
-	 * `id.userId || id.serviceId`) — the backend serialises requests that share a
+	 * `id.userId || id.projectId`) — the backend serialises requests that share a
 	 * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
 	 * different base does not hold the chat back at all. It was optional once,
 	 * defaulting to `service`; the chatbox omitted it, and its files were indexed
-	 * on "<serviceId>-bg" while its question ran on "<userId>-bg" — the question
-	 * was answered from a file nothing had read yet. Pass `userId || serviceId`.
+	 * on "<projectId>-bg" while its question ran on "<userId>-bg" — the question
+	 * was answered from a file nothing had read yet. Pass `userId || projectId`.
 	 */
 	userId: string;
 	serviceName?: string;
@@ -526,12 +735,19 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	// (substituting the window's 1-based start page for RENDER_FROM_TOKEN) and enqueues it
 	// itself. That is what makes a 500-page document index end-to-end — the loop no longer
 	// depends on the tab staying open, nor on the model correctly declaring itself unfinished.
+	// Window size and per-page tiling are resolved from the MODEL, not fixed: see
+	// getVisionProfile. Claude keeps the full window (renderDetail is OpenAI-only, and its
+	// own resizing behaviour is a separate question this does not try to answer).
+	const visionProfile: VisionProfile = platform === 'openai'
+		? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL)
+		: { detail: '', pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
 	const skapiRender = visionFile && renderPlaceholder
 		? {
 			_skapi_render: [
 				{
-					path: attachment.storagePath, from: renderFrom, count: RENDER_PAGES_PER_WINDOW,
+					path: attachment.storagePath, from: renderFrom, count: visionProfile.pagesPerWindow,
 					placeholder: renderPlaceholder, name: attachment.name, mime: attachment.mime, detail: renderDetail,
+					tile: visionProfile.tile,
 					auto_continue: true,
 					continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder),
 				},
@@ -560,6 +776,12 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					name: attachment.name,
 					mime: attachment.mime,
 					kind: 'window',
+					// Same per-image `detail` the render path sends. Without it the worker falls
+					// back to its model-blind default of 'high', so a spreadsheet's embedded
+					// photos were tiled at lower resolution than the SAME model gets for a PDF
+					// page or a chat attachment. That is why a model could describe an attached
+					// photo but reported the pictures inside a sheet as only partly legible.
+					detail: renderDetail,
 					auto_continue: true,
 					continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true),
 				},
@@ -579,7 +801,20 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }]
 			: undefined;
 	const skapiExtract =
-		extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
+		extractContent && extractContent.length
+			? {
+				_skapi_extract: extractContent.map((d) => ({
+					...d,
+					// FIRST pass of an INDEXING run only: tells the worker to also pull the
+					// file's embedded pictures into __MEDIA__ and register their records.
+					// Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
+					// never sets this, so merely ATTACHING a file to a chat message cannot
+					// write media records; a CONTINUE pass skips it because the first pass
+					// already saved (the save is whole-file, not windowed).
+					save_media: !continuing,
+				})),
+			}
+			: {};
 
 	const userMessage = (visionFile && renderPlaceholder)
 		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
@@ -599,7 +834,10 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			);
 
 	const systemPrompt = buildIndexingSystemPrompt({
-		service,
+		// The model copies this id verbatim into project_id tool calls, so it must be
+		// the PUBLIC token whenever the host supplied one; the raw code is rejected
+		// by the tools' schema pattern.
+		projectId: info.publicProjectId || service,
 		serviceName: info.serviceName,
 		serviceDescription: info.serviceDescription,
 	});
@@ -622,6 +860,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			data: {
 				model: resolvedModel,
 				max_output_tokens: MAX_TOKENS,
+				// Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
+				...variantIndexingOptions(resolvedModel),
 				...skapiExtract,
 				...skapiRender,
 				...skapiWindow,
@@ -830,7 +1070,7 @@ export function isBgIndexingQueue(queueName?: string): boolean {
 // (a Vue `reactive([])` in agent.vue, a plain array in bunnyquery) is app-level
 // state owned by the consumer — only the TYPE lives in the engine.
 export type BgTaskEntry = {
-	serviceId: string;
+	projectId: string;
 	platform: 'claude' | 'openai';
 	id: string;
 	filename: string;
@@ -842,6 +1082,13 @@ export type BgTaskEntry = {
 	poll: ((opts: { latency: number }) => Promise<any>) | undefined;
 	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
 	resumePass?: number;
+	/** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
+	 *  drainBgTaskQueue inserts this pass's bubble directly ABOVE that turn's bubble, so the
+	 *  collapsed row sits where the reader expects it — right before the message the files
+	 *  came with — from the moment it appears, instead of the turn being moved down past it
+	 *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
+	 *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
+	stageId?: string;
 };
 
 // Token the indexing agent appends to its final message ONLY when it has fully read and
@@ -851,11 +1098,31 @@ export type BgTaskEntry = {
 // asks the model whether it is finished — the worker advances that loop off the renderer's
 // page count — so this marker has no say in whether a PDF keeps going.
 export const INDEXING_COMPLETE_MARKER = 'INDEXING_COMPLETE';
+// What an indexing pass's bubble says when its ENTIRE answer was the completion
+// token and stripping it left nothing. Without a stand-in the history mappers emit
+// no bubble at all for that pass (their `else if (assistantText)` guard fails on the
+// empty string) while the live path emits one — so the same run read as finished
+// live and unfinished after a reload, and the row's loader came back.
+export const EMPTY_INDEXING_REPLY = 'Finished reading this file.';
 // Cap on CONTINUE passes per file, so a file the agent can never mark complete (or a
 // pathological loop) stops instead of re-dispatching forever. The text/grid paging path
 // reads MANY windows within a single pass (the agent loops readFileContent in one turn), so
 // a small cap suffices.
 export const MAX_INDEXING_RESUME_PASSES = 6;
+
+// Records per chat-history page. Bigger than skapi's own default so the first load
+// (and each scroll-up page) covers more of the conversation in one round-trip — a
+// short page leaves the box unfilled and forces the viewport-fill loop to page
+// again immediately. Callers that want a narrower page (the queue/status probes in
+// ChatSession) pass their own `limit`, which wins over this default.
+// 500, up from 100: an indexing run is dozens of rows that collapse into ONE visible
+// row, so a screenful of history behind a few indexed files took 5+ sequential
+// round trips to assemble (cursor paging cannot be parallelised - each page's
+// startKey comes from the previous response). The number is a CAP, not a payload
+// size: DynamoDB stops a page at 1MB regardless and hands back a cursor, and the
+// backend passes the limit through without looping, so heavy indexing rows page at
+// the same bytes per trip as before while light chat rows now arrive 500 at a time.
+export const CHAT_HISTORY_PAGE_LIMIT = 500;
 
 /**
  * `queue` narrows the fetch to one processing chain; `status` narrows it to items
@@ -885,6 +1152,6 @@ export async function getChatHistory(
 
 	return chatEngineConfig().clientSecretRequestHistory(
 		p as { url: string; method: 'POST'; queue?: string; status?: string },
-		Object.assign({ ascending: false }, fetchOptions),
+		Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions),
 	);
 }

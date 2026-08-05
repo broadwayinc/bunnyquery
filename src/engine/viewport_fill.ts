@@ -151,10 +151,51 @@ export async function fillHistoryViewport(opts: FillHistoryViewportOptions): Pro
  * come true are dropped as it goes, so the cost stays flat.
  */
 export function createHistoryFiller(
-	base: Omit<FillHistoryViewportOptions, 'isSatisfied'>,
+	base: Omit<FillHistoryViewportOptions, 'isSatisfied'> & {
+		/** Fired when the loop starts FETCHING and when it stops, and only on a real
+		 *  change.
+		 *
+		 *  This — not the caller's own per-request `isLoading` — is what "older
+		 *  history is still coming in" means to a view. A fill is many pages, and
+		 *  `isLoading` drops to false between every one of them, so anything
+		 *  rendered off it flickers once per page for the whole loop. A collapsed
+		 *  indexing row whose run begins above the loaded window renders exactly
+		 *  that ("still loading this run" vs a status it cannot know yet), which is
+		 *  why the loop has to publish its own span.
+		 *
+		 *  Fetching, NOT requested. Most fills fetch nothing: they are fired on every
+		 *  window resize, every row a user collapses, and every first-page load, and
+		 *  the overwhelmingly common outcome is `isSatisfied` returning true on the
+		 *  first look. Announcing at request time published a true/false pair for
+		 *  each of those, and the widget's own satisfied-check spans two animation
+		 *  frames — long enough for the browser to PAINT the intermediate state. Every
+		 *  collapsed row strobed through "loading" on every resize tick. So the span
+		 *  opens at the first actual page request, which is also the first moment the
+		 *  claim is true. */
+		onRunningChange?: (running: boolean) => void;
+	},
 ): { fill: (isSatisfied: () => boolean | Promise<boolean>) => Promise<void>; isRunning: () => boolean } {
 	var pending: Array<() => boolean | Promise<boolean>> = [];
+	// One loop at a time. Set the instant a fill is REQUESTED, whether or not that
+	// fill goes on to fetch anything.
 	var running = false;
+	// What the view is told: a page is actually being fetched. Deliberately a
+	// different fact from `running` — see onRunningChange.
+	var fetching = false;
+
+	// The callback can NEVER break the loop, and the swallow is the point. It is a
+	// view render (the widget rebuilds its whole message list from here), so it is
+	// the least trustworthy code this module touches, and it is invoked from two
+	// places that must both survive it: inside the fetch wrapper, and inside `done`
+	// — where a throw would reject the promise `fill()` returns and leave the
+	// closing edge unsent, pinning every row that renders off this at "loading"
+	// forever. A view that cannot paint is the view's problem, not the pager's.
+	function announce(next: boolean): void {
+		if (fetching === next) return;
+		fetching = next;
+		if (!base.onRunningChange) return;
+		try { base.onRunningChange(next); } catch (e) { /* never break the pager */ }
+	}
 
 	async function allSatisfied(): Promise<boolean> {
 		var next: Array<() => boolean | Promise<boolean>> = [];
@@ -166,18 +207,24 @@ export function createHistoryFiller(
 	}
 
 	return {
-		isRunning: function () { return running; },
+		// The published fact, so a view and `isRunning()` can never disagree about
+		// what they are showing. A fill that never fetches is not something anyone
+		// outside this module has any use for knowing about.
+		isRunning: function () { return fetching; },
 		fill: function (isSatisfied) {
 			pending.push(isSatisfied);
 			if (running) return Promise.resolve();
 			running = true;
-			var done = function () { running = false; pending = []; };
+			var done = function () { pending = []; running = false; announce(false); };
 			return fillHistoryViewport({
 				isSatisfied: allSatisfied,
 				isEndOfList: base.isEndOfList,
 				isLoading: base.isLoading,
 				messageCount: base.messageCount,
-				fetchOlder: base.fetchOlder,
+				// The span opens HERE, at the first real page request: past
+				// isEndOfList, past isStale, past isSatisfied. Everything before this
+				// point is a fill that concluded there was nothing to do.
+				fetchOlder: function () { announce(true); return base.fetchOlder(); },
 				isStale: base.isStale,
 				maxPages: base.maxPages,
 			}).then(done, done);

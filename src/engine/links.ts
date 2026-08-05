@@ -1,6 +1,6 @@
 /**
  * Pure link/path helpers (no DOM, no marked). Moved verbatim from the chatbox.
- * `serviceId` is passed as a PARAMETER (the original read it from a global) so
+ * `projectId` is passed as a PARAMETER (the original read it from a global) so
  * the engine stays consumer-agnostic. The HTML-emitting helpers
  * (buildLinkPartFromGroups, linkToAnchorHtml, fileToAnchorHtml, parseMsgParts*)
  * stay in each VIEW — only these pure pieces move here.
@@ -20,6 +20,34 @@ export var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
  * not, which is precisely the kind of divergence a shared constant exists to stop.
  */
 export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+
+/**
+ * Seconds the browser may reuse a minted preview url (`browser_cache`).
+ *
+ * A presigned url is a fresh SigV4 query string on every mint, so it can never
+ * be a browser cache key on its own and every reload re-downloads every image.
+ * Asking for the MINT with a cacheable GET fixes it from the other end: the same
+ * url comes back out of the browser cache, so the body already on disk stays
+ * addressable.
+ *
+ * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
+ * that is the whole trick: the url is short-lived while the file stays available
+ * locally for a WEEK. What keeps an image painting is the cached BODY, not a live
+ * url. Once the browser evicts that body it refetches with a url that has since
+ * expired, gets a 403, and the error path re-mints with `refresh`. That path is
+ * therefore load-bearing, not a rare fallback.
+ *
+ * A week is the platform default for reading a private file, not a number chosen
+ * here: skapi-js reads every private record file with
+ * PRIVATE_FILE_BROWSER_CACHE_SECONDS = 7 days against the same 20-minute url, and
+ * get_signed_url caps the header at BROWSER_CACHE_MAX_SECONDS = 7 days. A chat
+ * that asked for a day was re-downloading images the rest of the product would
+ * have served from disk.
+ *
+ * Applies to previews only. A CLICK must open a live url, so the chip refresh
+ * stays on an uncached POST mint.
+ */
+export var PREVIEW_BROWSER_CACHE_SECONDS = 7 * 24 * 60 * 60;
 
 /**
  * How long a client may keep serving an href it already minted before dropping
@@ -63,7 +91,7 @@ export function normalizeAttachmentPathCandidate(value: string): string {
 	return safeDecodeURIComponent((value || '').trim()).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
 }
 
-export function extractRemotePathFromAttachmentHref(href: string, serviceId: string): string | null {
+export function extractRemotePathFromAttachmentHref(href: string, projectId: string): string | null {
 	try {
 		var parsed = new URL(href);
 		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
@@ -71,7 +99,7 @@ export function extractRemotePathFromAttachmentHref(href: string, serviceId: str
 		var segs = path.split('/').filter(Boolean);
 		if (!segs.length) return null;
 		var HEX = /^[a-f0-9]{32,}$/i;
-		var sid = serviceId || '';
+		var sid = projectId || '';
 		var start = 0;
 		while (start < segs.length) {
 			var seg = segs[start];
@@ -94,16 +122,16 @@ export function buildDisplayExpiredAttachmentHref(remotePath: string, fallback?:
 }
 
 // Does `href` point at THIS service's db attachment storage? A db attachment URL's
-// path always begins with the serviceId segment (…/<serviceId>/<hash>/<path>). Used
+// path always begins with the projectId segment (…/<projectId>/<hash>/<path>). Used
 // to SAFELY sanitize assistant messages — where an arbitrary external citation URL
 // must never be rewritten, only the service's own volatile db links.
-export function isServiceDbAttachmentHref(href: string, serviceId: string): boolean {
-	if (!serviceId) return false;
+export function isServiceDbAttachmentHref(href: string, projectId: string): boolean {
+	if (!projectId) return false;
 	try {
 		var parsed = new URL(href);
 		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
 		var segs = normalizeAttachmentPathCandidate(parsed.pathname || '').split('/').filter(Boolean);
-		return segs.length > 0 && segs[0] === serviceId;
+		return segs.length > 0 && segs[0] === projectId;
 	} catch (e) { return false; }
 }
 
@@ -133,12 +161,12 @@ export function readExpiredAttachmentHref(href: string): string | null {
 // paste in the same message: it became a placeholder for a storage path that
 // never existed. We can only re-mint what we host, so we only rewrite what we
 // host.
-export function sanitizeAttachmentLinksForHistory(content: string, serviceId: string, forAssistant?: boolean): string {
+export function sanitizeAttachmentLinksForHistory(content: string, projectId: string, forAssistant?: boolean): string {
 	if (!content) return content;
 	if (!forAssistant && content.indexOf('Attached files:') === -1) return content;
 	return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function (_m: string, label: string, href: string) {
-		if (!isServiceDbAttachmentHref(href, serviceId)) return _m;
-		var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
+		if (!isServiceDbAttachmentHref(href, projectId)) return _m;
+		var remotePath = extractRemotePathFromAttachmentHref(href, projectId);
 		var fullPath = remotePath || normalizeAttachmentPathCandidate(label);
 		if (!fullPath) return _m;
 		return '[' + label + '](' + buildDisplayExpiredAttachmentHref(fullPath, label) + ')';
@@ -231,6 +259,59 @@ export function normalizeTrailingInlineToken(value: string): string {
 	return out;
 }
 
+/**
+ * Extensions a BROWSER can paint in an <img>, mapped to the content type the
+ * presign must declare.
+ *
+ * The content type is not optional here. get_signed_url only sets
+ * ResponseContentType when the caller passes `contentType`, and otherwise falls
+ * back to application/octet-stream, which a new tab DOWNLOADS instead of
+ * displaying. Since the whole point of the preview is that clicking it shows the
+ * picture, the mint has to name the real type.
+ *
+ * Deliberately narrower than the extraction/vision lists elsewhere in the repo:
+ *   heic/heif out: Safari paints them, Chrome and Firefox show a broken image,
+ *                  and it is the format every iPhone photo arrives in, so the
+ *                  failure would be common and would read as a bug.
+ *   tif/wmf/emf out: no mainstream browser paints them.
+ *   svg        out: inside an <img> an SVG is script-disabled and safe, but this
+ *                  feature's click target is a TOP-LEVEL navigation, where an
+ *                  SVG executes its own <script> in the serving origin with that
+ *                  origin's cookies, from user-uploaded content. A preview is an
+ *                  invitation to click exactly that.
+ */
+export var PREVIEWABLE_IMAGE_CONTENT_TYPES: Record<string, string> = {
+	png: 'image/png',
+	jpg: 'image/jpeg',
+	jpeg: 'image/jpeg',
+	gif: 'image/gif',
+	webp: 'image/webp',
+	avif: 'image/avif',
+	bmp: 'image/bmp',
+};
+
+/** Extension of a path or url, query and fragment stripped, '' when none. */
+export function previewableExtOf(nameOrPath: string | null | undefined): string {
+	var v = String(nameOrPath || '');
+	// A storage path may legally contain '?', so this cannot reuse extOf().
+	var cut = v.search(/[?#]/);
+	if (cut !== -1) v = v.slice(0, cut);
+	v = v.replace(/[\\/]+$/, '');
+	var dot = v.lastIndexOf('.');
+	if (dot <= 0) return '';
+	var ext = v.slice(dot + 1).trim().toLowerCase();
+	return /^[a-z0-9]+$/.test(ext) ? ext : '';
+}
+
+export function isPreviewableImagePath(nameOrPath: string | null | undefined): boolean {
+	return !!PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)];
+}
+
+/** Content type to hand the presign so a new tab displays rather than downloads. */
+export function previewImageContentType(nameOrPath: string | null | undefined): string | null {
+	return PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)] || null;
+}
+
 /** A link the view renders. `expired` means the href is the `_expired_.url`
  *  placeholder and a click must mint a fresh one from `remotePath`. */
 export interface InlineLinkPart {
@@ -241,11 +322,17 @@ export interface InlineLinkPart {
 	expired: boolean;
 	expiredHref?: string;
 	remotePath?: string;
+	/**
+	 * Set only for a file WE host whose PATH says a browser can paint it. Its
+	 * presence IS the "render a preview" decision, so a view never re-tests the
+	 * label and never tests `href` (which is the _expired_.url placeholder).
+	 */
+	image?: { ext: string; contentType: string };
 }
 
 export interface InlineLinkContext {
 	/** Current project id: the leading segment to strip off a db url. */
-	serviceId: string;
+	projectId: string;
 	/** `https://db.<hostDomain>` for this deployment. */
 	dbHostPrefix: string;
 	/** A fresh url already minted for this placeholder, if the view cached one. */
@@ -283,17 +370,22 @@ export function classifyInlineLink(
 		if (!remotePath) return null;
 		var expiredHref = buildDisplayExpiredAttachmentHref(remotePath, label);
 		var cached = fresh(expiredHref);
-		return {
-			part: {
-				type: 'link',
-				label: truncateLabelForDisplay(label),
-				fullLabel: label,
-				href: cached || expiredHref,
-				expired: !cached,
-				expiredHref: expiredHref,
-				remotePath: remotePath,
-			},
+		var part: InlineLinkPart = {
+			type: 'link',
+			label: truncateLabelForDisplay(label),
+			fullLabel: label,
+			href: cached || expiredHref,
+			expired: !cached,
+			expiredHref: expiredHref,
+			remotePath: remotePath,
 		};
+		// The PATH decides, never the label. The file is fetched by path, so the
+		// path is the only claim with consequences: a model-written label reading
+		// "chart.png" on a .xlsx would otherwise mint a url and paint a broken box.
+		var ext = previewableExtOf(remotePath);
+		var ct = PREVIEWABLE_IMAGE_CONTENT_TYPES[ext];
+		if (ct) part.image = { ext: ext, contentType: ct };
+		return { part: part };
 	};
 
 	// src::<token> — a path, or a url the model copied out of a record.
@@ -317,8 +409,10 @@ export function classifyInlineLink(
 		}
 		var srcPath = readExpiredAttachmentHref(rawPath)
 			|| (srcIsUrl
-				? (extractRemotePathFromAttachmentHref(rawPath, ctx.serviceId) || normalizeAttachmentPathCandidate(rawPath))
-				: normalizeAttachmentPathCandidate(rawPath));
+				? (extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath))
+				// bare stored path: same NON-decoding normalize as the db: branch; only
+				// URL-derived paths genuinely arrive percent-encoded.
+				: rawPath.trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/'));
 		var srcBuilt = asStoredFile(srcPath, srcPath);
 		return srcBuilt ? { part: srcBuilt.part, tail: tail } : null;
 	}
@@ -333,7 +427,12 @@ export function classifyInlineLink(
 		// EMITTING it; until then this branch simply never fires.
 		var dbTarget = /^db:(.+)$/i.exec(g5.trim());
 		if (dbTarget) {
-			var declared = asStoredFile(normalizeAttachmentPathCandidate(dbTarget[1]), g4);
+			// NON-decoding normalize: the prompt guarantees a db: target is the path exactly
+			// as stored, NOT url-encoded, and the MCP's own key builder refuses to decode
+			// bare paths for the same corruption: percent-decoding here turned a stored name
+			// containing a literal "%20" into the wrong key.
+			var rawDbPath = dbTarget[1].trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+			var declared = asStoredFile(rawDbPath, g4);
 			if (!declared) return null;
 			declared.part.label = truncateLabelForDisplay(g4);
 			declared.part.fullLabel = g4;
@@ -405,8 +504,8 @@ export function classifyInlineLink(
 	// This project's own db url: volatile, so render it re-mintable. A db url for
 	// a DIFFERENT project is not ours to mint, so it stays an ordinary link rather
 	// than a chip that would query this project for someone else's key.
-	if (isServiceDbAttachmentHref(originalHref, ctx.serviceId)) {
-		var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.serviceId);
+	if (isServiceDbAttachmentHref(originalHref, ctx.projectId)) {
+		var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.projectId);
 		if (remotePath) {
 			var dbBuilt = asStoredFile(remotePath, getExpiredAttachmentVisiblePath(remotePath, urlLabel));
 			if (dbBuilt) return withTail(dbBuilt);
@@ -421,6 +520,40 @@ export function classifyInlineLink(
 	return withTail({
 		part: { type: 'link', label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false },
 	});
+}
+
+/**
+ * "We asked for a url for this file and did not get one."
+ *
+ * A chip the client cannot mint a url for is not a link: the ↗ is a promise it
+ * already knows it cannot keep, and clicking it opens a dead tab or nothing at
+ * all. Both views therefore keep a map of failures and render those chips
+ * unavailable (renderInlineLinkHtml's `unavailable` option): greyed, ✕ instead
+ * of ↗, no href.
+ *
+ * The MAP lives in the view (agent.vue has to re-render when it changes, and
+ * that means a ref), so only the keys are here. A failure is reported with
+ * exactly one identifier (an image preview knows the storage path, a click knows
+ * the placeholder href), so marking writes one key and the lookup tries all of
+ * them.
+ */
+export function linkUnavailableKeyForPath(remotePath: string): string {
+	return 'path:' + (remotePath || '');
+}
+
+export function linkUnavailableKeyForHref(href: string): string {
+	return 'href:' + (href || '');
+}
+
+export function isLinkUnavailable(
+	link: { href?: string; expiredHref?: string; remotePath?: string } | null | undefined,
+	map: Record<string, boolean | undefined> | null | undefined,
+): boolean {
+	if (!link || !map) return false;
+	if (link.remotePath && map[linkUnavailableKeyForPath(link.remotePath)]) return true;
+	if (link.expiredHref && map[linkUnavailableKeyForHref(link.expiredHref)]) return true;
+	if (link.href && map[linkUnavailableKeyForHref(link.href)]) return true;
+	return false;
 }
 
 export function truncateLabelForDisplay(label: string): string {

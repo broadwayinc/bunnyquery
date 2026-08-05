@@ -1,12 +1,12 @@
 /**
- * BASE PROMPT — Background file-indexing agent (user message)
+ * BASE PROMPT - Background file-indexing agent (user message)
  * ============================================================================
  * USER-role message paired with the indexing system prompt. Sent by
  * notifyAgentSaveAttachment() each time a file is uploaded or re-indexed.
  *
  * NOTE: the leading line "A new file has just been uploaded. Index it now." and
  * the "- name: ..." line are also what the chat client parses to build the
- * "Indexing: <name>" history bubble — keep those fields on their own lines.
+ * "Indexing: <name>" history bubble - keep those fields on their own lines.
  */
 
 export type IndexingAttachmentInfo = {
@@ -24,15 +24,15 @@ export type IndexingAttachmentInfo = {
 
 export type BuildIndexingUserMessageOptions = {
 	/**
-	 * For office files (.docx/.xlsx/.pptx) the model can't read the binary via
+	 * For files with no paged reader (.epub/.hwp/.doc/.rtf, source code) the model can't read the binary via
 	 * web_fetch, so the proxy worker extracts the text server-side and replaces
 	 * this exact token with it. When provided, the message embeds the token (and
-	 * drops the temporary-URL line — there is nothing for the model to fetch).
+	 * drops the temporary-URL line - there is nothing for the model to fetch).
 	 */
 	inlineContentPlaceholder?: string;
 	/**
 	 * Actual file content parsed CLIENT-SIDE by an attachment-parser plugin (e.g.
-	 * an .hwp parser). Embedded inline verbatim — no server extraction and no
+	 * an .hwp parser). Embedded inline verbatim - no server extraction and no
 	 * web_fetch for this file. Takes precedence over `inlineContentPlaceholder`.
 	 */
 	inlineContent?: string;
@@ -58,12 +58,12 @@ export function buildIndexingUserMessage(
 
 	if (options?.inlineContent) {
 		// Parsed client-side (an attachment-parser plugin). The content is already
-		// inlined below — no server extraction, no URL to fetch.
+		// inlined below - no server extraction, no URL to fetch.
 		return (
 			head +
 			`\nThe file's content was parsed by the client and is provided inline below. ` +
-			`Read it directly — do NOT fetch any URL for this file. ` +
-			`Use the storage path above (not this content) for the "src::" unique_id.\n\n` +
+			`Read it directly - do NOT fetch any URL for this file. ` +
+			`Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.\n\n` +
 			`----- BEGIN FILE CONTENT -----\n` +
 			`${options.inlineContent}\n` +
 			`----- END FILE CONTENT -----`
@@ -76,8 +76,8 @@ export function buildIndexingUserMessage(
 		return (
 			head +
 			`\nThe file's text content was extracted on the server and is provided inline below. ` +
-			`Read it directly — do NOT fetch any URL for this file. ` +
-			`Use the storage path above (not this content) for the "src::" unique_id.\n\n` +
+			`Read it directly - do NOT fetch any URL for this file. ` +
+			`Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.\n\n` +
 			`----- BEGIN FILE CONTENT -----\n` +
 			`${options.inlineContentPlaceholder}\n` +
 			`----- END FILE CONTENT -----`
@@ -93,7 +93,7 @@ export function buildIndexingUserMessage(
 			`\nRead this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. ` +
 			`readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. ` +
 			`Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. ` +
-			`Do NOT stop after the first window and do NOT just write a summary. Use the storage path above for the "src::" unique_id.` +
+			`Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` +
 			(attachment.url ? `\n(A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : '')
 		);
 	}
@@ -186,7 +186,17 @@ function buildRenderDatafy(placeholder: string): string {
 		`LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page ` +
 		`call postRecords and save records - one record per row / table entry / line item visible on the page ` +
 		`(or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables ` +
-		`cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.\n\n` +
+		`cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.\n\n` +
+		`Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - ` +
+		`use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own ` +
+		`numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). ` +
+		`Whether a page is one you have already saved is stated in the note above the images - decide from that, ` +
+		`never from a printed page number.\n\n` +
+		`Transcribe COMPLETELY, not representatively. A table with twenty rows gets twenty records, not a sample ` +
+		`of the first few - if a page has more rows than you can save comfortably, still save them all rather than ` +
+		`summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the ` +
+		`exact text and should be preferred over reading the pixels, with the image used for layout, tables, ` +
+		`stamps and handwriting.\n\n` +
 		`Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read ` +
 		`the rest of the file and do NOT worry about the pages after this window: if any remain, the next window ` +
 		`is rendered and sent to you automatically. Report only the pages you were actually shown - never imply ` +
@@ -227,12 +237,12 @@ export function buildIndexingWindowMessage(
 		`\n${placeholder}\n\n` +
 		`DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW ` +
 		`for tabular data (keyed by the column headers), or one record per section for prose. Capture every ` +
-		`value you can read. Use the storage path above for the "src::" unique_id on the file-level record, ` +
+		`value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, ` +
 		`and link every row/section record to it by reference.\n\n` +
-		`If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows ` +
-		`into the record for the row it is anchored to (a «PHOTO A88» marker in the grid text only says WHERE ` +
-		`a picture sits - the picture itself is attached to this message). Never report that photo contents ` +
-		`could not be extracted when images are attached here.\n\n` +
+		`If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows. ` +
+		`A «PHOTO ...» marker in the grid text ties a picture to its row and comes in two forms. ` +
+		`«PHOTO A88 -> __MEDIA__/...» means the picture at cell A88 is saved as a permanent file at exactly that storage path, and its record in table "__MEDIA__" has unique_id "src::" + that path: UPDATE that record with updateRecords, adding what the picture SHOWS and TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). Do NOT create a duplicate and do NOT add a second photo record in another table: one file, one record. If that update reports the record does not exist, create it ONCE with that same unique_id, reference "src::" + the storage path above, table "__MEDIA__", access group "authorized", and data carrying the path - the path must never be lost. ` +
+		`A bare «PHOTO A88» marker with no arrow is a picture with no stored path of its own in this window: usually a repeat stored under an earlier anchor, or one too small to keep. NEVER construct a storage path or unique_id for it: find its record, if any, with getRecords reference "src::" + the storage path above, matching the cell against data.anchor or tags, and enrich what you find. The row record stays about its row's cells. Never report that photo contents could not be extracted when images are attached here.\n\n` +
 		`Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest ` +
 		`of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to ` +
 		`you automatically. Report only what you were actually shown, and never imply you have seen the whole ` +
@@ -253,13 +263,13 @@ export function buildIndexingContinueMessage(attachment: IndexingAttachmentInfo)
 		`- storage path: ${attachment.storagePath}\n` +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
 		`\nRecords for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). ` +
-		`First call getRecords with reference "${src}" to see how far the previous pass got (the furthest page/row/window already saved). ` +
+		`First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. ` +
 		`Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:\n` +
-		`  - PDF: the cursor is the NUMBER OF PAGES already read (0-based next page). If you saved up to page N, call readFileContent with cursor="N" to get page N+1 onward.\n` +
-		`  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".\n` +
-		`  - Text: the cursor is the character offset already read.\n` +
+		` - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".\n` +
+		` - Text: the cursor is the character offset already read.\n` +
 		`Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. ` +
+		`A «PHOTO <cell>» marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. ` +
 		`Do NOT re-save windows that are already saved. ` +
-		`Use the storage path above for the "src::" unique_id. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`
+		`Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`
 	);
 }

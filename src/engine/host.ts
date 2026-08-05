@@ -8,9 +8,17 @@
  */
 
 export interface ChatIdentity {
-	serviceId: string;
+	projectId: string;
+	/**
+	 * The PUBLIC project ID: the formatted two-segment token (skapi.project_id).
+	 * projectId above is the RAW regional code the wire endpoints take; the public
+	 * token is what MCP tools accept and what prompts must show the model, since the
+	 * model copies it verbatim into tool calls. Optional for older hosts; prompts
+	 * fall back to the raw code when absent.
+	 */
+	publicProjectId?: string;
 	owner: string;
-	/** Per-user queue name (falls back to serviceId). */
+	/** Per-user queue name (falls back to projectId). */
 	userId: string;
 	platform: 'claude' | 'openai' | 'none';
 	model?: string;
@@ -61,12 +69,33 @@ export interface ChatMessage {
 	isPendingInProcess?: boolean;
 	isPendingQueued?: boolean;
 	isPendingOlder?: boolean;
+	/** PROTOCOL flag: true from the moment a queued turn is dispatched until the
+	 *  server acknowledges it. It is the token the ack's findIndex matches on, so
+	 *  nothing may clear it early. It is NOT a style input — see _dimSending. */
 	isSendingToServer?: boolean;
+	/** PRESENTATIONAL flag: render this bubble dimmed because the turn has not been
+	 *  handed over yet. Split from isSendingToServer because an ATTACHMENT turn is
+	 *  un-dimmed the instant its files finish indexing, while the request itself is
+	 *  still un-acked for another moment; dropping isSendingToServer to achieve that
+	 *  would cost the turn its _serverItemId (the ack matches on that flag alone, and
+	 *  a _useBgQueue turn is excluded from every fallback that would recover it). */
+	_dimSending?: boolean;
 	isCancelled?: boolean;
 	isError?: boolean;
 	isBackgroundTask?: boolean;
 	/** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
 	_indexFile?: IndexingFileRef;
+	/** Set on a background-indexing RESPONSE bubble whose raw answer carried the
+	 *  INDEXING_COMPLETE marker. Stamped before the marker is stripped for display,
+	 *  in every path that builds one (live resolution and both history mappers), so
+	 *  a run reads the same before and after a reload.
+	 *
+	 *  Meaningful ONLY for a client-driven chain, where it is the very signal
+	 *  maybeResumeIndexing stops on. The worker-driven paths (PDF vision, windowed
+	 *  reads) advance off the renderer's page count and their prompt deliberately
+	 *  never asks for the marker, so a model that emits one there is guessing —
+	 *  which is how an 88-page file once "finished" at page 15. */
+	_indexComplete?: boolean;
 	_useBgQueue?: boolean;
 	/** Local id of a turn STAGED at Send time while its attachments upload. The
 	 *  bubble exists before any server request does, so it is never matched by
@@ -76,9 +105,14 @@ export interface ChatMessage {
 	 *  cache: an unmount kills the upload that would resolve them, so a cached
 	 *  copy would replay as a bubble that uploads forever. */
 	_stageId?: string;
-	/** True on a staged bubble while its files are still uploading (renders
-	 *  "(Uploading files...)" instead of "(In queue)"). */
+	/** Staged-turn phase 1: its files are still uploading. Renders
+	 *  "(Uploading files...)", dimmed. */
 	isUploadingAttachments?: boolean;
+	/** Staged-turn phase 2: the files are up and the turn is waiting for the whole
+	 *  background-indexing chain behind them to finish. Renders "(Indexing files...)",
+	 *  still dimmed. Cleared (with _dimSending) by markStagedMessageReady the moment
+	 *  the queue drains, which is when the turn genuinely becomes "(In queue)". */
+	isAwaitingIndexing?: boolean;
 	_serverItemId?: string;
 	_localId?: string;
 	_cancelling?: boolean;
@@ -89,7 +123,7 @@ export interface ChatMessage {
 	 *  it is created, then reconciled to the server value on the next history load.
 	 *  Absent while a turn is still pending, so no time shows on a "Thinking" bubble. */
 	_ts?: number;
-	// History cache key (`serviceId#platform`) this bubble was created under.
+	// History cache key (`projectId#platform`) this bubble was created under.
 	// Stamped on LOCALLY-created bubbles only (the optimistic user message and
 	// its "Thinking..." placeholder); server-mapped bubbles are identified by
 	// _serverItemId instead. The dashboard renders every project through ONE
@@ -113,6 +147,24 @@ export interface ChatState {
 	historyStartKeyHistory: string[];
 	historyRequestToken: number;
 	gateRefreshToken: number;
+	/** Files the SERVER still has unresolved indexing work for, by the key a
+	 *  collapsed row uses (storage path, else filename). Lives on the state rather
+	 *  than privately so a reactive consumer re-renders when it changes. */
+	liveIndexKeys: { [fileKey: string]: boolean };
+	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
+	 *  means "we have not found out", which the display layer reads as still
+	 *  working — never as an all-clear. */
+	liveIndexChecked: boolean;
+	/** Server item ids of the indexing passes that existed — on the row, or on the
+	 *  bg queue — when the user STOPPED that file. Two readers, one fact:
+	 *  buildChatDisplayList reports the run as stopped when it holds any of them
+	 *  (a stop routinely leaves no other trace), and _applyIndexCancellations
+	 *  refuses to let one of them lift the stop the way a genuinely new indexing
+	 *  request does. Ids, not file keys: they name the RUN that was stopped, so a
+	 *  later re-index of the same file cannot inherit it. On the state, like
+	 *  liveIndexKeys, so a reactive consumer re-renders the moment a stop is
+	 *  recorded — a stop with nothing left to cancel changes no message at all. */
+	stoppedIndexIds: { [serverItemId: string]: boolean };
 }
 
 export interface ChatHost {
@@ -171,6 +223,12 @@ export interface ChatHost {
 	 *  through to a plain re-index. Implementations must be best-effort (swallow
 	 *  "not found" / permission errors so indexing still proceeds). */
 	deleteExistingFileRecord?(storagePath: string): Promise<any>;
+	/**
+	 * Create the file's "src::<storagePath>" record before indexing starts, so every pass has a
+	 * reference target that exists. Optional: a host without it keeps the old behaviour, where
+	 * whichever pass got there first created the record and the others hoped it had.
+	 */
+	ensureFileIndexRecord?(storagePath: string, meta?: { name?: string; mime?: string; size?: number }): Promise<any>;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;

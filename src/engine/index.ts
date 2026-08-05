@@ -49,6 +49,8 @@ export * from './budget';
 // block and a server-published file open identically in Excel, Word and a browser.
 export * from './download_encoding';
 export * from './links';
+export * from './link_markup';
+export * from './image_preview';
 export * from './time';
 export * from './ai_agent';
 export {
@@ -97,6 +99,9 @@ export {
 export {
 	// constants
 	POLL_INTERVAL,
+	MAX_CONCURRENT_BG_POLLS,
+	getVisionProfile,
+	type VisionProfile,
 	BG_INDEXING_QUEUE_SUFFIX,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
@@ -117,6 +122,13 @@ export {
 	// content transforms
 	transformContentWithImages,
 	transformContentWithOpenAIImages,
+	// The token an indexing pass ends on when it has read the whole file. Exported
+	// because agent.vue's FORKED history mapper has to record-then-strip it exactly
+	// as the engine's own mapper does, or a run reads differently in the two clients.
+	INDEXING_COMPLETE_MARKER,
+	// Stand-in text for a pass whose whole answer was that token; both mappers need
+	// it so a run reads the same live and after a reload.
+	EMPTY_INDEXING_REPLY,
 	// types
 	type ClaudeRole,
 	type ClaudeMessage,

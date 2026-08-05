@@ -1,7 +1,7 @@
 /**
  * Token-budgeting (pure). Moved verbatim from the chatbox. Constants are shared
  * module-level values (identical in both consumers); a config knob is premature.
- * buildBoundedChatMessages now takes `serviceId` in its options so it can pass it
+ * buildBoundedChatMessages now takes `projectId` in its options so it can pass it
  * to sanitizeAttachmentLinksForHistory (which used to read a global).
  */
 import { sanitizeAttachmentLinksForHistory } from './links';
@@ -52,16 +52,16 @@ export function registerModelContextWindows(models: Array<{ id?: string; max_inp
 /** Per-project override, keyed by service id. Set from the project settings. */
 var projectContextWindows: Record<string, number> = {};
 
-export function setProjectContextWindow(serviceId: string, tokens: number | null | undefined): void {
-	var key = (serviceId || '').trim();
+export function setProjectContextWindow(projectId: string, tokens: number | null | undefined): void {
+	var key = (projectId || '').trim();
 	if (!key) return;
 	var n = Number(tokens);
 	if (Number.isFinite(n) && n > 0) projectContextWindows[key] = Math.floor(n);
 	else delete projectContextWindows[key];
 }
 
-export function getProjectContextWindow(serviceId: string): number | null {
-	var key = (serviceId || '').trim();
+export function getProjectContextWindow(projectId: string): number | null {
+	var key = (projectId || '').trim();
 	return key && projectContextWindows[key] ? projectContextWindows[key] : null;
 }
 export var OUTPUT_TOKEN_RESERVE = 22000;
@@ -99,8 +99,8 @@ export function estimateMessageTokens(msg: { role: string; content: string }): n
  * such as 'claude-opus-4-7-20260101' resolves via 'claude-opus-4-7'. The walk
  * stops at the first hit, so a more specific entry always wins over its family.
  */
-export function getContextWindow(platform: string, model?: string, serviceId?: string): number {
-	var override = serviceId ? getProjectContextWindow(serviceId) : null;
+export function getContextWindow(platform: string, model?: string, projectId?: string): number {
+	var override = projectId ? getProjectContextWindow(projectId) : null;
 	if (override) return override;
 
 	var normalized = (model || '').trim().toLowerCase();
@@ -128,11 +128,11 @@ export type BoundedChatOptions = {
 	systemPrompt: string;
 	history: Array<{ role: string; content: string }>;
 	/** Used to strip/rewrite expired attachment links in older user turns. */
-	serviceId: string;
+	projectId: string;
 };
 
 export function buildBoundedChatMessages(options: BoundedChatOptions) {
-	var contextWindow = getContextWindow(options.platform, options.model, options.serviceId);
+	var contextWindow = getContextWindow(options.platform, options.model, options.projectId);
 	var contextBasedBudget = Math.max(MIN_INPUT_TOKEN_BUDGET,
 		contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER);
 	// Scaling is gated on an EXPLICIT per-project window set from project
@@ -143,7 +143,7 @@ export function buildBoundedChatMessages(options: BoundedChatOptions) {
 	// sends more history instead of being absorbed by a hardcoded ceiling.
 	// Both derive from contextBasedBudget (pre-Claude-cap) so the two platforms
 	// scale symmetrically rather than the Claude cap compounding the ratio down.
-	var scaled = !!(options.serviceId && getProjectContextWindow(options.serviceId));
+	var scaled = !!(options.projectId && getProjectContextWindow(options.projectId));
 	var claudeInputCap = scaled
 		? Math.max(CLAUDE_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * CLAUDE_INPUT_CAP_RATIO))
 		: CLAUDE_PER_REQUEST_INPUT_CAP;
@@ -167,7 +167,7 @@ export function buildBoundedChatMessages(options: BoundedChatOptions) {
 		// Sanitize BOTH roles: user turns via the "Attached files:" block, assistant
 		// turns via the safe db-only path (forAssistant=true) so a volatile db url the
 		// model emitted doesn't get replayed into the LLM context as a dead link.
-		var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== 'user');
+		var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.projectId, m.role !== 'user');
 		return Object.assign({}, m, { content: sanitized });
 	});
 	var bounded: Array<{ role: string; content: string }> = [], used = 0;

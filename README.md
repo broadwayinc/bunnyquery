@@ -1,28 +1,28 @@
 # BunnyQuery
 
 An embeddable, dependency-free AI chat widget for [Skapi](https://www.skapi.com)-powered
-projects. Drop it into any web page and your users get a full chat experience —
+projects. Drop it into any web page and your users get a full chat experience:
 account login/signup, conversation history, file & folder uploads, and a settings
-panel — all talking to your project's **BunnyQuery** AI agent.
+panel, all talking to your project's **BunnyQuery** AI agent.
 
 BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.bunnyquery.com) agent
 chatbox. The **widget** ships as a single IIFE that exposes `window.BunnyQuery` plus one
-stylesheet — drop it in via `<script>`, no build step or framework required.
+stylesheet. Drop it in via `<script>`, no build step or framework required.
 
 The package also exports the **framework-agnostic chat engine** that powers it
-(`bunnyquery/engine`) — the same DOM-free core the Skapi admin chatbox consumes — so
+(`bunnyquery/engine`), the same DOM-free core the Skapi admin chatbox consumes, so
 you can build your own chat UI on top of it. See
 [Importing the chat engine](#importing-the-chat-engine).
 
 ## Features
 
 - **AI chat** against your project's configured agent (Claude or OpenAI under the
-  hood), with streaming-style "Thinking…" indicators and a background indexing queue.
-- **Authentication** — email/password login, optional signup, password change,
+  hood), with animated pending indicators and a background indexing queue.
+- **Authentication**: email/password login, optional signup, password change,
   email verification, account recovery, and "Sign in with Google".
-- **Conversation history** — paginated, with "Fetching history…" indicators on
+- **Conversation history**: paginated, with "Fetching history…" indicators on
   first load and on scroll-up.
-- **Attachments** — drag-and-drop files and folders, per-file upload status
+- **Attachments**: drag-and-drop files and folders, per-file upload status
   (uploading / failed / indexed), overflow collapsing for large batches, and a
   prompt when an upload hits a file that already exists (skip / reindex only /
   overwrite, with "apply to all remaining"). Images are read with vision/OCR,
@@ -33,12 +33,12 @@ you can build your own chat UI on top of it. See
   across as many passes as it takes. A file's passes collapse into a single
   status row in the chat that can be expanded, and stopped: "Stop" cancels every
   queued and running pass at once and ends the continuation chain.
-- **Attachment parser plugins** — register a client-side parser so the widget
+- **Attachment parser plugins**: register a client-side parser so the widget
   extracts text in the browser from formats the model can't otherwise read, and
   indexes it directly. See [Attachment parser plugins](#attachment-parser-plugins).
-- **Settings panel** — in-place inside the chat: light/dark theme, account details,
+- **Settings panel**, in place inside the chat: light/dark theme, account details,
   newsletter subscription, clear history, and remove account.
-- **Theming** — light and dark modes via CSS custom properties; the choice is
+- **Theming**: light and dark modes via CSS custom properties; the choice is
   remembered in `localStorage` and falls back to the OS preference.
 
 ## Requirements
@@ -82,7 +82,7 @@ call `BunnyQuery.init()`:
 </html>
 ```
 
-That's it — BunnyQuery takes over the `#chatbox` element and renders the login or
+That's it. BunnyQuery takes over the `#chatbox` element and renders the login or
 chat view depending on the user's session.
 
 ## What's in the package
@@ -91,11 +91,11 @@ chat view depending on the user's session.
 | ----------------------------- | -------------------------------------------------------------------------------- |
 | `bunnyquery.js`               | The widget IIFE. Exposes the global `window.BunnyQuery`. CDN / `<script>` drop-in. |
 | `bunnyquery.css`              | The widget's full stylesheet, scoped under `.bq-agent` / `[data-bq-theme]`.      |
-| `bunnyquery/engine`           | The framework-agnostic chat engine — ships as ESM + CJS with TypeScript types.   |
+| `bunnyquery/engine`           | The framework-agnostic chat engine. Ships as ESM + CJS with TypeScript types.   |
 | `bunnyquery/styles/chat.css`  | The shared chat-surface styles (bubbles, markdown, links) for an engine-built UI. |
 
 The two widget files can be hosted yourself (same origin recommended) or loaded from a
-CDN — no npm needed. The `engine` / `styles` subpaths are for bundler consumers
+CDN, no npm needed. The `engine` / `styles` subpaths are for bundler consumers
 (`npm install bunnyquery`); see [Importing the chat engine](#importing-the-chat-engine).
 
 ## API
@@ -123,6 +123,7 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `mcpBaseUrl`             | `string`  | `null`   | Override the MCP OAuth server base URL entirely (advanced).                                   |
 | `hostDomain`             | `string`  | `null`   | db-CDN host for temporary file URLs. Defaults to `skapi.app` (dev) / `skapi.com` (prod).     |
 | `attachmentParsers`      | `array`   | `null`   | Client-side attachment parsers. See [Attachment parser plugins](#attachment-parser-plugins). |
+| `windowedIndexing`       | `boolean` | `true`   | Server-driven windowed indexing for text and grid files (see [file types](#supported-file-types)). Pass `false` to fall back to agent-driven paging, which keeps the traversal inside the model's turn budget and the tab open. |
 
 ### Methods
 
@@ -142,9 +143,9 @@ BunnyQuery.toggleTheme();
 BunnyQuery.logout();
 ```
 
-> `init()` is idempotent — calling it twice logs a warning and returns the existing
+> `init()` is idempotent: calling it twice logs a warning and returns the existing
 > instance rather than re-mounting. On a successful mount it logs its version, e.g.
-> `[bunnyquery] v1.7.0`.
+> `[bunnyquery] v1.8.3`.
 
 See [HISTORY.md](HISTORY.md) for the release-by-release changelog.
 
@@ -209,13 +210,13 @@ upload: a 5MB `.txt` indexed 4.0% of its content, a 4.8MB `.json` 4.2%, a
 because the agent received a plausible-looking document with no way to know most
 of it was missing.
 
-Two drivers exist for this loop. By default the agent pages the file itself with
-the `readFileContent` tool. With the engine's `windowedIndexing` option enabled,
+Two drivers exist for this loop. With `windowedIndexing` (the widget's default)
 the **worker** reads a window per request and continues from the reader's own
-cursor, so the traversal no longer has to fit inside the model's turn budget.
-That option is off by default and must only be turned on against a deployed
-worker (see [Importing the chat engine](#importing-the-chat-engine)); the widget
-does not enable it.
+cursor, so the traversal neither has to fit inside the model's turn budget nor
+depends on the tab staying open. Without it the agent pages the file itself with
+the `readFileContent` tool. Pass `windowedIndexing: false` to `init()` to opt
+out; engine consumers opt in via `configureChatEngine` (see
+[Importing the chat engine](#importing-the-chat-engine)).
 
 ### 4. Everything else extractable: inlined as text server-side
 
@@ -223,8 +224,10 @@ The skapi proxy downloads the file, extracts its text **server-side**, and
 inlines that text into the request, so the model reads it directly with no
 fetching. This keeps indexing consistent across model providers.
 
-**Office & e-book** (binary/zip, parsed):
-`.docx` · `.xlsx` · `.pptx` · `.hwp` · `.hwpx` · `.ods` · `.odt` · `.odp` · `.epub`
+**Office & e-book** (binary/zip, parsed; includes legacy binary `.doc`/`.xls`/`.ppt`
+and the macro-enabled `.docm`/`.xlsm`/`.pptm`):
+`.doc` · `.docx` · `.docm` · `.xls` · `.xlsx` · `.xlsm` · `.ppt` · `.pptx` · `.pptm`
+· `.hwp` · `.hwpx` · `.ods` · `.odt` · `.odp` · `.epub`
 
 **Text, data, markup & source code** (decoded as text; `.html`/`.htm` have their
 tags stripped):
@@ -261,13 +264,9 @@ via `web_search` (external web access is enabled).
 
 ### Caveats
 
-- **Legacy / macro Office** — `.doc` `.xls` `.ppt` (legacy binary) and `.docm`
-  `.xlsm` `.pptm` (macro-enabled) have no reliable server-side reader. They
-  upload fine but are indexed from **metadata only**; re-save as
-  `.docx` / `.xlsx` / `.pptx` (or PDF) to capture their contents.
-- **Anything else** — a format covered by none of the above is indexed from its
+- **Anything else**: a format covered by none of the above is indexed from its
   metadata. To support it, register your own
-  [Attachment parser plugin](#attachment-parser-plugins) — it runs in the browser
+  [Attachment parser plugin](#attachment-parser-plugins), which runs in the browser
   and feeds parsed text straight into indexing.
 
 ### Re-indexing an existing file
@@ -311,7 +310,7 @@ interface AttachmentParser {
 ```
 
 The first parser whose `match` returns `true` wins. A parser that throws or
-returns nothing is ignored — the file falls back to its normal path. Output is
+returns nothing is ignored, and the file falls back to its normal path. Output is
 capped (~200k chars) before it is inlined.
 
 ### Example
@@ -370,13 +369,13 @@ The active theme is saved to `localStorage`, so a returning user keeps their cho
 ## Importing the chat engine
 
 `bunnyquery.js` is the ready-made widget. Under it sits a **framework-agnostic,
-DOM-free chat engine** — the same core that powers both this widget and the Skapi
+DOM-free chat engine**, the same core that powers both this widget and the Skapi
 admin chatbox. Import it from `bunnyquery/engine` when you want to build your own chat
 UI (React, Vue, Svelte, vanilla…) while reusing the engine's message/queue/typewriter/
 cache state machine, request builders, markdown-message composition, and prompts.
 
-Install the package, plus the `skapi-js` SDK (for the transport) and — if you don't
-already have one — a markdown renderer such as `marked`:
+Install the package, plus the `skapi-js` SDK (for the transport) and, if you don't
+already have one, a markdown renderer such as `marked`:
 
 ```bash
 npm install bunnyquery skapi-js marked
@@ -412,12 +411,12 @@ session.dispatchComposedMessage('Hello!'); // send a message
 
 The engine owns chat **state and logic** and calls back into your view through the
 `ChatHost` interface (render, scroll, identity, cancel/refresh). It has **no bundled
-runtime dependencies** — you inject the skapi transport via `configureChatEngine()` and
+runtime dependencies**: you inject the skapi transport via `configureChatEngine()` and
 render markdown yourself (e.g. with `marked`). Everything is fully typed: `ChatSession`,
 `ChatHost`, `ChatMessage`, `ChatIdentity`, `ChatState`, `composeUserMessage`, the request
 builders (`callClaudeWithPublicMcp` / `callOpenAIWithPublicMcp`, `getChatHistory`,
 `notifyAgentSaveAttachment`), the prompt builders, and the token-budget / link / history
-helpers — see the `.d.ts` shipped with `bunnyquery/engine`.
+helpers. See the `.d.ts` shipped with `bunnyquery/engine`.
 
 `configureChatEngine` options:
 
@@ -426,9 +425,9 @@ helpers — see the `.d.ts` shipped with `bunnyquery/engine`.
 | `clientSecretRequest`         | `function` | `skapi.clientSecretRequest`, bound to your Skapi instance. **Required.**                                      |
 | `clientSecretRequestHistory`  | `function` | `skapi.clientSecretRequestHistory`, bound to your Skapi instance. **Required.**                              |
 | `mcpBaseUrl`                  | `string`   | MCP server base URL (you resolve prod vs dev). **Required.**                                                  |
-| `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `clientSecretRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel — the widget's case). |
+| `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `clientSecretRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel, the widget's case). |
 | `attachmentParsers`           | `array?`   | Client-side attachment parsers, registered at configure time. More can be added later with `registerAttachmentParser()`. See [Attachment parser plugins](#attachment-parser-plugins). |
-| `windowedIndexing`            | `boolean?` | Opt in to **server-driven** windowed indexing for text and grid files (see [file types](#supported-file-types)). Off by default and must stay off until the worker that strips the `_skapi_window` directive is deployed: against an older worker the directive reaches the provider as an unknown body field and the call fails terminally with no retry. |
+| `windowedIndexing`            | `boolean?` | Opt in to **server-driven** windowed indexing for text and grid files (see [file types](#supported-file-types)). Off by default in the engine; the widget passes it as `true`. The deployed skapi workers support it; only leave it off against a self-hosted worker that does not yet strip the `_skapi_window` directive, where it would reach the provider as an unknown body field and fail the call terminally with no retry. |
 
 ### Display and paging helpers
 
@@ -464,7 +463,7 @@ never progress.
 BunnyQuery connects to your AI agent through an MCP OAuth server
 (`mcp.broadwayinc.computer` in production, `mcp-dev.broadwayinc.computer` when
 `dev: true`). After authorization, the OAuth server redirects back to **the current
-host page** — BunnyQuery reads the `?code=…&state=…` parameters, completes the
+host page**: BunnyQuery reads the `?code=…&state=…` parameters, completes the
 exchange, and cleans them from the URL automatically. No dedicated callback page is
 needed; just make sure the page that hosts the widget is a stable, reachable URL.
 

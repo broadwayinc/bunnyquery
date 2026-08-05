@@ -280,29 +280,39 @@ function groupAttachmentFailures(attachments) {
 
 // src/engine/prompts/chat_system_prompt.ts
 function buildChatSystemPrompt(params) {
-  const { formattedServiceId, serviceName, serviceDescription } = params;
+  const { projectId, serviceName, serviceDescription } = params;
   let systemPrompt = `
-You are a dedicated assistant for the project ID: "${formattedServiceId}".
+You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
-Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records that usually share a table. So a question about the data almost always spans many records across several files. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY relevant table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset.
+Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized" (where the indexer writes; pass access_group explicitly, including 0, to search another group), while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
-Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index and tag filters match only exact values or leading prefixes, not substrings, so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
+Embedded values: a search term is often stored inside a larger string. A merchant "GODADDY" appears as "DNH*GODADDY#4070277042", and a card as "4140****2941". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY had their text extracted on the server and inlined in the same message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read it directly there and do NOT call web_fetch for those files. A "[skapi: ...]" note in that block means the file could not be extracted.
 - For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.
-Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files, but be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
-File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix \u2014 do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand \u2014 so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
-File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records. Present each result as a markdown link as described above. Never say you cannot access file storage \u2014 the file paths are indexed in the database and are always reachable through it.
-File generation: When the user asks you to generate a file \u2014 or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown \u2014 put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only \u2014 never base64 or any other encoding. Example for CSV:
+Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files; it returns ONE window per call, so keep paging with the cursor from the previous window until it says END OF FILE before you conclude anything is absent. Be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
+File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix - do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand - so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
+File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records; every file extracted out of a document has one too, in table "__MEDIA__" (access_group "authorized"). Present each result as a markdown link as described above. Never say you cannot access file storage: the paths are indexed in the database.
+Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen. Never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
+Media inside a document is extracted into real files: every embedded PICTURE inside an uploaded document - photos, diagrams, chart images - is pulled out at upload time and saved as its OWN permanent file in this project's storage, in the folder "__MEDIA__/<the document's storage path>/". Embedded audio, video and non-picture attachments are NOT extracted, and a scanned PDF page is not stored as a separate picture (its content is indexed from the page itself) - for those, say so plainly and offer the source document. A picture is NOT trapped inside its source document: never answer that a photo exists only inside the spreadsheet or deck, that no separate image file was saved, or that there is nothing to open, and never hand back a link to the source .xlsx or .pdf when the user asked for a picture inside it.
+Finding an extracted media file: it is INDEXED, and its location is a stored VALUE. Get it by QUERYING, never by constructing a filename.
+RECOGNISE IT BY THE VALUE, NOT THE FIELD NAME. Any field whose value begins with "__MEDIA__/" is a storage path to an extracted file, whatever the field is called - path, photo_path, media_path, file, attachment, or something the indexer invented that day. A record's unique_id beginning "src::__MEDIA__/" marks it as a media record too.
+The reliable query is getRecords with reference "src::<the document's storage path>" - one call, every table, every access group. Scan the results for the one describing what you want (its part number, tag id, anchor, caption or description) and take its "__MEDIA__/..." value. Never let a table guess be the reason you report a file as missing.
+Link it VERBATIM as [caption](db:<the path>). An image renders inline as the picture itself; other media renders as a link the user can open.
+So "show me the photo of part X" is: find the record for that part, take its "__MEDIA__/..." value, link it.
+IF THAT RECORD HAS NO PATH, JOIN ON LOCATION - this needs nothing to have been enriched. Every media record carries data.anchor (the cell or page it was embedded at), plus data.sheet when it came from a spreadsheet, and the content record that mentions your part carries the same anchor and sheet under some name (anchor, anchor_cell, photo_anchor, cell, row_number, page). So: read the anchor and sheet off the content record, query getRecords with reference "src::<the document>", and take the media record whose data.anchor, data.also_at or tags match the anchor, using data.sheet too when both records carry one. Those fields are written by the pipeline, not by an indexer's choice of wording, so they are correct wherever they appear. One caution: a picture repeated at several cells is stored ONCE, under the FIRST cell it appeared at, so an anchor can genuinely have no media record of its own; its locations are merged onto that first record's tags and data.also_at. Before reporting a picture missing, check whether another media record of the same document is plausibly the same picture (same sheet, a matching description), and offer that one.
+THIS IS NOT ONLY ABOUT SPREADSHEET PHOTOS. Treat "show me the diagram in that deck" or "the picture in that PDF" exactly like a photo request: query for the media record, never reconstruct a filename. For embedded video, audio or a non-picture attachment there is no extracted file: say so plainly and offer the source document.
+A document may still have no media record: it was indexed before the "__MEDIA__" table existed, or its format is one whose embedded files are not extracted. Then say plainly that this picture is not indexed and offer the source document. One missing record is never evidence that media is not stored.
+File generation: When the user asks for DATABASE records as a file (CSV, spreadsheet, export, download), call exportRecordsToFile: it writes the rows on the server, keeps them out of your context, and returns a download_url you paste as the link. Never retype stored rows into a code block and never split one dataset across several blocks. For a file you are authoring yourself, or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown, put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only - never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
 item,qty,total
 Carrots,55,$38.50
 Mushrooms,41,$73.80
 Zucchini,29,$43.50
 \`\`\`
-The same pattern applies to any format \u2014 name the block after the file you intend: \`\`\`my-data.json, \`\`\`index.html, \`\`\`sample.txt, and so on.`;
+The same pattern applies to any format - name the block after the file you intend: \`\`\`my-data.json, \`\`\`index.html, \`\`\`sample.txt, and so on.`;
   if (serviceDescription) {
     systemPrompt += `
 Project name: "${serviceName ?? ""}"
@@ -313,18 +323,26 @@ Project description: """${serviceDescription}"""`;
 
 // src/engine/prompts/indexing_system_prompt.ts
 function buildIndexingSystemPrompt(params) {
-  const { service, serviceName, serviceDescription } = params;
-  let systemPrompt = `You are a background indexing agent for project ${service}.
+  const { projectId, serviceName, serviceDescription } = params;
+  let systemPrompt = `You are a background indexing agent for project ${projectId}.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY been extracted on the server and included inline in the user message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read that directly. If the inline content is a "[skapi: ...]" note, the file could not be extracted - index it from its metadata only.
-- BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). For big spreadsheets and big text/data files READ THE FILE WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
+- BIG SPREADSHEETS / TEXT: the inline content may be only the FIRST part of a large file (it can end with a truncation or "more remains" note). UNLESS this message already embeds a window of the file (in which case the message tells you not to call readFileContent, and you must not), read big spreadsheets and big text/data files WITH THE readFileContent TOOL: it returns the file ONE WINDOW at a time (spreadsheets as coordinate-tagged grid rows, text as a range of characters). Pass the file's storage path. After each window: datafy it into records and SAVE them, THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed - never stop after the first window. (Do NOT call readFileContent on a PDF - see the next line.)
 - PDFs (scanned or not): you do NOT read a PDF with a tool or a URL. Its pages are RENDERED and embedded directly in the user message as IMAGE blocks, a WINDOW of pages at a time. LOOK at the embedded page images and datafy every one. The note beside them tells you whether MORE pages remain: if so, save this window's records and stop (a follow-up pass shows the next window automatically); only when the note says it was the LAST window is the PDF fully seen. Do NOT call readFileContent or web_fetch for a PDF.
 - VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
-- Whatever the file type, use the file's storage path (the "storage path" metadata line) as the "src::" unique_id - never the inline content or a temporary URL.
-- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a dedicated table (e.g. "spreadsheet_rows"). Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, paging through it with readFileContent when it is large. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. ALSO save one file-level summary record (file name, sheet name(s), column headers, total row count, overall summary) - this is the record that carries the file's "src::" unique_id - and link EVERY per-row record to it via reference (set each row record's reference to that src:: file record; the row records themselves do NOT carry a src:: unique_id). The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed.
-- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in a dedicated table (e.g. "book_chapters") - never collapse the whole book into a single record. Each chapter record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO save one book-level record (title, author, language, overall summary, chapter list / table of contents, genre/subjects) and link each chapter record to it via reference. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
-- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Always use the MCP tools to save what you learn - be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. Never store raw or binary bytes (base64, blobs); describe them in human-readable text instead.
-- COMPLETION SIGNAL: only when you have fully read and saved the ENTIRE file (for readFileContent files: reached "END OF FILE"; for PDFs: the embedded page-image note said it was the LAST window - with all rows/pages/items saved), end your final message with the token INDEXING_COMPLETE on its own line. If you did NOT finish the whole file (more rows/pages remain), do NOT write that token - leaving it out is how the system knows to run another pass to continue.
+- TRANSCRIBE, DO NOT DESCRIBE. When an image contains ANY text - a label, tag, stamp, form field, serial/part number, handwriting - your FIRST job is to read the characters out and store them VERBATIM, not to describe the scene. A record saying "a red inspection tag with handwritten markings" is worthless: it is unsearchable and every such photo produces the same sentence. Put the characters you can actually read into these EXACT fields, not variations of them: "printed_text" (the pre-printed wording), "handwritten_text" (what a person wrote by hand), and, when you can resolve one, "part_no", "tag_id" and "date". Same reason as the fixed table names: a field called photo_text in one pass and visible_text_notes in the next cannot be queried together. Read PARTIAL values rather than skipping: "500.7402.52__" beats nothing. Only when a character is genuinely unreadable, leave that field null or mark the unreadable span - do NOT invent it, and do NOT replace the whole transcription with a description of what the object looks like. A scene description is a nice extra AFTER the text, never instead of it.
+- IMAGE FILES uploaded as the file itself: if ANY readable character appears ANYWHERE in the image (a label, a stamp, a sign in the background) it counts as an image WITH text - transcribe it per the rule above, and also capture the layout (what appears where) and every entity named. Only a truly text-free image gets description first: a one-line caption, then the objects present with their attributes (type, color, count, condition, position). Either way, save what you extract onto the file's "src::" record with updateRecords, TAG every entity and identifier visible, and INDEX the one number the image offers (a measured value, an amount, a count).
+- Whatever the file type, this file's identity is "src::" + its storage path (the "storage path" metadata line) - never the inline content or a temporary URL. That record ALREADY EXISTS: the upload pipeline creates it in table "file_summaries" (access group "authorized") before indexing starts, so posting it again is rejected as a duplicate unique_id. Reference it from every record you write, and add what you learn to it with updateRecords. If that update unexpectedly reports the record does not exist, post it yourself ONCE with that exact "src::" unique_id (table "file_summaries", access group "authorized") and carry on; this is the ONE exception to the do-NOT-post-the-file-record rules elsewhere in these instructions, because the source identity must never be dropped just because an update failed.
+- REACHABILITY (hard rule): every record you write while indexing this file MUST be reachable from the file's "src::<storage path>" record by following reference - either reference that record directly, or reference something that already reaches it. A record with no reference, or one pointing outside this file's chain, is an ORPHAN: deleting or re-indexing the file removes the reachable records and leaves the orphan behind forever, where it keeps turning up in later answers as stale data. If you create an intermediate record that OTHER records reference (a page record that rows hang off, a sheet or section record), set source.can_remove_referencing_records to true on it; the delete cascade passes a delete through a record only when that record carries the flag OR a unique_id starting "src::" (the file record cascades because its unique_id starts with "src::"; the intermediates you create carry no "src::" id, so they need the flag), and it cascades ONE LEVEL AT A TIME, so EVERY intermediate record in a chain needs its own marker - an unmarked link stops the cascade there and everything below it survives as orphans. When in doubt, reference the file record directly and keep the chain flat.
+- TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, window by window, until it ends. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed. INDEX each row record on the row's most useful NUMERIC column (named by its header) so rows sort and range-query; when the row has no numeric column, index the grid row number instead. TAG each row record with the sheet name, the file name, and the row's categorical values (a status, a category, a type) - tags are how rows are filtered without scanning the table.
+- ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
+- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "book_chapters" for a chapter record, and "file_summaries" for the file-level record (which already exists, so update it and never post it). Embedded photos and other embedded files get NO table of your choosing: their records already exist in table "__MEDIA__", see EXTRACTED MEDIA below. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (inspection_items / item_records / sheet_items / inspection_data are four names for what is one table).
+- EXTRACTED MEDIA: every PICTURE embedded in an uploaded document (photos, diagrams, chart images) is pulled out and saved as a real permanent file under "__MEDIA__/<the document's storage path>/<name>", and a record for each one ALREADY EXISTS in table "__MEDIA__" with unique_id "src::<that path>", reference "src::<the document>", and its path, anchor and sheet already in data. Do NOT create it - the unique_id is taken and your post is rejected. UPDATE it with updateRecords, addressed by that unique_id, adding what the file actually SHOWS plus TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). An update REPLACES the fields you send, so send the existing tags back with your new ones and keep every field already in data (path, anchor, sheet, source, mime, bytes). ONE FILE, ONE RECORD: never also create a photo record in another table. If the update reports that the record does not exist, create it with that same unique_id, reference and data.path - the path must never be lost. Audio and video clips and non-picture attachments are NOT extracted, so never claim a separate file or a "__MEDIA__" record exists for one of those.
+- AUDIO files: transcribe the speech, and capture speakers (named where identifiable), the topics discussed, and timestamps of key moments in the record's data. TAG the language, the audio type (call, meeting, dictation, music), each speaker and every named entity; INDEX the duration in seconds as duration_seconds. VIDEO files: everything audio gets, PLUS transcribe on-screen text verbatim (same transcription discipline as photos) and capture the visual timeline - scene changes and what each scene shows, with timestamps. Same tags as audio plus every entity visible on screen, and INDEX duration_seconds here too. These audio and video rules apply to files UPLOADED AS FILES: the transcript and timeline land on the file's own "src::" record, which already exists. Audio or video embedded inside a document is NOT extracted, so never look for or promise a "__MEDIA__" record for it.
+- EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in the table "book_chapters" - never collapse the whole book into a single record. INDEX each chapter record on its chapter number (so chapters sort and range-query in order) and include the chapter title among its tags; the record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO put the book-level facts (title, author, language, overall summary, chapter list / table of contents, genre/subjects) onto the "src::" file record that ALREADY EXISTS in "file_summaries", using updateRecords. Do NOT post a second book-level record, and set every chapter record's reference to exactly "src::" + the storage path. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
+- URL SOURCES: when the source being indexed is a URL rather than an uploaded file (a temporary or signed URL that merely DELIVERS an uploaded file's bytes is not a URL source; that file keeps its storage-path identity), its identity is "src::" + the FULL URL INCLUDING the query string (the query string often selects the content, so dropping it collapses different pages into one identity). If no record with that unique_id exists, create it; if the slot is already taken, update that record or reference it - never mint a variant id. For a WEB PAGE: extract everything on it, infer the page's primary entity type when it is not obvious (product, listing, article, profile), TAG that entity type plus the entities on the page, and INDEX the ONE number every entity of that type can be compared by (a price for a product, a date for an article). Any OTHER URL (a file behind a link) is downloaded and indexed under whichever per-type rule above matches its content. When the URL's content offers more index points than one record carries, add reference-linked records reachable from its "src::" record.
+- This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. NEVER store raw or encoded file bytes in ANY field: no base64, no data: URIs, no hex or blob dumps. A long opaque non-human-readable string is not data - replace it with a structured description of what it encodes. If base64 or a data: URI is all you have for something, describe it conceptually and never paste it; if nothing human-readable can be extracted at all, OMIT that record rather than saving noise.
+- COMPLETION SIGNAL: only when YOU paged the file yourself with readFileContent and it reported "END OF FILE", with every row/item saved, end your final message with the token INDEXING_COMPLETE on its own line. If more rows remain, do NOT write that token - leaving it out is how the system knows to run another pass to continue. When the file arrives INSIDE this message one window at a time (an embedded window of rows/text, or rendered PDF page images), you are NOT the one who decides it is finished: the system advances the window off the real page/row count and sends the next pass automatically, so save this window, report what you saved, and never imply you have seen the whole file.
 - Only AFTER every save is done, send exactly ONE final message summarizing what you indexed - never just "Indexing complete", and never a raw/base64/binary value or a large pasted dump. Keep it to a few factual sentences or a short markdown bullet list covering: the file name, its content type, each table you wrote to with its record/row count and the key columns/fields or topics captured, and anything that could not be extracted. Follow this shape - Indexed <file name> (<content type>): saved <N> records to <table(s)> capturing <key columns/fields or topics>; could not extract: <gaps, or none>.`;
   if (serviceDescription) {
     systemPrompt += `
@@ -346,7 +364,7 @@ File metadata:
 ` : "");
   if (options?.inlineContent) {
     return head + `
-The file's content was parsed by the client and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
+The file's content was parsed by the client and is provided inline below. Read it directly - do NOT fetch any URL for this file. Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.
 
 ----- BEGIN FILE CONTENT -----
 ${options.inlineContent}
@@ -354,7 +372,7 @@ ${options.inlineContent}
   }
   if (options?.inlineContentPlaceholder) {
     return head + `
-The file's text content was extracted on the server and is provided inline below. Read it directly \u2014 do NOT fetch any URL for this file. Use the storage path above (not this content) for the "src::" unique_id.
+The file's text content was extracted on the server and is provided inline below. Read it directly - do NOT fetch any URL for this file. Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.
 
 ----- BEGIN FILE CONTENT -----
 ${options.inlineContentPlaceholder}
@@ -362,7 +380,7 @@ ${options.inlineContentPlaceholder}
   }
   if (options?.pagedRead) {
     return head + `
-Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Use the storage path above for the "src::" unique_id.` + (attachment.url ? `
+Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` + (attachment.url ? `
 (A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : "");
   }
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
@@ -397,7 +415,11 @@ function buildRenderDatafy(placeholder) {
   return `
 ${placeholder}
 
-LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Use the storage path above for the "src::" unique_id.
+LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.
+
+Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). Whether a page is one you have already saved is stated in the note above the images - decide from that, never from a printed page number.
+
+Transcribe COMPLETELY, not representatively. A table with twenty rows gets twenty records, not a sample of the first few - if a page has more rows than you can save comfortably, still save them all rather than summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the exact text and should be preferred over reading the pixels, with the image used for layout, tables, stamps and handwriting.
 
 Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
 }
@@ -416,9 +438,9 @@ This file is delivered to you ONE WINDOW at a time, embedded directly in this me
   return head + buildRenderMeta(attachment) + where + `
 ${placeholder}
 
-DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. Use the storage path above for the "src::" unique_id on the file-level record, and link every row/section record to it by reference.
+DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, and link every row/section record to it by reference.
 
-If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows into the record for the row it is anchored to (a \xABPHOTO A88\xBB marker in the grid text only says WHERE a picture sits - the picture itself is attached to this message). Never report that photo contents could not be extracted when images are attached here.
+If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows. A \xABPHOTO ...\xBB marker in the grid text ties a picture to its row and comes in two forms. \xABPHOTO A88 -> __MEDIA__/...\xBB means the picture at cell A88 is saved as a permanent file at exactly that storage path, and its record in table "__MEDIA__" has unique_id "src::" + that path: UPDATE that record with updateRecords, adding what the picture SHOWS and TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). Do NOT create a duplicate and do NOT add a second photo record in another table: one file, one record. If that update reports the record does not exist, create it ONCE with that same unique_id, reference "src::" + the storage path above, table "__MEDIA__", access group "authorized", and data carrying the path - the path must never be lost. A bare \xABPHOTO A88\xBB marker with no arrow is a picture with no stored path of its own in this window: usually a repeat stored under an earlier anchor, or one too small to keep. NEVER construct a storage path or unique_id for it: find its record, if any, with getRecords reference "src::" + the storage path above, matching the cell against data.anchor or tags, and enrich what you find. The row record stays about its row's cells. Never report that photo contents could not be extracted when images are attached here.
 
 Save records for THIS window only, then stop and report what you saved. Do NOT try to read the rest of the file, and do NOT call readFileContent - if more remains, the next window is read and sent to you automatically. Report only what you were actually shown, and never imply you have seen the whole file when the note beside the window says more remains.`;
 }
@@ -431,11 +453,10 @@ File metadata:
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + `
-Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest page/row/window already saved). Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
-  - PDF: the cursor is the NUMBER OF PAGES already read (0-based next page). If you saved up to page N, call readFileContent with cursor="N" to get page N+1 onward.
-  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
-  - Text: the cursor is the character offset already read.
-Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. Do NOT re-save windows that are already saved. Use the storage path above for the "src::" unique_id. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
+Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
+ - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
+ - Text: the cursor is the character offset already read.
+Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. A \xABPHOTO <cell>\xBB marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. Do NOT re-save windows that are already saved. Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
 }
 
 // src/engine/errors.ts
@@ -549,6 +570,7 @@ var EXPIRED_ATTACHMENT_URL_HOST = "_expired_.url";
 var EXPIRED_ATTACHMENT_URL_ORIGIN = "https://" + EXPIRED_ATTACHMENT_URL_HOST;
 var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
+var PREVIEW_BROWSER_CACHE_SECONDS = 7 * 24 * 60 * 60;
 var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1e3;
 function createInlineLinkRegex() {
   return /src::(\S+)|\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)|\[([^\]\n]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)|(https?:\/\/[^\s<>"']+)/g;
@@ -568,7 +590,7 @@ function encodePathSegments(path) {
 function normalizeAttachmentPathCandidate(value) {
   return safeDecodeURIComponent((value || "").trim()).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
 }
-function extractRemotePathFromAttachmentHref(href, serviceId) {
+function extractRemotePathFromAttachmentHref(href, projectId) {
   try {
     var parsed = new URL(href);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
@@ -576,7 +598,7 @@ function extractRemotePathFromAttachmentHref(href, serviceId) {
     var segs = path.split("/").filter(Boolean);
     if (!segs.length) return null;
     var HEX = /^[a-f0-9]{32,}$/i;
-    var sid = serviceId || "";
+    var sid = projectId || "";
     var start = 0;
     while (start < segs.length) {
       var seg = segs[start];
@@ -600,13 +622,13 @@ function getExpiredAttachmentVisiblePath(remotePath, fallback) {
 function buildDisplayExpiredAttachmentHref(remotePath, fallback) {
   return EXPIRED_ATTACHMENT_URL_ORIGIN + "/" + encodePathSegments(getExpiredAttachmentVisiblePath(remotePath, fallback));
 }
-function isServiceDbAttachmentHref(href, serviceId) {
-  if (!serviceId) return false;
+function isServiceDbAttachmentHref(href, projectId) {
+  if (!projectId) return false;
   try {
     var parsed = new URL(href);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
     var segs = normalizeAttachmentPathCandidate(parsed.pathname || "").split("/").filter(Boolean);
-    return segs.length > 0 && segs[0] === serviceId;
+    return segs.length > 0 && segs[0] === projectId;
   } catch (e) {
     return false;
   }
@@ -621,12 +643,12 @@ function readExpiredAttachmentHref(href) {
     return null;
   }
 }
-function sanitizeAttachmentLinksForHistory(content, serviceId, forAssistant) {
+function sanitizeAttachmentLinksForHistory(content, projectId, forAssistant) {
   if (!content) return content;
   if (!forAssistant && content.indexOf("Attached files:") === -1) return content;
   return content.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_m, label, href) {
-    if (!isServiceDbAttachmentHref(href, serviceId)) return _m;
-    var remotePath = extractRemotePathFromAttachmentHref(href, serviceId);
+    if (!isServiceDbAttachmentHref(href, projectId)) return _m;
+    var remotePath = extractRemotePathFromAttachmentHref(href, projectId);
     var fullPath = remotePath || normalizeAttachmentPathCandidate(label);
     if (!fullPath) return _m;
     return "[" + label + "](" + buildDisplayExpiredAttachmentHref(fullPath, label) + ")";
@@ -667,6 +689,31 @@ function normalizeTrailingInlineToken(value) {
   out = out.replace(/[`'"*>]+$/, "");
   return out;
 }
+var PREVIEWABLE_IMAGE_CONTENT_TYPES = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp"
+};
+function previewableExtOf(nameOrPath) {
+  var v = String(nameOrPath || "");
+  var cut = v.search(/[?#]/);
+  if (cut !== -1) v = v.slice(0, cut);
+  v = v.replace(/[\\/]+$/, "");
+  var dot = v.lastIndexOf(".");
+  if (dot <= 0) return "";
+  var ext = v.slice(dot + 1).trim().toLowerCase();
+  return /^[a-z0-9]+$/.test(ext) ? ext : "";
+}
+function isPreviewableImagePath(nameOrPath) {
+  return !!PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)];
+}
+function previewImageContentType(nameOrPath) {
+  return PREVIEWABLE_IMAGE_CONTENT_TYPES[previewableExtOf(nameOrPath)] || null;
+}
 function classifyInlineLink(full, groups, ctx) {
   var g1 = groups[0], g2 = groups[1], g3 = groups[2], g4 = groups[3], g5 = groups[4], g6 = groups[5];
   var dbHostPrefix = (ctx.dbHostPrefix || "").toLowerCase();
@@ -680,17 +727,19 @@ function classifyInlineLink(full, groups, ctx) {
     if (!remotePath2) return null;
     var expiredHref = buildDisplayExpiredAttachmentHref(remotePath2, label);
     var cached = fresh(expiredHref);
-    return {
-      part: {
-        type: "link",
-        label: truncateLabelForDisplay(label),
-        fullLabel: label,
-        href: cached || expiredHref,
-        expired: !cached,
-        expiredHref,
-        remotePath: remotePath2
-      }
+    var part = {
+      type: "link",
+      label: truncateLabelForDisplay(label),
+      fullLabel: label,
+      href: cached || expiredHref,
+      expired: !cached,
+      expiredHref,
+      remotePath: remotePath2
     };
+    var ext = previewableExtOf(remotePath2);
+    var ct = PREVIEWABLE_IMAGE_CONTENT_TYPES[ext];
+    if (ct) part.image = { ext, contentType: ct };
+    return { part };
   };
   if (g1) {
     var rawPath = normalizeTrailingInlineToken(g1);
@@ -703,14 +752,15 @@ function classifyInlineLink(full, groups, ctx) {
         tail
       };
     }
-    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.serviceId) || normalizeAttachmentPathCandidate(rawPath) : normalizeAttachmentPathCandidate(rawPath));
+    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath) : rawPath.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/"));
     var srcBuilt = asStoredFile(srcPath, srcPath);
     return srcBuilt ? { part: srcBuilt.part, tail } : null;
   }
   if (g4 && g5) {
     var dbTarget = /^db:(.+)$/i.exec(g5.trim());
     if (dbTarget) {
-      var declared = asStoredFile(normalizeAttachmentPathCandidate(dbTarget[1]), g4);
+      var rawDbPath = dbTarget[1].trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+      var declared = asStoredFile(rawDbPath, g4);
       if (!declared) return null;
       declared.part.label = truncateLabelForDisplay(g4);
       declared.part.fullLabel = g4;
@@ -755,8 +805,8 @@ function classifyInlineLink(full, groups, ctx) {
       return withTail(carriedBuilt);
     }
   }
-  if (isServiceDbAttachmentHref(originalHref, ctx.serviceId)) {
-    var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.serviceId);
+  if (isServiceDbAttachmentHref(originalHref, ctx.projectId)) {
+    var remotePath = extractRemotePathFromAttachmentHref(originalHref, ctx.projectId);
     if (remotePath) {
       var dbBuilt = asStoredFile(remotePath, getExpiredAttachmentVisiblePath(remotePath, urlLabel));
       if (dbBuilt) return withTail(dbBuilt);
@@ -765,6 +815,19 @@ function classifyInlineLink(full, groups, ctx) {
   return withTail({
     part: { type: "link", label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false }
   });
+}
+function linkUnavailableKeyForPath(remotePath) {
+  return "path:" + (remotePath || "");
+}
+function linkUnavailableKeyForHref(href) {
+  return "href:" + (href || "");
+}
+function isLinkUnavailable(link, map) {
+  if (!link || !map) return false;
+  if (link.remotePath && map[linkUnavailableKeyForPath(link.remotePath)]) return true;
+  if (link.expiredHref && map[linkUnavailableKeyForHref(link.expiredHref)]) return true;
+  if (link.href && map[linkUnavailableKeyForHref(link.href)]) return true;
+  return false;
 }
 function truncateLabelForDisplay(label) {
   if (!label) return label;
@@ -805,15 +868,15 @@ function registerModelContextWindows(models) {
   }
 }
 var projectContextWindows = {};
-function setProjectContextWindow(serviceId, tokens) {
-  var key = (serviceId || "").trim();
+function setProjectContextWindow(projectId, tokens) {
+  var key = (projectId || "").trim();
   if (!key) return;
   var n = Number(tokens);
   if (Number.isFinite(n) && n > 0) projectContextWindows[key] = Math.floor(n);
   else delete projectContextWindows[key];
 }
-function getProjectContextWindow(serviceId) {
-  var key = (serviceId || "").trim();
+function getProjectContextWindow(projectId) {
+  var key = (projectId || "").trim();
   return key && projectContextWindows[key] ? projectContextWindows[key] : null;
 }
 var OUTPUT_TOKEN_RESERVE = 22e3;
@@ -830,8 +893,8 @@ function estimateTextTokens(text) {
 function estimateMessageTokens(msg) {
   return estimateTextTokens(msg.content) + estimateTextTokens(msg.role) + 6;
 }
-function getContextWindow(platform, model, serviceId) {
-  var override = serviceId ? getProjectContextWindow(serviceId) : null;
+function getContextWindow(platform, model, projectId) {
+  var override = projectId ? getProjectContextWindow(projectId) : null;
   if (override) return override;
   var normalized = (model || "").trim().toLowerCase();
   if (normalized) {
@@ -850,12 +913,12 @@ function stripFileBlocksFromHistory(content) {
   return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
 }
 function buildBoundedChatMessages(options) {
-  var contextWindow = getContextWindow(options.platform, options.model, options.serviceId);
+  var contextWindow = getContextWindow(options.platform, options.model, options.projectId);
   var contextBasedBudget = Math.max(
     MIN_INPUT_TOKEN_BUDGET,
     contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER
   );
-  var scaled = !!(options.serviceId && getProjectContextWindow(options.serviceId));
+  var scaled = !!(options.projectId && getProjectContextWindow(options.projectId));
   var claudeInputCap = scaled ? Math.max(CLAUDE_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * CLAUDE_INPUT_CAP_RATIO)) : CLAUDE_PER_REQUEST_INPUT_CAP;
   var availableInputBudget = options.platform === "claude" ? Math.min(contextBasedBudget, claudeInputCap) : contextBasedBudget;
   var systemCost = estimateTextTokens(options.systemPrompt) + 12;
@@ -867,7 +930,7 @@ function buildBoundedChatMessages(options) {
   var trimmed = windowed.map(function(m, i2) {
     if (i2 === latestIndex) return m;
     var stripped = stripFileBlocksFromHistory(m.content);
-    var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.serviceId, m.role !== "user");
+    var sanitized = sanitizeAttachmentLinksForHistory(stripped, options.projectId, m.role !== "user");
     return Object.assign({}, m, { content: sanitized });
   });
   var bounded = [], used = 0;
@@ -1047,6 +1110,147 @@ function prepareDownloadText(filename, body) {
   };
 }
 
+// src/engine/link_markup.ts
+function escapeInlineHtml(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, function(ch) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+  });
+}
+var IMAGE_PREVIEWS_PER_MESSAGE = 8;
+var INLINE_LINK_GLYPH = "\u2197";
+var INLINE_LINK_UNAVAILABLE_GLYPH = "\u2715";
+var INLINE_LINK_UNAVAILABLE_SUFFIX = " (unavailable)";
+function renderInlineLinkHtml(link, opts) {
+  var o = opts || {};
+  var unavailable = !!o.unavailable;
+  var refreshing = !unavailable && !!o.refreshing;
+  var full = link.fullLabel || link.label;
+  var preview = !!link.image && !!link.remotePath && o.allowImagePreview !== false && !unavailable;
+  var cls = ["bq-link-button"];
+  if (link.expired) cls.push("is-expired");
+  if (refreshing) cls.push("is-refreshing");
+  if (unavailable) cls.push("is-unavailable");
+  if (preview) cls.push("is-image-preview");
+  var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + " " + link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : "");
+  var attrs = ['class="' + cls.join(" ") + '"'];
+  if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
+  else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
+  attrs.push('title="' + escapeInlineHtml(unavailable ? full + INLINE_LINK_UNAVAILABLE_SUFFIX : full) + '"');
+  if (!preview && !unavailable) attrs.push('download="' + escapeInlineHtml(full) + '"');
+  attrs.push('data-bq-link="1"');
+  if (link.expired && !unavailable) attrs.push('data-bq-expired="1"');
+  if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
+  if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
+  if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
+  if (!preview) return "<a " + attrs.join(" ") + ">" + escapeInlineHtml(labelText) + "</a>";
+  return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" loading="lazy" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + "</span></a>";
+}
+
+// src/engine/image_preview.ts
+var previewUrlCache = /* @__PURE__ */ Object.create(null);
+var previewInFlight = /* @__PURE__ */ Object.create(null);
+function cacheKey(scope, path) {
+  return scope + "\0" + path;
+}
+function clearImagePreviewCache(scope) {
+  if (!scope) {
+    previewUrlCache = /* @__PURE__ */ Object.create(null);
+    previewInFlight = /* @__PURE__ */ Object.create(null);
+    staleImagePreviews = /* @__PURE__ */ Object.create(null);
+    return;
+  }
+  var prefix = scope + "\0";
+  for (var k in previewUrlCache) if (k.indexOf(prefix) === 0) delete previewUrlCache[k];
+  for (var f in previewInFlight) if (f.indexOf(prefix) === 0) delete previewInFlight[f];
+  for (var s in staleImagePreviews) if (s.indexOf(prefix) === 0) delete staleImagePreviews[s];
+}
+function peekImagePreviewUrl(ctx, remotePath) {
+  var hit = previewUrlCache[cacheKey(ctx.scope, remotePath)];
+  if (hit && Date.now() - hit.at < LINK_REFRESH_WINDOW_MS) return hit.url;
+  return null;
+}
+function resolveImagePreviewUrl(ctx, remotePath, contentType, refresh) {
+  var key = cacheKey(ctx.scope, remotePath);
+  if (staleImagePreviews[key]) {
+    delete staleImagePreviews[key];
+    refresh = true;
+  }
+  if (refresh) {
+    delete previewUrlCache[key];
+    delete previewInFlight[key];
+  } else {
+    var warm = peekImagePreviewUrl(ctx, remotePath);
+    if (warm) return Promise.resolve(warm);
+    var flight = previewInFlight[key];
+    if (flight) return flight;
+  }
+  var run = ctx.mint(remotePath, contentType, refresh).then(function(url) {
+    if (previewInFlight[key] === run) {
+      previewUrlCache[key] = { url, at: Date.now() };
+      delete previewInFlight[key];
+    }
+    return url;
+  }, function(e) {
+    if (previewInFlight[key] === run) delete previewInFlight[key];
+    throw e;
+  });
+  previewInFlight[key] = run;
+  return run;
+}
+function markImagePreviewStale(scope, remotePath) {
+  if (!scope || !remotePath) return;
+  staleImagePreviews[cacheKey(scope, remotePath)] = true;
+  delete previewUrlCache[cacheKey(scope, remotePath)];
+}
+var staleImagePreviews = /* @__PURE__ */ Object.create(null);
+function hydrateImagePreviews(imgs, ctx) {
+  for (var i = 0; i < imgs.length; i++) hydrateOne(imgs[i], ctx);
+}
+function hydrateOne(img, ctx) {
+  if (img.getAttribute("data-bq-img-state")) return;
+  var path = img.getAttribute("data-bq-img-path");
+  var type = img.getAttribute("data-bq-img-type") || "";
+  if (!path) {
+    img.setAttribute("data-bq-img-state", "error");
+    return;
+  }
+  img.setAttribute("data-bq-img-state", "loading");
+  img.addEventListener("load", function() {
+    img.setAttribute("data-bq-img-state", "ready");
+    if (ctx.onLoad) ctx.onLoad(path);
+  });
+  img.addEventListener("error", function() {
+    onImageError(img, ctx, path, type);
+  });
+  var warm = peekImagePreviewUrl(ctx, path);
+  if (warm) {
+    img.setAttribute("src", warm);
+    return;
+  }
+  resolveImagePreviewUrl(ctx, path, type).then(function(url) {
+    if (img.getAttribute("data-bq-img-state") !== "loading") return;
+    img.setAttribute("src", url);
+  }, function(e) {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, e);
+  });
+}
+function onImageError(img, ctx, path, type) {
+  if (img.getAttribute("data-bq-img-retry") === "1") {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, new Error("image preview failed to load"));
+    return;
+  }
+  img.setAttribute("data-bq-img-retry", "1");
+  img.removeAttribute("src");
+  resolveImagePreviewUrl(ctx, path, type, true).then(function(url) {
+    img.setAttribute("src", url);
+  }, function(e) {
+    img.setAttribute("data-bq-img-state", "error");
+    if (ctx.onError) ctx.onError(path, e);
+  });
+}
+
 // src/engine/time.ts
 function wallClockNow() {
   return Date.now();
@@ -1121,6 +1325,25 @@ var DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
 var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
+var VARIANT_IMAGE_DETAIL = "original";
+var VARIANT_TEXT_VERBOSITY = "high";
+var OLDEST_NANO_REASONING_EFFORT = "high";
+var isOpenAINano = (model) => {
+  const normalized = (model).trim().toLowerCase();
+  if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+  const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = match[2] === void 0 ? null : Number(match[2]);
+  return major > 5 || major === 5 && minor !== null && minor >= 4;
+};
+var variantIndexingOptions = (model) => {
+  if (!isOpenAINano(model) || !isOldestNano(model)) return {};
+  return {
+    ...{ text: { verbosity: VARIANT_TEXT_VERBOSITY } } ,
+    ...{ reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } 
+  };
+};
 var getOpenAIImageDetail = (model) => {
   const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
   const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
@@ -1134,12 +1357,40 @@ var getOpenAIImageDetail = (model) => {
   if (!supportsOriginal) {
     return DEFAULT_OPENAI_IMAGE_DETAIL;
   }
-  return isVariant ? "high" : "original";
+  return isVariant ? VARIANT_IMAGE_DETAIL : "original";
 };
 var getRenderImageDetail = (model) => {
   const detail = getOpenAIImageDetail(model);
   return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? "high" : detail;
 };
+var OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
+var isRecognisedOpenAIVersion = (model) => OPENAI_VERSIONED_ID.test((model || DEFAULT_OPENAI_MODEL).trim().toLowerCase());
+var isOldestNano = (model) => {
+  const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+  if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+  const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+  if (!match) return true;
+  const major = Number(match[1]);
+  const minor = match[2] === void 0 ? null : Number(match[2]);
+  if (major < 5) return true;
+  if (major > 5) return false;
+  return minor === null || minor <= 4;
+};
+var SMALL_TIER_PAGES_PER_WINDOW = 2;
+var DOWNSAMPLED_TIER_TILE = 2;
+function getVisionProfile(model) {
+  const detail = getRenderImageDetail(model);
+  if (!isRecognisedOpenAIVersion(model)) {
+    return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+  }
+  if (detail !== "original") {
+    return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
+  }
+  if (isOldestNano(model)) {
+    return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
+  }
+  return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+}
 var IMAGE_URL_REGEX = /\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
 function transformContentWithImages(content) {
   if (typeof content !== "string" || !content) {
@@ -1220,6 +1471,7 @@ function applyHistoryCacheBreakpoint(messages) {
   });
 }
 var POLL_INTERVAL = 3e3;
+var MAX_CONCURRENT_BG_POLLS = 6;
 async function callClaudeWithMcp({
   prompt,
   messages,
@@ -1384,16 +1636,18 @@ async function notifyAgentSaveAttachment(info) {
   const renderFrom = Math.max(0, info.renderFrom || 0);
   const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
   const renderDetail = platform === "openai" ? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
+  const visionProfile = platform === "openai" ? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL) : { pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
   const skapiRender = visionFile && renderPlaceholder ? {
     _skapi_render: [
       {
         path: attachment.storagePath,
         from: renderFrom,
-        count: RENDER_PAGES_PER_WINDOW,
+        count: visionProfile.pagesPerWindow,
         placeholder: renderPlaceholder,
         name: attachment.name,
         mime: attachment.mime,
         detail: renderDetail,
+        tile: visionProfile.tile,
         auto_continue: true,
         continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder)
       }
@@ -1410,6 +1664,12 @@ async function notifyAgentSaveAttachment(info) {
         name: attachment.name,
         mime: attachment.mime,
         kind: "window",
+        // Same per-image `detail` the render path sends. Without it the worker falls
+        // back to its model-blind default of 'high', so a spreadsheet's embedded
+        // photos were tiled at lower resolution than the SAME model gets for a PDF
+        // page or a chat attachment. That is why a model could describe an attached
+        // photo but reported the pictures inside a sheet as only partly legible.
+        detail: renderDetail,
         auto_continue: true,
         continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true)
       }
@@ -1419,13 +1679,27 @@ async function notifyAgentSaveAttachment(info) {
   const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
   const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
   const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
-  const skapiExtract = extractContent && extractContent.length ? { _skapi_extract: extractContent } : {};
+  const skapiExtract = extractContent && extractContent.length ? {
+    _skapi_extract: extractContent.map((d) => ({
+      ...d,
+      // FIRST pass of an INDEXING run only: tells the worker to also pull the
+      // file's embedded pictures into __MEDIA__ and register their records.
+      // Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
+      // never sets this, so merely ATTACHING a file to a chat message cannot
+      // write media records; a CONTINUE pass skips it because the first pass
+      // already saved (the save is whole-file, not windowed).
+      save_media: !continuing
+    }))
+  } : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
   );
   const systemPrompt = buildIndexingSystemPrompt({
-    service,
+    // The model copies this id verbatim into project_id tool calls, so it must be
+    // the PUBLIC token whenever the host supplied one; the raw code is rejected
+    // by the tools' schema pattern.
+    projectId: info.publicProjectId || service,
     serviceName: info.serviceName,
     serviceDescription: info.serviceDescription
   });
@@ -1447,6 +1721,8 @@ async function notifyAgentSaveAttachment(info) {
       data: {
         model: resolvedModel2,
         max_output_tokens: MAX_TOKENS,
+        // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
+        ...variantIndexingOptions(resolvedModel2),
         ...skapiExtract,
         ...skapiRender,
         ...skapiWindow,
@@ -1603,7 +1879,9 @@ function isBgIndexingQueue(queueName) {
   return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
 }
 var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+var EMPTY_INDEXING_REPLY = "Finished reading this file.";
 var MAX_INDEXING_RESUME_PASSES = 6;
+var CHAT_HISTORY_PAGE_LIMIT = 500;
 async function getChatHistory(params, fetchOptions) {
   const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
   const p = Object.assign(
@@ -1617,7 +1895,7 @@ async function getChatHistory(params, fetchOptions) {
   );
   return chatEngineConfig().clientSecretRequestHistory(
     p,
-    Object.assign({ ascending: false }, fetchOptions)
+    Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
   );
 }
 
@@ -1684,6 +1962,8 @@ function mapHistoryListToMessages(list, platform, opts) {
     var userText = extractLastUserTextFromRequest(requestBody);
     var assistantText = isPending ? "" : (extractAssistantText(response) || "").trim() || "";
     var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
+    var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+    if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
     var createdTs = Number(item && item.created);
     var updatedTs = Number(item && item.updated);
@@ -1708,7 +1988,7 @@ function mapHistoryListToMessages(list, platform, opts) {
           displayContent = userText;
         }
       } else {
-        displayContent = sanitizeAttachmentLinksForHistory(userText, opts.serviceId);
+        displayContent = sanitizeAttachmentLinksForHistory(userText, opts.projectId);
       }
       var userMsg = { role: "user", content: displayContent };
       if (isInProcess) userMsg.isPendingInProcess = true;
@@ -1735,11 +2015,12 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
       if (replyTs !== void 0) em._ts = replyTs;
       mapped.push(em);
-    } else if (assistantText) {
-      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.serviceId, true) };
+    } else if (assistantText || reportedComplete) {
+      var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
+      if (reportedComplete) okm._indexComplete = true;
       mapped.push(okm);
     }
   });
@@ -1798,6 +2079,16 @@ async function fillHistoryViewport(opts) {
 function createHistoryFiller(base) {
   var pending = [];
   var running = false;
+  var fetching = false;
+  function announce(next) {
+    if (fetching === next) return;
+    fetching = next;
+    if (!base.onRunningChange) return;
+    try {
+      base.onRunningChange(next);
+    } catch (e) {
+    }
+  }
   async function allSatisfied() {
     var next = [];
     for (var i = 0; i < pending.length; i++) {
@@ -1807,23 +2098,33 @@ function createHistoryFiller(base) {
     return pending.length === 0;
   }
   return {
+    // The published fact, so a view and `isRunning()` can never disagree about
+    // what they are showing. A fill that never fetches is not something anyone
+    // outside this module has any use for knowing about.
     isRunning: function() {
-      return running;
+      return fetching;
     },
     fill: function(isSatisfied) {
       pending.push(isSatisfied);
       if (running) return Promise.resolve();
       running = true;
       var done = function() {
-        running = false;
         pending = [];
+        running = false;
+        announce(false);
       };
       return fillHistoryViewport({
         isSatisfied: allSatisfied,
         isEndOfList: base.isEndOfList,
         isLoading: base.isLoading,
         messageCount: base.messageCount,
-        fetchOlder: base.fetchOlder,
+        // The span opens HERE, at the first real page request: past
+        // isEndOfList, past isStale, past isSatisfied. Everything before this
+        // point is a fill that concluded there was nothing to do.
+        fetchOlder: function() {
+          announce(true);
+          return base.fetchOlder();
+        },
         isStale: base.isStale,
         maxPages: base.maxPages
       }).then(done, done);
@@ -1833,12 +2134,16 @@ function createHistoryFiller(base) {
 
 // src/engine/session.ts
 var WORKER_PASS_ADOPT_LIMIT = 20;
+var LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5e3;
+var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
 var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
 var INDEXING_DRAIN_IDLE_LOOKS = 2;
 var INDEXING_DRAIN_MIN_MS = 8e3;
 var INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1e3;
+var INDEXING_DRAIN_LOOK_TIMEOUT_MS = 45e3;
+var INDEXING_DRAIN_NUDGE_MIN_GAP_MS = 1500;
 var _g = typeof globalThis !== "undefined" ? globalThis : {};
 function nowMs() {
   return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
@@ -1900,7 +2205,10 @@ var ChatSession = class {
       historyEndOfList: false,
       historyStartKeyHistory: [],
       historyRequestToken: 0,
-      gateRefreshToken: 0
+      gateRefreshToken: 0,
+      liveIndexKeys: {},
+      liveIndexChecked: false,
+      stoppedIndexIds: {}
     };
     this.bgTaskQueue = [];
     this.cancelledServerIds = /* @__PURE__ */ new Set();
@@ -1914,6 +2222,254 @@ var ChatSession = class {
     this._stageSeq = 0;
     this._uploadBatches = 0;
     this._indexDispatchesInFlight = 0;
+    this._drainNudges = [];
+    this._liveStages = {};
+    this._liveIndexKey = "";
+    this._liveIndexAt = 0;
+    this._indexClaims = {};
+  }
+  /** What the display layer needs to decide whether a run is finished. `keys` holds
+   *  every file the server still has indexing work for; `checked` is false until the
+   *  first answer for this chat, and false means "we do not know yet". */
+  getLiveIndexState() {
+    return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+  }
+  /** Passes that were on a row when the user stopped it, so the display layer can
+   *  still tell that this run was stopped once the stop has left no other trace.
+   *  See cancelIndexingGroup, which fills it, and buildChatDisplayList, which is
+   *  the only reader. */
+  getStoppedIndexIds() {
+    return this.state.stoppedIndexIds;
+  }
+  /**
+   * Is this file ALREADY being indexed by this client?
+   *
+   * One live run per file, and the reason is what a second one looks like: the
+   * conversation grows a SECOND collapsed row for the same file (a run is opened
+   * by every FIRST pass, so two of them are two rows), the same document is read
+   * twice at full provider cost, and the two chains fight over the same records —
+   * the delete-then-repost that starts run 2 wipes what run 1 has saved so far.
+   *
+   * Asked of this client's own live work, so it cannot be wrong in the dangerous
+   * direction: a queued/running pass keeps its bgTaskQueue entry until its bubble
+   * settles, and a settled run answers false, which is what a genuine later
+   * re-index needs.
+   *
+   * The retry that made this necessary: a chip whose INDEX request failed is
+   * handed back to the composer to be retried on the next send, and an index
+   * request can fail from the client's side (a lost ack, an expired token on the
+   * response) while the server has already queued the pass. The retry then indexes
+   * a file that was never not being indexed.
+   */
+  hasLiveIndexRun(storagePath) {
+    if (!storagePath) return false;
+    var claimed = this._indexClaims[this._indexClaimKey(storagePath)];
+    if (claimed && nowMs() - claimed < INDEX_DISPATCH_CLAIM_MS) return true;
+    var id = this.host.getIdentity();
+    for (var i = 0; i < this.bgTaskQueue.length; i++) {
+      var e = this.bgTaskQueue[i];
+      if (e && e.storagePath === storagePath && e.projectId === id.projectId && e.platform === id.platform) return true;
+    }
+    return this.state.messages.some(function(m) {
+      if (!m.isBackgroundTask || m.role !== "user" || m.isCancelled) return false;
+      if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
+      return !!m._indexFile && m._indexFile.path === storagePath;
+    });
+  }
+  /** Storage paths are project-relative, and one ChatSession serves every
+   *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
+  _indexClaimKey(storagePath) {
+    return this.getHistoryCacheKey() + "|" + storagePath;
+  }
+  /**
+   * Take this file's indexing slot, or report that someone already has it.
+   *
+   * The check-and-CLAIM is what makes it safe against a second caller arriving
+   * mid-flight: the claim is written SYNCHRONOUSLY, before the first await, so a
+   * concurrent caller sees it even though no request has completed and no queue
+   * has admitted anything. Ask-then-dispatch could not do that — every source it
+   * consults only learns about a dispatch after the ack.
+   *
+   * Returns true when the caller owns the slot and should dispatch. A caller that
+   * then fails to dispatch MUST releaseIndexRun, or the file waits out the claim
+   * (a few minutes) before it can be retried.
+   */
+  claimIndexRun(storagePath) {
+    var self = this;
+    if (!storagePath) return Promise.resolve(true);
+    if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(false);
+    this._indexClaims[this._indexClaimKey(storagePath)] = nowMs();
+    return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS).then(function() {
+      if (!self.state.liveIndexKeys[storagePath]) return true;
+      self.releaseIndexRun(storagePath);
+      return false;
+    }).catch(function() {
+      return true;
+    });
+  }
+  /** Give the slot back — the dispatch failed, or was abandoned. */
+  releaseIndexRun(storagePath) {
+    if (storagePath) delete this._indexClaims[this._indexClaimKey(storagePath)];
+  }
+  /**
+   * The same question, asked of the SERVER when this page cannot answer it.
+   *
+   * hasLiveIndexRun only knows what this page did. That is not enough for the
+   * case duplicates actually come from: the first run was started before a
+   * reload, or in another tab, or its bubble has since been paged out of the
+   * loaded window — and then the retry finds nothing locally and starts a second
+   * run of a file that is still being indexed. The queue is the one place that
+   * knows, and it is already asked for exactly this list.
+   *
+   * Only a POSITIVE answer is used. Absence proves nothing here (the query is
+   * capped, and `liveIndexChecked` records that), so an unanswerable question
+   * falls back to dispatching — the cost of a wrong "no" is the duplicate this
+   * exists to prevent, and the cost of a wrong "yes" is a file that never gets
+   * indexed at all. Only one of those is recoverable by the user.
+   */
+  isIndexRunLive(storagePath) {
+    var self = this;
+    if (!storagePath) return Promise.resolve(false);
+    if (this.hasLiveIndexRun(storagePath)) return Promise.resolve(true);
+    return this._refreshLiveIndexKeys(LIVE_INDEX_SNAPSHOT_MAX_AGE_MS).then(function() {
+      return !!self.state.liveIndexKeys[storagePath];
+    }).catch(function() {
+      return false;
+    });
+  }
+  /** Re-ask the queue which files are still being indexed, unless the answer we
+   *  have is younger than `maxAgeMs`. Shared by every caller that needs a current
+   *  one; the display layer's own refresh path is the adopt ladder. */
+  _refreshLiveIndexKeys(maxAgeMs) {
+    var self = this;
+    var id = this.host.getIdentity();
+    var platform = id.platform;
+    if (!id.projectId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+    var askedKey = this.getHistoryCacheKey();
+    if (this._liveIndexKey === askedKey && nowMs() - this._liveIndexAt < maxAgeMs) {
+      return Promise.resolve();
+    }
+    var queue = bgIndexingQueueName(id.userId, id.projectId);
+    var ask = function(status) {
+      return Promise.resolve(getChatHistory(
+        { service: id.projectId, owner: id.owner, platform, queue, status },
+        { limit: WORKER_PASS_ADOPT_LIMIT }
+      )).catch(function() {
+        return null;
+      });
+    };
+    return Promise.all([ask("pending"), ask("running")]).then(function(results) {
+      if (results[0] === null || results[1] === null) return;
+      if (self.getHistoryCacheKey() !== askedKey) return;
+      self._liveIndexKey = askedKey;
+      self._recordLiveIndexKeys(results);
+    });
+  }
+  /**
+   * Replace the live-index snapshot from a queue query's raw items.
+   *
+   * Whole-snapshot, never incremental: the query returns everything unresolved on
+   * the queue, so a file MISSING from it is precisely the fact we are after. Merging
+   * would make a finished file impossible to observe.
+   */
+  _recordLiveIndexKeys(lists) {
+    var next = {};
+    var truncated = false;
+    var settledIds = {};
+    this.state.messages.forEach(function(m) {
+      if (!m._serverItemId) return;
+      if (m.isPending || m.isPendingInProcess || m.isPendingQueued) return;
+      settledIds[m._serverItemId] = true;
+    });
+    for (var li = 0; li < lists.length; li++) {
+      var list = lists[li] && Array.isArray(lists[li].list) ? lists[li].list : [];
+      if (list.length >= WORKER_PASS_ADOPT_LIMIT) truncated = true;
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        if (!item || item.status !== "pending" && item.status !== "running") continue;
+        if (item.id && settledIds[item.id]) continue;
+        var text = extractLastUserTextFromRequest(item.request_body);
+        if (!isIndexingRequestText(text)) continue;
+        var ref = parseIndexingRequestText(text);
+        if (!ref) continue;
+        if (ref.path) next[ref.path] = true;
+        if (ref.name) next[ref.name] = true;
+      }
+    }
+    var nowChecked = !truncated;
+    var was = this.state.liveIndexKeys, changed = this.state.liveIndexChecked !== nowChecked;
+    if (!changed) {
+      for (var k in next) if (!was[k]) {
+        changed = true;
+        break;
+      }
+      if (!changed) {
+        for (var k2 in was) if (!next[k2]) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    this.state.liveIndexKeys = next;
+    this.state.liveIndexChecked = nowChecked;
+    this._liveIndexAt = nowMs();
+    this._liveIndexKey = this.getHistoryCacheKey();
+    if (changed) this.host.notify();
+  }
+  /** Forget the snapshot: it describes ONE chat's queue, and the answer for the
+   *  project the user just switched to is unknown until it is asked for again. */
+  _resetLiveIndexKeys() {
+    this.state.liveIndexKeys = {};
+    this.state.liveIndexChecked = false;
+    this._liveIndexAt = 0;
+  }
+  /**
+   * Ask the queue what is still indexing, once, for the chat that is on screen.
+   *
+   * Seeds the snapshot on a history load. Without it a reloaded chat has no way to
+   * learn that a run it can see is over: the adopt ladder that normally answers this
+   * only fires when a pass SETTLES, and after a reload there is no pass left to
+   * settle — so every finished worker-driven row would spin forever.
+   *
+   * Best-effort: a failure leaves `checked` false, which reads as "still working"
+   * rather than as a false all-clear.
+   *
+   * Delegates to the adopt ladder rather than asking once. A single empty look is
+   * exactly what that ladder exists to distrust — the worker writes pass N+1 a few
+   * milliseconds AFTER flipping pass N to resolved, so a query landing in that gap
+   * sees an empty queue for a chain that is very much alive. One look would turn
+   * that into a confident "Indexed" with a green check, on the one scenario this
+   * whole feature is for, and nothing would ever re-ask: the ladder is normally
+   * triggered by a pass SETTLING, and after a reload there is no pass left to
+   * settle. The ladder re-asks at 0/2s/6s, records each answer, and as a bonus
+   * adopts and polls any live pass it finds, which makes the row genuinely active
+   * instead of merely unconfirmed.
+   */
+  refreshLiveIndexState() {
+    this._adoptWorkerIndexingPasses(0);
+  }
+  /** Forget what we know about which files are indexing — but ONLY when the
+   *  snapshot was taken for a different chat than the one on screen now. For a
+   *  consumer whose history loading is its own fork and so never reaches
+   *  loadHistory's reset — a snapshot describes ONE chat's queue, and carrying it
+   *  into another project would let a row there claim to be finished on someone
+   *  else's evidence.
+   *
+   *  Conditional for the same reason loadHistory's own reset is (the
+   *  `loadKey !== _liveIndexKey` gate): the view calls this on every mount, and
+   *  an unconditional wipe turned every re-entry to the chat into a grey
+   *  "Checking status:" sweep across rows whose state was already known. A
+   *  RE-entry keeps showing the last answer (green/yellow) while the first-page
+   *  refresh re-asks quietly; only a genuine project/platform switch starts from
+   *  "not known yet". Claiming `_liveIndexKey` here (before any answer) is the
+   *  same fudge loadHistory makes: it marks WHOSE chat the empty snapshot is
+   *  for, so repeated calls do not re-wipe, and _recordLiveIndexKeys re-claims
+   *  it when the real answer lands. */
+  resetLiveIndexState() {
+    var key = this.getHistoryCacheKey();
+    if (key === this._liveIndexKey) return;
+    this._liveIndexKey = key;
+    this._resetLiveIndexKeys();
   }
   /** Wrap an indexing-request dispatch so awaitIndexingDrained counts it as
    *  live work from the moment it is sent, not from the moment it is acked. */
@@ -1932,6 +2488,31 @@ var ChatSession = class {
     });
   }
   /**
+   * Something just happened that plausibly ENDED indexing work, so let any waiting
+   * turn look now instead of sitting out the rest of its busy interval.
+   *
+   * A nudge changes only WHEN a look happens, never what it concludes: the two
+   * agreeing idle looks, the confirm gap between them, "a failed look counts as
+   * busy" and the minimum wait are all untouched. That is why it is safe to fire
+   * from places that are merely good guesses.
+   *
+   * Fired from end-of-chain points ONLY: the adopt ladder giving up, a resume
+   * declining to continue, a pass failing. Not from every settling pass (one nudge
+   * per pass per file for the whole run), and not from an indexing request being
+   * accepted — see the note in trackIndexDispatch for why that one is actively
+   * harmful rather than merely wasteful.
+   */
+  _nudgeIndexingDrain() {
+    if (!this._drainNudges.length) return;
+    var list = this._drainNudges.slice();
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i]();
+      } catch (e) {
+      }
+    }
+  }
+  /**
    * Register a live poll so (a) a remount dedupes against it instead of stacking a
    * SECOND poll on the same item, and (b) pausePolling can stop it.
    *
@@ -1945,6 +2526,18 @@ var ChatSession = class {
     }
     this.historyItemPolls.set(id, { kind, stop });
     return p;
+  }
+  /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
+   *  Counts the registry rather than a separate tally so it cannot drift: every
+   *  attach goes through _trackPoll and every detach deletes the entry. Note an
+   *  entry left behind by pausePolling on an older skapi-js (no stop handle)
+   *  still counts, which is correct — that poll really is still running. */
+  _countBgPolls() {
+    var n = 0;
+    this.historyItemPolls.forEach(function(handle) {
+      if (handle && handle.kind === "bg") n++;
+    });
+    return n;
   }
   /**
    * Stop and forget one item's poll. Used after a cancel: the row is either gone
@@ -2027,15 +2620,14 @@ var ChatSession = class {
   }
   getHistoryCacheKey() {
     var id = this.host.getIdentity();
-    if (!id.serviceId || id.platform === "none") return "";
-    return id.serviceId + "#" + id.platform;
+    if (!id.projectId || id.platform === "none") return "";
+    return id.projectId + "#" + id.platform;
   }
   updateHistoryCache() {
     var key = this.getHistoryCacheKey();
     if (!key) return;
     this.aiChatHistoryCache[key] = {
       messages: this.state.messages.filter(function(m) {
-        if (m._stageId) return false;
         return m._ownerKey === void 0 || m._ownerKey === key;
       }),
       endOfList: this.state.historyEndOfList,
@@ -2082,6 +2674,7 @@ var ChatSession = class {
     for (var j = 0; j < msgs.length; j++) {
       var u = msgs[j];
       if (!u || u.role !== "user" || u.isBackgroundTask) continue;
+      if (u._stageId) continue;
       if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
       if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
       var settled = { role: "user", content: u.content };
@@ -2097,26 +2690,26 @@ var ChatSession = class {
     };
   }
   /**
-   * serviceId/owner are passed explicitly by every caller: a request can be
+   * projectId/owner are passed explicitly by every caller: a request can be
    * dispatched after the user moved to another project, and re-reading the live
    * identity here would silently send the turn to THAT project instead of the
    * one it was composed for. Falls back to the live read only when a caller
    * omits them.
    */
-  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, serviceId, owner) {
-    if (serviceId === void 0 || owner === void 0) {
+  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, projectId, owner) {
+    if (projectId === void 0 || owner === void 0) {
       var id = this.host.getIdentity();
-      if (serviceId === void 0) serviceId = id.serviceId;
+      if (projectId === void 0) projectId = id.projectId;
       if (owner === void 0) owner = id.owner;
     }
-    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, serviceId, owner, messages, system, model, userId, extractContent, fileUrls);
+    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls);
   }
   dispatchAgentRequest(params) {
     var self = this;
     var dispatchItemId;
     var sendAndPoll = function() {
       return Promise.resolve(
-        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.serviceId, params.owner)
+        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
           if (initial.id) {
@@ -2200,15 +2793,59 @@ var ChatSession = class {
       isPendingQueued: true,
       isUploadingAttachments: true,
       isSendingToServer: true,
+      _dimSending: true,
+      // A staged bubble has no server id for minutes, and its indexing rows are
+      // now inserted ABOVE it — so its array index moves. Both views fall back to
+      // the index when a bubble has no id, which would re-key (and in Vue, remount)
+      // this bubble on every file, restarting its transition and losing it as a
+      // scroll anchor. A local id it keeps for its whole life fixes both.
+      _localId: this._newLocalId(),
       _useBgQueue: true,
       _stageId: stageId,
       _ts: wallClockNow()
     };
     if (key) staged._ownerKey = key;
+    this._liveStages[stageId] = true;
     this.state.messages.push(staged);
     this.host.notify();
     this.host.scrollToBottom(true);
     return stageId;
+  }
+  /** Is anything in this page still uploading/dispatching for this stage? */
+  isLiveStage(stageId) {
+    return !!stageId && !!this._liveStages[stageId];
+  }
+  /**
+   * Settle any staged bubble in `list` whose chain no longer exists, and return the
+   * list (a new array only if something changed).
+   *
+   * The caller is a cache restore. A staged bubble is the one kind of message whose
+   * resolution lives entirely in page memory — no server request stands behind it
+   * yet — so a copy that outlives its upload would render "(Uploading files...)"
+   * forever with nothing left to finish it. Today nothing can: this cache dies with
+   * the page, so every restored stage is still live and this is a no-op. It exists
+   * so that stops being a silent assumption.
+   */
+  settleDeadStagedMessages(list) {
+    if (!Array.isArray(list)) return list;
+    var self = this;
+    var dead = false;
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m && m._stageId && !self._liveStages[m._stageId]) {
+        dead = true;
+        break;
+      }
+    }
+    if (!dead) return list;
+    return list.map(function(m2) {
+      if (!m2 || !m2._stageId || self._liveStages[m2._stageId]) return m2;
+      var settled = { role: "user", content: m2.content };
+      if (m2._ownerKey !== void 0) settled._ownerKey = m2._ownerKey;
+      if (m2._ts !== void 0) settled._ts = m2._ts;
+      if (m2._localId !== void 0) settled._localId = m2._localId;
+      return settled;
+    });
   }
   _stageIndex(list, stageId) {
     if (!stageId) return -1;
@@ -2218,32 +2855,46 @@ var ChatSession = class {
     return -1;
   }
   /**
-   * Where a staged turn belongs once it is finally sent: BELOW every indexing
-   * row, because that is the order it ran in and the order the server history
-   * will report on the next load (its request id is newer than every pass it
-   * waited for). While its files were uploading it sat above them — the rows
-   * are injected as each file's pass starts, after the bubble was staged.
+   * Staged turn, phase 2: its files are up and it is now waiting for the whole
+   * indexing chain behind them. Swaps "(Uploading files...)" for
+   * "(Indexing files...)"; the bubble stays dimmed, because from the user's side
+   * nothing has been handed over yet.
    *
-   * Returns the index to insert at, or -1 to leave the turn where it is. Never
-   * moves a turn UP: a bubble that already sits below the indexing rows (or a
-   * chat with no indexing at all) must not jump backwards over anything.
+   * It deliberately does NOT say "(In queue)" here. The turn is not queued behind
+   * anything the server knows about yet — it is waiting on work that can run for
+   * minutes — and claiming otherwise is what made the wait look like a stall.
    */
-  _settledStagePosition(fromIdx) {
-    var lastBg = -1;
-    for (var i = 0; i < this.state.messages.length; i++) {
-      if (this.state.messages[i] && this.state.messages[i].isBackgroundTask) lastBg = i;
-    }
-    if (lastBg <= fromIdx) return -1;
-    return lastBg;
-  }
-  /** The staged turn's files are up; it is now just waiting its place in the
-   *  queue. Drops the "(Uploading files...)" note back to "(In queue)". */
-  markStagedMessageQueued(stageId) {
+  markStagedMessageIndexing(stageId) {
     var idx = this._stageIndex(this.state.messages, stageId);
     if (idx === -1) return;
     var ex = this.state.messages[idx];
     if (!ex.isUploadingAttachments) return;
-    this.state.messages[idx] = Object.assign({}, ex, { isUploadingAttachments: false });
+    this.state.messages[idx] = Object.assign({}, ex, {
+      isUploadingAttachments: false,
+      isAwaitingIndexing: true
+    });
+    this.host.notify();
+  }
+  /**
+   * Staged turn, phase 3: the last of its files has finished indexing, so the turn
+   * is genuinely just queued now. Full opacity + "(In queue)".
+   *
+   * Clears the PRESENTATIONAL _dimSending only; isSendingToServer stays set until
+   * the server actually acks (it is the token that ack matches on). Called by the
+   * clients the instant awaitIndexingDrained resolves, i.e. immediately before the
+   * dispatch that replaces this bubble — dispatchComposedMessage carries the
+   * cleared flag onto the replacement so the turn does not blink back to dimmed.
+   */
+  markStagedMessageReady(stageId) {
+    var idx = this._stageIndex(this.state.messages, stageId);
+    if (idx === -1) return;
+    var ex = this.state.messages[idx];
+    if (!ex.isAwaitingIndexing && !ex._dimSending && !ex.isUploadingAttachments) return;
+    this.state.messages[idx] = Object.assign({}, ex, {
+      isUploadingAttachments: false,
+      isAwaitingIndexing: false,
+      _dimSending: false
+    });
     this.host.notify();
   }
   /**
@@ -2270,7 +2921,7 @@ var ChatSession = class {
    */
   awaitIndexingDrained(identity) {
     var self = this;
-    var svcId = identity && identity.serviceId;
+    var svcId = identity && identity.projectId;
     var platform = identity && identity.platform;
     if (!svcId || platform !== "claude" && platform !== "openai") return Promise.resolve("skipped");
     var owner = identity.owner;
@@ -2279,11 +2930,29 @@ var ChatSession = class {
     var deadline = startedAt + INDEXING_DRAIN_TIMEOUT_MS;
     var idleLooks = 0;
     var ask = function(status) {
-      return Promise.resolve(getChatHistory(
-        { service: svcId, owner, platform, queue, status },
-        { limit: WORKER_PASS_ADOPT_LIMIT }
-      )).catch(function() {
-        return null;
+      var answered = false;
+      return new Promise(function(res) {
+        var bail = null;
+        var settle = function(v) {
+          if (answered) return;
+          answered = true;
+          if (bail) {
+            clearTimeout(bail);
+            bail = null;
+          }
+          res(v);
+        };
+        bail = setTimeout(function() {
+          settle(null);
+        }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
+        Promise.resolve(getChatHistory(
+          { service: svcId, owner, platform, queue, status },
+          { limit: WORKER_PASS_ADOPT_LIMIT }
+        )).then(function(r) {
+          settle(r);
+        }, function() {
+          settle(null);
+        });
       });
     };
     var hasLiveIndexing = function(res) {
@@ -2296,12 +2965,42 @@ var ChatSession = class {
       return false;
     };
     return new Promise(function(resolve) {
-      var again = function() {
-        setTimeout(look, idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS);
+      var timer = null;
+      var lastLookAt = -Infinity;
+      var nudgedThisInterval = false;
+      var inFlight = false;
+      var finish = function(v) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        var ni = self._drainNudges.indexOf(nudge);
+        if (ni !== -1) self._drainNudges.splice(ni, 1);
+        resolve(v);
+      };
+      var again = function(ms) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        var wait = ms == null ? idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS : ms;
+        timer = setTimeout(look, wait);
+      };
+      var nudge = function() {
+        if (idleLooks > 0) return;
+        if (inFlight) return;
+        if (nudgedThisInterval) return;
+        if (self._indexDispatchesInFlight > 0) return;
+        nudgedThisInterval = true;
+        again(Math.max(0, INDEXING_DRAIN_NUDGE_MIN_GAP_MS - (nowMs() - lastLookAt)));
       };
       var look = function() {
+        timer = null;
+        if (inFlight) return;
+        lastLookAt = nowMs();
+        nudgedThisInterval = false;
         if (nowMs() >= deadline) {
-          resolve("timedout");
+          finish("timedout");
           return;
         }
         if (self._indexDispatchesInFlight > 0) {
@@ -2309,20 +3008,24 @@ var ChatSession = class {
           again();
           return;
         }
+        inFlight = true;
         Promise.all([ask("running"), ask("pending")]).then(function(res) {
+          inFlight = false;
           var unknown = res[0] === null || res[1] === null;
           if (unknown || hasLiveIndexing(res[0]) || hasLiveIndexing(res[1])) idleLooks = 0;
           else idleLooks += 1;
           if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) {
-            resolve("drained");
+            finish("drained");
             return;
           }
           again();
         }, function() {
+          inFlight = false;
           idleLooks = 0;
           again();
         });
       };
+      self._drainNudges.push(nudge);
       look();
     });
   }
@@ -2333,12 +3036,14 @@ var ChatSession = class {
    * failure separately.
    */
   settleStagedMessage(stageId) {
+    delete this._liveStages[stageId];
     var idx = this._stageIndex(this.state.messages, stageId);
     if (idx === -1) return;
     var ex = this.state.messages[idx];
     var settled = { role: "user", content: ex.content };
     if (ex._ownerKey !== void 0) settled._ownerKey = ex._ownerKey;
     if (ex._ts !== void 0) settled._ts = ex._ts;
+    if (ex._localId !== void 0) settled._localId = ex._localId;
     this.state.messages[idx] = settled;
     this.host.notify();
     this.updateHistoryCache();
@@ -2358,8 +3063,9 @@ var ChatSession = class {
       if (stageId) this.settleStagedMessage(stageId);
       return;
     }
+    if (stageId) delete this._liveStages[stageId];
     var llmComposed = composedForLlm || composed;
-    var key = !id.serviceId ? "" : id.serviceId + "#" + id.platform;
+    var key = !id.projectId ? "" : id.projectId + "#" + id.platform;
     var offChat = !!key && key !== this.getHistoryCacheKey();
     var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function(m) {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
@@ -2367,7 +3073,7 @@ var ChatSession = class {
     var aiPlatform = id.platform;
     var aiModel = id.model || void 0;
     var systemPrompt = pinned ? pinned.systemPrompt : this.host.buildSystemPrompt();
-    var userId = id.userId || id.serviceId;
+    var userId = id.userId || id.projectId;
     var chatQueue = useBgQueue ? bgIndexingQueueName(userId) : userId;
     if (offChat) {
       var offHistory = (this.aiChatHistoryCache[key] ? this.aiChatHistoryCache[key].messages : []).filter(function(m) {
@@ -2377,7 +3083,7 @@ var ChatSession = class {
         platform: aiPlatform,
         model: aiModel,
         systemPrompt,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         history: offHistory.concat([{ role: "user", content: llmComposed }])
       });
       var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
@@ -2388,8 +3094,16 @@ var ChatSession = class {
         this.state.messages.splice(offStage, 1);
         this.host.notify();
       }
+      var offCached = offExisting.messages;
+      if (stageId) {
+        offCached = offCached.filter(function(m) {
+          if (m._stageId !== stageId) return true;
+          if (offStage === -1 && m._ts !== void 0) offUser._ts = m._ts;
+          return false;
+        });
+      }
       this.aiChatHistoryCache[key] = {
-        messages: offExisting.messages.concat([
+        messages: offCached.concat([
           offUser,
           { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
         ]),
@@ -2398,7 +3112,7 @@ var ChatSession = class {
       };
       this.dispatchAgentRequest({
         key,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         owner: id.owner,
         aiPlatform,
         aiModel,
@@ -2419,22 +3133,19 @@ var ChatSession = class {
         platform: aiPlatform,
         model: aiModel,
         systemPrompt,
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         history: resolvedHistory.concat([{ role: "user", content: llmComposed }])
       });
-      var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _ts: wallClockNow() };
+      var queuedBubble = { role: "user", content: composed, isPendingQueued: true, isSendingToServer: true, _dimSending: true, _localId: this._newLocalId(), _ts: wallClockNow() };
       if (key) queuedBubble._ownerKey = key;
       if (useBgQueue) queuedBubble._useBgQueue = true;
       var qStage = this._stageIndex(this.state.messages, stageId);
       if (qStage !== -1) {
-        if (this.state.messages[qStage]._ts !== void 0) queuedBubble._ts = this.state.messages[qStage]._ts;
-        var qTarget = this._settledStagePosition(qStage);
-        if (qTarget === -1) {
-          this.state.messages.splice(qStage, 1, queuedBubble);
-        } else {
-          this.state.messages.splice(qStage, 1);
-          this.state.messages.splice(qTarget, 0, queuedBubble);
-        }
+        var qEx = this.state.messages[qStage];
+        if (qEx._ts !== void 0) queuedBubble._ts = qEx._ts;
+        if (qEx._dimSending === false) queuedBubble._dimSending = false;
+        if (qEx._localId) queuedBubble._localId = qEx._localId;
+        this.state.messages.splice(qStage, 1, queuedBubble);
       } else {
         this.state.messages.push(queuedBubble);
       }
@@ -2442,13 +3153,13 @@ var ChatSession = class {
       this.updateHistoryCache();
       this.host.scrollToBottom(true);
       var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
-      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.serviceId, id.owner)).then(function(result) {
+      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner)).then(function(result) {
         var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
           return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
         });
         var serverId = result && typeof result.id === "string" ? result.id : void 0;
         if (sendingIdx >= 0) {
-          var upd = Object.assign({}, self.state.messages[sendingIdx], { isSendingToServer: false });
+          var upd = Object.assign({}, self.state.messages[sendingIdx], { isSendingToServer: false, _dimSending: false });
           if (serverId) upd._serverItemId = serverId;
           self.state.messages[sendingIdx] = upd;
           self.host.notify();
@@ -2469,18 +3180,14 @@ var ChatSession = class {
       });
       return;
     }
-    var immediateUser = { role: "user", content: composed, _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
+    var immediateUser = { role: "user", content: composed, _localId: this._newLocalId(), _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
     var immediatePlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} };
     var iStage = this._stageIndex(this.state.messages, stageId);
     if (iStage !== -1) {
-      if (this.state.messages[iStage]._ts !== void 0) immediateUser._ts = this.state.messages[iStage]._ts;
-      var iTarget = this._settledStagePosition(iStage);
-      if (iTarget === -1) {
-        this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
-      } else {
-        this.state.messages.splice(iStage, 1);
-        this.state.messages.splice(iTarget, 0, immediateUser, immediatePlaceholder);
-      }
+      var iEx = this.state.messages[iStage];
+      if (iEx._ts !== void 0) immediateUser._ts = iEx._ts;
+      if (iEx._localId) immediateUser._localId = iEx._localId;
+      this.state.messages.splice(iStage, 1, immediateUser, immediatePlaceholder);
     } else {
       this.state.messages.push(immediateUser);
       this.state.messages.push(immediatePlaceholder);
@@ -2498,12 +3205,12 @@ var ChatSession = class {
       platform: aiPlatform,
       model: aiModel,
       systemPrompt,
-      serviceId: id.serviceId,
+      projectId: id.projectId,
       history: historyForLlm
     });
     var run = this.dispatchAgentRequest({
       key,
-      serviceId: id.serviceId,
+      projectId: id.projectId,
       owner: id.owner,
       aiPlatform,
       aiModel,
@@ -2560,12 +3267,41 @@ var ChatSession = class {
     if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
     if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
     if (existing.isSendingToServer) promoted.isSendingToServer = true;
+    if (existing._dimSending) promoted._dimSending = true;
+    if (existing._localId !== void 0) promoted._localId = existing._localId;
     this.state.messages[nextIdx] = promoted;
     var placeholder = { role: "assistant", content: "", isPending: true };
     if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
     if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
     this.state.messages.splice(nextIdx + 1, 0, placeholder);
     this.host.notify();
+  }
+  /**
+   * The "Thinking..." placeholder belonging to the user bubble at `userIdx`, or -1.
+   *
+   * Every path that creates one puts it IMMEDIATELY after its user bubble
+   * (promoteNextQueuedToRunning, the immediate-send pair, applyHistoryItemResolution),
+   * so ownership is adjacency — modulo background bubbles, which get spliced in
+   * around them. Taking the first pending assistant ANYWHERE below instead was a
+   * hijack: a turn sent with attachments never gets a placeholder of its own
+   * (promoteNextQueuedToRunning skips _useBgQueue turns) and now keeps the position
+   * it was sent in, so an ordinary turn sent while its files indexed sits BELOW it
+   * with a placeholder of its own — and the attachment turn's answer was rendered
+   * as the answer to that unrelated question.
+   */
+  _ownThinkingIndex(userIdx, serverId) {
+    if (userIdx < 0) return -1;
+    for (var i = userIdx + 1; i < this.state.messages.length; i++) {
+      var m = this.state.messages[i];
+      if (!m) return -1;
+      if (m.isBackgroundTask) continue;
+      if (m.isPending && m.role === "assistant") {
+        if (serverId && m._serverItemId && m._serverItemId !== serverId) return -1;
+        return i;
+      }
+      return -1;
+    }
+    return -1;
   }
   resolveQueuedUserBubble(serverId) {
     var liveKey = this.getHistoryCacheKey();
@@ -2593,9 +3329,7 @@ var ChatSession = class {
       if (userIdx >= 0) {
         var ex = this.state.messages[userIdx];
         this.state.messages[userIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId, ...ex._ownerKey !== void 0 ? { _ownerKey: ex._ownerKey } : {} };
-        var thIdx = this.state.messages.findIndex(function(m, i) {
-          return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-        });
+        var thIdx = this._ownThinkingIndex(userIdx, serverId);
         if (thIdx !== -1) this.state.messages.splice(thIdx, 1);
       }
       this.promoteNextQueuedToRunning();
@@ -2607,16 +3341,17 @@ var ChatSession = class {
       if (exist._serverItemId !== void 0) repl._serverItemId = exist._serverItemId;
       if (exist._ownerKey !== void 0) repl._ownerKey = exist._ownerKey;
       if (exist._ts !== void 0) repl._ts = exist._ts;
+      if (exist._localId !== void 0) repl._localId = exist._localId;
       this.state.messages[userIdx] = repl;
     }
-    var thinkingIdx = userIdx >= 0 ? this.state.messages.findIndex(function(m, i) {
-      return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-    }) : -1;
+    var thinkingIdx = this._ownThinkingIndex(userIdx, serverId);
     return thinkingIdx !== -1 ? thinkingIdx : userIdx >= 0 ? userIdx + 1 : -1;
   }
   insertAtTarget(msg, targetIdx) {
     if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = wallClockNow();
-    if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) this.state.messages[targetIdx] = msg;
+    var tgt = targetIdx >= 0 ? this.state.messages[targetIdx] : void 0;
+    var replaceable = !!tgt && !!tgt.isPending && !tgt.isBackgroundTask && this._isOwnPlaceholderOf(targetIdx, this._owningUserIndex(targetIdx));
+    if (replaceable) this.state.messages[targetIdx] = msg;
     else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
     else this.state.messages.push(msg);
   }
@@ -2733,16 +3468,21 @@ var ChatSession = class {
     var platform = id.platform;
     if (platform !== "claude" && platform !== "openai") return;
     var url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
-    var queueBase = id.userId || id.serviceId;
+    var queueBase = id.userId || id.projectId;
     var queue = msg.isBackgroundTask || msg._useBgQueue ? bgIndexingQueueName(queueBase) : queueBase;
-    this.state.messages[idx] = Object.assign({}, msg, { _cancelling: true, _cancelError: void 0 });
+    var at = this.state.messages[idx] && this.state.messages[idx]._serverItemId === serverId && this.state.messages[idx].role === msg.role ? idx : this.state.messages.findIndex(function(m) {
+      return m._serverItemId === serverId && m.role === msg.role;
+    });
+    if (at !== -1) {
+      this.state.messages[at] = Object.assign({}, this.state.messages[at], { _cancelling: true, _cancelError: void 0 });
+    }
     this.host.notify();
     Promise.resolve(this.host.cancelRequest({
       url,
       method: "POST",
       id: serverId,
       queue,
-      service: id.serviceId,
+      service: id.projectId,
       owner: id.owner
     })).then(function(result) {
       if (result && result.removed) {
@@ -2812,7 +3552,10 @@ var ChatSession = class {
    *   2. the file is remembered in cancelledIndexKeys, so the client-driven
    *      resume (maybeResumeIndexing) stops dispatching CONTINUE passes; and
    *   3. any of its passes still sitting in bgTaskQueue is dropped by the next
-   *      drain rather than surfacing a fresh "Indexing…" bubble.
+   *      drain rather than surfacing a fresh "Indexing…" bubble; and
+   *   4. the RUN is remembered (state.stoppedIndexIds), because none of the above
+   *      necessarily leaves a mark on the conversation — see below — and without
+   *      it the collapsed row reported the stopped file as finished.
    *
    * Records already written by the passes that DID run are kept — this stops the
    * work, it does not undo it.
@@ -2822,6 +3565,19 @@ var ChatSession = class {
     if (!group || !group.key) return;
     var scoped = this.getHistoryCacheKey() + "|" + group.key;
     this.cancelledIndexKeys.add(scoped);
+    if (!group.finished) {
+      var stoppedIds = {};
+      for (var sk in this.state.stoppedIndexIds) stoppedIds[sk] = true;
+      (group.members || []).forEach(function(m) {
+        var sid = m && m.msg && m.msg._serverItemId;
+        if (sid) stoppedIds[sid] = true;
+      });
+      this.bgTaskQueue.forEach(function(e) {
+        if (e && e.id && self._indexKeyOf(e) === scoped) stoppedIds[e.id] = true;
+      });
+      this.state.stoppedIndexIds = stoppedIds;
+    }
+    this._adoptWorkerIndexingPasses(0);
     var ids = group.cancellableIds || [];
     if (!ids.length) {
       this.host.notify();
@@ -2995,21 +3751,69 @@ var ChatSession = class {
     this.promoteNextQueuedToRunning();
     return this.enqueueTypewrite(pendingIdx, latest.content, lid);
   }
-  // Remove any leftover non-background pending ("Thinking…") assistant bubbles.
-  // There is normally at most ONE such bubble at a time (promoteNext* refuses to
-  // add a second), so any extra is a duplicate — it appears when a concurrent
-  // history refetch re-maps the still-"running" turn into a pending placeholder
-  // (with a real _serverItemId) while the local pending bubble (no _serverItemId)
-  // is rescued and re-appended (see loadHistory rescue below). Each resolve path
-  // only replaces the FIRST pending bubble, so without this a stray "Thinking…"
-  // survives next to the reply/error. MUST run AFTER the resolved bubble has been
-  // made non-pending and BEFORE promoteNext*() (so a freshly-promoted Thinking,
-  // which is added only once no pending assistant remains, is preserved).
+  // Remove leftover non-background pending ("Thinking…") assistant bubbles: the
+  // duplicate that appears when a concurrent history refetch re-maps the still-
+  // "running" turn into a pending placeholder (with a real _serverItemId) while the
+  // local pending bubble (no _serverItemId) is rescued and re-appended (see the
+  // loadHistory rescue below), and the orphan a resolve leaves when it splices its
+  // reply beside a placeholder instead of into it. Each resolve path only replaces
+  // ONE pending bubble, so without this a stray "Thinking…" survives forever next to
+  // the reply. MUST run AFTER the resolved bubble has been made non-pending and
+  // BEFORE promoteNext*() (which only adds a Thinking once none remains).
+  //
+  // It used to take EVERY one, on the premise that there is at most one at a time
+  // because promoteNext* refuses to add a second. That premise never covered the
+  // immediate-send path, which creates its pair directly — and a turn sent with
+  // attachments does not block the composer and resolves on its own queue, so an
+  // ordinary question asked while files index is in flight, with a placeholder of
+  // its own, exactly when the attachment turn resolves. Sweeping it left that
+  // question with no spinner and, worse, nowhere for its answer to land:
+  // typewriteLatestReply bails when there is no pending assistant, so the reply
+  // reached the cache and never the screen.
+  //
+  // The discriminator is the owning USER bubble. A live immediate send's user bubble
+  // carries NO pending flags (its in-flight-ness lives in state.sending), while every
+  // duplicate this sweep is for belongs to a user bubble that is still pending — and
+  // an orphan has no user bubble above it at all.
   _removeStrayPendingAssistants() {
     for (var k = this.state.messages.length - 1; k >= 0; k--) {
       var m = this.state.messages[k];
-      if (m.isPending && m.role === "assistant" && !m.isBackgroundTask) this.state.messages.splice(k, 1);
+      if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
+      if (this._isLiveImmediatePlaceholder(k)) continue;
+      this.state.messages.splice(k, 1);
     }
+  }
+  /** Index of the USER bubble the message at `idx` belongs to — the nearest one
+   *  above it, stepping over background bubbles (a file's indexing rows are
+   *  inserted between turns). -1 when the nearest thing above is not a user turn,
+   *  which for a placeholder means it is an orphan. */
+  _owningUserIndex(idx) {
+    for (var j = idx - 1; j >= 0; j--) {
+      var p = this.state.messages[j];
+      if (!p) return -1;
+      if (p.isBackgroundTask) continue;
+      return p.role === "user" ? j : -1;
+    }
+    return -1;
+  }
+  /** The bubble at `idx` is the "Thinking…" of a DIFFERENT turn that is still
+   *  waiting for its answer, so the sweep above must leave it alone. */
+  _isLiveImmediatePlaceholder(idx) {
+    var ui = this._owningUserIndex(idx);
+    if (ui === -1) return false;
+    var p = this.state.messages[ui];
+    return !p.isPending && !p.isPendingQueued && !p.isPendingInProcess && !p.isPendingOlder && !p.isSendingToServer && !p.isCancelled;
+  }
+  /** A pending assistant at `idx` is the placeholder OF the turn above it, so a
+   *  reply may take its slot. Every path that makes one copies the parent's
+   *  _serverItemId (or neither has one yet), so a mismatch means the slot belongs to
+   *  some other request and the reply must be spliced in beside it, not on top. */
+  _isOwnPlaceholderOf(idx, userIdx) {
+    if (userIdx === -1) return false;
+    var ph = this.state.messages[idx], u = this.state.messages[userIdx];
+    if (!ph || !u) return false;
+    if (ph._serverItemId === void 0 || u._serverItemId === void 0) return true;
+    return ph._serverItemId === u._serverItemId;
   }
   // Drop the pending flags on the resolved turn's USER bubble (preserving its
   // content + background-task marker). Needed because a bg "Indexing:" turn's user
@@ -3057,6 +3861,7 @@ var ChatSession = class {
     var indexRef = this._indexRefOfItem(itemId);
     this.applyHistoryItemResolution(itemId, response, platform);
     this.promoteNextBgQueuedToRunning();
+    this.drainBgTaskQueue();
     if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
   }
   /** The file an already-rendered background pass is about, off its request
@@ -3070,11 +3875,67 @@ var ChatSession = class {
     }
     return null;
   }
+  /**
+   * Settle a turn the server reports as cancelled: the request bubble goes to its
+   * cancelled form and the "Thinking..." placeholder goes away. The same shape
+   * cancelQueuedMessage produces locally, so a cancel this client made and one it
+   * merely found out about render identically — and an indexing pass keeps the
+   * markers that hold it in its file's collapsed row.
+   */
+  _settleCancelledItem(itemId) {
+    var uIdx = this.state.messages.findIndex(function(m) {
+      return m.role === "user" && m._serverItemId === itemId && !m.isCancelled;
+    });
+    if (uIdx !== -1) {
+      var u = this.state.messages[uIdx];
+      var cancelled = { role: "user", content: u.content, isCancelled: true, _serverItemId: itemId };
+      if (u.isBackgroundTask) cancelled.isBackgroundTask = true;
+      if (u._indexFile) cancelled._indexFile = u._indexFile;
+      if (u._useBgQueue) cancelled._useBgQueue = true;
+      if (u._ownerKey !== void 0) cancelled._ownerKey = u._ownerKey;
+      if (u._ts !== void 0) cancelled._ts = u._ts;
+      this.state.messages[uIdx] = cancelled;
+    }
+    var pIdx = this.state.messages.findIndex(function(m) {
+      return m.isPending && m.role === "assistant" && m._serverItemId === itemId;
+    });
+    if (pIdx !== -1) this.state.messages.splice(pIdx, 1);
+    this.cancelledServerIds.delete(itemId);
+    this._removeStrayPendingAssistants();
+    this.host.notify();
+    this.updateHistoryCache();
+  }
+  /**
+   * A poll that came back saying the request was CANCELLED, rather than with an
+   * answer.
+   *
+   * The server keeps a cancelled request as a terminal row instead of deleting it
+   * (that row is the durable record of the stop, and the chat history it belongs
+   * to), so a poll still running when the cancel lands now RESOLVES on it. It used
+   * to reject with NOT_EXISTS, and the resolution path below reads a status object
+   * as an answer with no text — which would stamp "No text response received from
+   * AI provider" over a turn the user had just stopped.
+   *
+   * Reachable whenever the poll was not stopped by whoever cancelled: another tab,
+   * another device, or the row being cancelled server-side by the file's own stop.
+   */
+  _isCancelledPollResult(response) {
+    if (!response || typeof response !== "object" || response.status !== "cancelled") return false;
+    if (response.content !== void 0 || response.output !== void 0) return false;
+    return response.queue_name !== void 0 || response.in_queue !== void 0;
+  }
   applyHistoryItemResolution(itemId, response, platform) {
     this.historyItemPolls.delete(itemId);
+    if (this._isCancelledPollResult(response)) {
+      this._settleCancelledItem(itemId);
+      return;
+    }
     var isErr = isErrorResponseBody(response);
     var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
-    if (!isErr && answer) answer = answer.split(INDEXING_COMPLETE_MARKER).join("").trim();
+    var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+    var stripMarker = function(t) {
+      return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join("").trim() : t;
+    };
     var idx = this.state.messages.findIndex(function(m) {
       return m.isPending && m._serverItemId === itemId;
     });
@@ -3090,7 +3951,7 @@ var ChatSession = class {
       }
       var text = answer || "No text response received from AI provider.";
       if (wasBgTask) {
-        this.state.messages[idx] = { role: "assistant", content: text, isBackgroundTask: true, _serverItemId: itemId };
+        this.state.messages[idx] = { role: "assistant", content: stripMarker(text) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} };
         this.host.notify();
         this.updateHistoryCache();
         return;
@@ -3123,7 +3984,7 @@ var ChatSession = class {
     }
     var text2 = answer || "No text response received from AI provider.";
     if (ex.isBackgroundTask) {
-      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: text2, isBackgroundTask: true, _serverItemId: itemId });
+      this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: stripMarker(text2) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} });
       this.host.notify();
       this.updateHistoryCache();
       return;
@@ -3144,7 +4005,7 @@ var ChatSession = class {
     if (!entry) return "";
     var file = entry.storagePath || entry.filename;
     if (!file) return "";
-    return entry.serviceId + "#" + entry.platform + "|" + file;
+    return entry.projectId + "#" + entry.platform + "|" + file;
   }
   /**
    * Reconcile the bg queue with the files the user has stopped.
@@ -3154,17 +4015,33 @@ var ChatSession = class {
    * path, and without this an earlier cancel would silently kill every future
    * index of the same path. A continuation of a stopped file is dropped instead,
    * covering the pass that was dispatched in the moment before the cancel landed.
+   *
+   * "Fresh" is the load-bearing word, and it used to be missing. A run's OWN first
+   * pass sits in this queue for as long as it runs (entries are only dropped once
+   * their bubble settles), so stopping a file during its first pass — which is
+   * exactly when a user who has just uploaded it does — met that first-pass entry
+   * on the very next drain and lifted the stop the user had just asked for. The
+   * chain then carried on, one worker-minted window after another, with nothing
+   * client-side left to suppress it. The ids recorded at stop time are what tells
+   * the two apart: a pass that was already there when the user hit Stop cannot be
+   * the new request that lifts it.
    */
   _applyIndexCancellations() {
     if (!this.cancelledIndexKeys.size) return;
+    var surfaced = {};
+    this.state.messages.forEach(function(m) {
+      if (!m._serverItemId) return;
+      if (m.isPending || m.isPendingQueued || m.isPendingInProcess) surfaced[m._serverItemId] = true;
+    });
     for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
       var entry = this.bgTaskQueue[i];
       var key = this._indexKeyOf(entry);
       if (!key || !this.cancelledIndexKeys.has(key)) continue;
-      if (!entry.resumePass) {
+      if (!entry.resumePass && !this.state.stoppedIndexIds[entry.id]) {
         this.cancelledIndexKeys.delete(key);
         continue;
       }
+      if (surfaced[entry.id]) continue;
       this.bgTaskQueue.splice(i, 1);
       this._stopPoll(entry.id);
       this._cancelServerItem(entry.id);
@@ -3217,10 +4094,10 @@ var ChatSession = class {
     if (this._adoptingWorkerPasses) return;
     var id = this.host.getIdentity();
     var platform = id.platform;
-    if (!id.serviceId || platform !== "claude" && platform !== "openai") return;
+    if (!id.projectId || platform !== "claude" && platform !== "openai") return;
     if (this.isPollingPaused() || !this.host.isViewMounted()) return;
-    var svcId = id.serviceId, owner = id.owner;
-    var queue = bgIndexingQueueName(id.userId, id.serviceId);
+    var svcId = id.projectId, owner = id.owner;
+    var queue = bgIndexingQueueName(id.userId, id.projectId);
     var ask = function(status) {
       return Promise.resolve(getChatHistory(
         { service: svcId, owner, platform, queue, status },
@@ -3233,8 +4110,9 @@ var ChatSession = class {
     Promise.all([ask("running"), ask("pending")]).then(function(results) {
       self._adoptingWorkerPasses = false;
       var now = self.host.getIdentity();
-      if (now.serviceId !== svcId || now.platform !== platform) return;
+      if (now.projectId !== svcId || now.platform !== platform) return;
       if (!self.host.isViewMounted()) return;
+      if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
       var adoptedIds = [];
       for (var ri = 0; ri < results.length; ri++) {
         var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
@@ -3246,10 +4124,13 @@ var ChatSession = class {
         self.drainBgTaskQueue();
         if (self._isTrackingAny(adoptedIds)) return;
       }
-      if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) return;
+      if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
+        self._nudgeIndexingDrain();
+        return;
+      }
       setTimeout(function() {
         var later = self.host.getIdentity();
-        if (later.serviceId !== svcId || later.platform !== platform) return;
+        if (later.projectId !== svcId || later.platform !== platform) return;
         if (self.isPollingPaused() || !self.host.isViewMounted()) return;
         self._adoptWorkerIndexingPasses(attempt + 1);
       }, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
@@ -3291,7 +4172,7 @@ var ChatSession = class {
     if (!ref || !ref.name) return false;
     if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
     this.bgTaskQueue.push({
-      serviceId: svcId,
+      projectId: svcId,
       platform,
       id: item.id,
       filename: ref.name,
@@ -3322,8 +4203,8 @@ var ChatSession = class {
       url,
       method: "POST",
       id: serverId,
-      queue: bgIndexingQueueName(id.userId, id.serviceId),
-      service: id.serviceId,
+      queue: bgIndexingQueueName(id.userId, id.projectId),
+      service: id.projectId,
       owner: id.owner
     })).catch(function() {
     });
@@ -3332,7 +4213,7 @@ var ChatSession = class {
   drainBgTaskQueue() {
     var self = this;
     var id = this.host.getIdentity();
-    var svcId = id.serviceId, plat = id.platform;
+    var svcId = id.projectId, plat = id.platform;
     if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
     this._applyIndexCancellations();
     this._sweepCancelledIndexing();
@@ -3346,11 +4227,13 @@ var ChatSession = class {
     });
     for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
       var e = this.bgTaskQueue[i];
-      if (e.serviceId !== svcId || e.platform !== plat) continue;
+      if (e.projectId !== svcId || e.platform !== plat) continue;
       if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
     }
+    var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+    var injectedAny = false;
     this.bgTaskQueue.forEach(function(entry) {
-      if (entry.serviceId !== svcId || entry.platform !== plat) return;
+      if (entry.projectId !== svcId || entry.platform !== plat) return;
       if (!presentIds[entry.id]) {
         var isRunning = entry.status === "running";
         var userBubble = {
@@ -3371,16 +4254,21 @@ var ChatSession = class {
         };
         if (isRunning) userBubble.isPendingInProcess = true;
         else userBubble.isPendingQueued = true;
-        self.state.messages.push(userBubble);
-        if (isRunning) {
-          self.state.messages.push({ role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id });
+        var stageAt = self._stageIndex(self.state.messages, entry.stageId);
+        var runningBubble = isRunning ? { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id } : null;
+        if (stageAt === -1) {
+          self.state.messages.push(userBubble);
+          if (runningBubble) self.state.messages.push(runningBubble);
+        } else if (runningBubble) {
+          self.state.messages.splice(stageAt, 0, userBubble, runningBubble);
+        } else {
+          self.state.messages.splice(stageAt, 0, userBubble);
         }
         presentIds[entry.id] = true;
-        self.host.notify();
-        self.updateHistoryCache();
-        self.host.scrollToBottomIfSticky(false);
+        injectedAny = true;
       }
-      if (!self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+      if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+        bgPollBudget--;
         var capturedId = entry.id, capturedPlat = plat;
         var capturedEntry = entry;
         var wasStopped = false;
@@ -3413,15 +4301,24 @@ var ChatSession = class {
           }
           self.host.notify();
           self.updateHistoryCache();
+          if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+            self._nudgeIndexingDrain();
+          }
         }).then(function() {
           if (wasStopped) return;
           var qi = self.bgTaskQueue.findIndex(function(q) {
             return q.id === capturedId;
           });
           if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+          self.drainBgTaskQueue();
         });
       }
     });
+    if (injectedAny) {
+      this.host.notify();
+      this.updateHistoryCache();
+      this.host.scrollToBottomIfSticky(false);
+    }
     this.promoteNextBgQueuedToRunning();
   }
   // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
@@ -3438,25 +4335,45 @@ var ChatSession = class {
   // as well would now double-index every window.
   maybeResumeIndexing(entry, response, platform) {
     var self = this;
+    var endOfClientChain = function() {
+      self._nudgeIndexingDrain();
+    };
     try {
       if (!entry || !entry.storagePath) return;
       if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
-      if (!isPagedReadFile(entry.filename, entry.mime)) return;
+      if (!isPagedReadFile(entry.filename, entry.mime)) {
+        endOfClientChain();
+        return;
+      }
       if (isImageVisionFile(entry.filename, entry.mime)) return;
       if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
-      if (isErrorResponseBody(response)) return;
+      if (isErrorResponseBody(response)) {
+        endOfClientChain();
+        return;
+      }
       var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
-      if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) return;
+      if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
+        endOfClientChain();
+        return;
+      }
       var pass = (entry.resumePass || 0) + 1;
-      if (pass > MAX_INDEXING_RESUME_PASSES) return;
+      if (pass > MAX_INDEXING_RESUME_PASSES) {
+        endOfClientChain();
+        return;
+      }
       var id = this.host.getIdentity();
-      if (!id || id.platform === "none" || id.serviceId !== entry.serviceId) return;
+      if (!id || id.platform === "none" || id.projectId !== entry.projectId) return;
       this.trackIndexDispatch(notifyAgentContinueIndexing({
         platform: id.platform,
         model: id.model,
-        service: id.serviceId,
+        service: id.projectId,
+        // Without this the resume pass rebuilds its system prompt from the RAW
+        // regional id (requests.ts falls back to `service`), and the model copies
+        // that id verbatim into project_id tool calls, which the MCP schema
+        // pattern rejects - the whole continue pass saves nothing.
+        publicProjectId: id.publicProjectId,
         owner: id.owner,
-        userId: id.userId || id.serviceId,
+        userId: id.userId || id.projectId,
         serviceName: id.serviceName,
         serviceDescription: id.serviceDescription,
         attachment: {
@@ -3469,7 +4386,7 @@ var ChatSession = class {
       }).then(function(ack) {
         if (ack && typeof ack.id === "string") {
           self.bgTaskQueue.push({
-            serviceId: id.serviceId,
+            projectId: id.projectId,
             platform: id.platform,
             id: ack.id,
             filename: entry.filename,
@@ -3480,6 +4397,13 @@ var ChatSession = class {
             status: ack.status === "running" ? "running" : "pending",
             poll: ack.poll,
             resumePass: pass
+            // Deliberately NOT stamped with entry.stageId. Only a batch's FIRST
+            // pass anchors to the turn; a continuation appends, which is the
+            // order the server queued it in and therefore the order
+            // promoteNextBgQueuedToRunning should spin it in. It costs nothing
+            // on screen: a continuation is folded into the run whose row
+            // already sits above the turn, and renders nothing at its own
+            // index (indexing_groups anchors a run at its FIRST loaded pass).
           });
           self.drainBgTaskQueue();
         }
@@ -3498,21 +4422,25 @@ var ChatSession = class {
   loadHistory(fetchMore, token) {
     var self = this;
     var id = this.host.getIdentity();
-    var loadKey = !id.serviceId || id.platform === "none" ? "" : id.serviceId + "#" + id.platform;
+    var loadKey = !id.projectId || id.platform === "none" ? "" : id.projectId + "#" + id.platform;
     if (token === void 0) token = this.state.gateRefreshToken;
-    if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.serviceId) {
+    if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.projectId) {
       return Promise.resolve();
     }
     this.state.historyRequestToken = token;
     this.state.loadingHistory = true;
+    if (!fetchMore && loadKey !== this._liveIndexKey) {
+      this._liveIndexKey = loadKey;
+      this._resetLiveIndexKeys();
+    }
     if (fetchMore) this.state.loadingOlderHistory = true;
     this.host.notify();
     var platform = id.platform;
-    var serviceId = id.serviceId, owner = id.owner;
+    var projectId = id.projectId, owner = id.owner;
     var options = { fetchMore };
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
     var fetchHistory = function() {
-      return getChatHistory({ service: serviceId, owner, platform }, options);
+      return getChatHistory({ service: projectId, owner, platform }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
       if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -3532,7 +4460,7 @@ var ChatSession = class {
       });
       var mapped = mapHistoryListToMessages(list, platform, {
         clearedAt: self.host.getClearedAt(),
-        serviceId: id.serviceId,
+        projectId: id.projectId,
         formatIndexingLabel: self.host.formatIndexingLabel
       }).messages;
       var keptOlderPages = false;
@@ -3638,12 +4566,26 @@ var ChatSession = class {
       self.updateHistoryCache();
       self.host.notify();
       if (!fetchMore) {
+        var bgAllow = {};
+        var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
+        if (bgHistBudget > 0) {
+          var bgIds = chatList.filter(function(it) {
+            if (it.status !== "running" && it.status !== "pending") return false;
+            if (!it.poll || !it.id) return false;
+            if (!(it._isBgTask || it._isOnBgQueue)) return false;
+            return !self.historyItemPolls.has(it.id);
+          }).map(function(it) {
+            return it.id;
+          }).sort();
+          for (var ba = 0; ba < bgIds.length && ba < bgHistBudget; ba++) bgAllow[bgIds[ba]] = true;
+        }
         chatList.forEach(function(item) {
           if (item.status !== "running" && item.status !== "pending") return;
           if (!item.poll || !item.id) return;
           if (self.historyItemPolls.has(item.id)) return;
           if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
           if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
+          if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
           var capturedId = item.id;
           var pp = item.poll({
             latency: POLL_INTERVAL,
@@ -3697,6 +4639,7 @@ var ChatSession = class {
         });
         self.drainBgTaskQueue();
       }
+      if (!fetchMore) self.refreshLiveIndexState();
       if (!fetchMore) return self.host.scrollToBottomIfSticky();
     }).catch(function(err) {
       console.warn("[chat-engine] getChatHistory failed", err);
@@ -3714,7 +4657,7 @@ var ChatSession = class {
   // Upload one attachment (a file = 1 member, a folder = N) to db storage and
   // queue indexing per member. The bytes I/O + chip rendering go through host
   // hooks; the overwrite/reindex flow, status lifecycle, and indexing live here.
-  uploadSingleAttachment(att) {
+  uploadSingleAttachment(att, stageId) {
     var self = this;
     var id = this.host.getIdentity();
     att.status = "uploading";
@@ -3761,6 +4704,7 @@ var ChatSession = class {
           return self.host.promptOverwrite(member.file.name).then(function(choice) {
             if (choice === "overwrite") {
               existedBefore = true;
+              markImagePreviewStale(self.host.getIdentity().projectId || "default", member.storagePath);
               return doMemberUpload(false);
             }
             if (choice === "skip") {
@@ -3781,17 +4725,39 @@ var ChatSession = class {
             att.storagePath = member.storagePath;
           }
           var mime = member.file.type || self.host.getMimeType(member.file.name);
-          var preIndex = existedBefore && typeof self.host.deleteExistingFileRecord === "function" ? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
-          }) : Promise.resolve();
+          var alreadyIndexing = false;
+          var preIndex = self.claimIndexRun(member.storagePath).then(function(claimed) {
+            alreadyIndexing = !claimed;
+            if (alreadyIndexing) {
+              console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
+              return;
+            }
+            if (existedBefore && typeof self.host.deleteExistingFileRecord === "function") {
+              return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+              });
+            }
+          });
+          preIndex = preIndex.then(function() {
+            if (alreadyIndexing) return;
+            if (typeof self.host.ensureFileIndexRecord !== "function") return;
+            return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
+              name: member.file.name,
+              mime: mime || void 0,
+              size: member.file.size
+            })).catch(function() {
+            });
+          });
           return preIndex.then(function() {
             return parseAttachmentContent(member.file, member.file.name, mime || void 0);
           }).then(function(parsedContent) {
+            if (alreadyIndexing) return;
             return self.trackIndexDispatch(notifyAgentSaveAttachment({
               platform: id.platform,
               model: id.model,
-              service: id.serviceId,
+              service: id.projectId,
+              publicProjectId: id.publicProjectId,
               owner: id.owner,
-              userId: id.userId || id.serviceId,
+              userId: id.userId || id.projectId,
               serviceName: id.serviceName,
               serviceDescription: id.serviceDescription,
               attachment: {
@@ -3805,7 +4771,7 @@ var ChatSession = class {
             }).then(function(ack) {
               if (ack && typeof ack.id === "string") {
                 self.bgTaskQueue.push({
-                  serviceId: id.serviceId,
+                  projectId: id.projectId,
                   platform: id.platform,
                   id: ack.id,
                   filename: member.file.name,
@@ -3814,12 +4780,17 @@ var ChatSession = class {
                   mime: mime || void 0,
                   size: member.file.size,
                   status: ack.status === "running" ? "running" : "pending",
-                  poll: ack.poll
+                  poll: ack.poll,
+                  // Puts this file's row directly above the chat turn it was
+                  // attached to (drainBgTaskQueue). Undefined for an
+                  // attachment-only send, which appends.
+                  stageId
                 });
                 self.drainBgTaskQueue();
               }
             }, function(e) {
               console.error("[chat-engine] indexing request failed", e);
+              self.releaseIndexRun(member.storagePath);
               anyIndexFailed = true;
               if (!att.errorCode && !att.errorDetail) {
                 att.errorCode = e && (e.code || e.body && e.body.code) || "";
@@ -3851,7 +4822,11 @@ var ChatSession = class {
   // message — uploading those here would attach them to the wrong turn, and
   // collecting the previous batch's finished urls would attach files the user
   // already sent. Omitted (no batch) means every chip, the old behavior.
-  uploadPendingAttachments(batchId) {
+  //
+  // `stageId` is the turn these chips were attached to, carried onto every indexing
+  // task so its collapsed row renders directly ABOVE that turn's bubble (see
+  // BgTaskEntry.stageId). Omitted for an attachment-only send, which has no turn.
+  uploadPendingAttachments(batchId, stageId) {
     var self = this;
     this.host.resetOverwriteBatch();
     this._uploadBatches += 1;
@@ -3880,7 +4855,7 @@ var ChatSession = class {
             return;
           }
         }
-        return self.uploadSingleAttachment(att).then(function(us) {
+        return self.uploadSingleAttachment(att, stageId).then(function(us) {
           collected.push.apply(collected, us);
         }).catch(function(err) {
           var removed = !self.state.attachments.some(function(a) {
@@ -3959,9 +4934,22 @@ function readFileRef(msg) {
 function isPendingMsg(m) {
   return !!(m.isPending || m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
 }
+function isHiddenPass(m) {
+  if (m.role === "user") {
+    if (m.isCancelled) return false;
+    var ref = readFileRef(m);
+    return !!(ref && ref.continued);
+  }
+  return !!m.isPending;
+}
 function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
+  var liveIndexKeys = opts && opts.liveIndexKeys || {};
+  var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+  var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
+  var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
   var hasMoreHistory = !!(opts && opts.hasMoreHistory);
+  var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
   var groups = {};
   var order = [];
   var runOfIndex = new Array(list.length);
@@ -4009,11 +4997,17 @@ function buildChatDisplayList(messages, opts) {
         status: "done",
         cancellableIds: [],
         cancelling: false,
+        stopped: false,
         mayHaveOlder: false,
         // The run's first loaded pass, and never re-stamped: see the file
         // docstring. `anchorId` is filled in once every member is known.
         anchorIndex: i,
-        anchorId: ""
+        anchorId: "",
+        // All five are derived once every member is known, below.
+        visibleMembers: [],
+        driver: "single",
+        finished: false,
+        resolving: false
       };
       order.push(runId);
     }
@@ -4030,6 +5024,11 @@ function buildChatDisplayList(messages, opts) {
     runOfIndex[i] = runId;
     if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
     if (ref && ref.name) keyByName[ref.name] = g.key;
+  }
+  var newestRunOfKey = {};
+  for (var nk in runsOfKey) {
+    var nrs = runsOfKey[nk];
+    if (nrs.length) newestRunOfKey[nrs[nrs.length - 1]] = true;
   }
   for (var rk in runsOfKey) {
     var runIds = runsOfKey[rk];
@@ -4054,6 +5053,19 @@ function buildChatDisplayList(messages, opts) {
         break;
       }
     }
+    var stopped = false;
+    for (var ki = 0; ki < grp.members.length; ki++) {
+      var km = grp.members[ki].msg;
+      if (km.isCancelled) {
+        stopped = true;
+        break;
+      }
+      if (km._serverItemId && stoppedIndexIds[km._serverItemId]) {
+        stopped = true;
+        break;
+      }
+    }
+    grp.stopped = stopped;
     for (var xi = 0; xi < grp.members.length; xi++) {
       if (grp.members[xi].msg._cancelling) {
         grp.cancelling = true;
@@ -4063,7 +5075,7 @@ function buildChatDisplayList(messages, opts) {
     var seenIds = {};
     for (var ci = 0; ci < grp.members.length; ci++) {
       var cm = grp.members[ci].msg;
-      if (cm._cancelError && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
+      if (cm._cancelError && !stopped && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
       if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
       if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
       if (ci < lastSettled) continue;
@@ -4073,9 +5085,12 @@ function buildChatDisplayList(messages, opts) {
     }
     if (active) {
       grp.status = "active";
+      if (stopped) grp.cancelling = true;
+    } else if (stopped) {
+      grp.status = "cancelled";
     } else {
       var last = grp.members[grp.members.length - 1].msg;
-      grp.status = last.isError ? "error" : last.isCancelled ? "cancelled" : "done";
+      grp.status = last.isError ? "error" : "done";
     }
     var sawFirstPass = false;
     for (var pi = 0; pi < grp.members.length; pi++) {
@@ -4091,6 +5106,35 @@ function buildChatDisplayList(messages, opts) {
     var anchor = grp.members[0];
     grp.anchorIndex = anchor.index;
     grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
+    var sawComplete = false;
+    for (var vi = 0; vi < grp.members.length; vi++) {
+      var vm = grp.members[vi];
+      if (vm.msg._indexComplete) sawComplete = true;
+      if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+    }
+    grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
+    if (grp.status === "active") {
+      grp.finished = false;
+    } else if (grp.status === "cancelled") {
+      grp.finished = true;
+    } else if (grp.driver === "single") {
+      grp.finished = true;
+    } else if (grp.driver === "client") {
+      grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
+    } else {
+      grp.finished = !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+    }
+    if (grp.status !== "done") {
+      grp.resolving = false;
+    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
+      grp.resolving = true;
+      grp.resolvingReason = "history";
+    } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
+      grp.resolving = true;
+      grp.resolvingReason = "status";
+    } else {
+      grp.resolving = false;
+    }
   }
   var out = [];
   for (var j = 0; j < list.length; j++) {
@@ -4104,6 +5148,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, groupAttachmentFailures, hasBom, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isNonRetryableRequestError, isOfficeFile, isServerExtractable, isServiceDbAttachmentHref, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, prepareDownloadText, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, repairUrlEntities, repairUrlWhitespace, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

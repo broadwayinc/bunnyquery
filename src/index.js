@@ -56,17 +56,29 @@ import {
     buildDisplayExpiredAttachmentHref,
     getExpiredAttachmentVisiblePath,
     truncateLabelForDisplay,
+    // A file whose url could not be minted: shared keys so this chip reads the
+    // same here and in agent.vue.
+    isLinkUnavailable,
+    linkUnavailableKeyForPath,
+    linkUnavailableKeyForHref,
     isHttpUrlLike,
     repairUrlWhitespace,
     classifyInlineLink,
     normalizeTrailingInlineToken,
     formatChatTimestamp,
+    // Inline image previews: the chip/preview markup is shared with agent.vue so
+    // the two clients cannot drift, and the url mint is cached outside the parse.
+    renderInlineLinkHtml,
+    IMAGE_PREVIEWS_PER_MESSAGE,
+    hydrateImagePreviews,
+    clearImagePreviewCache,
     // Per-format UTF-8 declaration for downloadable files, single-sourced in
     // engine/download_encoding.ts and mirrored in skapi-mcp.
     prepareDownloadText,
     extOf,
     EXT_CONTENT_TYPES,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
+    PREVIEW_BROWSER_CACHE_SECONDS,
     LINK_REFRESH_WINDOW_MS,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
@@ -271,7 +283,7 @@ import {
         booted: false,
         user: null,        // current UserProfile or null
         service: null,     // resolved service info ({ ai_agent, name, ... })
-        serviceId: null,
+        projectId: null,
         owner: null,
         theme: null,
         // agent config (read-only, admin-provided)
@@ -285,7 +297,7 @@ import {
 
     // Per-service storage key helper
     function skey(base) {
-        return base + ":" + (S.serviceId || "default");
+        return base + ":" + (S.projectId || "default");
     }
 
     /* ========================================================================
@@ -294,7 +306,7 @@ import {
 
     function loadTheme() {
         // Fixed key (NOT per-service): theme is a global UI preference, and at
-        // init() serviceId isn't known yet — a per-service key would save/load
+        // init() projectId isn't known yet — a per-service key would save/load
         // under different names and never persist.
         var stored = lsGet(SK.theme);
         if (stored === "dark" || stored === "light") return stored;
@@ -354,7 +366,7 @@ import {
     // Pull the service info (so we can read the admin-configured ai_agent).
     // The Skapi connection object carries the service record once resolved.
     function loadServiceInfo() {
-        S.serviceId = (S.skapi && (S.skapi.service || (S.skapi.connection && S.skapi.connection.service))) || S.serviceId;
+        S.projectId = (S.skapi && (S.skapi.service || (S.skapi.connection && S.skapi.connection.service))) || S.projectId;
         S.owner = (S.skapi && (S.skapi.owner || (S.skapi.connection && S.skapi.connection.owner))) || S.owner;
         return Promise.resolve()
             .then(function () {
@@ -364,7 +376,7 @@ import {
             .then(function (conn) {
                 if (S.opts && S.opts.dev) console.log("[bunnyquery] loadServiceInfo", conn);
                 if (conn) {
-                    S.serviceId = conn.service || S.serviceId;
+                    S.projectId = conn.service || S.projectId;
                     S.owner = conn.owner || S.owner;
                 }
                 return conn;
@@ -1545,7 +1557,7 @@ import {
      * CHAT ENGINE
      * Ported from agent.vue + ai_agent.ts. Vue reactivity → explicit
      * renderMessages()/refreshMessageBubble() calls. `currentService.value`
-     * → S.serviceId/S.owner/S.serviceName/S.serviceDescription.
+     * → S.projectId/S.owner/S.serviceName/S.serviceDescription.
      * Attachments + expired-link refresh are stubbed (next phase).
      * ======================================================================*/
 
@@ -1566,8 +1578,10 @@ import {
         // Rendered .bq-message nodes, indexed BY MESSAGE INDEX (sparse: a message
         // folded into a collapsed indexing row has no node of its own).
         messageEls: [],
-        // Expanded background-indexing rows, keyed by RUN (group.runKey), not by
-        // file: re-indexing a file is a separate row and expands separately.
+        // Expanded background-indexing rows, keyed by FILE (group.key). Not by run:
+        // runKey is renamed whenever an earlier pass of the run loads, which closed
+        // a row the user had opened. Two runs of one file therefore share an open
+        // state, which is the right reading of "show me this file's steps".
         indexGroupsOpen: {},
         messagesBox: null,       // .bq-messages element
         sending: false,
@@ -1577,6 +1591,12 @@ import {
         stickToBottom: true,
         loadingHistory: false,
         loadingOlderHistory: false,
+        // The viewport-fill LOOP is running (createHistoryFiller.onRunningChange).
+        // Spans the gaps between its pages, where loadingOlderHistory keeps dropping
+        // back to false; a collapsed indexing row that is still waiting for its own
+        // earlier passes renders off this rather than flickering once per page.
+        // View-side, not delegated to session.state: the filler is view-side too.
+        historyFilling: false,
         historyEndOfList: false,
         historyStartKeyHistory: [],
         historyRequestToken: 0,
@@ -1602,6 +1622,11 @@ import {
     var refreshingLinkMap = {};
     var refreshedExpiredLinkMap = {};
     var refreshingLinkPromises = new Map();
+    // Files we asked for a url for and did not get one: a failed mint (click or
+    // image preview) or a preview whose minted url would not load. Keyed by the
+    // engine's linkUnavailableKeyFor* so a failure reported with a storage path
+    // and one reported with a placeholder href both find their chip.
+    var unavailableLinkMap = {};
     var fileBlobCache = new Map();
     var markedReady = null;
 
@@ -1622,8 +1647,22 @@ import {
     // it was asked of, not whatever is selected when the upload finishes.
     function currentIdentity() {
         return {
-            serviceId: S.serviceId, owner: S.owner,
-            userId: (S.user && S.user.user_id) || S.serviceId,
+            projectId: S.projectId,
+            // Prefer the SDK's formatted token. The widget takes the page's own
+            // skapi-js <script> pin, and builds older than 1.8.4 have no .project_id;
+            // compose the formatted token exactly as buildSystemPrompt does, because
+            // the raw regional id must never reach the indexing prompt - the model
+            // copies it verbatim into project_id tool calls, which the MCP schema
+            // pattern rejects.
+            publicProjectId: (S.skapi && S.skapi.project_id) || (function () {
+                if (S.projectId && S.owner && S.skapi && S.skapi.util && typeof S.skapi.util.formatServiceId === "function") {
+                    try { return S.skapi.util.formatServiceId(S.projectId, S.owner); }
+                    catch (e) { /* no public compound form; leave undefined */ }
+                }
+                return undefined;
+            })(),
+            owner: S.owner,
+            userId: (S.user && S.user.user_id) || S.projectId,
             platform: S.aiPlatform, model: S.aiModel || undefined,
             serviceName: S.serviceName, serviceDescription: S.serviceDescription,
         };
@@ -1653,6 +1692,7 @@ import {
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
         deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
+        ensureFileIndexRecord: function (path, meta) { return ensureFileIndexRecordDb(path, meta); },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
@@ -1721,11 +1761,18 @@ import {
 
     /* ---- system prompt (agent.vue buildSystemPrompt) --------------------- */
     function buildSystemPrompt() {
-        // The chat system prompt now lives in @skapi/chat-engine (shared with the
-        // agent.vue chatbox so the two can't drift). bunnyquery has no "formatted"
-        // service id, so the raw serviceId is used directly.
+        // The chat system prompt now lives in the shared engine (same as the
+        // agent.vue chatbox so the two can't drift). The prompt must carry the
+        // FORMATTED project id (the public two-segment token the MCP tools accept
+        // and tell the model to copy verbatim) - S.projectId is the RAW regional
+        // code the SDK decoded at construction, which the tools reject.
+        var promptProjectId = S.projectId || "";
+        if (S.projectId && S.owner && S.skapi && S.skapi.util && typeof S.skapi.util.formatServiceId === "function") {
+            try { promptProjectId = S.skapi.util.formatServiceId(S.projectId, S.owner); }
+            catch (e) { /* keep the raw id rather than an empty prompt */ }
+        }
         return buildChatSystemPrompt({
-            formattedServiceId: S.serviceId || "",
+            projectId: promptProjectId,
             serviceName: S.serviceName,
             serviceDescription: S.serviceDescription,
         });
@@ -1778,7 +1825,10 @@ import {
     // happens AFTER the user has moved on, so it touches only what it captured at
     // Send time.
     function runAttachmentUpload(job) {
-        return session.uploadPendingAttachments(job.batchId).then(function (attachmentUrls) {
+        // stageId: each file's indexing row is inserted directly ABOVE this turn's
+        // staged bubble, so the collapsed row sits right before the message its files
+        // came with from the moment it appears (see BgTaskEntry.stageId).
+        return session.uploadPendingAttachments(job.batchId, job.stageId).then(function (attachmentUrls) {
             // Collect any failures (upload or indexing) now, grouped by error
             // code + description, so we can report them once below.
             var failureGroups = groupAttachmentFailures(CS.attachments.filter(function (a) {
@@ -1809,14 +1859,19 @@ import {
         // Upload failed (already reported), or an attachment-only turn: the files
         // are indexing and there is no chat message to send.
         if (!attachmentUrls || !job.text) return Promise.resolve();
-        // The files are up; the turn is now just waiting its place in the queue.
-        if (job.stageId) session.markStagedMessageQueued(job.stageId);
+        // The files are up; what the turn is waiting on now is their INDEXING.
+        if (job.stageId) session.markStagedMessageIndexing(job.stageId);
         // Indexing a file is a CHAIN — each pass is only enqueued once the previous
         // one lands — so a turn sent when the uploads finish is answered from a
         // half-read file, with the remaining passes queued up behind it. Wait for
         // the background queue to actually drain. (Times out rather than stranding
         // the message if a chain wedges server-side.)
         return session.awaitIndexingDrained(job.pinned.identity).then(function () {
+            // The files are indexed: the turn is genuinely just queued now, so it
+            // reads solid and "(In queue)" from this instant — not once the request
+            // lands, which is another round trip after a wait measured in minutes.
+            // Fires on 'timedout' and 'skipped' too: the turn is being sent either way.
+            if (job.stageId) session.markStagedMessageReady(job.stageId);
             // Compose the user message (attachment-link block + office-extraction
             // placeholders) via the shared engine helper — identical to agent.vue —
             // then dispatch through the shared ChatSession (which owns the queued-
@@ -1927,7 +1982,7 @@ import {
 
     /* ---- render helpers (agent.vue) -------------------------------------- */
     function getOrCreateFileHref(filename, body) {
-        var key = filename + " " + body;
+        var key = filename + "\u0000" + body;
         var existing = fileBlobCache.get(key);
         if (existing) return existing;
         // The engine decides how this format declares UTF-8: a BOM for a spreadsheet
@@ -1948,30 +2003,22 @@ import {
         var text = "↗ " + filename;
         return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
     }
-    function linkToAnchorHtml(link) {
-        var refreshing = !!refreshingLinkMap[link.expiredHref || link.href];
-        var cls = ["bq-link-button"];
-        if (link.expired) cls.push("is-expired");
-        if (refreshing) cls.push("is-refreshing");
-        var labelText = "↗ " + link.label + (refreshing ? " (fetching...)" : "");
-        var attrs = [
-            'class="' + cls.join(" ") + '"', 'href="' + escapeHtml(link.href) + '"',
-            'target="_blank"', 'rel="noopener noreferrer"',
-            'title="' + escapeHtml(link.fullLabel || link.label) + '"',
-            'download="' + escapeHtml(link.fullLabel || link.label) + '"', 'data-bq-link="1"',
-        ];
-        if (link.expired) attrs.push('data-bq-expired="1"');
-        if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeHtml(link.expiredHref) + '"');
-        if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeHtml(link.remotePath) + '"');
-        if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeHtml(link.fullLabel) + '"');
-        return "<a " + attrs.join(" ") + ">" + escapeHtml(labelText) + "</a>";
+    // The markup is the ENGINE's (renderInlineLinkHtml): this used to be a byte
+    // for byte copy of agent.vue's emitter, and the image preview would have had
+    // to be written into both. This view supplies only what is local to it.
+    function linkToAnchorHtml(link, allowImagePreview) {
+        return renderInlineLinkHtml(link, {
+            refreshing: !!refreshingLinkMap[link.expiredHref || link.href],
+            allowImagePreview: allowImagePreview,
+            unavailable: isLinkUnavailable(link, unavailableLinkMap),
+        });
     }
     // Classification is the ENGINE's (classifyInlineLink): what a link IS must
     // not be decided twice, once here and once in agent.vue. This view supplies
     // only what is local to it and renders whatever comes back.
     function buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6) {
         return classifyInlineLink(full, [g1, g2, g3, g4, g5, g6], {
-            serviceId: S.serviceId,
+            projectId: S.projectId,
             dbHostPrefix: "https://db." + hostDomain(),
             resolveFreshHref: function (expiredHref) { return refreshedExpiredLinkMap[expiredHref]; },
         });
@@ -1992,12 +2039,20 @@ import {
         }
         var codeMasks = [];
         working = working.replace(/`[^`\n]+`/g, function (match) { var idx = codeMasks.length; codeMasks.push(match); return "C" + idx + ""; });
+        // Each preview costs a presign call and an image download once hydrated,
+        // and a reply listing a folder can name dozens. Past the budget a link
+        // renders as the ordinary text chip. Local to this call, so the output
+        // stays a pure function of `content`.
+        var previewsLeft = IMAGE_PREVIEWS_PER_MESSAGE;
         var linkRe = createInlineLinkRegex();
         working = working.replace(linkRe, function (full) {
             var args = Array.prototype.slice.call(arguments, 1, 7);
             var built = buildLinkPartFromGroups(full, args[0], args[1], args[2], args[3], args[4], args[5]);
             if (!built) return full;
-            return pushPlaceholder(linkToAnchorHtml(built.part)) + (built.tail || "");
+            var allow = previewsLeft > 0;
+            var html = linkToAnchorHtml(built.part, allow);
+            if (allow && built.part.image) previewsLeft--;
+            return pushPlaceholder(html) + (built.tail || "");
         });
         working = working.replace(/C(\d+)/g, function (_m, idx) { return codeMasks[Number(idx)] || ""; });
         var html;
@@ -2112,7 +2167,7 @@ import {
         if (checkExistence === undefined) checkExistence = true;
         var params = {
             reserved_key: uploadReservedKey(),
-            service: S.serviceId,
+            service: S.projectId,
             owner: S.owner,
             request: "db",
             key: storagePath,
@@ -2136,8 +2191,32 @@ import {
     // unique_id) or a permission error must not block indexing.
     function deleteFileIndexRecordDb(storagePath) {
         if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
-        return S.skapi.deleteRecords({ service: S.serviceId, unique_id: "src::" + storagePath })
+        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
             .catch(function () { });
+    }
+    // Create the file's "src::<storagePath>" record BEFORE any indexing pass runs, so every
+    // pass has a reference target that is guaranteed to exist (mirrors ai_agent.ts). Without
+    // it the backend rejected every referencing record - including the pipeline's own
+    // "__MEDIA__" media-index writes, which land while window 1 is still being BUILT, before
+    // the model's first turn could create anything. Best-effort: losing the guarantee must
+    // not lose the upload.
+    function ensureFileIndexRecordDb(storagePath, meta) {
+        if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
+        return Promise.resolve(S.skapi.postRecord(null, {
+            service: S.projectId,
+            unique_id: "src::" + storagePath,
+            table: { name: "file_summaries", access_group: "authorized" },
+            // Deleting the file record must cascade to every record referencing it.
+            source: { can_remove_referencing_records: true },
+            data: {
+                file_name: (meta && meta.name) || storagePath.split("/").pop() || storagePath,
+                storage_path: storagePath,
+                mime_type: (meta && meta.mime) || null,
+                size_bytes: (meta && typeof meta.size === "number") ? meta.size : null,
+                indexed_at: Date.now(),
+                note: "File-level record created at upload. The indexing agent enriches this with sheet names, column headers and row counts."
+            }
+        })).catch(function () { });
     }
     // Mint a temporary CDN url for a db file (request:'get-db'), matching
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
@@ -2147,19 +2226,57 @@ import {
     // (24-48h); a plain get-db presign honours `expires` to the second. Passing
     // the flag while also passing a short `expires` is the trap: it reads as a
     // 10 minute url and behaves as a two day one.
-    function getTemporaryUrlDb(path, expires, cdn) {
+    // `contentType` overrides the extension guess. It is what decides whether a
+    // new tab DISPLAYS the file or downloads it: get_signed_url only sets
+    // ResponseContentType when we pass one, and application/octet-stream always
+    // downloads. The image preview passes the type the engine classified.
+    // `opts.browserCache` (seconds) mints through a CACHEABLE GET instead of a
+    // POST, so the same url comes back out of the browser cache and the body it
+    // already downloaded stays addressable. `opts.refresh` bypasses that cache.
+    // Neither applies to the cdn branch, whose url is stable by construction.
+    function getTemporaryUrlDb(path, expires, cdn, contentType, opts) {
+        opts = opts || {};
         var body = {
-            service: S.serviceId,
+            service: S.projectId,
             owner: S.owner,
             request: "get-db",
             key: path,
             expires: expires || ATTACHMENT_URL_EXPIRES_SECONDS,
-            contentType: mimeGetType(path) || "application/octet-stream",
+            contentType: contentType || mimeGetType(path) || "application/octet-stream",
         };
         if (cdn !== false) body.generate_temporary_cdn_url = true;
-        return S.skapi.util.request("get-signed-url", body, { auth: true, method: "post" }).then(function (res) {
+
+        var reqOpts = { auth: true, method: "post" };
+        if (cdn === false && opts.browserCache) {
+            reqOpts.method = "get";
+            // PIN THE HOST. This dest routes through the record gateway's round
+            // robin, which alternates between record_private and record_private_2
+            // — two urls for one mint, so the browser stores two entries holding
+            // two different signed urls and downloads the same image twice. The
+            // dashboard never had this because it passes a full endpoint url.
+            reqOpts.stableGateway = true;
+            // REPLACE the cached mint rather than route around it: a `nocache`
+            // query param is a different url, so the poisoned entry survives and
+            // keeps answering every ordinary mint for the rest of the week.
+            if (opts.refresh) reqOpts.revalidate = true;
+            body.browser_cache = opts.browserCache;
+            // Partitions the browser cache per user: a cache is keyed by url
+            // alone and shared by everyone using the profile, so without this a
+            // second user signing in here would be handed the first user's
+            // signed urls. The backend rejects a uid that is not the caller.
+            var uid = S.user && S.user.user_id;
+            if (uid) body.uid = uid;
+        }
+
+        return S.skapi.util.request("get-signed-url", body, reqOpts).then(function (res) {
             var u = typeof res === "string" ? res : (res && res.url);
             if (!u) throw new Error("No temporary URL returned.");
+            // ONLY the cdn branch returns a bare path to prepend the db host to.
+            // A presign is already absolute, and prefixing it produced
+            // "https://db.<host>/https://<bucket>.s3..." — a url that resolves to
+            // the db CDN, fails signature validation and 401s. That is why every
+            // cdn:false mint (image previews, expired-chip clicks) was dead.
+            if (/^https?:\/\//i.test(u)) return u;
             return "https://db." + hostDomain() + "/" + u;
         });
     }
@@ -2546,6 +2663,13 @@ import {
     // hide the attach affordances (clip button + drag-drop) below that. The flag
     // lives under ConnectionInfo.conf (S.service = getConnectionInfo() result).
     function uploadsFrozenForUser() {
+        // ANONYMOUS SESSIONS CANNOT UPLOAD, ever. The whole indexing chain runs as the
+        // uploading user, and the backend forbids anonymous users from setting unique_ids,
+        // so an anon upload would store a file whose records (the "src::" file record and
+        // every "__MEDIA__" media record) are all rejected: an unsearchable orphan. The
+        // MCP rejects the writes server-side too; hiding the affordance here means the
+        // user never hits that wall.
+        if (!S.user) return true;
         var conf = (S.service && S.service.conf) || {};
         if (!conf.freeze_database) return false;
         var ag = (S.user && typeof S.user.access_group === "number") ? S.user.access_group : 0;
@@ -2645,12 +2769,75 @@ import {
         return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false);
     }
 
+    // A url for this file could not be produced, so every chip for it stops
+    // pretending to be a link: ✕ instead of ↗, greyed, no href and no click.
+    //
+    // The re-render is coalesced because the trigger is per-IMAGE: a reply
+    // listing a folder of deleted pictures reports one failure per preview, and
+    // renderMessages rebuilds every bubble in the list. Marking is idempotent, so
+    // the repaint only happens for keys that are actually new.
+    var unavailableRepaintQueued = false;
+    function markLinkUnavailable(key) {
+        if (!key || unavailableLinkMap[key]) return;
+        unavailableLinkMap[key] = true;
+        // Nothing has necessarily minted successfully yet, so the boundary timer
+        // that clears this map may not be running.
+        if (!refreshedLinkExpiryTimer) scheduleNextLinkExpiryBoundary();
+        if (unavailableRepaintQueued) return;
+        unavailableRepaintQueued = true;
+        setTimeout(function () { unavailableRepaintQueued = false; renderMessages(); }, 0);
+    }
+
+    // Inline image previews. The same plain presign the link chips use, with the
+    // content type the engine classified, but minted through a CACHEABLE GET:
+    // without it every reload re-mints a fresh SigV4 url, which is a fresh cache
+    // key, so every visible image downloads again. See
+    // PREVIEW_BROWSER_CACHE_SECONDS. `refresh` is how the error path escapes
+    // that cache when the url it cached has since expired.
+    function imagePreviewCtx() {
+        return {
+            scope: S.projectId || "default",
+            mint: function (remotePath, contentType, refresh) {
+                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType, {
+                    browserCache: PREVIEW_BROWSER_CACHE_SECONDS,
+                    refresh: refresh,
+                });
+            },
+            // An image arriving late pushes the conversation down under the
+            // viewport. Re-pin only if the user was already at the bottom.
+            onLoad: function () { scrollToBottomIfSticky(false); },
+            // The mint was refused, or the url it minted would not load. Either
+            // way there is no url for this file, so the caption chip left behind
+            // must not keep offering a click that opens a dead tab.
+            onError: function (path, err) {
+                console.warn("[bunnyquery] image preview failed", path, err);
+                markLinkUnavailable(linkUnavailableKeyForPath(path));
+            },
+        };
+    }
+    function hydrateMessageImagePreviews() {
+        if (!CS.messagesBox) return;
+        var nodes = CS.messagesBox.querySelectorAll("img.bq-img-preview:not([data-bq-img-state])");
+        if (!nodes.length) return;
+        // A collapsed indexing row is one line and its label is the indexed
+        // file's own path, which is often an image. Never mint for those.
+        var list = Array.prototype.filter.call(nodes, function (n) {
+            return !(n.closest && n.closest(".bq-index-label"));
+        });
+        if (list.length) hydrateImagePreviews(list, imagePreviewCtx());
+    }
+
     // Drop minted hrefs on the same wall-clock boundary the dashboard uses, so a
     // cached href can never outlive the url behind it. Without this the widget
     // held a fresh href for the life of the page.
     var refreshedLinkExpiryTimer = null;
     function expireAllRefreshedLinks() {
         for (var k in refreshedExpiredLinkMap) delete refreshedExpiredLinkMap[k];
+        // Failures expire on the same boundary. A mint can fail because the file
+        // is gone, but it can also fail because the network blinked, and a chip
+        // greyed out by a five-second outage that stays grey for the life of the
+        // page is its own bug. The boundary already re-renders.
+        for (var u in unavailableLinkMap) delete unavailableLinkMap[u];
     }
     function scheduleNextLinkExpiryBoundary() {
         if (refreshedLinkExpiryTimer) clearTimeout(refreshedLinkExpiryTimer);
@@ -2669,7 +2856,7 @@ import {
         if (inFlight) return inFlight;
         var run = (function () {
             refreshingLinkMap[expiredHref] = true;
-            var resolved = remotePath || extractRemotePathFromAttachmentHref(expiredHref, S.serviceId);
+            var resolved = remotePath || extractRemotePathFromAttachmentHref(expiredHref, S.projectId);
             if (!resolved) return Promise.reject(new Error("Unable to refresh this expired attachment link."));
             return getPublicTemporaryUrl(resolved).then(function (fresh) {
                 refreshedExpiredLinkMap[expiredHref] = fresh;
@@ -2686,6 +2873,10 @@ import {
         if (!target) return;
         var anchor = target.closest ? target.closest("a[data-bq-link]") : null;
         if (!anchor) return;
+        // A chip we already failed to mint a url for carries no href and no
+        // `data-bq-expired`, so it cannot navigate and cannot ask for another
+        // mint. Swallowing the click keeps a stray listener from reviving it.
+        if (anchor.dataset.bqUnavailable === "1") { e.preventDefault(); return; }
         if (anchor.dataset.bqExpired !== "1") return;
         e.preventDefault();
         var originalHref = anchor.dataset.bqExpiredHref || anchor.href;
@@ -2700,14 +2891,18 @@ import {
             anchor.href = fresh; anchor.dataset.bqExpired = "0"; anchor.click();
         }).catch(function (err) {
             console.error("[bunnyquery] expired link refresh failed", err);
-            alert((err && err.message) || "Failed to refresh this expired link.");
+            // The chip itself is the message now: it turns grey and takes a ✕,
+            // which survives past the moment an alert would have been dismissed
+            // and does not interrupt whatever else the user was doing.
+            markLinkUnavailable(linkUnavailableKeyForHref(originalHref));
+            if (anchor.dataset.bqRemotePath) markLinkUnavailable(linkUnavailableKeyForPath(anchor.dataset.bqRemotePath));
         });
     }
 
     /* ---- history + clear-horizon (agent.vue) ----------------------------- */
     function getClearHistoryStorageKey() {
-        if (!S.serviceId || S.aiPlatform === "none") return "";
-        return SK.clearHorizon + ":" + S.serviceId + "#" + S.aiPlatform;
+        if (!S.projectId || S.aiPlatform === "none") return "";
+        return SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
     }
     function getClearedAt() {
         var key = getClearHistoryStorageKey();
@@ -2794,6 +2989,15 @@ import {
         isStale: function () { return _historyFillToken !== CS.gateRefreshToken || !CS.messagesBox || CS.chatSettingsOpen; },
         messageCount: function () { return CS.messages.length; },
         fetchOlder: function () { return fetchOlderHistoryIfNeeded(); },
+        // A collapsed indexing row whose run begins above the loaded window says
+        // "loading" for as long as the pages that would complete it keep coming, and
+        // that span is the LOOP, not a page (see createHistoryFiller). Rendering the
+        // flip is safe from here: renderMessages never starts a fill of its own, and
+        // the loop's own guard has already flipped before this is called.
+        onRunningChange: function (running) {
+            CS.historyFilling = running;
+            renderMessages();
+        },
     });
     function pageOlderHistoryUntil(isSatisfied, token) {
         if (token === undefined) token = CS.gateRefreshToken;
@@ -2897,7 +3101,10 @@ import {
         if (msg.isError) cls.push("is-error");
         if (msg.isCancelled) cls.push("is-cancelled");
         if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
-        if (msg.isSendingToServer || msg._cancelling) cls.push("is-sending-to-server");
+        // The DIM reads _dimSending, not isSendingToServer: an attachment turn is
+        // un-dimmed the moment its files finish indexing, while its own request is
+        // still un-acked for a moment longer (see ChatMessage._dimSending).
+        if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
 
         var bubble;
         if (msg.isPending) {
@@ -2919,7 +3126,10 @@ import {
             var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
             md.addEventListener("click", onBubbleLinkClick);
             bubble.appendChild(md);
+            // Order matters: a staged turn carries isPendingQueued the whole way
+            // through, so the two attachment phases have to be tested first.
             if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
+            else if (msg.isAwaitingIndexing) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Indexing files...)" }));
             else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
@@ -2941,18 +3151,42 @@ import {
     var INDEX_ICON_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5 5L20 6.5"/></svg>';
     var INDEX_ICON_ERROR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><path d="M12 16.6h.01"/></svg>';
     var INDEX_ICON_CANCELLED = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.2 8.2l7.6 7.6"/></svg>';
+    // "Not known yet" — a clock, deliberately NOT the circular arrow: a spinning
+    // sync glyph is how this row says WORK IS HAPPENING, and the whole point of
+    // this state is that it is not claiming that. CSS fades it instead of spinning.
+    var INDEX_ICON_PENDING = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.4V12l3.3 2"/></svg>';
 
+    // Head and tail must never contradict each other, so both read `finished` BEFORE
+    // status: a run between two passes has status "done" and is not finished, and a
+    // check-mark reading "Indexed" over a still-spinning tail is the exact claim this
+    // is meant to stop making. Cancelled is tested first because a stop is final
+    // whatever else is true, then `resolving` — which outranks `finished` for the
+    // same reason `finished` outranks status: it is the coarsest thing known, and
+    // both of the answers below it are derived from data still arriving. Mirrored
+    // verbatim in agent.vue.
     function indexGroupIcon(group) {
-        if (group.status === "active") return INDEX_ICON_ACTIVE;
-        if (group.status === "error") return INDEX_ICON_ERROR;
         if (group.status === "cancelled") return INDEX_ICON_CANCELLED;
+        if (group.resolving) return INDEX_ICON_PENDING;
+        if (!group.finished) return INDEX_ICON_ACTIVE;
+        if (group.status === "error") return INDEX_ICON_ERROR;
         return INDEX_ICON_DONE;
     }
 
     function indexGroupVerb(group) {
-        if (group.status === "active") return group.isReindex ? "Reindexing" : "Indexing";
-        if (group.status === "error") return "Indexing failed:";
         if (group.status === "cancelled") return "Indexing cancelled:";
+        // Name the wait. "Loading history" is a statement about the CHAT being paged
+        // in, not about the file — the row deliberately says nothing about the file
+        // until it has the run's beginning to say it from.
+        //
+        // Short on purpose. The label is one nowrap ellipsized line shared with the
+        // file name, and at the widget's narrow end (~360px) the row has roughly
+        // 196px for both: a 26-character verb ate the name down to a few characters
+        // for the whole wait, which trades one confusing row for another.
+        if (group.resolving) {
+            return group.resolvingReason === "history" ? "Loading history:" : "Checking status:";
+        }
+        if (!group.finished) return group.isReindex ? "Reindexing" : "Indexing";
+        if (group.status === "error") return "Indexing failed:";
         return group.isReindex ? "Reindexed" : "Indexed";
     }
 
@@ -2970,6 +3204,145 @@ import {
         return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
 
+    // Everything buildChatDisplayList needs to state a row's case, in ONE place:
+    // renderMessages draws the rows from it and the stop dialog re-resolves its
+    // target from it, and the two asking different questions is a bug the dialog
+    // already had (see findCancellableIndexGroup).
+    function displayListOptions() {
+        var liveIndex = session.getLiveIndexState();
+        return {
+            hasMoreHistory: !CS.historyEndOfList,
+            // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
+            // per-request flag: the viewport fill is many pages and that flag drops
+            // to false between every one of them, which is once per page of flicker
+            // on any row rendered off it.
+            loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
+            liveIndexKeys: liveIndex.keys,
+            liveIndexChecked: liveIndex.checked,
+            // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
+            // cancelled bubble behind (that pass finishes and answers normally), so
+            // without this the row reports the stop as a finished "Indexed".
+            stoppedIndexIds: session.getStoppedIndexIds(),
+        };
+    }
+
+    /* ---- stop-indexing confirmation ----------------------------------------
+     * The row's Stop only ASKS. Cancelling is not resumable from the row (the
+     * queued passes are dropped, not paused, so finishing the file means
+     * reindexing it from the start), and the button sits inside a one-line row
+     * the user is often just trying to expand — one stray click should not throw
+     * away an hour of indexing. agent.vue asks with the same wording.
+     *
+     * State holds the run KEY, not the group object: the display list is rebuilt
+     * on every render, so a group captured at click time goes stale within
+     * seconds and a pass queued while the dialog sat open would be missing from
+     * the cancellableIds we would then cancel. */
+    var stopIndexState = { runKey: "", fileKey: "", handle: null };
+
+    // Is there still work to stop? NOT "does the row have a cancellable pass right
+    // now", which is what this used to ask. A worker-driven file (any PDF, and every
+    // windowed read) has no pass in this client between two passes: the worker mints
+    // the next one itself and the client only learns about it a beat later. That gap
+    // is seconds long, happens once per pass, and is the most likely moment for a
+    // user to be looking at the row — so keying the button and the dialog off a live
+    // pass made both blink out mid-run, and a confirm that landed in the gap
+    // cancelled nothing at all while the worker carried on. `finished` is the
+    // question actually being asked, and for a worker run it is answered by the
+    // queue; `resolving` keeps it from being asked before anything is known.
+    // agent.vue's indexGroupStoppable is the same predicate.
+    function indexGroupStoppable(group) {
+        return !!group && !group.finished && !group.resolving && !group.stopped && !group.cancelling;
+    }
+
+    // The group the open dialog is about, or null once there is nothing left to
+    // stop. Rows are matched by runKey; the FILE key is the fallback for the one
+    // thing that renames a run under an open dialog — an older history page arriving
+    // with the run's true first pass, which the run is named after. Without it the
+    // confirm would silently cancel nothing.
+    function findCancellableIndexGroup(runKey, fileKey) {
+        if (!runKey) return null;
+        // The SAME options renderMessages builds the rows from. Anything less and
+        // this asks a different question than the row the user clicked: without
+        // liveIndexKeys, `finished` is false for every worker-driven run, so a file
+        // the queue has confirmed is over would still look stoppable here.
+        var list = buildChatDisplayList(CS.messages, displayListOptions());
+        var byFile = null;
+        for (var i = 0; i < list.length; i++) {
+            var row = list[i];
+            if (row.kind !== "indexing") continue;
+            var live = indexGroupStoppable(row.group) ? row.group : null;
+            if (row.group.runKey === runKey) return live;
+            if (!byFile && live && fileKey && row.group.key === fileKey) byFile = row.group;
+        }
+        return byFile;
+    }
+
+    // openModal's own dismissals (backdrop click, ×) just detach the root, so a
+    // dismissed dialog is detected here rather than through a callback.
+    function stopIndexModalIsOpen() {
+        var hnd = stopIndexState.handle;
+        if (hnd && hnd.root && hnd.root.parentNode) return true;
+        stopIndexState.runKey = "";
+        stopIndexState.fileKey = "";
+        stopIndexState.handle = null;
+        return false;
+    }
+
+    function closeStopIndexModal() {
+        var hnd = stopIndexState.handle;
+        stopIndexState.runKey = "";
+        stopIndexState.fileKey = "";
+        stopIndexState.handle = null;
+        if (hnd) hnd.close();
+    }
+
+    // The file can finish (or fail, or start cancelling) while the dialog sits
+    // open, which takes the row's Stop away — drop the dialog with it rather than
+    // leave a dead confirm on screen offering to cancel nothing. Called from every
+    // renderMessages; the list rebuild only happens while a confirm is actually
+    // open, which is a human-timescale window.
+    function syncStopIndexModal() {
+        if (!stopIndexModalIsOpen()) return;
+        if (!findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)) closeStopIndexModal();
+    }
+
+    function openStopIndexModal(group) {
+        if (!indexGroupStoppable(group)) return;
+        closeStopIndexModal();
+        stopIndexState.runKey = group.runKey;
+        stopIndexState.fileKey = group.key;
+        var name = group.name;
+        stopIndexState.handle = openModal(function (close) {
+            var stopBtn = h("button", { class: "btn btn--danger", type: "button" }, "Stop indexing");
+            stopBtn.addEventListener("click", function () {
+                var runKey = stopIndexState.runKey;
+                var fileKey = stopIndexState.fileKey;
+                closeStopIndexModal();
+                // Re-resolve: the row this was opened from is several renders old.
+                var live = findCancellableIndexGroup(runKey, fileKey);
+                if (live) session.cancelIndexingGroup(live);
+            });
+            return h("div", { class: "bq-modal" },
+                h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
+                h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Stop indexing" })),
+                // The file name is user data: translate="no" keeps a browser
+                // translator from rewriting it (agent.vue tags it the same way).
+                h("p", { class: "bq-modal-desc" },
+                    "Stop indexing “", h("span", { translate: "no", text: name }), "”?"),
+                h("p", { class: "bq-modal-desc bq-modal-delete-warn" },
+                    "Whatever has been indexed so far stays searchable, and the pass already running finishes on the server. " +
+                    "The remaining passes are dropped, not paused, so the file stays partly indexed until you reindex it."),
+                h("div", { class: "bq-modal-btns" },
+                    h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Keep indexing"),
+                    stopBtn));
+        });
+    }
+
+    // Keyed by FILE (group.key), NOT by run (group.runKey): a run is named after its
+    // first LOADED pass, so it is renamed the moment an earlier pass arrives —
+    // routine while a worker-driven chain runs, because an adopted pass reaches the
+    // client before the ones before it are paged in. Keyed by run, a row the user had
+    // opened closed itself every time that happened. See IndexingGroup.key.
     function toggleIndexGroup(key) {
         if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
         else CS.indexGroupsOpen[key] = true;
@@ -2981,8 +3354,22 @@ import {
 
     function buildIndexGroupEl(group, isOpen) {
         var cls = ["bq-index-group"];
-        if (group.status === "active") cls.push("is-active");
-        if (group.status === "error") cls.push("is-error");
+        // The row's colour, one class per state: yellow working, green indexed, red
+        // failed, grey not-known-yet and grey for anything else, cancelled included.
+        // Same ordering as indexGroupIcon: is-active is the WORKING look (warning
+        // colour, a spinning glyph) and must never win over is-resolving, where "not
+        // confirmed over" is precisely what has not been established; is-indexed
+        // mirrors the DONE glyph and is reachable only from status 'done', so a
+        // failure or a stop can never come out green.
+        //
+        // Each condition is self-contained, NOT chained with `else`: agent.vue
+        // expresses these as a class-binding object, where every entry stands alone,
+        // and the two clients must be the same booleans rather than the same
+        // outcome reached two different ways.
+        if (group.resolving) cls.push("is-resolving");
+        if (!group.resolving && !group.finished && group.status !== "cancelled") cls.push("is-active");
+        if (!group.resolving && group.finished && group.status === "done") cls.push("is-indexed");
+        if (group.finished && group.status === "error") cls.push("is-error");
         if (isOpen) cls.push("is-open");
 
         var label = h("span", { class: "bq-index-label", html: parseMsgPartsHtml(indexGroupLabel(group)) });
@@ -2995,8 +3382,11 @@ import {
         // Stop indexing this file: cancels every queued/running pass and keeps the
         // client from dispatching the next one. Sits in the head so it is reachable
         // without expanding the row; its click must not toggle that row.
+        // Offered while there is work left to stop, not while a pass happens to be
+        // live in THIS client: a worker-driven file has none between passes and the
+        // button used to blink out for the whole gap. See indexGroupStoppable.
         var cancelBtn = null;
-        if (group.cancellableIds.length || group.cancelling) {
+        if (indexGroupStoppable(group) || group.cancelling) {
             cancelBtn = h("button", {
                 class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
                 type: "button",
@@ -3007,7 +3397,7 @@ import {
             if (group.cancelling) cancelBtn.disabled = true;
             else cancelBtn.addEventListener("click", function (e) {
                 e.stopPropagation();
-                session.cancelIndexingGroup(group);
+                openStopIndexModal(group);
             });
             cancelBtn.addEventListener("keydown", function (e) { e.stopPropagation(); });
         }
@@ -3020,11 +3410,11 @@ import {
             tabindex: "0",
             "aria-expanded": isOpen ? "true" : "false",
             title: isOpen ? "Hide indexing steps" : "Show indexing steps",
-            onclick: function () { toggleIndexGroup(group.runKey); },
+            onclick: function () { toggleIndexGroup(group.key); },
             onkeydown: function (e) {
                 if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
                 e.preventDefault();
-                toggleIndexGroup(group.runKey);
+                toggleIndexGroup(group.key);
             },
         },
             h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
@@ -3040,10 +3430,14 @@ import {
                 text: "Could not stop this file: " + group.cancelError,
             }));
         }
+        // "Scroll up to load them" is an instruction, so it must not be given while
+        // the loading it asks for is already in flight: following it does nothing the
+        // row is not doing, and reads as the row not having noticed.
         if (isOpen && group.mayHaveOlder) {
             el.appendChild(h("div", {
                 class: "bq-index-note",
-                text: "Earlier passes of this file are further back in the conversation. Scroll up to load them.",
+                text: "Earlier passes of this file are further back in the conversation. "
+                    + (group.resolvingReason === "history" ? "Loading them now." : "Scroll up to load them."),
             }));
         }
         return el;
@@ -3149,6 +3543,10 @@ import {
     }
 
     function renderMessages() {
+        // Before the early returns below: a cleared history and an opened settings
+        // panel both take the row (and its Stop) off screen while the confirm this
+        // opened is still sitting on top of the widget.
+        syncStopIndexModal();
         if (!CS.messagesBox) return;
         if (CS.chatSettingsOpen) return; // the settings panel occupies the messages area
         var anchor = captureScrollAnchor();
@@ -3172,10 +3570,10 @@ import {
         // Rows, not raw messages: a file's many background-indexing turns collapse
         // into one status row. An expanded row's own turns are emitted as ordinary
         // message rows right after it, so buildMessageEl stays the single source.
-        var rows = buildChatDisplayList(CS.messages, { hasMoreHistory: !CS.historyEndOfList });
+        var rows = buildChatDisplayList(CS.messages, displayListOptions());
         rows.forEach(function (row) {
             if (row.kind === "indexing") {
-                var isOpen = !!CS.indexGroupsOpen[row.group.runKey];
+                var isOpen = !!CS.indexGroupsOpen[row.group.key];
                 var groupEl = buildIndexGroupEl(row.group, isOpen);
                 // The group's own key: it survives passes joining the group and
                 // the row relocating to the file's newest turn. data-row-pos says
@@ -3188,13 +3586,38 @@ import {
                 groupEl.setAttribute("data-row-pos", indexGroupAnchorId(row.group));
                 CS.messagesBox.appendChild(groupEl);
                 if (!isOpen) return;
-                row.group.members.forEach(function (member) {
+                // visibleMembers, not members: a CONTINUE pass's request bubble only
+                // repeats the row's own header, and the running placeholder is
+                // superseded by the group's own loader below. members stays the full
+                // list for every count/status/cancel/anchor decision.
+                row.group.visibleMembers.forEach(function (member) {
                     var pass = buildMessageEl(member.msg, member.index);
                     pass.classList.add("bq-index-pass");
                     pass.setAttribute("data-row-key", rowAnchorKey(member.msg, member.index));
                     CS.messageEls[member.index] = pass;
                     CS.messagesBox.appendChild(pass);
                 });
+                // Still working, or we cannot confirm otherwise. Carries NO
+                // data-row-key: the scroll anchor picks its target by that attribute
+                // and a keyed element with no data-row-pos would be preferred over the
+                // real rows. aria-hidden because the state is already on the row head.
+                //
+                // NOT while resolving, for the same reason the head refuses to spin
+                // there: an animated rail under an open row is the "work is happening
+                // here" signal, and this state exists to withhold exactly that claim.
+                // It also has nothing to point at — the passes a 'history' wait is
+                // missing are EARLIER ones, which arrive above the row, not below it.
+                //
+                // Cancelled is tested here for the same reason indexGroupIcon tests it
+                // first: a stop is final whatever else is true. The engine does already
+                // force `finished` on a cancelled run, so this can never fire — but the
+                // head does not lean on that and neither should the tail, which is the
+                // whole point of the two being one claim made twice.
+                if (!row.group.finished && !row.group.resolving && row.group.status !== "cancelled") {
+                    CS.messagesBox.appendChild(h("div", {
+                        class: "bq-index-pass bq-index-tail", "aria-hidden": "true",
+                    }, h("span", { class: "bq-loader" })));
+                }
                 return;
             }
             var el = buildMessageEl(row.msg, row.index);
@@ -3203,6 +3626,9 @@ import {
             CS.messagesBox.appendChild(el);
         });
         restoreScrollAnchor(anchor);
+        // Synchronous, so a preview whose url is already cached gets its src in
+        // this same block and a full re-render never blanks a loaded image.
+        hydrateMessageImagePreviews();
     }
 
     function refreshMessageBubble(idx) {
@@ -3215,10 +3641,17 @@ import {
         if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
         oldEl.parentNode.replaceChild(newEl, oldEl);
         CS.messageEls[idx] = newEl;
+        hydrateMessageImagePreviews();
     }
 
     function renderChat() {
         // reset transient chat state on (re)entry
+        // Preview urls are keyed by project, and an identity-blind cache is how
+        // one project's content has reached another project's chat before.
+        clearImagePreviewCache(S.projectId || "default");
+        // Same reason, and the same blast radius: a "this file has no url" mark
+        // is keyed by a project-relative storage path.
+        for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
@@ -3443,7 +3876,7 @@ import {
         // visitors, not project owners, so it applies the setting rather than
         // offering a control. Without an override the engine keeps its fixed
         // ceilings, so this is a no-op for every project that has not set one.
-        setProjectContextWindow(S.serviceId, engineParseAiAgentValue(raw).contextWindow);
+        setProjectContextWindow(S.projectId, engineParseAiAgentValue(raw).contextWindow);
         S.serviceName = conn.service_name || "";
         S.serviceDescription = conn.service_description || "";
     }
