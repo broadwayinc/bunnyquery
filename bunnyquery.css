@@ -1311,10 +1311,12 @@
     font-size: 0.78rem;
     color: var(--bq-muted);
 }
-/* An open row animates for as long as the file is indexing, which can be minutes.
-   Readers who ask for less motion get the static end state. */
+/* An open row animates for as long as the file is indexing, which can be
+   minutes, and the user-side drafting bubble animates for as long as a draft
+   sits in the composer. Readers who ask for less motion get the static dots. */
 @media (prefers-reduced-motion: reduce) {
-    .bq-index-tail .bq-loader::after { animation: none; content: '...'; }
+    .bq-index-tail .bq-loader::after,
+    .bq-user-drafting .bq-loader::after { animation: none; content: '...'; }
 }
 .bq-index-note {
     padding: 0 0.6rem 0.45rem;

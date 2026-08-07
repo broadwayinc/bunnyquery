@@ -6996,6 +6996,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         autoGrowInput(inputEl);
       }
       updateComposerControls();
+      CS.drafting = false;
+      syncDraftingIndicator();
       if (!hasAttachments) {
         session.dispatchComposedMessage(text, false);
         return;
@@ -7913,7 +7915,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function messagesBoxCanScroll() {
       if (!CS.messagesBox || CS.chatSettingsOpen) return true;
-      return CS.messagesBox.scrollHeight - CS.messagesBox.clientHeight > HISTORY_FILL_SLACK_PX;
+      var drafting = CS.draftingEl && CS.draftingEl.parentNode === CS.messagesBox ? CS.draftingEl.offsetHeight : 0;
+      return CS.messagesBox.scrollHeight - drafting - CS.messagesBox.clientHeight > HISTORY_FILL_SLACK_PX;
     }
     function topVisibleRowKey() {
       var box = CS.messagesBox;
@@ -8343,6 +8346,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       box.scrollTop = anchor.scrollTop;
     }
+    function syncDraftingIndicator() {
+      if (!CS.messagesBox) return;
+      if (CS.drafting && !CS.chatSettingsOpen) {
+        if (!CS.draftingEl) {
+          CS.draftingEl = h(
+            "div",
+            { class: "bq-message is-user bq-user-drafting", "aria-hidden": "true" },
+            h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }))
+          );
+        }
+        CS.messagesBox.appendChild(CS.draftingEl);
+      } else if (CS.draftingEl && CS.draftingEl.parentNode) {
+        CS.draftingEl.parentNode.removeChild(CS.draftingEl);
+      }
+    }
     function renderMessages() {
       syncStopIndexModal();
       if (!CS.messagesBox) return;
@@ -8354,6 +8372,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!CS.messages.length) {
         if (CS.loadingHistory && !CS.loadingOlderHistory) {
           CS.messagesBox.appendChild(historyLoadingEl(true));
+          syncDraftingIndicator();
           return;
         }
         var greet = h(
@@ -8366,6 +8385,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           )
         );
         CS.messagesBox.appendChild(greet);
+        syncDraftingIndicator();
         return;
       }
       var rows = buildChatDisplayList(CS.messages, displayListOptions());
@@ -8397,6 +8417,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.messageEls[row.index] = el;
         CS.messagesBox.appendChild(el);
       });
+      syncDraftingIndicator();
       restoreScrollAnchor(anchor);
       hydrateMessageImagePreviews();
     }
@@ -8419,6 +8440,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       CS.sending = false;
       CS.typing = false;
       CS.typingAbort = true;
+      CS.drafting = false;
+      CS.draftingEl = null;
       CS.historyEndOfList = false;
       CS.historyStartKeyHistory = [];
       CS.stickToBottom = true;
@@ -8502,6 +8525,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (CS.attachmentWarning !== prev) {
             renderAttachmentChips();
             scheduleAttachmentOverflowRecompute();
+          }
+          var drafting = !!input.value.trim();
+          if (drafting !== CS.drafting) {
+            CS.drafting = drafting;
+            syncDraftingIndicator();
+            scrollToBottomIfSticky(false);
           }
         });
         input.addEventListener("keydown", function(e) {

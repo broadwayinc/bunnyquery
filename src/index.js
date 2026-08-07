@@ -1921,6 +1921,9 @@ import {
         // input is empty again, so Send drops back to disabled.
         if (inputEl) { inputEl.value = ""; autoGrowInput(inputEl); }
         updateComposerControls();
+        // Programmatic clears fire no input event; drop the "typing" bubble here.
+        CS.drafting = false;
+        syncDraftingIndicator();
 
         if (!hasAttachments) { session.dispatchComposedMessage(text, false); return; }
 
@@ -2962,7 +2965,12 @@ import {
         // over the box (renderMessages no-ops while it is open, so paging could
         // never change the height and the loop would burn every page it has).
         if (!CS.messagesBox || CS.chatSettingsOpen) return true;
-        return CS.messagesBox.scrollHeight - CS.messagesBox.clientHeight > HISTORY_FILL_SLACK_PX;
+        // The drafting bubble is cosmetic and vanishes on send; if it counted,
+        // the fill loop could stop a bubble short of genuinely scrollable
+        // history and lose its only trigger when the bubble leaves.
+        var drafting = (CS.draftingEl && CS.draftingEl.parentNode === CS.messagesBox)
+            ? CS.draftingEl.offsetHeight : 0;
+        return CS.messagesBox.scrollHeight - drafting - CS.messagesBox.clientHeight > HISTORY_FILL_SLACK_PX;
     }
 
     // The row currently at the top of the viewport, and how much scrollable
@@ -3572,6 +3580,25 @@ import {
         box.scrollTop = anchor.scrollTop;
     }
 
+    // Local "you are typing" indicator: while the composer holds text, the list
+    // ends with a user-side bubble running the same dot-trail as the assistant's
+    // Thinking placeholder. Cosmetic only; it never becomes a message and never
+    // enters history. renderMessages clears the box on every rebuild, so it (and
+    // every other exit that leaves the list on screen) re-appends via this sync.
+    function syncDraftingIndicator() {
+        if (!CS.messagesBox) return;
+        if (CS.drafting && !CS.chatSettingsOpen) {
+            if (!CS.draftingEl) {
+                CS.draftingEl = h("div", { class: "bq-message is-user bq-user-drafting", "aria-hidden": "true" },
+                    h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" })));
+            }
+            // appendChild moves it if already attached, so it is always LAST.
+            CS.messagesBox.appendChild(CS.draftingEl);
+        } else if (CS.draftingEl && CS.draftingEl.parentNode) {
+            CS.draftingEl.parentNode.removeChild(CS.draftingEl);
+        }
+    }
+
     function renderMessages() {
         // Before the early returns below: a cleared history and an opened settings
         // panel both take the row (and its Stop) off screen while the confirm this
@@ -3588,6 +3615,11 @@ import {
             // Initial load: show "Fetching history..." instead of the greeting.
             if (CS.loadingHistory && !CS.loadingOlderHistory) {
                 CS.messagesBox.appendChild(historyLoadingEl(true));
+                // Same contract as every other exit that leaves the list on
+                // screen: the input listener shows the bubble under this bar,
+                // so a rebuild here must not silently drop it (a later
+                // keystroke cannot restore it; CS.drafting does not change).
+                syncDraftingIndicator();
                 return;
             }
             var greet = h("div", { class: "bq-message is-assistant bq-empty-greeting" },
@@ -3595,6 +3627,8 @@ import {
                     document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
                         ".")));
             CS.messagesBox.appendChild(greet);
+            // A first-ever message can be mid-draft under the greeting.
+            syncDraftingIndicator();
             return;
         }
         // Rows, not raw messages: a file's many background-indexing turns collapse
@@ -3655,6 +3689,13 @@ import {
             CS.messageEls[row.index] = el;
             CS.messagesBox.appendChild(el);
         });
+        // BEFORE the anchor restore: the sticky-bottom branch measures
+        // scrollHeight, and it must include the drafting bubble or a pinned
+        // reader is left one bubble short of the bottom (and the resulting
+        // scroll event then flips stickToBottom off). Safe here: the bubble
+        // carries no data-row-key, so the anchor math never picks it, and as
+        // the last child it cannot shift the anchored rows above it.
+        syncDraftingIndicator();
         restoreScrollAnchor(anchor);
         // Synchronous, so a preview whose url is already cached gets its src in
         // this same block and a full re-render never blanks a loaded image.
@@ -3683,6 +3724,7 @@ import {
         // is keyed by a project-relative storage path.
         for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
+        CS.drafting = false; CS.draftingEl = null;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
@@ -3745,6 +3787,14 @@ import {
                 // crosses the empty line even when the warning did not change.
                 updateComposerControls();
                 if (CS.attachmentWarning !== prev) { renderAttachmentChips(); scheduleAttachmentOverflowRecompute(); }
+                // Show/hide the user-side "typing" bubble as the text crosses the
+                // empty line, keeping a bottom-pinned reader pinned.
+                var drafting = !!input.value.trim();
+                if (drafting !== CS.drafting) {
+                    CS.drafting = drafting;
+                    syncDraftingIndicator();
+                    scrollToBottomIfSticky(false);
+                }
             });
             input.addEventListener("keydown", function (e) {
                 if (e.key === "Enter" && !e.shiftKey && !composing) { e.preventDefault(); sendMessage(); }
