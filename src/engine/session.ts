@@ -42,7 +42,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { markImagePreviewStale } from './image_preview';
-import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText } from './history';
+import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
@@ -384,11 +384,13 @@ export class ChatSession {
 			return Promise.resolve();
 		}
 		var queue = bgIndexingQueueName(id.userId, id.projectId);
+		// Snapshot reader: a young shared answer (this session's own adopt
+		// ladder, or the db-files page's probe) is as good as a fresh one.
 		var ask = function (status: 'pending' | 'running') {
-			return Promise.resolve(getChatHistory(
-				{ service: id.projectId, owner: id.owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
-				{ limit: WORKER_PASS_ADOPT_LIMIT },
-			)).catch(function () { return null; });
+			return Promise.resolve(probeBgQueue(
+				{ service: id.projectId, owner: id.owner, platform: platform as 'claude' | 'openai', queue: queue, status: status, limit: WORKER_PASS_ADOPT_LIMIT },
+				{ maxAgeMs: BG_PROBE_TTL_MS },
+			)).then(function (entry) { return entry.result; }).catch(function () { return null; });
 		};
 		return Promise.all([ask('pending'), ask('running')]).then(function (results) {
 			if (results[0] === null || results[1] === null) return;
@@ -1069,10 +1071,13 @@ export class ChatSession {
 					res(v);
 				};
 				bail = setTimeout(function () { settle(null); }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
-				Promise.resolve(getChatHistory(
-					{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
-					{ limit: WORKER_PASS_ADOPT_LIMIT },
-				)).then(function (r: any) { settle(r); }, function () { settle(null); });
+				// maxAgeMs 0: this loop is WAITING for the queue to change, so a
+				// cached answer is useless to it — but its fresh answers write
+				// through into the shared probe memo for the snapshot readers.
+				Promise.resolve(probeBgQueue(
+					{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status, limit: WORKER_PASS_ADOPT_LIMIT },
+					{ maxAgeMs: 0 },
+				)).then(function (entry: any) { settle(entry.result); }, function () { settle(null); });
 			});
 		};
 		// Ordinary chats are routed onto this queue too (_isOnBgQueue), and those
@@ -2460,11 +2465,15 @@ export class ChatSession {
 		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
 		var svcId = id.projectId, owner = id.owner;
 		var queue = bgIndexingQueueName(id.userId, id.projectId);
+		// maxAgeMs 0: adoption exists to notice passes the worker JUST minted,
+		// so it must always look fresh — but its answers write through into the
+		// shared probe memo, which is what keeps the snapshot readers (and the
+		// db-files page's badge probe) from re-asking seconds later.
 		var ask = function (status: 'pending' | 'running') {
-			return Promise.resolve(getChatHistory(
-				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status },
-				{ limit: WORKER_PASS_ADOPT_LIMIT },
-			)).catch(function () { return null; });
+			return Promise.resolve(probeBgQueue(
+				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status, limit: WORKER_PASS_ADOPT_LIMIT },
+				{ maxAgeMs: 0 },
+			)).then(function (entry) { return entry.result; }).catch(function () { return null; });
 		};
 		this._adoptingWorkerPasses = true;
 		Promise.all([ask('running'), ask('pending')]).then(function (results: any[]) {

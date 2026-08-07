@@ -1884,6 +1884,34 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       continued: userText.indexOf("CONTINUE indexing") === 0
     };
   }
+  var BG_PROBE_TTL_MS = 4e3;
+  var bgProbeCache = {};
+  var bgProbeInflight = {};
+  function probeBgQueue(params, opts) {
+    const key = [params.service, params.owner, params.platform, params.queue, params.status, params.limit].join("|");
+    const maxAge = opts && typeof opts.maxAgeMs === "number" ? opts.maxAgeMs : 0;
+    const cached = bgProbeCache[key];
+    if (maxAge > 0 && cached && Date.now() - cached.at < maxAge) {
+      return Promise.resolve(cached);
+    }
+    const inflight = bgProbeInflight[key];
+    if (inflight) return inflight;
+    const p = Promise.resolve(getChatHistory(
+      { service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
+      { limit: params.limit, fetchMore: false }
+    )).then(function(result) {
+      const entry = { result, at: Date.now() };
+      bgProbeCache[key] = entry;
+      return entry;
+    });
+    bgProbeInflight[key] = p;
+    p.then(function() {
+      delete bgProbeInflight[key];
+    }, function() {
+      delete bgProbeInflight[key];
+    });
+    return p;
+  }
   function mapHistoryListToMessages(list, platform, opts) {
     var mapped = [], runningItemIds = [];
     var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
@@ -2288,10 +2316,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       var queue = bgIndexingQueueName(id.userId, id.projectId);
       var ask = function(status) {
-        return Promise.resolve(getChatHistory(
-          { service: id.projectId, owner: id.owner, platform, queue, status },
-          { limit: WORKER_PASS_ADOPT_LIMIT }
-        )).catch(function() {
+        return Promise.resolve(probeBgQueue(
+          { service: id.projectId, owner: id.owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+          { maxAgeMs: BG_PROBE_TTL_MS }
+        )).then(function(entry) {
+          return entry.result;
+        }).catch(function() {
           return null;
         });
       };
@@ -2882,11 +2912,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           bail = setTimeout(function() {
             settle(null);
           }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
-          Promise.resolve(getChatHistory(
-            { service: svcId, owner, platform, queue, status },
-            { limit: WORKER_PASS_ADOPT_LIMIT }
-          )).then(function(r) {
-            settle(r);
+          Promise.resolve(probeBgQueue(
+            { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+            { maxAgeMs: 0 }
+          )).then(function(entry) {
+            settle(entry.result);
           }, function() {
             settle(null);
           });
@@ -4036,10 +4066,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var svcId = id.projectId, owner = id.owner;
       var queue = bgIndexingQueueName(id.userId, id.projectId);
       var ask = function(status) {
-        return Promise.resolve(getChatHistory(
-          { service: svcId, owner, platform, queue, status },
-          { limit: WORKER_PASS_ADOPT_LIMIT }
-        )).catch(function() {
+        return Promise.resolve(probeBgQueue(
+          { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+          { maxAgeMs: 0 }
+        )).then(function(entry) {
+          return entry.result;
+        }).catch(function() {
           return null;
         });
       };

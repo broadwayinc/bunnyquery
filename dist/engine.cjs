@@ -1953,16 +1953,45 @@ function parseIndexingRequestText(userText) {
   };
 }
 var LIVE_INDEX_PROBE_LIMIT = 20;
+var BG_PROBE_TTL_MS = 4e3;
+var bgProbeCache = {};
+var bgProbeInflight = {};
+function probeBgQueue(params, opts) {
+  const key = [params.service, params.owner, params.platform, params.queue, params.status, params.limit].join("|");
+  const maxAge = opts && typeof opts.maxAgeMs === "number" ? opts.maxAgeMs : 0;
+  const cached = bgProbeCache[key];
+  if (maxAge > 0 && cached && Date.now() - cached.at < maxAge) {
+    return Promise.resolve(cached);
+  }
+  const inflight = bgProbeInflight[key];
+  if (inflight) return inflight;
+  const p = Promise.resolve(getChatHistory(
+    { service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
+    { limit: params.limit, fetchMore: false }
+  )).then(function(result) {
+    const entry = { result, at: Date.now() };
+    bgProbeCache[key] = entry;
+    return entry;
+  });
+  bgProbeInflight[key] = p;
+  p.then(function() {
+    delete bgProbeInflight[key];
+  }, function() {
+    delete bgProbeInflight[key];
+  });
+  return p;
+}
 async function fetchLiveIndexingKeys(params) {
   const queue = bgIndexingQueueName(params.userId, params.service);
   const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
   const [pending, running] = await Promise.all([
-    getChatHistory({ ...base, status: "pending" }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
-    getChatHistory({ ...base, status: "running" }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false })
+    probeBgQueue({ ...base, status: "pending", limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS }),
+    probeBgQueue({ ...base, status: "running", limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS })
   ]);
   const keys = /* @__PURE__ */ new Set();
   let truncated = false;
-  for (const res of [pending, running]) {
+  for (const entry of [pending, running]) {
+    const res = entry.result;
     const list = res && Array.isArray(res.list) ? res.list : [];
     if (list.length >= LIVE_INDEX_PROBE_LIMIT) truncated = true;
     for (const item of list) {
@@ -1974,7 +2003,7 @@ async function fetchLiveIndexingKeys(params) {
       if (ref.name) keys.add(ref.name);
     }
   }
-  return { keys, checked: !truncated };
+  return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
@@ -2380,10 +2409,12 @@ var ChatSession = class {
     }
     var queue = bgIndexingQueueName(id.userId, id.projectId);
     var ask = function(status) {
-      return Promise.resolve(getChatHistory(
-        { service: id.projectId, owner: id.owner, platform, queue, status },
-        { limit: WORKER_PASS_ADOPT_LIMIT }
-      )).catch(function() {
+      return Promise.resolve(probeBgQueue(
+        { service: id.projectId, owner: id.owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+        { maxAgeMs: BG_PROBE_TTL_MS }
+      )).then(function(entry) {
+        return entry.result;
+      }).catch(function() {
         return null;
       });
     };
@@ -2974,11 +3005,11 @@ var ChatSession = class {
         bail = setTimeout(function() {
           settle(null);
         }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
-        Promise.resolve(getChatHistory(
-          { service: svcId, owner, platform, queue, status },
-          { limit: WORKER_PASS_ADOPT_LIMIT }
-        )).then(function(r) {
-          settle(r);
+        Promise.resolve(probeBgQueue(
+          { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+          { maxAgeMs: 0 }
+        )).then(function(entry) {
+          settle(entry.result);
         }, function() {
           settle(null);
         });
@@ -4128,10 +4159,12 @@ var ChatSession = class {
     var svcId = id.projectId, owner = id.owner;
     var queue = bgIndexingQueueName(id.userId, id.projectId);
     var ask = function(status) {
-      return Promise.resolve(getChatHistory(
-        { service: svcId, owner, platform, queue, status },
-        { limit: WORKER_PASS_ADOPT_LIMIT }
-      )).catch(function() {
+      return Promise.resolve(probeBgQueue(
+        { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
+        { maxAgeMs: 0 }
+      )).then(function(entry) {
+        return entry.result;
+      }).catch(function() {
         return null;
       });
     };

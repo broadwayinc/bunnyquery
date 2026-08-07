@@ -86,6 +86,60 @@ export function parseIndexingRequestText(userText: any): IndexingRequestRef | nu
 // probe reports checked=false rather than letting a miss read as "finished".
 const LIVE_INDEX_PROBE_LIMIT = 20;
 
+// ─── Shared bg-queue probe (write-through memo) ──────────────────────────────
+// The SAME two queries — getChatHistory({queue, status: 'pending'|'running'})
+// — are fired by four independent callers: the session's live-index snapshot,
+// its worker-pass adoption ladder, its drain wait, and fetchLiveIndexingKeys
+// (the db-files page's badge probe). Navigating chat → files re-asked the queue
+// the chat had answered seconds earlier.
+//
+// This memo dedupes them WITHOUT weakening anyone's evidence:
+//   • progress loops (adopt ladder, drain wait) call with maxAgeMs 0 — they
+//     always fetch fresh, because their whole point is to observe a CHANGE —
+//     but their answers write through into the memo;
+//   • snapshot readers pass a maxAge and reuse a young answer.
+// Every entry carries `at`, the time the underlying fetch actually ran. A
+// caller that needs two INDEPENDENT looks (dbfile's green-confirm ladder) must
+// compare `at`, never its own receipt time: a memo re-serve has the same `at`
+// and therefore counts as the single look it really is.
+export const BG_PROBE_TTL_MS = 4000;
+type BgProbeEntry = { result: any; at: number };
+const bgProbeCache: { [key: string]: BgProbeEntry } = {};
+const bgProbeInflight: { [key: string]: Promise<BgProbeEntry> } = {};
+
+export function probeBgQueue(
+	params: {
+		service: string;
+		owner: string;
+		platform: 'claude' | 'openai';
+		queue: string;
+		status: 'pending' | 'running';
+		limit: number;
+	},
+	opts?: { maxAgeMs?: number },
+): Promise<BgProbeEntry> {
+	const key = [params.service, params.owner, params.platform, params.queue, params.status, params.limit].join('|');
+	const maxAge = opts && typeof opts.maxAgeMs === 'number' ? opts.maxAgeMs : 0;
+	const cached = bgProbeCache[key];
+	if (maxAge > 0 && cached && Date.now() - cached.at < maxAge) {
+		return Promise.resolve(cached);
+	}
+	const inflight = bgProbeInflight[key];
+	if (inflight) return inflight;
+	const p = Promise.resolve(getChatHistory(
+		{ service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
+		{ limit: params.limit, fetchMore: false },
+	)).then(function (result: any) {
+		const entry: BgProbeEntry = { result: result, at: Date.now() };
+		bgProbeCache[key] = entry;
+		return entry;
+	});
+	bgProbeInflight[key] = p;
+	// Clear the in-flight slot on either outcome; failures are NOT cached.
+	p.then(function () { delete bgProbeInflight[key]; }, function () { delete bgProbeInflight[key]; });
+	return p;
+}
+
 /**
  * One bounded look at the background-indexing queue: which files still have a
  * pass pending or running? This is the same negative signal ChatSession's
@@ -97,6 +151,12 @@ const LIVE_INDEX_PROBE_LIMIT = 20;
  * older prompts may lack the storage-path line), plus `checked`: false when a
  * page came back full, in which case absence from `keys` proves nothing and
  * the caller must keep whatever state it already had.
+ *
+ * SCOPE: the probed queue is "<userId>-bg" - THIS user's dispatches only. A
+ * chain launched by another collaborator or a widget end-user lives on their
+ * queue and is invisible here, so "idle" must never be read as "nobody is
+ * indexing this file", only as "this user's runs are over". The durable done::
+ * marker (indexDoneUniqueId) is the cross-user signal.
  */
 export async function fetchLiveIndexingKeys(params: {
 	service: string;
@@ -104,16 +164,17 @@ export async function fetchLiveIndexingKeys(params: {
 	platform: 'claude' | 'openai';
 	/** Same value the dispatch used - see bgIndexingQueueName. */
 	userId?: string;
-}): Promise<{ keys: Set<string>; checked: boolean }> {
+}): Promise<{ keys: Set<string>; checked: boolean; at: number }> {
 	const queue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
 	const [pending, running] = await Promise.all([
-		getChatHistory({ ...base, status: 'pending' }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
-		getChatHistory({ ...base, status: 'running' }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
+		probeBgQueue({ ...base, status: 'pending', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS }),
+		probeBgQueue({ ...base, status: 'running', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS }),
 	]);
 	const keys = new Set<string>();
 	let truncated = false;
-	for (const res of [pending, running]) {
+	for (const entry of [pending, running]) {
+		const res = entry.result;
 		const list: any[] = (res && Array.isArray((res as any).list)) ? (res as any).list : [];
 		if (list.length >= LIVE_INDEX_PROBE_LIMIT) truncated = true;
 		for (const item of list) {
@@ -125,7 +186,10 @@ export async function fetchLiveIndexingKeys(params: {
 			if (ref.name) keys.add(ref.name);
 		}
 	}
-	return { keys, checked: !truncated };
+	// `at` = when the OLDER of the two underlying fetches ran. Consumers that
+	// need two independent looks (dbfile's green ladder) key on this, so a
+	// memo re-serve is correctly seen as the same single look.
+	return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
 
 export type MapHistoryOptions = {

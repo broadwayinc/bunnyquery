@@ -923,6 +923,12 @@ declare function parseIndexingRequestText(userText: any): IndexingRequestRef | n
  * older prompts may lack the storage-path line), plus `checked`: false when a
  * page came back full, in which case absence from `keys` proves nothing and
  * the caller must keep whatever state it already had.
+ *
+ * SCOPE: the probed queue is "<userId>-bg" - THIS user's dispatches only. A
+ * chain launched by another collaborator or a widget end-user lives on their
+ * queue and is invisible here, so "idle" must never be read as "nobody is
+ * indexing this file", only as "this user's runs are over". The durable done::
+ * marker (indexDoneUniqueId) is the cross-user signal.
  */
 declare function fetchLiveIndexingKeys(params: {
     service: string;
@@ -933,6 +939,7 @@ declare function fetchLiveIndexingKeys(params: {
 }): Promise<{
     keys: Set<string>;
     checked: boolean;
+    at: number;
 }>;
 type MapHistoryOptions = {
     clearedAt: number;
