@@ -4,7 +4,7 @@
  * formatIndexingLabel callback) so the engine touches neither localStorage nor
  * view-specific display formatting. projectId is passed for link sanitization.
  */
-import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY } from './requests';
+import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
 import { sanitizeAttachmentLinksForHistory } from './links';
 
@@ -78,6 +78,54 @@ export function parseIndexingRequestText(userText: any): IndexingRequestRef | nu
 		size: sizeMatch ? Number(sizeMatch[1]) : undefined,
 		continued: userText.indexOf('CONTINUE indexing') === 0,
 	};
+}
+
+// One page of the status probe below. Matches ChatSession's own
+// WORKER_PASS_ADOPT_LIMIT: the queue holds one live pass per file (plus a
+// handful pending), so a FULL page means the answer may be incomplete and the
+// probe reports checked=false rather than letting a miss read as "finished".
+const LIVE_INDEX_PROBE_LIMIT = 20;
+
+/**
+ * One bounded look at the background-indexing queue: which files still have a
+ * pass pending or running? This is the same negative signal ChatSession's
+ * display layer relies on - for a worker-driven (auto_continue) run, only the
+ * queue can say the run is over, because the worker enqueues continuation
+ * passes the client never dispatched.
+ *
+ * Returns every storage path AND file name found on live passes (both, because
+ * older prompts may lack the storage-path line), plus `checked`: false when a
+ * page came back full, in which case absence from `keys` proves nothing and
+ * the caller must keep whatever state it already had.
+ */
+export async function fetchLiveIndexingKeys(params: {
+	service: string;
+	owner: string;
+	platform: 'claude' | 'openai';
+	/** Same value the dispatch used - see bgIndexingQueueName. */
+	userId?: string;
+}): Promise<{ keys: Set<string>; checked: boolean }> {
+	const queue = bgIndexingQueueName(params.userId, params.service);
+	const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
+	const [pending, running] = await Promise.all([
+		getChatHistory({ ...base, status: 'pending' }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
+		getChatHistory({ ...base, status: 'running' }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
+	]);
+	const keys = new Set<string>();
+	let truncated = false;
+	for (const res of [pending, running]) {
+		const list: any[] = (res && Array.isArray((res as any).list)) ? (res as any).list : [];
+		if (list.length >= LIVE_INDEX_PROBE_LIMIT) truncated = true;
+		for (const item of list) {
+			const text = extractLastUserTextFromRequest(item && item.request_body);
+			if (!text || !isIndexingRequestText(text)) continue;
+			const ref = parseIndexingRequestText(text);
+			if (!ref) continue;
+			if (ref.path) keys.add(ref.path);
+			if (ref.name) keys.add(ref.name);
+		}
+	}
+	return { keys, checked: !truncated };
 }
 
 export type MapHistoryOptions = {

@@ -1802,6 +1802,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return "";
   }
   var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+  function indexDoneUniqueId(storagePath) {
+    return "done::" + storagePath;
+  }
   function bgIndexingQueueName(userId, service) {
     return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
   }
@@ -7220,7 +7223,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function deleteFileIndexRecordDb(storagePath) {
       if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
+      var doneDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: indexDoneUniqueId(storagePath) }).catch(function() {
+      });
       return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath }).catch(function() {
+      }).then(function() {
+        return doneDelete;
       });
     }
     function ensureFileIndexRecordDb(storagePath, meta) {

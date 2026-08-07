@@ -64,6 +64,10 @@ export {
 	// read it the same way or the two will not group together.
 	isIndexingRequestText,
 	parseIndexingRequestText,
+	// One bounded look at the bg-indexing queue: which files still have a live
+	// pass. The dbfile browser's "indexed" badge uses this so a file only goes
+	// green once the run is confirmed over, not when its src:: record appears.
+	fetchLiveIndexingKeys,
 	type IndexingRequestRef,
 	type MapHistoryOptions,
 } from './history';
@@ -105,6 +109,7 @@ export {
 	BG_INDEXING_QUEUE_SUFFIX,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
+	indexDoneUniqueId,
 	MCP_NAME,
 	DEFAULT_CLAUDE_MODEL,
 	DEFAULT_OPENAI_MODEL,

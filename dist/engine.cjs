@@ -1870,6 +1870,9 @@ async function listOpenAIModels(service, owner) {
   });
 }
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+function indexDoneUniqueId(storagePath) {
+  return "done::" + storagePath;
+}
 function bgIndexingQueueName(userId, service) {
   return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
 }
@@ -1948,6 +1951,30 @@ function parseIndexingRequestText(userText) {
     size: sizeMatch ? Number(sizeMatch[1]) : void 0,
     continued: userText.indexOf("CONTINUE indexing") === 0
   };
+}
+var LIVE_INDEX_PROBE_LIMIT = 20;
+async function fetchLiveIndexingKeys(params) {
+  const queue = bgIndexingQueueName(params.userId, params.service);
+  const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
+  const [pending, running] = await Promise.all([
+    getChatHistory({ ...base, status: "pending" }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false }),
+    getChatHistory({ ...base, status: "running" }, { limit: LIVE_INDEX_PROBE_LIMIT, fetchMore: false })
+  ]);
+  const keys = /* @__PURE__ */ new Set();
+  let truncated = false;
+  for (const res of [pending, running]) {
+    const list = res && Array.isArray(res.list) ? res.list : [];
+    if (list.length >= LIVE_INDEX_PROBE_LIMIT) truncated = true;
+    for (const item of list) {
+      const text = extractLastUserTextFromRequest(item && item.request_body);
+      if (!text || !isIndexingRequestText(text)) continue;
+      const ref = parseIndexingRequestText(text);
+      if (!ref) continue;
+      if (ref.path) keys.add(ref.path);
+      if (ref.name) keys.add(ref.name);
+    }
+  }
+  return { keys, checked: !truncated };
 }
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
@@ -5229,6 +5256,7 @@ exports.extractClaudeText = extractClaudeText;
 exports.extractLastUserTextFromRequest = extractLastUserTextFromRequest;
 exports.extractOpenAIText = extractOpenAIText;
 exports.extractRemotePathFromAttachmentHref = extractRemotePathFromAttachmentHref;
+exports.fetchLiveIndexingKeys = fetchLiveIndexingKeys;
 exports.fillHistoryViewport = fillHistoryViewport;
 exports.filterListByClearHorizon = filterListByClearHorizon;
 exports.findAttachmentParser = findAttachmentParser;
@@ -5243,6 +5271,7 @@ exports.getVisionProfile = getVisionProfile;
 exports.groupAttachmentFailures = groupAttachmentFailures;
 exports.hasBom = hasBom;
 exports.hydrateImagePreviews = hydrateImagePreviews;
+exports.indexDoneUniqueId = indexDoneUniqueId;
 exports.isAuthExpiredError = isAuthExpiredError;
 exports.isBgIndexingQueue = isBgIndexingQueue;
 exports.isErrorResponseBody = isErrorResponseBody;

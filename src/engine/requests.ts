@@ -1039,6 +1039,24 @@ export async function listOpenAIModels(service: string, owner: string) {
 export const BG_INDEXING_QUEUE_SUFFIX = '-bg';
 
 /**
+ * unique_id of the durable "indexing finished" marker record for a stored file.
+ *
+ * Written by the BACKEND (the polling worker calls the MCP server's
+ * /internal/index-complete at the end of an auto_continue chain whose final
+ * window reported no more content), never by the model and never by a client.
+ * The marker record carries `reference: "src::<path>"`, so the reindex flow's
+ * delete of the src:: record cascades to it and a re-run starts unmarked.
+ *
+ * Existence semantics: present = the whole file was read to the end. Absent =
+ * unknown (still running, failed partway, indexed before this marker existed,
+ * or a single-pass run, which never mints one) - callers must fall back to the
+ * live-queue probe (fetchLiveIndexingKeys) before reading absence as anything.
+ */
+export function indexDoneUniqueId(storagePath: string): string {
+	return 'done::' + storagePath;
+}
+
+/**
  * The one place the background-indexing queue name is spelled out. The backend
  * serialises requests sharing a queue name and runs different names in PARALLEL,
  * so every indexing pass AND the chat turn that must wait behind them have to

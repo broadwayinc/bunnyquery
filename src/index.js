@@ -33,6 +33,7 @@ import {
     extractClaudeText,
     extractOpenAIText,
     getChatHistory,
+    indexDoneUniqueId,
     composeUserMessage,
     groupAttachmentFailures,
     notifyAgentSaveAttachment,
@@ -2209,8 +2210,15 @@ import {
     // unique_id) or a permission error must not block indexing.
     function deleteFileIndexRecordDb(storagePath) {
         if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
-        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
+        // Also drop the backend's "indexing finished" marker (done::<path>): it
+        // references the src:: record so the cascade normally sweeps it, but a
+        // record from before the cascade flag has no cascade, and a re-index must
+        // never start with a stale "finished" verdict standing.
+        var doneDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: indexDoneUniqueId(storagePath) })
             .catch(function () { });
+        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
+            .catch(function () { })
+            .then(function () { return doneDelete; });
     }
     // Create the file's "src::<storagePath>" record BEFORE any indexing pass runs, so every
     // pass has a reference target that is guaranteed to exist (mirrors ai_agent.ts). Without
