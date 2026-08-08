@@ -7824,8 +7824,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       shown.forEach(function(att) {
         var isFolder = att.kind === "folder";
         var clickable = att.status === "done" && !isFolder && !!att.uploadedUrl;
+        var finalizing = att.status === "uploading" && (att.progress || 0) >= 100;
         var cls = "bq-attachment";
         if (att.status === "uploading") cls += " is-uploading";
+        if (finalizing) cls += " is-finalizing";
         else if (att.status === "error") cls += " is-error";
         else if (att.status === "indexError") cls += " is-index-error";
         else if (att.status === "done") cls += " is-done";
@@ -7838,7 +7840,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         });
         chip.appendChild(h("span", { class: "bq-attachment-icon", html: isFolder ? FOLDER_ICON_SVG : FILE_ICON_SVG }));
         chip.appendChild(h("span", { class: "bq-attachment-name", text: att.name, title: att.name }));
-        var meta = att.status === "error" ? "(Failed)" : att.status === "indexError" ? "(Error)" : att.status === "uploading" ? (att.progress || 0) + "%" : isFolder ? "(" + (att.files ? att.files.length : 0) + ")" : formatBytes(att.file ? att.file.size : att.size);
+        var meta = att.status === "error" ? "(Failed)" : att.status === "indexError" ? "(Error)" : finalizing ? "Finalizing" : att.status === "uploading" ? (att.progress || 0) + "%" : isFolder ? "(" + (att.files ? att.files.length : 0) + ")" : formatBytes(att.file ? att.file.size : att.size);
         chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
         if (clickable) chip.appendChild(h("span", { class: "bq-attachment-arrow", text: "\u2197" }));
         if (att.status !== "uploading" && att.status !== "done") {

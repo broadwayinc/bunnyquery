@@ -821,6 +821,33 @@
     pointer-events: none;
 }
 .bq-attachment.is-uploading > * { position: relative; z-index: 1; }
+/* Bytes done, post-upload work (signed url, src:: record, indexing dispatch)
+   still running: indeterminate stripes instead of a frozen solid 100%, and
+   walking dots on the meta (mirror of agent.vue's is-finalizing). */
+.bq-attachment.is-finalizing::before {
+    width: 100%;
+    background: repeating-linear-gradient(
+        -45deg,
+        color-mix(in srgb, var(--bq-main) 22%, transparent) 0 8px,
+        color-mix(in srgb, var(--bq-main) 10%, transparent) 8px 16px
+    );
+    background-size: 22.6px 100%;
+    animation: bq-att-finalizing 0.8s linear infinite;
+    transition: none;
+}
+.bq-attachment.is-finalizing .bq-attachment-meta::after {
+    content: ".";
+    display: inline-block;
+    width: 1.1em;
+    text-align: left;
+    animation: bq-att-dots 1.2s steps(1) infinite;
+}
+@keyframes bq-att-finalizing { to { background-position: 22.6px 0; } }
+@keyframes bq-att-dots {
+    0%  { content: "."; }
+    33% { content: ".."; }
+    66% { content: "..."; }
+}
 .bq-attachment.is-error { border-color: var(--bq-danger); background: var(--bq-danger-bg); }
 .bq-attachment.is-error .bq-attachment-meta,
 .bq-attachment.is-error .bq-attachment-name { color: var(--bq-danger); }

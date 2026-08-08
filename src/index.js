@@ -2632,8 +2632,14 @@ import {
         shown.forEach(function (att) {
             var isFolder = att.kind === "folder";
             var clickable = att.status === "done" && !isFolder && !!att.uploadedUrl;
+            // Bytes done but the post-upload work (signed url, src:: record,
+            // indexing dispatch) hasn't settled: show "Finalizing" with an
+            // indeterminate fill instead of freezing at 100% (mirror of
+            // agent.vue's is-finalizing treatment).
+            var finalizing = att.status === "uploading" && (att.progress || 0) >= 100;
             var cls = "bq-attachment";
             if (att.status === "uploading") cls += " is-uploading";
+            if (finalizing) cls += " is-finalizing";
             else if (att.status === "error") cls += " is-error";            // red: upload failed
             else if (att.status === "indexError") cls += " is-index-error"; // yellow: indexing failed
             else if (att.status === "done") cls += " is-done";              // green: uploaded + indexed
@@ -2651,6 +2657,7 @@ import {
             chip.appendChild(h("span", { class: "bq-attachment-name", text: att.name, title: att.name }));
             var meta = att.status === "error" ? "(Failed)"
                 : att.status === "indexError" ? "(Error)"
+                : finalizing ? "Finalizing"
                 : att.status === "uploading" ? (att.progress || 0) + "%"
                 : isFolder ? "(" + (att.files ? att.files.length : 0) + ")"
                 : formatBytes(att.file ? att.file.size : att.size);
