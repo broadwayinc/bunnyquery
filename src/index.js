@@ -3416,7 +3416,7 @@ import {
             var entries = buildChatDisplayList(session.state.messages, displayListOptions());
             for (var i = 0; i < entries.length; i++) {
                 var en = entries[i];
-                if (en.kind !== "group" || en.group.key !== key) continue;
+                if (en.kind !== "indexing" || en.group.key !== key) continue;
                 var ids = [];
                 for (var mi = 0; mi < en.group.members.length; mi++) {
                     var m = en.group.members[mi].msg;
