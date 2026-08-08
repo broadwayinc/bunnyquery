@@ -1921,8 +1921,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var BG_COVERAGE_MAX_PAGES = 8;
   var splitHistoryStates = {};
+  var splitHistoryLocks = {};
   function freshSplitState() {
-    return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, lastSurfaceKeys: [] };
+    return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [] };
   }
   var createdOf = (it) => {
     const c = Number(it && it.created);
@@ -1936,33 +1937,53 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     return m;
   };
+  var SURFACE_EMPTY_MAX_PAGES = 10;
   async function getSplitChatHistory(params, fetchOptions, _fetchImpl) {
+    const key = [params.service, params.owner, params.platform, params.userId || ""].join("|");
+    const prev = splitHistoryLocks[key] || Promise.resolve();
+    const run = () => _getSplitChatHistoryLocked(key, params, fetchOptions);
+    const p = prev.then(run, run);
+    splitHistoryLocks[key] = p.then(() => void 0, () => void 0);
+    return p;
+  }
+  async function _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl) {
     const fetch2 = getChatHistory;
     const bgQueue = bgIndexingQueueName(params.userId, params.service);
     const base = { service: params.service, owner: params.owner, platform: params.platform };
     const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
     const limit = fetchOptions && fetchOptions.limit;
-    const key = [params.service, params.owner, params.platform, params.userId || ""].join("|");
     if (!fetchMore || !splitHistoryStates[key]) {
       splitHistoryStates[key] = freshSplitState();
     }
     const state = splitHistoryStates[key];
+    if (state.pendingSurface && state.pendingSurface.forFetchMore !== fetchMore) {
+      state.pendingSurface = null;
+    }
     if (!state.pendingSurface) {
       if (state.surfaceEnd) {
-        state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys };
+        state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys, forFetchMore: fetchMore };
       } else {
         const sOpts = { fetchMore };
         if (limit) sOpts.limit = limit;
-        const s = await fetch2({ ...base, queue_exclude: bgQueue }, sOpts);
+        let s = await fetch2({ ...base, queue_exclude: bgQueue }, sOpts);
+        let hops = 0;
+        while (s && !s.endOfList && !(s.list || []).length && hops < SURFACE_EMPTY_MAX_PAGES) {
+          hops++;
+          const nOpts = { fetchMore: true };
+          if (limit) nOpts.limit = limit;
+          s = await fetch2({ ...base, queue_exclude: bgQueue }, nOpts);
+        }
         state.pendingSurface = {
           list: s && Array.isArray(s.list) ? s.list : [],
           endOfList: !!(s && s.endOfList),
-          startKeyHistory: s && Array.isArray(s.startKeyHistory) ? s.startKeyHistory : []
+          startKeyHistory: s && Array.isArray(s.startKeyHistory) ? s.startKeyHistory : [],
+          forFetchMore: fetchMore
         };
       }
     }
     const surface = state.pendingSurface;
-    const boundary = surface.endOfList ? -Infinity : oldestCreated(surface.list);
+    const surfaceList = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
+    const boundary = surface.endOfList ? -Infinity : oldestCreated(surfaceList);
     if (boundary !== Infinity || surface.endOfList) {
       let hops = 0;
       while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
@@ -1976,34 +1997,52 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         const bList = b && Array.isArray(b.list) ? b.list : [];
         for (const it of bList) state.bgBuffer.push(it);
         state.bgEnd = !!(b && b.endOfList);
-        if (!bList.length) break;
+        if (!bList.length && !state.bgEnd) break;
+        if (state.bgEnd) break;
       }
     }
-    let emit;
-    if (boundary === -Infinity) {
-      emit = state.bgBuffer;
+    const bufOldestNow = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
+    const uncovered = !state.bgEnd && boundary !== -Infinity && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
+    const effBoundary = uncovered ? bufOldestNow : boundary;
+    let emitSurface;
+    if (uncovered) {
+      emitSurface = [];
+      const carry = [];
+      for (const it of surfaceList) {
+        const c = createdOf(it);
+        if (isNaN(c) || c >= effBoundary) emitSurface.push(it);
+        else carry.push(it);
+      }
+      state.surfaceCarry = carry;
+    } else {
+      emitSurface = surfaceList;
+      state.surfaceCarry = [];
+    }
+    let emitBg;
+    if (effBoundary === -Infinity) {
+      emitBg = state.bgBuffer;
       state.bgBuffer = [];
     } else {
-      emit = [];
+      emitBg = [];
       const keep = [];
       for (const it of state.bgBuffer) {
         const c = createdOf(it);
-        if (isNaN(c) || c >= boundary) emit.push(it);
+        if (isNaN(c) || c >= effBoundary) emitBg.push(it);
         else keep.push(it);
       }
       state.bgBuffer = keep;
     }
     const seen = {};
-    for (const it of surface.list) {
+    for (const it of emitSurface) {
       if (it && typeof it.id === "string") seen[it.id] = true;
     }
-    const merged = surface.list.concat(emit.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
+    const merged = emitSurface.concat(emitBg.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
     state.surfaceEnd = surface.endOfList;
     state.lastSurfaceKeys = surface.startKeyHistory;
     state.pendingSurface = null;
     return {
       list: merged,
-      endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0,
+      endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0 && state.surfaceCarry.length === 0,
       // Bookkeeping only (both the consumers and the SDK treat it opaquely);
       // the real cursors are the SDK's internal ones plus this module's state.
       startKeyHistory: surface.startKeyHistory

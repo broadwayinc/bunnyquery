@@ -3067,7 +3067,23 @@ export class ChatSession {
 			var keptOlderPages = false;
 
 			if (fetchMore) {
-				self.state.messages = mapped.concat(self.state.messages);
+				// Prepend-dedup by server item id: a first-page refresh rewinds
+				// the SDK's cursor chain while retainedOlder keeps deeper pages
+				// on screen, so the next older-page fetch can return a page that
+				// is ALREADY displayed — prepending it raw duplicated (and
+				// misordered) the transcript. Id-less bubbles (staged/local)
+				// only ever live at the bottom and pass through untouched.
+				var onScreenIds: any = {};
+				self.state.messages.forEach(function (m) { if (m._serverItemId) onScreenIds[m._serverItemId + '|' + m.role] = true; });
+				var prepend = mapped.filter(function (m: any) {
+					return !(m._serverItemId && onScreenIds[m._serverItemId + '|' + m.role]);
+				});
+				self.state.messages = prepend.concat(self.state.messages);
+			} else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) {
+				// Empty-but-not-end first page (a pure-bg band past every hop
+				// cap): REPLACING with it would blank the chat and overwrite the
+				// cache with the wipe. Keep what is on screen; the pager can
+				// still walk older pages from here.
 			} else {
 				if (self.state.typing) self.state.typingAbort = true;
 				var serverIds: any = {};
