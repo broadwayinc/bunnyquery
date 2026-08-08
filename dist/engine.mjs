@@ -1894,12 +1894,19 @@ async function getChatHistory(params, fetchOptions) {
     },
     { service: params.service, owner: params.owner },
     params.queue ? { queue: params.queue } : {},
-    params.status ? { status: params.status } : {}
+    params.status ? { status: params.status } : {},
+    params.queue_exact ? { queue_exact: true } : {},
+    params.compact ? { compact: true } : {},
+    params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
   );
   return chatEngineConfig().clientSecretRequestHistory(
     p,
     Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
   );
+}
+function buildHistoryItemFullId(platform, service, itemId) {
+  const url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+  return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
 }
 
 // src/engine/history.ts
@@ -2003,6 +2010,88 @@ async function fetchLiveIndexingKeys(params) {
   }
   return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
+var SPLIT_CURSOR_TAG = "__split_v1__";
+function packSplitCursors(surface, bg) {
+  return [SPLIT_CURSOR_TAG, JSON.stringify({ s: surface || [], b: bg || [] })];
+}
+function unpackSplitCursors(arr) {
+  if (Array.isArray(arr) && arr[0] === SPLIT_CURSOR_TAG && typeof arr[1] === "string") {
+    try {
+      const o = JSON.parse(arr[1]);
+      return { s: Array.isArray(o.s) ? o.s : [], b: Array.isArray(o.b) ? o.b : [] };
+    } catch (_e) {
+      return null;
+    }
+  }
+  return null;
+}
+var BG_COVERAGE_MAX_PAGES = 8;
+async function getSplitChatHistory(params, fetchOptions) {
+  const bgQueue = bgIndexingQueueName(params.userId, params.service);
+  const base = { service: params.service, owner: params.owner, platform: params.platform };
+  const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
+  const limit = fetchOptions && fetchOptions.limit;
+  const cursors = unpackSplitCursors(fetchOptions && fetchOptions.startKeyHistory);
+  const surfaceOpts = { fetchMore };
+  const bgOpts = { fetchMore };
+  if (limit) {
+    surfaceOpts.limit = limit;
+    bgOpts.limit = limit;
+  }
+  if (fetchMore && cursors) {
+    if (cursors.s.length) surfaceOpts.startKeyHistory = cursors.s.slice();
+    if (cursors.b.length) bgOpts.startKeyHistory = cursors.b.slice();
+  } else if (fetchMore && Array.isArray(fetchOptions?.startKeyHistory) && fetchOptions.startKeyHistory.length) {
+    surfaceOpts.startKeyHistory = fetchOptions.startKeyHistory.slice();
+  }
+  const [surface, bg] = await Promise.all([
+    getChatHistory({ ...base, queue_exclude: bgQueue }, surfaceOpts),
+    getChatHistory({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bgOpts)
+  ]);
+  const surfaceList = surface && Array.isArray(surface.list) ? surface.list : [];
+  let bgList = bg && Array.isArray(bg.list) ? bg.list : [];
+  let bgEnd = !!(bg && bg.endOfList);
+  let bgKeys = bg && Array.isArray(bg.startKeyHistory) ? bg.startKeyHistory : [];
+  const oldestCreated = (lst) => {
+    let m = Infinity;
+    for (const it of lst) {
+      const c = Number(it && it.created);
+      if (isFinite(c) && c > 0 && c < m) m = c;
+    }
+    return m;
+  };
+  const surfaceOldest = surface && surface.endOfList ? -Infinity : oldestCreated(surfaceList);
+  if (isFinite(surfaceOldest) || surfaceOldest === -Infinity) {
+    let guard = 0;
+    while (!bgEnd && guard < BG_COVERAGE_MAX_PAGES) {
+      const bgOldest = bgList.length ? oldestCreated(bgList) : Infinity;
+      if (bgList.length && bgOldest <= surfaceOldest) break;
+      guard++;
+      const more = await getChatHistory(
+        { ...base, queue: bgQueue, queue_exact: true, compact: true },
+        limit ? { fetchMore: true, limit } : { fetchMore: true }
+      );
+      const moreList = more && Array.isArray(more.list) ? more.list : [];
+      bgList = bgList.concat(moreList);
+      bgEnd = !!(more && more.endOfList);
+      bgKeys = more && Array.isArray(more.startKeyHistory) ? more.startKeyHistory : bgKeys;
+      if (!moreList.length) break;
+    }
+  }
+  const seen = {};
+  for (const it of surfaceList) {
+    if (it && typeof it.id === "string") seen[it.id] = true;
+  }
+  const merged = surfaceList.concat(bgList.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
+  return {
+    list: merged,
+    endOfList: !!(surface && surface.endOfList) && bgEnd,
+    startKeyHistory: packSplitCursors(
+      surface && Array.isArray(surface.startKeyHistory) ? surface.startKeyHistory : [],
+      bgKeys
+    )
+  };
+}
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
   var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
@@ -2015,10 +2104,11 @@ function mapHistoryListToMessages(list, platform, opts) {
     var isPending = isInProcess || isQueued;
     var isFailed = item && item.status === "failed";
     var response = isFailed ? item.error != null ? item.error : item.response_body : item && item.response_body != null ? item.response_body : item && item.error;
-    var userText = extractLastUserTextFromRequest(requestBody);
-    var assistantText = isPending ? "" : (extractAssistantText(response) || "").trim() || "";
-    var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
-    var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+    var isCompact = !!(item && item.compact);
+    var userText = isCompact ? typeof item.request_text === "string" ? item.request_text : "" : extractLastUserTextFromRequest(requestBody);
+    var assistantText = isPending ? "" : isCompact ? (typeof item.response_text === "string" ? item.response_text : "").trim() : (extractAssistantText(response) || "").trim() || "";
+    var isErrorResponse = !isPending && (isFailed || !isCompact && isErrorResponseBody(response));
+    var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && (isCompact ? item.response_complete_marker === true : !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1);
     if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
     var createdTs = Number(item && item.created);
@@ -2050,6 +2140,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (isInProcess) userMsg.isPendingInProcess = true;
       if (isQueued) userMsg.isPendingQueued = true;
       if (isCancelledItem) userMsg.isCancelled = true;
+      if (isCompact) userMsg._compact = true;
       if (item._isBgTask) userMsg.isBackgroundTask = true;
       if (indexFile) userMsg._indexFile = indexFile;
       if (item._isOnBgQueue) userMsg._useBgQueue = true;
@@ -2074,6 +2165,7 @@ function mapHistoryListToMessages(list, platform, opts) {
     } else if (assistantText || reportedComplete) {
       var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
       if (item._isBgTask) okm.isBackgroundTask = true;
+      if (isCompact) okm._compact = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
       if (reportedComplete) okm._indexComplete = true;
@@ -4393,6 +4485,20 @@ var ChatSession = class {
   // memory (a reload or a closed tab ended it), and it stopped whenever the model claimed
   // completion, which on an 88-page file happened at page 15. Continuing to dispatch here
   // as well would now double-index every window.
+  /** Fire the consumer's done::-marker hook for a run whose completion this
+   *  client knows DETERMINISTICALLY (see the two call sites in
+   *  maybeResumeIndexing). Best-effort by contract; identity-checked so a
+   *  project switch mid-settle cannot stamp the wrong service. */
+  _mintDoneMarker(entry) {
+    try {
+      var mint = chatEngineConfig().mintIndexDoneMarker;
+      if (!mint || !entry || !entry.storagePath || !entry.projectId) return;
+      var id = this.host.getIdentity();
+      if (!id || id.projectId !== entry.projectId) return;
+      mint({ service: entry.projectId, storagePath: entry.storagePath });
+    } catch (_e) {
+    }
+  }
   maybeResumeIndexing(entry, response, platform) {
     var self = this;
     var endOfClientChain = function() {
@@ -4402,6 +4508,9 @@ var ChatSession = class {
       if (!entry || !entry.storagePath) return;
       if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
       if (!isPagedReadFile(entry.filename, entry.mime)) {
+        if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
+          this._mintDoneMarker(entry);
+        }
         endOfClientChain();
         return;
       }
@@ -4413,6 +4522,7 @@ var ChatSession = class {
       }
       var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
       if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
+        this._mintDoneMarker(entry);
         endOfClientChain();
         return;
       }
@@ -4510,7 +4620,8 @@ var ChatSession = class {
       var chatList = history && Array.isArray(history.list) ? history.list : [];
       chatList.forEach(function(item) {
         if (isBgIndexingQueue(item.queue_name)) {
-          if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) item._isBgTask = true;
+          var clsText = item.compact ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+          if (isIndexingRequestText(clsText)) item._isBgTask = true;
           else item._isOnBgQueue = true;
         }
       });
@@ -5006,6 +5117,7 @@ function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
   var liveIndexKeys = opts && opts.liveIndexKeys || {};
   var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+  var doneKeys = opts && opts.doneKeys || {};
   var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
   var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
   var hasMoreHistory = !!(opts && opts.hasMoreHistory);
@@ -5182,11 +5294,11 @@ function buildChatDisplayList(messages, opts) {
     } else if (grp.driver === "client") {
       grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
     } else {
-      grp.finished = !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+      grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
     }
     if (grp.status !== "done") {
       grp.resolving = false;
-    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
+    } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !doneKeys[grp.key] && newestRunOfKey[order[oi]]) {
       grp.resolving = true;
       grp.resolvingReason = "history";
     } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
@@ -5208,6 +5320,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

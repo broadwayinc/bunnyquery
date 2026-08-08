@@ -192,6 +192,128 @@ export async function fetchLiveIndexingKeys(params: {
 	return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
 
+// ─── Split history fetch — PARKED, NOT WIRED ─────────────────────────────────
+// Design intent: surface listing (id-prefix minus bg queue, full bodies) +
+// bg-queue compact stubs, merged into the single-fetch shape. DO NOT wire this
+// back into loadHistory / fetchHistoryPage until the following review-confirmed
+// defects are redesigned away (2026-08-11 adversarial review):
+//   1. The SDK IGNORES explicit fetchOptions.startKeyHistory (network.ts copies
+//      only limit/startKey/ascending; paging rides internal per-params-hash
+//      stacks) — the composite cursor below is INERT, and consumers' deep-cursor
+//      logic (keptOlderPages, cache resume) silently does nothing.
+//   2. Merged pages do not TILE: the bg coverage loop over/undershoots the
+//      surface window, breaking the strict newer-to-older page invariant that
+//      the consumers' raw prepend, retainedOlder pruning and the clear-horizon
+//      early end-of-list all rely on (misordered rows, dropped messages, hidden
+//      post-horizon pages). Pages must be trimmed to the shared covered window
+//      with the overflow buffered across calls.
+//   3. Empty-but-not-end pages (surface window entirely bg rows, post-filtered
+//      server-side) dead-end both clients' no-progress fill loops.
+//   4. The coverage loop is non-atomic over the SDK's internal bg cursor: a
+//      mid-loop failure + caller retry skips bg pages permanently.
+//   5. Ordinary chats routed onto the bg queue (post-attachment turns) must
+//      NEVER be stubbed — the lambda's compact mode now stubs only
+//      indexing-shaped items, but the tiling/cursor work above is still needed.
+//
+// Backwards-safe by construction: an old backend ignores queue_exclude/compact
+// — the surface then includes bg items with bodies (exactly today's fetch), the
+// bg call returns duplicates, and the id-dedup below drops them. Degrades to
+// current behavior plus one redundant query, never to data loss.
+const SPLIT_CURSOR_TAG = '__split_v1__';
+function packSplitCursors(surface: any[], bg: any[]): string[] {
+	return [SPLIT_CURSOR_TAG, JSON.stringify({ s: surface || [], b: bg || [] })];
+}
+function unpackSplitCursors(arr: any): { s: any[]; b: any[] } | null {
+	if (Array.isArray(arr) && arr[0] === SPLIT_CURSOR_TAG && typeof arr[1] === 'string') {
+		try {
+			const o = JSON.parse(arr[1]);
+			return { s: Array.isArray(o.s) ? o.s : [], b: Array.isArray(o.b) ? o.b : [] };
+		} catch (_e) { return null; }
+	}
+	return null;
+}
+const BG_COVERAGE_MAX_PAGES = 8;
+
+export async function getSplitChatHistory(
+	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
+	fetchOptions: Record<string, any>,
+): Promise<{ list: any[]; endOfList: boolean; startKeyHistory: string[] }> {
+	const bgQueue = bgIndexingQueueName(params.userId, params.service);
+	const base = { service: params.service, owner: params.owner, platform: params.platform };
+	const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
+	const limit = fetchOptions && fetchOptions.limit;
+
+	const cursors = unpackSplitCursors(fetchOptions && fetchOptions.startKeyHistory);
+	const surfaceOpts: any = { fetchMore };
+	const bgOpts: any = { fetchMore };
+	if (limit) { surfaceOpts.limit = limit; bgOpts.limit = limit; }
+	if (fetchMore && cursors) {
+		if (cursors.s.length) surfaceOpts.startKeyHistory = cursors.s.slice();
+		if (cursors.b.length) bgOpts.startKeyHistory = cursors.b.slice();
+	} else if (fetchMore && Array.isArray(fetchOptions?.startKeyHistory) && fetchOptions.startKeyHistory.length) {
+		// A cursor from before the split existed (defensive; in-memory cursors
+		// cannot normally survive a code swap): treat it as the surface's.
+		surfaceOpts.startKeyHistory = fetchOptions.startKeyHistory.slice();
+	}
+
+	const [surface, bg] = await Promise.all([
+		getChatHistory({ ...base, queue_exclude: bgQueue }, surfaceOpts),
+		getChatHistory({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bgOpts),
+	]);
+
+	const surfaceList: any[] = (surface && Array.isArray(surface.list)) ? surface.list : [];
+	let bgList: any[] = (bg && Array.isArray(bg.list)) ? bg.list : [];
+	let bgEnd = !!(bg && bg.endOfList);
+	let bgKeys: any[] = (bg && Array.isArray(bg.startKeyHistory)) ? bg.startKeyHistory : [];
+
+	// Cursor paging is per-queue, so one bg page may cover a much narrower time
+	// window than the surface page (compact stubs are small; indexing bursts are
+	// dense). Page the bg side until its OLDEST loaded item is at least as old
+	// as the surface page's oldest — otherwise the merged page would have a band
+	// of conversation whose indexing rows silently arrive pages later.
+	const oldestCreated = (lst: any[]): number => {
+		let m = Infinity;
+		for (const it of lst) {
+			const c = Number(it && it.created);
+			if (isFinite(c) && c > 0 && c < m) m = c;
+		}
+		return m;
+	};
+	const surfaceOldest = (surface && surface.endOfList) ? -Infinity : oldestCreated(surfaceList);
+	if (isFinite(surfaceOldest) || surfaceOldest === -Infinity) {
+		let guard = 0;
+		while (!bgEnd && guard < BG_COVERAGE_MAX_PAGES) {
+			const bgOldest = bgList.length ? oldestCreated(bgList) : Infinity;
+			if (bgList.length && bgOldest <= surfaceOldest) break;
+			guard++;
+			const more = await getChatHistory(
+				{ ...base, queue: bgQueue, queue_exact: true, compact: true },
+				limit ? { fetchMore: true, limit } : { fetchMore: true },
+			);
+			const moreList: any[] = (more && Array.isArray(more.list)) ? more.list : [];
+			bgList = bgList.concat(moreList);
+			bgEnd = !!(more && more.endOfList);
+			bgKeys = (more && Array.isArray(more.startKeyHistory)) ? more.startKeyHistory : bgKeys;
+			if (!moreList.length) break;
+		}
+	}
+
+	// Dedup by item id, surface copy (full bodies) winning — this is what makes
+	// the split safe against a backend that ignored queue_exclude.
+	const seen: { [id: string]: boolean } = {};
+	for (const it of surfaceList) { if (it && typeof it.id === 'string') seen[it.id] = true; }
+	const merged = surfaceList.concat(bgList.filter((it: any) => !(it && typeof it.id === 'string' && seen[it.id])));
+
+	return {
+		list: merged,
+		endOfList: !!(surface && surface.endOfList) && bgEnd,
+		startKeyHistory: packSplitCursors(
+			(surface && Array.isArray(surface.startKeyHistory)) ? surface.startKeyHistory : [],
+			bgKeys,
+		),
+	};
+}
+
 export type MapHistoryOptions = {
 	clearedAt: number;
 	projectId: string;
@@ -212,9 +334,19 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		var isFailed = item && item.status === 'failed';
 		var response = isFailed ? (item.error != null ? item.error : item.response_body)
 			: (item && item.response_body != null ? item.response_body : item && item.error);
-		var userText = extractLastUserTextFromRequest(requestBody);
-		var assistantText = isPending ? '' : ((extractAssistantText(response) || '').trim() || '');
-		var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
+		// COMPACT listing stubs (bg-queue pages fetched with `compact: true`):
+		// bodies never left the server; the label line, the response head, and
+		// the completion-marker bit arrive as dedicated fields. Everything the
+		// COLLAPSED row needs is here; expanding a row fetches the real bodies
+		// per item (buildHistoryItemFullId point lookups) and remaps.
+		var isCompact = !!(item && item.compact);
+		var userText = isCompact
+			? (typeof item.request_text === 'string' ? item.request_text : '')
+			: extractLastUserTextFromRequest(requestBody);
+		var assistantText = isPending ? '' : (isCompact
+			? ((typeof item.response_text === 'string' ? item.response_text : '').trim())
+			: ((extractAssistantText(response) || '').trim() || ''));
+		var isErrorResponse = !isPending && (isFailed || (!isCompact && isErrorResponseBody(response)));
 		// Record the completion marker, then STRIP it — both, and in that order.
 		// Recording gives the display layer a structured signal instead of a substring
 		// search over model prose. Stripping matches the live resolution path: without
@@ -224,8 +356,12 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		//
 		// Gated on _isBgTask: only an INDEXING pass has a protocol token to hide. An
 		// ordinary reply that merely mentions it keeps its own words.
-		var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText &&
-			assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+		var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && (isCompact
+			? item.response_complete_marker === true
+			: (!!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1));
+		// Still gated on the recorded marker (i.e. an INDEXING pass): an ordinary
+		// reply that merely mentions the token keeps its own words. A compact
+		// head can carry the literal token too, so the strip covers both forms.
 		if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join('').trim();
 		var serverItemId = item && typeof item.id === 'string' && item.id ? item.id : undefined;
 		// A USER bubble shows when the request was made (`created`); an ASSISTANT
@@ -267,6 +403,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (isInProcess) userMsg.isPendingInProcess = true;
 			if (isQueued) userMsg.isPendingQueued = true;
 			if (isCancelledItem) userMsg.isCancelled = true;
+			if (isCompact) userMsg._compact = true;
 			if (item._isBgTask) userMsg.isBackgroundTask = true;
 			if (indexFile) userMsg._indexFile = indexFile;
 			if (item._isOnBgQueue) userMsg._useBgQueue = true;
@@ -296,6 +433,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			// emitted renders as a re-mintable `_expired_.url` link, not a dead one.
 			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
 			if (item._isBgTask) okm.isBackgroundTask = true;
+			if (isCompact) okm._compact = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
 			if (reportedComplete) okm._indexComplete = true;

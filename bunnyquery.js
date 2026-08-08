@@ -1828,7 +1828,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       },
       { service: params.service, owner: params.owner },
       params.queue ? { queue: params.queue } : {},
-      params.status ? { status: params.status } : {}
+      params.status ? { status: params.status } : {},
+      params.queue_exact ? { queue_exact: true } : {},
+      params.compact ? { compact: true } : {},
+      params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
     );
     return chatEngineConfig().clientSecretRequestHistory(
       p,
@@ -1924,10 +1927,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var isPending = isInProcess || isQueued;
       var isFailed = item && item.status === "failed";
       var response = isFailed ? item.error != null ? item.error : item.response_body : item && item.response_body != null ? item.response_body : item && item.error;
-      var userText = extractLastUserTextFromRequest(requestBody);
-      var assistantText = isPending ? "" : (extractAssistantText(response) || "").trim() || "";
-      var isErrorResponse = !isPending && (isFailed || isErrorResponseBody(response));
-      var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+      var isCompact = !!(item && item.compact);
+      var userText = isCompact ? typeof item.request_text === "string" ? item.request_text : "" : extractLastUserTextFromRequest(requestBody);
+      var assistantText = isPending ? "" : isCompact ? (typeof item.response_text === "string" ? item.response_text : "").trim() : (extractAssistantText(response) || "").trim() || "";
+      var isErrorResponse = !isPending && (isFailed || !isCompact && isErrorResponseBody(response));
+      var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && (isCompact ? item.response_complete_marker === true : !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1);
       if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
       var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
       var createdTs = Number(item && item.created);
@@ -1959,6 +1963,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isInProcess) userMsg.isPendingInProcess = true;
         if (isQueued) userMsg.isPendingQueued = true;
         if (isCancelledItem) userMsg.isCancelled = true;
+        if (isCompact) userMsg._compact = true;
         if (item._isBgTask) userMsg.isBackgroundTask = true;
         if (indexFile) userMsg._indexFile = indexFile;
         if (item._isOnBgQueue) userMsg._useBgQueue = true;
@@ -1983,6 +1988,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (assistantText || reportedComplete) {
         var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
         if (item._isBgTask) okm.isBackgroundTask = true;
+        if (isCompact) okm._compact = true;
         if (serverItemId !== void 0) okm._serverItemId = serverItemId;
         if (replyTs !== void 0) okm._ts = replyTs;
         if (reportedComplete) okm._indexComplete = true;
@@ -4302,6 +4308,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     // memory (a reload or a closed tab ended it), and it stopped whenever the model claimed
     // completion, which on an 88-page file happened at page 15. Continuing to dispatch here
     // as well would now double-index every window.
+    /** Fire the consumer's done::-marker hook for a run whose completion this
+     *  client knows DETERMINISTICALLY (see the two call sites in
+     *  maybeResumeIndexing). Best-effort by contract; identity-checked so a
+     *  project switch mid-settle cannot stamp the wrong service. */
+    _mintDoneMarker(entry) {
+      try {
+        var mint = chatEngineConfig().mintIndexDoneMarker;
+        if (!mint || !entry || !entry.storagePath || !entry.projectId) return;
+        var id = this.host.getIdentity();
+        if (!id || id.projectId !== entry.projectId) return;
+        mint({ service: entry.projectId, storagePath: entry.storagePath });
+      } catch (_e) {
+      }
+    }
     maybeResumeIndexing(entry, response, platform) {
       var self = this;
       var endOfClientChain = function() {
@@ -4311,6 +4331,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (!entry || !entry.storagePath) return;
         if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
         if (!isPagedReadFile(entry.filename, entry.mime)) {
+          if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
+            this._mintDoneMarker(entry);
+          }
           endOfClientChain();
           return;
         }
@@ -4322,6 +4345,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
         var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
         if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
+          this._mintDoneMarker(entry);
           endOfClientChain();
           return;
         }
@@ -4419,7 +4443,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var chatList = history && Array.isArray(history.list) ? history.list : [];
         chatList.forEach(function(item) {
           if (isBgIndexingQueue(item.queue_name)) {
-            if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) item._isBgTask = true;
+            var clsText = item.compact ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+            if (isIndexingRequestText(clsText)) item._isBgTask = true;
             else item._isOnBgQueue = true;
           }
         });
@@ -4915,6 +4940,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var list = Array.isArray(messages) ? messages : [];
     var liveIndexKeys = opts && opts.liveIndexKeys || {};
     var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+    var doneKeys = opts && opts.doneKeys || {};
     var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
     var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
     var hasMoreHistory = !!(opts && opts.hasMoreHistory);
@@ -5091,11 +5117,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (grp.driver === "client") {
         grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
       } else {
-        grp.finished = !newestRunOfKey[order[oi]] || liveIndexChecked && !liveIndexKeys[grp.key];
+        grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
       }
       if (grp.status !== "done") {
         grp.resolving = false;
-      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
+      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !doneKeys[grp.key] && newestRunOfKey[order[oi]]) {
         grp.resolving = true;
         grp.resolvingReason = "history";
       } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
@@ -5121,7 +5147,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.8.6" ;
+    var BQ_VERSION = "1.8.7" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

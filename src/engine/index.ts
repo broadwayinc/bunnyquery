@@ -68,6 +68,7 @@ export {
 	// pass. The dbfile browser's "indexed" badge uses this so a file only goes
 	// green once the run is confirmed over, not when its src:: record appears.
 	fetchLiveIndexingKeys,
+	getSplitChatHistory,
 	type IndexingRequestRef,
 	type MapHistoryOptions,
 } from './history';
@@ -121,6 +122,7 @@ export {
 	listClaudeModels,
 	listOpenAIModels,
 	getChatHistory,
+	buildHistoryItemFullId,
 	// response extraction
 	extractClaudeText,
 	extractOpenAIText,

@@ -222,6 +222,14 @@ export type BuildDisplayListOptions = {
 	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
 	 *  is "we do not know", and a worker-driven run stays unfinished on it. */
 	liveIndexChecked?: boolean;
+	/** Files carrying the durable done:: completion marker (one prefix sweep),
+	 *  keyed like IndexingGroup.key (storage path; the bare-name fallback keys
+	 *  of very old prompts simply never match — they keep the queue inference).
+	 *  A marker is PROOF the file was read to the end: it settles a worker-run
+	 *  green without waiting for the queue answer, and it is never withheld by
+	 *  the resolving logic. A live queue hit still outranks it (a re-index in
+	 *  flight whose marker-cascade delete lagged). */
+	doneKeys?: { [fileKey: string]: boolean };
 	/** Server item ids of passes that were on a row when the user STOPPED it
 	 *  (ChatSession.state.stoppedIndexIds). A run holding any of them is a run the
 	 *  user stopped — see the status derivation for why a stop usually leaves no
@@ -324,6 +332,7 @@ export function buildChatDisplayList(
 	var list = Array.isArray(messages) ? messages : [];
 	var liveIndexKeys = (opts && opts.liveIndexKeys) || {};
 	var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+	var doneKeys = (opts && opts.doneKeys) || {};
 	var stoppedIndexIds = (opts && opts.stoppedIndexIds) || {};
 	var windowedIndexing = opts && opts.windowedIndexing !== undefined
 		? !!opts.windowedIndexing
@@ -629,7 +638,13 @@ export function buildChatDisplayList(
 			// permanently false and the two tests below were already carrying the whole
 			// decision. It is gone rather than left as a hook, so this reads as what it
 			// actually is: for a worker-driven run, ONLY the queue can say it is over.
+			// The done:: marker is the third — and strongest — disjunct: written
+			// only at a chain's true end (backend worker, or a client's own
+			// deterministic completion), it answers without any queue round
+			// trip. Gated on the queue NOT claiming the file live, so a
+			// re-index whose marker-cascade delete lagged still shows yellow.
 			grp.finished = !newestRunOfKey[order[oi]] ||
+				(!!doneKeys[grp.key] && !liveIndexKeys[grp.key]) ||
 				(liveIndexChecked && !liveIndexKeys[grp.key]);
 		}
 
@@ -645,7 +660,7 @@ export function buildChatDisplayList(
 			// newest pass's own outcome, and newest-first paging always has that pass.
 			grp.resolving = false;
 		} else if (grp.mayHaveOlder && loadingOlderHistory &&
-			!liveIndexKeys[grp.key] && newestRunOfKey[order[oi]]) {
+			!liveIndexKeys[grp.key] && !doneKeys[grp.key] && newestRunOfKey[order[oi]]) {
 			// The line this draws, and it is the same line the 'status' branch draws:
 			// withhold what is UNKNOWN, and what is only INFERRED settled. Never
 			// withhold what is PROVEN, in either direction. Two proofs, and an older

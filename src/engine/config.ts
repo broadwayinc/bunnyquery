@@ -47,6 +47,18 @@ export interface ChatEngineConfig {
      * until the worker is deployed, then flip it per environment.
      */
     windowedIndexing?: boolean;
+    /**
+     * Mint the durable "indexing finished" marker record ("done::<path>",
+     * reference "src::<path>", table __INDEXING__ — same shape the backend
+     * worker writes via /internal/index-complete) for runs whose completion
+     * THIS CLIENT knows deterministically: a single-pass file's settled pass,
+     * or a client-driven chain whose reply carried the completion token.
+     * Worker-driven chains are NOT minted from the client (their completion is
+     * only ever inferred here); the worker writes their marker itself.
+     * Must be best-effort: tolerate the marker already existing and never
+     * throw. Optional so older consumers keep the pre-marker inference.
+     */
+    mintIndexDoneMarker?: (info: { service: string; storagePath: string }) => void;
 }
 
 let _config: ChatEngineConfig | null = null;

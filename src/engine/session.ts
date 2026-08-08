@@ -37,12 +37,12 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled } from './config';
+import { windowedIndexingEnabled, chatEngineConfig } from './config';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex } from './links';
 import { markImagePreviewStale } from './image_preview';
-import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS } from './history';
+import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
@@ -2804,6 +2804,20 @@ export class ChatSession {
 	// memory (a reload or a closed tab ended it), and it stopped whenever the model claimed
 	// completion, which on an 88-page file happened at page 15. Continuing to dispatch here
 	// as well would now double-index every window.
+	/** Fire the consumer's done::-marker hook for a run whose completion this
+	 *  client knows DETERMINISTICALLY (see the two call sites in
+	 *  maybeResumeIndexing). Best-effort by contract; identity-checked so a
+	 *  project switch mid-settle cannot stamp the wrong service. */
+	_mintDoneMarker(entry: BgTaskEntry): void {
+		try {
+			var mint = chatEngineConfig().mintIndexDoneMarker;
+			if (!mint || !entry || !entry.storagePath || !entry.projectId) return;
+			var id = this.host.getIdentity();
+			if (!id || id.projectId !== entry.projectId) return;
+			mint({ service: entry.projectId, storagePath: entry.storagePath });
+		} catch (_e) { /* best-effort */ }
+	}
+
 	maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void {
 		var self = this;
 		// This client is the ONLY driver of the chains that reach the returns below,
@@ -2820,7 +2834,22 @@ export class ChatSession {
 			// pass here is exactly what "stop" has to prevent — the cancelled pass
 			// settles, and without this the chain simply carries on.
 			if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
-			if (!isPagedReadFile(entry.filename, entry.mime)) { endOfClientChain(); return; }
+			if (!isPagedReadFile(entry.filename, entry.mime)) {
+				// Single-pass file: one settled pass IS the whole job. This is
+				// deterministic knowledge (this client is the only dispatcher),
+				// so record the durable done:: marker — single-pass runs never
+				// get one from the worker. Errors don't count as completion
+				// (this branch sits above the error check on purpose: the chain
+				// is over either way, but only success gets a marker), and
+				// neither does a CANCELLED poll shape — a row stopped from
+				// another tab/device settles through here as {status:
+				// 'cancelled', queue fields} with no provider payload, and
+				// cancelledIndexKeys only records stops issued from THIS tab.
+				if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
+					this._mintDoneMarker(entry);
+				}
+				endOfClientChain(); return;
+			}
 			if (isImageVisionFile(entry.filename, entry.mime)) return; // worker owns this loop (PDF vision)
 			// When windowed indexing is on, the WORKER drives the text/grid loop too. The
 			// client MUST NOT also resume, or two drivers each enqueue a continuation per
@@ -2830,7 +2859,15 @@ export class ChatSession {
 			if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
 			if (isErrorResponseBody(response)) { endOfClientChain(); return; } // a failed pass is not "incomplete"
 			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '';
-			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) { endOfClientChain(); return; } // fully indexed
+			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
+				// Client-driven chain, and the model's reply carried the
+				// completion token — the same signal the worker requires before
+				// minting for its own chains. Deterministic here: this client
+				// is the only dispatcher and it is deciding, right now, that no
+				// further pass will run.
+				this._mintDoneMarker(entry);
+				endOfClientChain(); return; // fully indexed
+			}
 			var pass = (entry.resumePass || 0) + 1;
 			if (pass > MAX_INDEXING_RESUME_PASSES) { endOfClientChain(); return; } // give up after the cap
 			var id = this.host.getIdentity();
@@ -2915,6 +2952,13 @@ export class ChatSession {
 		var options: any = { fetchMore: fetchMore };
 		if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
 
+		// NOT the split fetch (getSplitChatHistory): adversarial review found the
+		// merged pages break the page-tiling invariant this function's prepend,
+		// retainedOlder and clear-horizon logic all rely on, the SDK ignores
+		// explicit startKeyHistory (composite cursors were inert), and compact
+		// would truncate ordinary post-attachment chats routed onto the bg
+		// queue. The split stays parked until those are redesigned — see the
+		// note on getSplitChatHistory.
 		var fetchHistory = function () { return getChatHistory({ service: projectId, owner: owner, platform: platform }, options); };
 
 		return Promise.resolve().then(fetchHistory).catch(function (err: any) {
@@ -2925,7 +2969,11 @@ export class ChatSession {
 			var chatList = history && Array.isArray(history.list) ? history.list : [];
 			chatList.forEach(function (item: any) {
 				if (isBgIndexingQueue(item.queue_name)) {
-					if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) item._isBgTask = true;
+					// Compact stubs carry the label as request_text — the body
+					// never left the server — so classify from whichever form
+					// this item arrived in.
+					var clsText = item.compact ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+					if (isIndexingRequestText(clsText)) item._isBgTask = true;
 					else item._isOnBgQueue = true;
 				}
 			});

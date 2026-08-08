@@ -1151,7 +1151,21 @@ export const CHAT_HISTORY_PAGE_LIMIT = 500;
  * everything already finished.
  */
 export async function getChatHistory(
-	params: { service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string; status?: 'pending' | 'running' | 'resolved' | 'failed' },
+	params: {
+		service?: string; owner?: string; platform: 'claude' | 'openai'; queue?: string;
+		status?: 'pending' | 'running' | 'resolved' | 'failed';
+		/** Exact-queue listing: without it the qid range is a PREFIX match, so
+		 *  queue "u1" also returns "u1-bg" rows. Requires the updated polling
+		 *  lambda; older backends ignore it (harmless, wider results). */
+		queue_exact?: boolean;
+		/** Label/marker STUBS instead of full bodies (see the polling lambda).
+		 *  Older backends ignore it and return full items. */
+		compact?: boolean;
+		/** Drop one queue's rows from an id-prefix listing — how the surface
+		 *  chat is fetched WITHOUT the bg-indexing queue while legacy items on
+		 *  odd queue names survive. Older backends ignore it. */
+		queue_exclude?: string;
+	},
 	fetchOptions: Record<string, any>,
 ) {
 	const url =
@@ -1166,10 +1180,22 @@ export async function getChatHistory(
 		{ service: params.service, owner: params.owner },
 		params.queue ? { queue: params.queue } : {},
 		params.status ? { status: params.status } : {},
+		params.queue_exact ? { queue_exact: true } : {},
+		params.compact ? { compact: true } : {},
+		params.queue_exclude ? { queue_exclude: params.queue_exclude } : {},
 	);
 
 	return chatEngineConfig().clientSecretRequestHistory(
 		p as { url: string; method: 'POST'; queue?: string; status?: string },
 		Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions),
 	);
+}
+
+/** Full server-side id of one history item, for a csr-poll POINT LOOKUP (the
+ *  single-item path returns the item WITH bodies — how an expanded row fetches
+ *  the passes a compact listing stubbed out). Mirrors the id the SDK builds:
+ *  `[METHOD]url#service:` + the item's own `stamp:entropy` id. */
+export function buildHistoryItemFullId(platform: 'claude' | 'openai', service: string, itemId: string): string {
+	const url = platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+	return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
 }
