@@ -32,6 +32,7 @@ import {
 	MAX_CONCURRENT_BG_POLLS,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
+	buildHistoryItemFullId,
 	ANTHROPIC_MESSAGES_API_URL,
 	OPENAI_RESPONSES_API_URL,
 	type BgTaskEntry,
@@ -40,7 +41,7 @@ import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office
 import { windowedIndexingEnabled, chatEngineConfig } from './config';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
 import { buildBoundedChatMessages } from './budget';
-import { createInlineLinkRegex } from './links';
+import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
 import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory } from './history';
 import { wallClockNow } from './time';
@@ -688,6 +689,79 @@ export class ChatSession {
 		var id = this.host.getIdentity();
 		if (!id.projectId || id.platform === 'none') return '';
 		return id.projectId + '#' + id.platform;
+	}
+
+	// ─── compact-stub hydration ─────────────────────────────────────────────
+	// Split-fetch bg pages arrive as label stubs (no bodies). When the user
+	// expands a row, the real reply text is fetched per item (csr-poll point
+	// lookup) and MEMOIZED per chat: every later remap (first-page refresh,
+	// queue-detect tick, cache restore) re-applies the memo, so a hydrated
+	// bubble can never silently revert to its 200-char head.
+	private _hydratedBodies: { [chatKey: string]: { [itemId: string]: string } } = {};
+	private _hydratingItems: { [key: string]: boolean } = {};
+
+	/** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
+	 *  clients call this right after their mapper runs (loadHistory does it
+	 *  internally); it mutates the given array's items in place. */
+	applyHydratedBodies(messages: ChatMessage[]): void {
+		var key = this.getHistoryCacheKey();
+		var memo = key ? this._hydratedBodies[key] : null;
+		if (!memo) return;
+		var id = this.host.getIdentity();
+		for (var i = 0; i < messages.length; i++) {
+			var m: any = messages[i];
+			if (!m || !m._compact || m.role !== 'assistant' || !m._serverItemId) continue;
+			var text = memo[m._serverItemId];
+			if (typeof text !== 'string') continue;
+			m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+			delete m._compact;
+		}
+	}
+
+	/** Fetch the real response bodies for compact history stubs (one csr-poll
+	 *  point lookup per item id), memoize, and swap them into the live list.
+	 *  Best-effort: a failed lookup leaves the stub (its head + fallback line
+	 *  still render) and a later expand retries. */
+	hydrateCompactItems(itemIds: string[]): Promise<void> {
+		var self = this;
+		var lookup = chatEngineConfig().csrHistoryItemLookup;
+		if (!lookup || !itemIds || !itemIds.length) return Promise.resolve();
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve();
+		var chatKey = this.getHistoryCacheKey();
+		if (!chatKey) return Promise.resolve();
+		var jobs = itemIds.map(function (itemId) {
+			if (!itemId) return Promise.resolve();
+			var already = self._hydratedBodies[chatKey] && self._hydratedBodies[chatKey][itemId] !== undefined;
+			var inflightKey = chatKey + '|' + itemId;
+			if (already || self._hydratingItems[inflightKey]) return Promise.resolve();
+			self._hydratingItems[inflightKey] = true;
+			return Promise.resolve(lookup(buildHistoryItemFullId(platform as 'claude' | 'openai', id.projectId, itemId), id.projectId, id.owner)).then(function (body: any) {
+				// Chat may have switched while the lookup flew; the memo is
+				// per-chat so record under the key we started with, and only
+				// touch the live list if it is still that chat's.
+				var text = ((platform === 'openai' ? extractOpenAIText(body) : extractClaudeText(body)) || '').trim();
+				if (text.indexOf(INDEXING_COMPLETE_MARKER) !== -1) text = text.split(INDEXING_COMPLETE_MARKER).join('').trim();
+				if (!self._hydratedBodies[chatKey]) self._hydratedBodies[chatKey] = {};
+				self._hydratedBodies[chatKey][itemId] = text;
+				if (self.getHistoryCacheKey() !== chatKey) return;
+				for (var i = 0; i < self.state.messages.length; i++) {
+					var m: any = self.state.messages[i];
+					if (m && m._compact && m.role === 'assistant' && m._serverItemId === itemId) {
+						m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+						delete m._compact;
+					}
+				}
+			}).catch(function () { /* stub stays; expand retries */ }).then(function () {
+				delete self._hydratingItems[inflightKey];
+			});
+		});
+		return Promise.all(jobs).then(function () {
+			if (self.getHistoryCacheKey() !== chatKey) return;
+			self.host.notify();
+			self.updateHistoryCache();
+		});
 	}
 
 	updateHistoryCache(): void {
@@ -2952,14 +3026,11 @@ export class ChatSession {
 		var options: any = { fetchMore: fetchMore };
 		if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
 
-		// NOT the split fetch (getSplitChatHistory): adversarial review found the
-		// merged pages break the page-tiling invariant this function's prepend,
-		// retainedOlder and clear-horizon logic all rely on, the SDK ignores
-		// explicit startKeyHistory (composite cursors were inert), and compact
-		// would truncate ordinary post-attachment chats routed onto the bg
-		// queue. The split stays parked until those are redesigned — see the
-		// note on getSplitChatHistory.
-		var fetchHistory = function () { return getChatHistory({ service: projectId, owner: owner, platform: platform }, options); };
+		// Split fetch v2: surface (full bodies, bg queue excluded) + bg compact
+		// stubs, tiled to the surface page's time window with module-level
+		// state (buffering + retry safety) — see getSplitChatHistory. Returns
+		// the exact single-fetch shape; startKeyHistory is bookkeeping only.
+		var fetchHistory = function () { return getSplitChatHistory({ service: projectId, owner: owner, platform: platform, userId: id.userId }, options); };
 
 		return Promise.resolve().then(fetchHistory).catch(function (err: any) {
 			if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -2986,6 +3057,10 @@ export class ChatSession {
 				projectId: id.projectId,
 				formatIndexingLabel: self.host.formatIndexingLabel,
 			}).messages;
+			// Re-apply any previously-hydrated compact bodies: a refresh maps
+			// fresh stubs, and without this a bubble the user already expanded
+			// would silently revert to its 200-char head.
+			self.applyHydratedBodies(mapped);
 
 			// Set when a first-page refresh re-prepended already-loaded older pages,
 			// so the cursor reset below knows not to rewind to page 1's boundary.

@@ -2042,7 +2042,11 @@ import {
             resolveFreshHref: function (expiredHref) { return refreshedExpiredLinkMap[expiredHref]; },
         });
     }
-    function parseMsgPartsHtml(content) {
+    // opts.imagePreviews: false — used by the collapsed indexing-row HEADER,
+    // whose file chip must stay a plain inline chip: an is-image-preview block
+    // there breaks the header's horizontal alignment (mirror of agent.vue).
+    function parseMsgPartsHtml(content, opts) {
+        var noPreviews = !!(opts && opts.imagePreviews === false);
         var placeholderHtml = [];
         var PH = function (idx) { return "BQ" + idx + ""; };
         var pushPlaceholder = function (anchorHtml) { var idx = placeholderHtml.length; placeholderHtml.push(anchorHtml); return PH(idx); };
@@ -2062,7 +2066,7 @@ import {
         // and a reply listing a folder can name dozens. Past the budget a link
         // renders as the ordinary text chip. Local to this call, so the output
         // stays a pure function of `content`.
-        var previewsLeft = IMAGE_PREVIEWS_PER_MESSAGE;
+        var previewsLeft = noPreviews ? 0 : IMAGE_PREVIEWS_PER_MESSAGE;
         var linkRe = createInlineLinkRegex();
         working = working.replace(linkRe, function (full) {
             var args = Array.prototype.slice.call(arguments, 1, 7);
@@ -3384,11 +3388,37 @@ import {
     // opened closed itself every time that happened. See IndexingGroup.key.
     function toggleIndexGroup(key) {
         if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
-        else CS.indexGroupsOpen[key] = true;
+        else {
+            CS.indexGroupsOpen[key] = true;
+            // The row's settled replies may be compact stubs (split history
+            // fetch) — ask the engine for their real bodies now that someone
+            // wants to read them. The engine memoizes per chat, so refreshes
+            // cannot revert an expanded row to its stub heads.
+            hydrateCompactIndexGroup(key);
+        }
         renderMessages();
         // Collapsing a row can drop the list below one screen, which removes the
         // scroll-to-top pager trigger along with the height.
         ensureHistoryFillsViewport();
+    }
+
+    // Map an expanded group's compact passes to their item ids and delegate the
+    // fetch/memo/swap to the engine (mirror of agent.vue's wrapper).
+    function hydrateCompactIndexGroup(key) {
+        try {
+            var entries = buildChatDisplayList(session.state.messages, displayListOptions());
+            for (var i = 0; i < entries.length; i++) {
+                var en = entries[i];
+                if (en.kind !== "group" || en.group.key !== key) continue;
+                var ids = [];
+                for (var mi = 0; mi < en.group.members.length; mi++) {
+                    var m = en.group.members[mi].msg;
+                    if (m && m._compact && m.role === "assistant" && m._serverItemId && !m.isError && !m.isPending) ids.push(m._serverItemId);
+                }
+                if (ids.length) session.hydrateCompactItems(ids);
+                return;
+            }
+        } catch (e) { /* best-effort: stubs keep their heads */ }
     }
 
     function buildIndexGroupEl(group, isOpen) {
@@ -3418,7 +3448,7 @@ import {
         // on the label span left a bare <p> carrying the host page's default
         // margins, which made the collapsed row tall in the widget only.
         var label = h("span", { class: "bq-index-label" },
-            h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group)) }));
+            h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group), { imagePreviews: false }) }));
         label.addEventListener("click", function (e) {
             // A click on the file name is a download, not a collapse toggle.
             if (e.target && e.target.closest && e.target.closest("a")) e.stopPropagation();
@@ -4138,6 +4168,11 @@ import {
         configureChatEngine({
             clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
             clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
+            // Single-item csr-poll point lookup: how the engine hydrates a
+            // compact history stub's real body when an indexing row expands.
+            csrHistoryItemLookup: function (fullId, service, owner) {
+                return S.skapi.util.request('csr-poll', { id: fullId, service: service, owner: owner }, { auth: true });
+            },
             mcpBaseUrl: mcpBaseUrl(),
             poll: 0,
             // Server-driven windowed indexing. Off by default in the engine because the

@@ -59,6 +59,15 @@ export interface ChatEngineConfig {
      * throw. Optional so older consumers keep the pre-marker inference.
      */
     mintIndexDoneMarker?: (info: { service: string; storagePath: string }) => void;
+    /**
+     * Single-item csr-poll point lookup (skapi.util.request('csr-poll', {id,
+     * service, owner}, {auth:true})). For a RESOLVED item the backend returns
+     * the provider response body itself; for a failed one, the resolved error.
+     * Used by ChatSession.hydrateCompactItems to fetch the real bodies of
+     * compact history stubs when the user expands an indexing row. Optional:
+     * without it, stubs keep their server-extracted heads.
+     */
+    csrHistoryItemLookup?: (fullId: string, service: string, owner: string) => Promise<any>;
 }
 
 let _config: ChatEngineConfig | null = null;

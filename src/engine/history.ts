@@ -192,125 +192,180 @@ export async function fetchLiveIndexingKeys(params: {
 	return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
 
-// ─── Split history fetch — PARKED, NOT WIRED ─────────────────────────────────
-// Design intent: surface listing (id-prefix minus bg queue, full bodies) +
-// bg-queue compact stubs, merged into the single-fetch shape. DO NOT wire this
-// back into loadHistory / fetchHistoryPage until the following review-confirmed
-// defects are redesigned away (2026-08-11 adversarial review):
-//   1. The SDK IGNORES explicit fetchOptions.startKeyHistory (network.ts copies
-//      only limit/startKey/ascending; paging rides internal per-params-hash
-//      stacks) — the composite cursor below is INERT, and consumers' deep-cursor
-//      logic (keptOlderPages, cache resume) silently does nothing.
-//   2. Merged pages do not TILE: the bg coverage loop over/undershoots the
-//      surface window, breaking the strict newer-to-older page invariant that
-//      the consumers' raw prepend, retainedOlder pruning and the clear-horizon
-//      early end-of-list all rely on (misordered rows, dropped messages, hidden
-//      post-horizon pages). Pages must be trimmed to the shared covered window
-//      with the overflow buffered across calls.
-//   3. Empty-but-not-end pages (surface window entirely bg rows, post-filtered
-//      server-side) dead-end both clients' no-progress fill loops.
-//   4. The coverage loop is non-atomic over the SDK's internal bg cursor: a
-//      mid-loop failure + caller retry skips bg pages permanently.
-//   5. Ordinary chats routed onto the bg queue (post-attachment turns) must
-//      NEVER be stubbed — the lambda's compact mode now stubs only
-//      indexing-shaped items, but the tiling/cursor work above is still needed.
+// ─── Split history fetch ─────────────────────────────────────────────────────
+// One conversation, two queues: ordinary chat lives on the user's queue (or a
+// legacy/random one), indexing passes on "<userId>-bg" — whose stored request
+// bodies carry whole file windows and dominated every history page. The split
+// fetches the SURFACE (id-prefix listing minus the bg queue, full bodies) and
+// the BG queue (exact, compact stubs — the lambda stubs ONLY indexing-shaped
+// items, ordinary chats deferred onto the bg queue keep full bodies) and
+// returns a getChatHistory-shaped page.
 //
-// Backwards-safe by construction: an old backend ignores queue_exclude/compact
-// — the surface then includes bg items with bodies (exactly today's fetch), the
-// bg call returns duplicates, and the id-dedup below drops them. Degrades to
-// current behavior plus one redundant query, never to data loss.
-const SPLIT_CURSOR_TAG = '__split_v1__';
-function packSplitCursors(surface: any[], bg: any[]): string[] {
-	return [SPLIT_CURSOR_TAG, JSON.stringify({ s: surface || [], b: bg || [] })];
-}
-function unpackSplitCursors(arr: any): { s: any[]; b: any[] } | null {
-	if (Array.isArray(arr) && arr[0] === SPLIT_CURSOR_TAG && typeof arr[1] === 'string') {
-		try {
-			const o = JSON.parse(arr[1]);
-			return { s: Array.isArray(o.s) ? o.s : [], b: Array.isArray(o.b) ? o.b : [] };
-		} catch (_e) { return null; }
-	}
-	return null;
-}
+// This is v2, redesigned around the 2026-08-11 review findings:
+//   • The SDK ignores explicit fetchOptions.startKeyHistory — paging rides its
+//     internal per-params-hash cursors. So ALL split state lives HERE, module-
+//     level, keyed by (service|owner|platform|userId): the bg overflow buffer,
+//     the undelivered surface page, end flags. Callers keep echoing
+//     startKeyHistory opaquely; it is bookkeeping only, on both sides.
+//   • Pages TILE exactly: each page emits only items at-or-newer-than the
+//     surface page's oldest item (the boundary); bg items older than that are
+//     BUFFERED for the next page. Consumers' raw prepend, retainedOlder
+//     pruning and clear-horizon early-end all rely on this invariant.
+//   • Retry-safe: the fetched surface page is held as pendingSurface until the
+//     merged page is actually returned, and every bg page lands in the buffer
+//     the moment it arrives — a mid-call failure + caller retry resumes with
+//     nothing skipped (the SDK's internal cursors have already advanced; the
+//     state carries what they advanced past).
+//   • Empty-but-not-end pages are eliminated SERVER-side (the lambda re-queries
+//     past fully-filtered windows). A defensive client cap remains.
+//
+// Backwards-safe: an old backend ignores queue_exclude/compact — the surface
+// then includes bg items with bodies (exactly today's single fetch), the bg
+// call returns duplicates, and dedup-by-id (surface wins) degrades to current
+// behavior plus one redundant query, never to data loss.
 const BG_COVERAGE_MAX_PAGES = 8;
+
+type SplitHistoryState = {
+	/** Fetched bg items not yet emitted (older than the last page's boundary). */
+	bgBuffer: any[];
+	bgEnd: boolean;
+	/** Whether the bg chain has fetched at least once (first call resets the
+	 *  SDK's internal bg cursor with fetchMore:false; later calls continue). */
+	bgStarted: boolean;
+	surfaceEnd: boolean;
+	/** Surface page fetched but not yet delivered in a returned merged page —
+	 *  reused on retry so the SDK's advanced cursor cannot skip it. */
+	pendingSurface: { list: any[]; endOfList: boolean; startKeyHistory: any[] } | null;
+	lastSurfaceKeys: any[];
+};
+const splitHistoryStates: { [key: string]: SplitHistoryState } = {};
+
+function freshSplitState(): SplitHistoryState {
+	return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, lastSurfaceKeys: [] };
+}
+
+/** Test hook: drop split-fetch state (all keys, or one). */
+export function __resetSplitHistoryState(key?: string): void {
+	if (key !== undefined) { delete splitHistoryStates[key]; return; }
+	for (const k in splitHistoryStates) delete splitHistoryStates[k];
+}
+
+const createdOf = (it: any): number => {
+	const c = Number(it && it.created);
+	return isFinite(c) && c > 0 ? c : NaN;
+};
+const oldestCreated = (lst: any[]): number => {
+	let m = Infinity;
+	for (const it of lst) {
+		const c = createdOf(it);
+		if (!isNaN(c) && c < m) m = c;
+	}
+	return m; // Infinity when no item carries a usable timestamp
+};
 
 export async function getSplitChatHistory(
 	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
 	fetchOptions: Record<string, any>,
-): Promise<{ list: any[]; endOfList: boolean; startKeyHistory: string[] }> {
+	/** Test seam: replaces getChatHistory. Not for production callers. */
+	_fetchImpl?: typeof getChatHistory,
+): Promise<{ list: any[]; endOfList: boolean; startKeyHistory: any[] }> {
+	const fetch = _fetchImpl || getChatHistory;
 	const bgQueue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform };
 	const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
 	const limit = fetchOptions && fetchOptions.limit;
+	const key = [params.service, params.owner, params.platform, params.userId || ''].join('|');
 
-	const cursors = unpackSplitCursors(fetchOptions && fetchOptions.startKeyHistory);
-	const surfaceOpts: any = { fetchMore };
-	const bgOpts: any = { fetchMore };
-	if (limit) { surfaceOpts.limit = limit; bgOpts.limit = limit; }
-	if (fetchMore && cursors) {
-		if (cursors.s.length) surfaceOpts.startKeyHistory = cursors.s.slice();
-		if (cursors.b.length) bgOpts.startKeyHistory = cursors.b.slice();
-	} else if (fetchMore && Array.isArray(fetchOptions?.startKeyHistory) && fetchOptions.startKeyHistory.length) {
-		// A cursor from before the split existed (defensive; in-memory cursors
-		// cannot normally survive a code swap): treat it as the surface's.
-		surfaceOpts.startKeyHistory = fetchOptions.startKeyHistory.slice();
+	if (!fetchMore || !splitHistoryStates[key]) {
+		// First page (or a fetchMore with no chain, e.g. after a code swap):
+		// start a fresh chain. The underlying fetchMore:false calls below reset
+		// the SDK's own cursors to match.
+		splitHistoryStates[key] = freshSplitState();
 	}
+	const state = splitHistoryStates[key];
 
-	const [surface, bg] = await Promise.all([
-		getChatHistory({ ...base, queue_exclude: bgQueue }, surfaceOpts),
-		getChatHistory({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bgOpts),
-	]);
-
-	const surfaceList: any[] = (surface && Array.isArray(surface.list)) ? surface.list : [];
-	let bgList: any[] = (bg && Array.isArray(bg.list)) ? bg.list : [];
-	let bgEnd = !!(bg && bg.endOfList);
-	let bgKeys: any[] = (bg && Array.isArray(bg.startKeyHistory)) ? bg.startKeyHistory : [];
-
-	// Cursor paging is per-queue, so one bg page may cover a much narrower time
-	// window than the surface page (compact stubs are small; indexing bursts are
-	// dense). Page the bg side until its OLDEST loaded item is at least as old
-	// as the surface page's oldest — otherwise the merged page would have a band
-	// of conversation whose indexing rows silently arrive pages later.
-	const oldestCreated = (lst: any[]): number => {
-		let m = Infinity;
-		for (const it of lst) {
-			const c = Number(it && it.created);
-			if (isFinite(c) && c > 0 && c < m) m = c;
-		}
-		return m;
-	};
-	const surfaceOldest = (surface && surface.endOfList) ? -Infinity : oldestCreated(surfaceList);
-	if (isFinite(surfaceOldest) || surfaceOldest === -Infinity) {
-		let guard = 0;
-		while (!bgEnd && guard < BG_COVERAGE_MAX_PAGES) {
-			const bgOldest = bgList.length ? oldestCreated(bgList) : Infinity;
-			if (bgList.length && bgOldest <= surfaceOldest) break;
-			guard++;
-			const more = await getChatHistory(
-				{ ...base, queue: bgQueue, queue_exact: true, compact: true },
-				limit ? { fetchMore: true, limit } : { fetchMore: true },
-			);
-			const moreList: any[] = (more && Array.isArray(more.list)) ? more.list : [];
-			bgList = bgList.concat(moreList);
-			bgEnd = !!(more && more.endOfList);
-			bgKeys = (more && Array.isArray(more.startKeyHistory)) ? more.startKeyHistory : bgKeys;
-			if (!moreList.length) break;
+	// ── surface page ────────────────────────────────────────────────────────
+	if (!state.pendingSurface) {
+		if (state.surfaceEnd) {
+			state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys };
+		} else {
+			const sOpts: any = { fetchMore };
+			if (limit) sOpts.limit = limit;
+			const s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+			state.pendingSurface = {
+				list: (s && Array.isArray(s.list)) ? s.list : [],
+				endOfList: !!(s && s.endOfList),
+				startKeyHistory: (s && Array.isArray(s.startKeyHistory)) ? s.startKeyHistory : [],
+			};
 		}
 	}
+	const surface = state.pendingSurface;
 
-	// Dedup by item id, surface copy (full bodies) winning — this is what makes
-	// the split safe against a backend that ignored queue_exclude.
+	// The tiling line: everything at-or-newer than this is emitted now, older
+	// bg items wait in the buffer. A finished surface (endOfList) opens the
+	// line all the way (-Infinity) so the bg side drains over the next pages.
+	// A surface page with NO timestamped items and more to come cannot define
+	// a boundary — with the updated lambda that page shape no longer exists
+	// (it re-queries past filtered-empty windows); against an older backend
+	// nothing is filtered, so it cannot happen there either. Defensively, an
+	// undefinable boundary emits the page as-is with no bg drain.
+	const boundary = surface.endOfList ? -Infinity : oldestCreated(surface.list);
+
+	// ── bg coverage ─────────────────────────────────────────────────────────
+	if (boundary !== Infinity || surface.endOfList) {
+		let hops = 0;
+		while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
+			const bufOldest = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
+			if (state.bgBuffer.length && bufOldest <= boundary) break;
+			hops++;
+			const bOpts: any = { fetchMore: state.bgStarted };
+			if (limit) bOpts.limit = limit;
+			const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+			state.bgStarted = true;
+			const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
+			// Buffer IMMEDIATELY: the SDK cursor has advanced; this is what a
+			// retry resumes from.
+			for (const it of bList) state.bgBuffer.push(it);
+			state.bgEnd = !!(b && b.endOfList);
+			if (!bList.length) break; // defensive: server loops past empties
+		}
+	}
+
+	// ── emit: tile to the boundary ──────────────────────────────────────────
+	let emit: any[];
+	if (boundary === -Infinity) {
+		emit = state.bgBuffer;
+		state.bgBuffer = [];
+	} else {
+		emit = [];
+		const keep: any[] = [];
+		for (const it of state.bgBuffer) {
+			const c = createdOf(it);
+			// Timestamp-less items cannot be placed relative to the boundary —
+			// emit them now rather than risk holding them forever.
+			if (isNaN(c) || c >= boundary) emit.push(it);
+			else keep.push(it);
+		}
+		state.bgBuffer = keep;
+	}
+
+	// Dedup by item id, surface copy (full bodies) winning — the old-backend
+	// degradation path, and a guard against any range overlap.
 	const seen: { [id: string]: boolean } = {};
-	for (const it of surfaceList) { if (it && typeof it.id === 'string') seen[it.id] = true; }
-	const merged = surfaceList.concat(bgList.filter((it: any) => !(it && typeof it.id === 'string' && seen[it.id])));
+	for (const it of surface.list) { if (it && typeof it.id === 'string') seen[it.id] = true; }
+	const merged = surface.list.concat(emit.filter((it: any) => !(it && typeof it.id === 'string' && seen[it.id])));
+
+	// ── deliver ─────────────────────────────────────────────────────────────
+	state.surfaceEnd = surface.endOfList;
+	state.lastSurfaceKeys = surface.startKeyHistory;
+	state.pendingSurface = null;
 
 	return {
 		list: merged,
-		endOfList: !!(surface && surface.endOfList) && bgEnd,
-		startKeyHistory: packSplitCursors(
-			(surface && Array.isArray(surface.startKeyHistory)) ? surface.startKeyHistory : [],
-			bgKeys,
-		),
+		endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0,
+		// Bookkeeping only (both the consumers and the SDK treat it opaquely);
+		// the real cursors are the SDK's internal ones plus this module's state.
+		startKeyHistory: surface.startKeyHistory,
 	};
 }
 

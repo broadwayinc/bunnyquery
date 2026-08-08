@@ -1838,6 +1838,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
     );
   }
+  function buildHistoryItemFullId(platform, service, itemId) {
+    const url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+    return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
+  }
 
   // src/engine/history.ts
   function filterListByClearHorizon(list, clearedAt) {
@@ -1914,6 +1918,96 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       delete bgProbeInflight[key];
     });
     return p;
+  }
+  var BG_COVERAGE_MAX_PAGES = 8;
+  var splitHistoryStates = {};
+  function freshSplitState() {
+    return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, lastSurfaceKeys: [] };
+  }
+  var createdOf = (it) => {
+    const c = Number(it && it.created);
+    return isFinite(c) && c > 0 ? c : NaN;
+  };
+  var oldestCreated = (lst) => {
+    let m = Infinity;
+    for (const it of lst) {
+      const c = createdOf(it);
+      if (!isNaN(c) && c < m) m = c;
+    }
+    return m;
+  };
+  async function getSplitChatHistory(params, fetchOptions, _fetchImpl) {
+    const fetch2 = getChatHistory;
+    const bgQueue = bgIndexingQueueName(params.userId, params.service);
+    const base = { service: params.service, owner: params.owner, platform: params.platform };
+    const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
+    const limit = fetchOptions && fetchOptions.limit;
+    const key = [params.service, params.owner, params.platform, params.userId || ""].join("|");
+    if (!fetchMore || !splitHistoryStates[key]) {
+      splitHistoryStates[key] = freshSplitState();
+    }
+    const state = splitHistoryStates[key];
+    if (!state.pendingSurface) {
+      if (state.surfaceEnd) {
+        state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys };
+      } else {
+        const sOpts = { fetchMore };
+        if (limit) sOpts.limit = limit;
+        const s = await fetch2({ ...base, queue_exclude: bgQueue }, sOpts);
+        state.pendingSurface = {
+          list: s && Array.isArray(s.list) ? s.list : [],
+          endOfList: !!(s && s.endOfList),
+          startKeyHistory: s && Array.isArray(s.startKeyHistory) ? s.startKeyHistory : []
+        };
+      }
+    }
+    const surface = state.pendingSurface;
+    const boundary = surface.endOfList ? -Infinity : oldestCreated(surface.list);
+    if (boundary !== Infinity || surface.endOfList) {
+      let hops = 0;
+      while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
+        const bufOldest = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
+        if (state.bgBuffer.length && bufOldest <= boundary) break;
+        hops++;
+        const bOpts = { fetchMore: state.bgStarted };
+        if (limit) bOpts.limit = limit;
+        const b = await fetch2({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+        state.bgStarted = true;
+        const bList = b && Array.isArray(b.list) ? b.list : [];
+        for (const it of bList) state.bgBuffer.push(it);
+        state.bgEnd = !!(b && b.endOfList);
+        if (!bList.length) break;
+      }
+    }
+    let emit;
+    if (boundary === -Infinity) {
+      emit = state.bgBuffer;
+      state.bgBuffer = [];
+    } else {
+      emit = [];
+      const keep = [];
+      for (const it of state.bgBuffer) {
+        const c = createdOf(it);
+        if (isNaN(c) || c >= boundary) emit.push(it);
+        else keep.push(it);
+      }
+      state.bgBuffer = keep;
+    }
+    const seen = {};
+    for (const it of surface.list) {
+      if (it && typeof it.id === "string") seen[it.id] = true;
+    }
+    const merged = surface.list.concat(emit.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
+    state.surfaceEnd = surface.endOfList;
+    state.lastSurfaceKeys = surface.startKeyHistory;
+    state.pendingSurface = null;
+    return {
+      list: merged,
+      endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0,
+      // Bookkeeping only (both the consumers and the SDK treat it opaquely);
+      // the real cursors are the SDK's internal ones plus this module's state.
+      startKeyHistory: surface.startKeyHistory
+    };
   }
   function mapHistoryListToMessages(list, platform, opts) {
     var mapped = [], runningItemIds = [];
@@ -2133,6 +2227,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var ChatSession = class {
     constructor(host) {
+      // ─── compact-stub hydration ─────────────────────────────────────────────
+      // Split-fetch bg pages arrive as label stubs (no bodies). When the user
+      // expands a row, the real reply text is fetched per item (csr-poll point
+      // lookup) and MEMOIZED per chat: every later remap (first-page refresh,
+      // queue-detect tick, cache restore) re-applies the memo, so a hydrated
+      // bubble can never silently revert to its 200-char head.
+      this._hydratedBodies = {};
+      this._hydratingItems = {};
       this.typewriterQueue = Promise.resolve();
       /**
        * Pick up indexing passes the WORKER minted, which no client ever dispatched.
@@ -2595,6 +2697,66 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var id = this.host.getIdentity();
       if (!id.projectId || id.platform === "none") return "";
       return id.projectId + "#" + id.platform;
+    }
+    /** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
+     *  clients call this right after their mapper runs (loadHistory does it
+     *  internally); it mutates the given array's items in place. */
+    applyHydratedBodies(messages) {
+      var key = this.getHistoryCacheKey();
+      var memo = key ? this._hydratedBodies[key] : null;
+      if (!memo) return;
+      var id = this.host.getIdentity();
+      for (var i = 0; i < messages.length; i++) {
+        var m = messages[i];
+        if (!m || !m._compact || m.role !== "assistant" || !m._serverItemId) continue;
+        var text = memo[m._serverItemId];
+        if (typeof text !== "string") continue;
+        m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+        delete m._compact;
+      }
+    }
+    /** Fetch the real response bodies for compact history stubs (one csr-poll
+     *  point lookup per item id), memoize, and swap them into the live list.
+     *  Best-effort: a failed lookup leaves the stub (its head + fallback line
+     *  still render) and a later expand retries. */
+    hydrateCompactItems(itemIds) {
+      var self = this;
+      var lookup = chatEngineConfig().csrHistoryItemLookup;
+      if (!lookup || !itemIds || !itemIds.length) return Promise.resolve();
+      var id = this.host.getIdentity();
+      var platform = id.platform;
+      if (!id.projectId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+      var chatKey = this.getHistoryCacheKey();
+      if (!chatKey) return Promise.resolve();
+      var jobs = itemIds.map(function(itemId) {
+        if (!itemId) return Promise.resolve();
+        var already = self._hydratedBodies[chatKey] && self._hydratedBodies[chatKey][itemId] !== void 0;
+        var inflightKey = chatKey + "|" + itemId;
+        if (already || self._hydratingItems[inflightKey]) return Promise.resolve();
+        self._hydratingItems[inflightKey] = true;
+        return Promise.resolve(lookup(buildHistoryItemFullId(platform, id.projectId, itemId), id.projectId, id.owner)).then(function(body) {
+          var text = ((platform === "openai" ? extractOpenAIText(body) : extractClaudeText(body)) || "").trim();
+          if (text.indexOf(INDEXING_COMPLETE_MARKER) !== -1) text = text.split(INDEXING_COMPLETE_MARKER).join("").trim();
+          if (!self._hydratedBodies[chatKey]) self._hydratedBodies[chatKey] = {};
+          self._hydratedBodies[chatKey][itemId] = text;
+          if (self.getHistoryCacheKey() !== chatKey) return;
+          for (var i = 0; i < self.state.messages.length; i++) {
+            var m = self.state.messages[i];
+            if (m && m._compact && m.role === "assistant" && m._serverItemId === itemId) {
+              m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+              delete m._compact;
+            }
+          }
+        }).catch(function() {
+        }).then(function() {
+          delete self._hydratingItems[inflightKey];
+        });
+      });
+      return Promise.all(jobs).then(function() {
+        if (self.getHistoryCacheKey() !== chatKey) return;
+        self.host.notify();
+        self.updateHistoryCache();
+      });
     }
     updateHistoryCache() {
       var key = this.getHistoryCacheKey();
@@ -4433,7 +4595,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var options = { fetchMore };
       if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
       var fetchHistory = function() {
-        return getChatHistory({ service: projectId, owner, platform }, options);
+        return getSplitChatHistory({ service: projectId, owner, platform, userId: id.userId }, options);
       };
       return Promise.resolve().then(fetchHistory).catch(function(err) {
         if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -4457,6 +4619,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           projectId: id.projectId,
           formatIndexingLabel: self.host.formatIndexingLabel
         }).messages;
+        self.applyHydratedBodies(mapped);
         var keptOlderPages = false;
         if (fetchMore) {
           self.state.messages = mapped.concat(self.state.messages);
@@ -7142,7 +7305,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       });
     }
-    function parseMsgPartsHtml(content) {
+    function parseMsgPartsHtml(content, opts) {
+      var noPreviews = !!(opts && opts.imagePreviews === false);
       var placeholderHtml = [];
       var PH = function(idx) {
         return "\uE000BQ" + idx + "\uE001";
@@ -7170,7 +7334,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         codeMasks.push(match);
         return "\uE002C" + idx + "\uE003";
       });
-      var previewsLeft = IMAGE_PREVIEWS_PER_MESSAGE;
+      var previewsLeft = noPreviews ? 0 : IMAGE_PREVIEWS_PER_MESSAGE;
       var linkRe = createInlineLinkRegex();
       working = working.replace(linkRe, function(full) {
         var args = Array.prototype.slice.call(arguments, 1, 7);
@@ -8277,9 +8441,29 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function toggleIndexGroup(key) {
       if (CS.indexGroupsOpen[key]) delete CS.indexGroupsOpen[key];
-      else CS.indexGroupsOpen[key] = true;
+      else {
+        CS.indexGroupsOpen[key] = true;
+        hydrateCompactIndexGroup(key);
+      }
       renderMessages();
       ensureHistoryFillsViewport();
+    }
+    function hydrateCompactIndexGroup(key) {
+      try {
+        var entries = buildChatDisplayList(session.state.messages, displayListOptions());
+        for (var i = 0; i < entries.length; i++) {
+          var en = entries[i];
+          if (en.kind !== "group" || en.group.key !== key) continue;
+          var ids = [];
+          for (var mi = 0; mi < en.group.members.length; mi++) {
+            var m = en.group.members[mi].msg;
+            if (m && m._compact && m.role === "assistant" && m._serverItemId && !m.isError && !m.isPending) ids.push(m._serverItemId);
+          }
+          if (ids.length) session.hydrateCompactItems(ids);
+          return;
+        }
+      } catch (e) {
+      }
     }
     function buildIndexGroupEl(group, isOpen) {
       var cls = ["bq-index-group"];
@@ -8291,7 +8475,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var label = h(
         "span",
         { class: "bq-index-label" },
-        h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group)) })
+        h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group), { imagePreviews: false }) })
       );
       label.addEventListener("click", function(e) {
         if (e.target && e.target.closest && e.target.closest("a")) e.stopPropagation();
@@ -8916,6 +9100,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         },
         clientSecretRequestHistory: function(p, f) {
           return S.skapi.clientSecretRequestHistory(p, f);
+        },
+        // Single-item csr-poll point lookup: how the engine hydrates a
+        // compact history stub's real body when an indexing row expands.
+        csrHistoryItemLookup: function(fullId, service, owner) {
+          return S.skapi.util.request("csr-poll", { id: fullId, service, owner }, { auth: true });
         },
         mcpBaseUrl: mcpBaseUrl(),
         poll: 0,

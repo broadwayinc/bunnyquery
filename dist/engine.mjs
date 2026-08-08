@@ -2010,86 +2010,101 @@ async function fetchLiveIndexingKeys(params) {
   }
   return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
-var SPLIT_CURSOR_TAG = "__split_v1__";
-function packSplitCursors(surface, bg) {
-  return [SPLIT_CURSOR_TAG, JSON.stringify({ s: surface || [], b: bg || [] })];
-}
-function unpackSplitCursors(arr) {
-  if (Array.isArray(arr) && arr[0] === SPLIT_CURSOR_TAG && typeof arr[1] === "string") {
-    try {
-      const o = JSON.parse(arr[1]);
-      return { s: Array.isArray(o.s) ? o.s : [], b: Array.isArray(o.b) ? o.b : [] };
-    } catch (_e) {
-      return null;
-    }
-  }
-  return null;
-}
 var BG_COVERAGE_MAX_PAGES = 8;
-async function getSplitChatHistory(params, fetchOptions) {
+var splitHistoryStates = {};
+function freshSplitState() {
+  return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, lastSurfaceKeys: [] };
+}
+function __resetSplitHistoryState(key) {
+  if (key !== void 0) {
+    delete splitHistoryStates[key];
+    return;
+  }
+  for (const k in splitHistoryStates) delete splitHistoryStates[k];
+}
+var createdOf = (it) => {
+  const c = Number(it && it.created);
+  return isFinite(c) && c > 0 ? c : NaN;
+};
+var oldestCreated = (lst) => {
+  let m = Infinity;
+  for (const it of lst) {
+    const c = createdOf(it);
+    if (!isNaN(c) && c < m) m = c;
+  }
+  return m;
+};
+async function getSplitChatHistory(params, fetchOptions, _fetchImpl) {
+  const fetch = _fetchImpl || getChatHistory;
   const bgQueue = bgIndexingQueueName(params.userId, params.service);
   const base = { service: params.service, owner: params.owner, platform: params.platform };
   const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
   const limit = fetchOptions && fetchOptions.limit;
-  const cursors = unpackSplitCursors(fetchOptions && fetchOptions.startKeyHistory);
-  const surfaceOpts = { fetchMore };
-  const bgOpts = { fetchMore };
-  if (limit) {
-    surfaceOpts.limit = limit;
-    bgOpts.limit = limit;
+  const key = [params.service, params.owner, params.platform, params.userId || ""].join("|");
+  if (!fetchMore || !splitHistoryStates[key]) {
+    splitHistoryStates[key] = freshSplitState();
   }
-  if (fetchMore && cursors) {
-    if (cursors.s.length) surfaceOpts.startKeyHistory = cursors.s.slice();
-    if (cursors.b.length) bgOpts.startKeyHistory = cursors.b.slice();
-  } else if (fetchMore && Array.isArray(fetchOptions?.startKeyHistory) && fetchOptions.startKeyHistory.length) {
-    surfaceOpts.startKeyHistory = fetchOptions.startKeyHistory.slice();
+  const state = splitHistoryStates[key];
+  if (!state.pendingSurface) {
+    if (state.surfaceEnd) {
+      state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys };
+    } else {
+      const sOpts = { fetchMore };
+      if (limit) sOpts.limit = limit;
+      const s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+      state.pendingSurface = {
+        list: s && Array.isArray(s.list) ? s.list : [],
+        endOfList: !!(s && s.endOfList),
+        startKeyHistory: s && Array.isArray(s.startKeyHistory) ? s.startKeyHistory : []
+      };
+    }
   }
-  const [surface, bg] = await Promise.all([
-    getChatHistory({ ...base, queue_exclude: bgQueue }, surfaceOpts),
-    getChatHistory({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bgOpts)
-  ]);
-  const surfaceList = surface && Array.isArray(surface.list) ? surface.list : [];
-  let bgList = bg && Array.isArray(bg.list) ? bg.list : [];
-  let bgEnd = !!(bg && bg.endOfList);
-  let bgKeys = bg && Array.isArray(bg.startKeyHistory) ? bg.startKeyHistory : [];
-  const oldestCreated = (lst) => {
-    let m = Infinity;
-    for (const it of lst) {
-      const c = Number(it && it.created);
-      if (isFinite(c) && c > 0 && c < m) m = c;
+  const surface = state.pendingSurface;
+  const boundary = surface.endOfList ? -Infinity : oldestCreated(surface.list);
+  if (boundary !== Infinity || surface.endOfList) {
+    let hops = 0;
+    while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
+      const bufOldest = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
+      if (state.bgBuffer.length && bufOldest <= boundary) break;
+      hops++;
+      const bOpts = { fetchMore: state.bgStarted };
+      if (limit) bOpts.limit = limit;
+      const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+      state.bgStarted = true;
+      const bList = b && Array.isArray(b.list) ? b.list : [];
+      for (const it of bList) state.bgBuffer.push(it);
+      state.bgEnd = !!(b && b.endOfList);
+      if (!bList.length) break;
     }
-    return m;
-  };
-  const surfaceOldest = surface && surface.endOfList ? -Infinity : oldestCreated(surfaceList);
-  if (isFinite(surfaceOldest) || surfaceOldest === -Infinity) {
-    let guard = 0;
-    while (!bgEnd && guard < BG_COVERAGE_MAX_PAGES) {
-      const bgOldest = bgList.length ? oldestCreated(bgList) : Infinity;
-      if (bgList.length && bgOldest <= surfaceOldest) break;
-      guard++;
-      const more = await getChatHistory(
-        { ...base, queue: bgQueue, queue_exact: true, compact: true },
-        limit ? { fetchMore: true, limit } : { fetchMore: true }
-      );
-      const moreList = more && Array.isArray(more.list) ? more.list : [];
-      bgList = bgList.concat(moreList);
-      bgEnd = !!(more && more.endOfList);
-      bgKeys = more && Array.isArray(more.startKeyHistory) ? more.startKeyHistory : bgKeys;
-      if (!moreList.length) break;
+  }
+  let emit;
+  if (boundary === -Infinity) {
+    emit = state.bgBuffer;
+    state.bgBuffer = [];
+  } else {
+    emit = [];
+    const keep = [];
+    for (const it of state.bgBuffer) {
+      const c = createdOf(it);
+      if (isNaN(c) || c >= boundary) emit.push(it);
+      else keep.push(it);
     }
+    state.bgBuffer = keep;
   }
   const seen = {};
-  for (const it of surfaceList) {
+  for (const it of surface.list) {
     if (it && typeof it.id === "string") seen[it.id] = true;
   }
-  const merged = surfaceList.concat(bgList.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
+  const merged = surface.list.concat(emit.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
+  state.surfaceEnd = surface.endOfList;
+  state.lastSurfaceKeys = surface.startKeyHistory;
+  state.pendingSurface = null;
   return {
     list: merged,
-    endOfList: !!(surface && surface.endOfList) && bgEnd,
-    startKeyHistory: packSplitCursors(
-      surface && Array.isArray(surface.startKeyHistory) ? surface.startKeyHistory : [],
-      bgKeys
-    )
+    endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0,
+    // Bookkeeping only (both the consumers and the SDK treat it opaquely);
+    // the real cursors are the SDK's internal ones plus this module's state.
+    startKeyHistory: surface.startKeyHistory
   };
 }
 function mapHistoryListToMessages(list, platform, opts) {
@@ -2310,6 +2325,14 @@ function isPollStopped(res) {
 }
 var ChatSession = class {
   constructor(host) {
+    // ─── compact-stub hydration ─────────────────────────────────────────────
+    // Split-fetch bg pages arrive as label stubs (no bodies). When the user
+    // expands a row, the real reply text is fetched per item (csr-poll point
+    // lookup) and MEMOIZED per chat: every later remap (first-page refresh,
+    // queue-detect tick, cache restore) re-applies the memo, so a hydrated
+    // bubble can never silently revert to its 200-char head.
+    this._hydratedBodies = {};
+    this._hydratingItems = {};
     this.typewriterQueue = Promise.resolve();
     /**
      * Pick up indexing passes the WORKER minted, which no client ever dispatched.
@@ -2772,6 +2795,66 @@ var ChatSession = class {
     var id = this.host.getIdentity();
     if (!id.projectId || id.platform === "none") return "";
     return id.projectId + "#" + id.platform;
+  }
+  /** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
+   *  clients call this right after their mapper runs (loadHistory does it
+   *  internally); it mutates the given array's items in place. */
+  applyHydratedBodies(messages) {
+    var key = this.getHistoryCacheKey();
+    var memo = key ? this._hydratedBodies[key] : null;
+    if (!memo) return;
+    var id = this.host.getIdentity();
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      if (!m || !m._compact || m.role !== "assistant" || !m._serverItemId) continue;
+      var text = memo[m._serverItemId];
+      if (typeof text !== "string") continue;
+      m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+      delete m._compact;
+    }
+  }
+  /** Fetch the real response bodies for compact history stubs (one csr-poll
+   *  point lookup per item id), memoize, and swap them into the live list.
+   *  Best-effort: a failed lookup leaves the stub (its head + fallback line
+   *  still render) and a later expand retries. */
+  hydrateCompactItems(itemIds) {
+    var self = this;
+    var lookup = chatEngineConfig().csrHistoryItemLookup;
+    if (!lookup || !itemIds || !itemIds.length) return Promise.resolve();
+    var id = this.host.getIdentity();
+    var platform = id.platform;
+    if (!id.projectId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+    var chatKey = this.getHistoryCacheKey();
+    if (!chatKey) return Promise.resolve();
+    var jobs = itemIds.map(function(itemId) {
+      if (!itemId) return Promise.resolve();
+      var already = self._hydratedBodies[chatKey] && self._hydratedBodies[chatKey][itemId] !== void 0;
+      var inflightKey = chatKey + "|" + itemId;
+      if (already || self._hydratingItems[inflightKey]) return Promise.resolve();
+      self._hydratingItems[inflightKey] = true;
+      return Promise.resolve(lookup(buildHistoryItemFullId(platform, id.projectId, itemId), id.projectId, id.owner)).then(function(body) {
+        var text = ((platform === "openai" ? extractOpenAIText(body) : extractClaudeText(body)) || "").trim();
+        if (text.indexOf(INDEXING_COMPLETE_MARKER) !== -1) text = text.split(INDEXING_COMPLETE_MARKER).join("").trim();
+        if (!self._hydratedBodies[chatKey]) self._hydratedBodies[chatKey] = {};
+        self._hydratedBodies[chatKey][itemId] = text;
+        if (self.getHistoryCacheKey() !== chatKey) return;
+        for (var i = 0; i < self.state.messages.length; i++) {
+          var m = self.state.messages[i];
+          if (m && m._compact && m.role === "assistant" && m._serverItemId === itemId) {
+            m.content = sanitizeAttachmentLinksForHistory(text, id.projectId, true) || EMPTY_INDEXING_REPLY;
+            delete m._compact;
+          }
+        }
+      }).catch(function() {
+      }).then(function() {
+        delete self._hydratingItems[inflightKey];
+      });
+    });
+    return Promise.all(jobs).then(function() {
+      if (self.getHistoryCacheKey() !== chatKey) return;
+      self.host.notify();
+      self.updateHistoryCache();
+    });
   }
   updateHistoryCache() {
     var key = this.getHistoryCacheKey();
@@ -4610,7 +4693,7 @@ var ChatSession = class {
     var options = { fetchMore };
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
     var fetchHistory = function() {
-      return getChatHistory({ service: projectId, owner, platform }, options);
+      return getSplitChatHistory({ service: projectId, owner, platform, userId: id.userId }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
       if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -4634,6 +4717,7 @@ var ChatSession = class {
         projectId: id.projectId,
         formatIndexingLabel: self.host.formatIndexingLabel
       }).messages;
+      self.applyHydratedBodies(mapped);
       var keptOlderPages = false;
       if (fetchMore) {
         self.state.messages = mapped.concat(self.state.messages);
@@ -5320,6 +5404,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

@@ -69,6 +69,7 @@ export {
 	// green once the run is confirmed over, not when its src:: record appears.
 	fetchLiveIndexingKeys,
 	getSplitChatHistory,
+	__resetSplitHistoryState,
 	type IndexingRequestRef,
 	type MapHistoryOptions,
 } from './history';
