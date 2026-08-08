@@ -2104,7 +2104,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl)
     }
   }
   const bufOldestNow = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
-  const uncovered = !state.bgEnd && boundary !== -Infinity && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
+  const uncovered = !state.bgEnd && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
   const effBoundary = uncovered ? bufOldestNow : boundary;
   let emitSurface;
   if (uncovered) {
@@ -4763,8 +4763,15 @@ var ChatSession = class {
       self.applyHydratedBodies(mapped);
       var keptOlderPages = false;
       if (fetchMore) {
-        self.state.messages = mapped.concat(self.state.messages);
-      } else {
+        var onScreenIds = {};
+        self.state.messages.forEach(function(m) {
+          if (m._serverItemId) onScreenIds[m._serverItemId + "|" + m.role] = true;
+        });
+        var prepend = mapped.filter(function(m) {
+          return !(m._serverItemId && onScreenIds[m._serverItemId + "|" + m.role]);
+        });
+        self.state.messages = prepend.concat(self.state.messages);
+      } else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) ; else {
         if (self.state.typing) self.state.typingAbort = true;
         var serverIds = {};
         mapped.forEach(function(m) {

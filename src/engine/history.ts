@@ -389,8 +389,11 @@ async function _getSplitChatHistoryLocked(
 	// boundary, the covered window ends at the bg buffer's oldest item:
 	// surface items older than that are HELD (surfaceCarry) so the uncovered
 	// bg stubs can never land on a later page above newer surface turns.
+	// Applies to the surface-ENDED case too (boundary -Infinity): while the bg
+	// side still has undrained pages, surface items older than the bg buffer's
+	// oldest must wait, or the next page's stubs would land above them.
 	const bufOldestNow = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
-	const uncovered = !state.bgEnd && boundary !== -Infinity && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
+	const uncovered = !state.bgEnd && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
 	const effBoundary = uncovered ? bufOldestNow : boundary;
 
 	let emitSurface: any[];
