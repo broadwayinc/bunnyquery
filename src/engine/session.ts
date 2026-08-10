@@ -2666,7 +2666,12 @@ export class ChatSession {
 		}
 		var keys = this.state.liveIndexKeys || {};
 		for (var k in keys) { if (keys[k]) return true; }
-		return this.historyItemPolls.size > 0;
+		// BG polls only: a pending ORDINARY chat turn also holds a poll, and
+		// counting it made every tab return during a conversation climb the
+		// full passive ladder for indexing that does not exist.
+		var found = false;
+		this.historyItemPolls.forEach(function (h: any) { if (h && h.kind === 'bg') found = true; });
+		return found;
 	}
 
 	/** Any of these ids still queued or still polled, i.e. surviving work. */
@@ -3234,6 +3239,11 @@ export class ChatSession {
 			// Set when a first-page refresh re-prepended already-loaded older pages,
 			// so the cursor reset below knows not to rewind to page 1's boundary.
 			var keptOlderPages = false;
+			// The empty-page-1 keep below was taken ONLY on the strength of a
+			// deferred batch still flying — if that batch then proves the chat
+			// empty server-side, the kept screen must be let go (see the batch
+			// handler), or an emptied transcript is indelible.
+			var keptScreenAwaitingBg = false;
 
 			if (fetchMore) {
 				// STRIP-THEN-MERGE keyed on SERVER ITEM ID. Incoming bubbles are
@@ -3268,11 +3278,17 @@ export class ChatSession {
 				while (pi < mapped.length) mergedList.push(mapped[pi++]);
 				while (ei < existing.length) mergedList.push(existing[ei++]);
 				self.state.messages = mergedList;
-			} else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) {
-				// Empty-but-not-end first page (a pure-bg band past every hop
-				// cap): REPLACING with it would blank the chat and overwrite the
-				// cache with the wipe. Keep what is on screen; the pager can
-				// still walk older pages from here.
+			} else if (!mapped.length && history && (history.endOfList === false || (history as any).bgPending) && self.state.messages.length) {
+				// Empty first page that cannot judge the chat empty: either
+				// empty-but-not-end (a pure-bg band past every hop cap), or an
+				// empty DEFERRED page whose bg batch is still flying — a chat
+				// whose whole conversation rides the bg queue has a genuinely
+				// empty surface (endOfList true on a head refresh), and the
+				// batch carries everything. REPLACING with it would blank the
+				// chat for the batch's flight time — the greeting flashed over
+				// real messages on every tab return. Keep what is on screen.
+				// Kept ONLY on the batch's word: the batch handler revisits.
+				if (history.endOfList !== false) keptScreenAwaitingBg = true;
 			} else {
 				if (self.state.typing) self.state.typingAbort = true;
 				var serverIds: any = {};
@@ -3379,8 +3395,38 @@ export class ChatSession {
 					if (m._fromBgChain) return true;
 					return (m._serverItemId as string) < (retainBoundary as string);
 				});
-				keptOlderPages = retainedOlder.length > 0;
-				self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
+				// Prepend only the STRICTLY-older bubbles. Retained bg bubbles whose
+				// ids sit inside page 1's own range are ID-MERGED into it instead —
+				// blanket prepending hoisted every indexing row above the whole
+				// conversation, and after a head refresh the single-page batch
+				// never re-placed the deep ones, so they sat hoisted for good.
+				var prependOlder: ChatMessage[] = [];
+				var interleave: ChatMessage[] = [];
+				retainedOlder.forEach(function (m) {
+					var sid = m._serverItemId as string;
+					if (serverIds[sid]) return; // page 1 carries a fresher copy
+					if (retainBoundary !== undefined && sid < (retainBoundary as string)) prependOlder.push(m);
+					else interleave.push(m);
+				});
+				var page1: ChatMessage[] = mapped;
+				if (interleave.length) {
+					// Both sides are id-sorted oldest-first (retention preserves the
+					// on-screen order; the mapper emits oldest-first).
+					var mergedP: ChatMessage[] = [];
+					var ii2 = 0, mi2 = 0;
+					while (ii2 < interleave.length && mi2 < mapped.length) {
+						var iv: any = interleave[ii2], mv: any = mapped[mi2];
+						var mid2 = typeof mv._serverItemId === 'string' ? mv._serverItemId : undefined;
+						if (mid2 === undefined) break; // defensive: id-less tail
+						if ((iv._serverItemId as string) <= mid2) { mergedP.push(iv); ii2++; }
+						else { mergedP.push(mv); mi2++; }
+					}
+					while (ii2 < interleave.length) mergedP.push(interleave[ii2++]);
+					while (mi2 < mapped.length) mergedP.push(mapped[mi2++]);
+					page1 = mergedP;
+				}
+				keptOlderPages = prependOlder.length > 0 || interleave.length > 0;
+				self.state.messages = prependOlder.length ? prependOlder.concat(page1) : page1;
 				rescued.forEach(function (m) { self.state.messages.push(m); });
 				if (Object.keys(locallyCancelled).length) {
 					for (var ci = 0; ci < self.state.messages.length; ci++) {
@@ -3449,8 +3495,16 @@ export class ChatSession {
 				// mint a SECOND bgPending, and the older handler settling later must
 				// not clear (or keep) the flag the newer batch owns.
 				var batchId = ++_bgHistoryBatchSeq;
-				self.state.bgHistoryLoading = true;
-				self.host.notify();
+				// SILENT unless this is the chat's genuine FIRST PAINT. Two quiet
+				// cases: an ended chain's head refresh (endOfList already true),
+				// and a MID-WALK tab return — the walk restarts for cursor
+				// safety, but the conversation is already on screen and flashing
+				// "Loading indexing history" over it on every return was the
+				// reported bug. Only a never-walked chat announces the batch.
+				if (history.endOfList !== true && (history as any).firstLoad === true) {
+					self.state.bgHistoryLoading = true;
+					self.host.notify();
+				}
 				var releaseBgFlag = function () {
 					if (_bgHistoryBatchSeq === batchId) self.state.bgHistoryLoading = false;
 				};
@@ -3474,6 +3528,25 @@ export class ChatSession {
 						formatIndexingLabel: self.host.formatIndexingLabel,
 					}).messages;
 					self.applyHydratedBodies(m2);
+					if (keptScreenAwaitingBg && !m2.length && batch && batch.endOfList === true) {
+						// The empty page 1 was kept ONLY on this batch's word — and it
+						// just proved the chat empty server-side (an emptied/cleared
+						// transcript). Let the kept screen go: drop this chat's settled
+						// server bubbles, keep staged and in-flight local work and any
+						// other chat's strays for their own reconcilers, and remember
+						// the end. Without this the stale transcript was indelible and
+						// even re-persisted itself into the history cache.
+						self.state.messages = self.state.messages.filter(function (m: any) {
+							if (typeof m._serverItemId !== 'string') return true;
+							if (m._ownerKey !== undefined && m._ownerKey !== loadKey) return true;
+							return false;
+						});
+						self.state.historyEndOfList = true;
+						releaseBgFlag();
+						self.updateHistoryCache();
+						self.host.notify();
+						return;
+					}
 					var incoming: any = {};
 					m2.forEach(function (m: any) { if (m._serverItemId) incoming[m._serverItemId + '|' + m.role] = true; });
 					var baseList = self.state.messages.filter(function (m: any) { return !(m._serverItemId && incoming[m._serverItemId + '|' + m.role]); });

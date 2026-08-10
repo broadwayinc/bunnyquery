@@ -1957,7 +1957,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var splitHistoryStates = {};
   var splitHistoryLocks = {};
   function freshSplitState() {
-    return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [] };
+    return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [], newestBgId: "" };
+  }
+  function noteBgIds(state, list) {
+    for (const it of list) {
+      const id = it && typeof it.id === "string" ? it.id : "";
+      if (id && id > state.newestBgId) state.newestBgId = id;
+    }
   }
   var createdOf = (it) => {
     const c = Number(it && it.created);
@@ -1993,6 +1999,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const base = { service: params.service, owner: params.owner, platform: params.platform };
     const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
     const limit = fetchOptions && fetchOptions.limit;
+    const firstLoad = !splitHistoryStates[key];
     let headRefresh = false;
     if (!splitHistoryStates[key]) {
       splitHistoryStates[key] = freshSplitState();
@@ -2054,6 +2061,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               if (it && typeof it === "object") it._fromBgChain = true;
               batch.push(it);
             }
+            const prevNewest = state.newestBgId;
+            noteBgIds(state, bList);
+            if (prevNewest && !(b && b.endOfList) && !bList.some((it) => it && it.id === prevNewest)) {
+              state.bgEnd = false;
+              state.bgStarted = true;
+            }
           } else {
             let hops = 0;
             while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
@@ -2067,6 +2080,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                 if (it && typeof it === "object") it._fromBgChain = true;
                 batch.push(it);
               }
+              noteBgIds(state, bList);
               state.bgEnd = !!(b && b.endOfList);
               if (!bList.length && !state.bgEnd) break;
               if (state.bgEnd) break;
@@ -2086,6 +2100,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // carries the final word for that case.
         endOfList: state.surfaceEnd && state.bgEnd,
         startKeyHistory: surface.startKeyHistory,
+        firstLoad,
         bgPending
       };
     }
@@ -2099,6 +2114,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       for (const it of hbList) {
         if (it && typeof it === "object") it._fromBgChain = true;
         state.bgBuffer.push(it);
+      }
+      const prevNewestH = state.newestBgId;
+      noteBgIds(state, hbList);
+      if (prevNewestH && !(hb && hb.endOfList) && !hbList.some((it) => it && it.id === prevNewestH)) {
+        state.bgEnd = false;
+        state.bgStarted = true;
       }
     } else if (boundary !== Infinity || surface.endOfList) {
       let hops = 0;
@@ -2115,6 +2136,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (it && typeof it === "object") it._fromBgChain = true;
           state.bgBuffer.push(it);
         }
+        noteBgIds(state, bList);
         state.bgEnd = !!(b && b.endOfList);
         if (!bList.length && !state.bgEnd) break;
         if (state.bgEnd) break;
@@ -2137,7 +2159,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0 && state.surfaceCarry.length === 0,
       // Bookkeeping only (both the consumers and the SDK treat it opaquely);
       // the real cursors are the SDK's internal ones plus this module's state.
-      startKeyHistory: surface.startKeyHistory
+      startKeyHistory: surface.startKeyHistory,
+      firstLoad
     };
   }
   function mapHistoryListToMessages(list, platform, opts) {
@@ -4454,7 +4477,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       for (var k in keys) {
         if (keys[k]) return true;
       }
-      return this.historyItemPolls.size > 0;
+      var found = false;
+      this.historyItemPolls.forEach(function(h) {
+        if (h && h.kind === "bg") found = true;
+      });
+      return found;
     }
     /** Any of these ids still queued or still polled, i.e. surviving work. */
     _isTrackingAny(ids) {
@@ -4874,6 +4901,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }).messages;
         self.applyHydratedBodies(mapped);
         var keptOlderPages = false;
+        var keptScreenAwaitingBg = false;
         if (fetchMore) {
           var incomingKeys = {};
           mapped.forEach(function(m) {
@@ -4905,7 +4933,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           while (pi < mapped.length) mergedList.push(mapped[pi++]);
           while (ei < existing.length) mergedList.push(existing[ei++]);
           self.state.messages = mergedList;
-        } else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) ; else {
+        } else if (!mapped.length && history && (history.endOfList === false || history.bgPending) && self.state.messages.length) {
+          if (history.endOfList !== false) keptScreenAwaitingBg = true;
+        } else {
           if (self.state.typing) self.state.typingAbort = true;
           var serverIds = {};
           mapped.forEach(function(m) {
@@ -4965,8 +4995,36 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             if (m._fromBgChain) return true;
             return m._serverItemId < retainBoundary;
           });
-          keptOlderPages = retainedOlder.length > 0;
-          self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
+          var prependOlder = [];
+          var interleave = [];
+          retainedOlder.forEach(function(m) {
+            var sid = m._serverItemId;
+            if (serverIds[sid]) return;
+            if (retainBoundary !== void 0 && sid < retainBoundary) prependOlder.push(m);
+            else interleave.push(m);
+          });
+          var page1 = mapped;
+          if (interleave.length) {
+            var mergedP = [];
+            var ii2 = 0, mi2 = 0;
+            while (ii2 < interleave.length && mi2 < mapped.length) {
+              var iv = interleave[ii2], mv = mapped[mi2];
+              var mid2 = typeof mv._serverItemId === "string" ? mv._serverItemId : void 0;
+              if (mid2 === void 0) break;
+              if (iv._serverItemId <= mid2) {
+                mergedP.push(iv);
+                ii2++;
+              } else {
+                mergedP.push(mv);
+                mi2++;
+              }
+            }
+            while (ii2 < interleave.length) mergedP.push(interleave[ii2++]);
+            while (mi2 < mapped.length) mergedP.push(mapped[mi2++]);
+            page1 = mergedP;
+          }
+          keptOlderPages = prependOlder.length > 0 || interleave.length > 0;
+          self.state.messages = prependOlder.length ? prependOlder.concat(page1) : page1;
           rescued.forEach(function(m) {
             self.state.messages.push(m);
           });
@@ -5021,8 +5079,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var bgPending = !fetchMore && history && history.bgPending;
         if (bgPending) {
           var batchId = ++_bgHistoryBatchSeq;
-          self.state.bgHistoryLoading = true;
-          self.host.notify();
+          if (history.endOfList !== true && history.firstLoad === true) {
+            self.state.bgHistoryLoading = true;
+            self.host.notify();
+          }
           var releaseBgFlag = function() {
             if (_bgHistoryBatchSeq === batchId) self.state.bgHistoryLoading = false;
           };
@@ -5049,6 +5109,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               formatIndexingLabel: self.host.formatIndexingLabel
             }).messages;
             self.applyHydratedBodies(m2);
+            if (keptScreenAwaitingBg && !m2.length && batch && batch.endOfList === true) {
+              self.state.messages = self.state.messages.filter(function(m) {
+                if (typeof m._serverItemId !== "string") return true;
+                if (m._ownerKey !== void 0 && m._ownerKey !== loadKey) return true;
+                return false;
+              });
+              self.state.historyEndOfList = true;
+              releaseBgFlag();
+              self.updateHistoryCache();
+              self.host.notify();
+              return;
+            }
             var incoming = {};
             m2.forEach(function(m) {
               if (m._serverItemId) incoming[m._serverItemId + "|" + m.role] = true;
@@ -7951,44 +8023,63 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (reference) cfg.reference = "src::" + storagePath;
         return S.skapi.postRecord(null, cfg);
       }
-      return Promise.resolve(createWith(true)).catch(function(err) {
-        var msg = String(err && err.message || err || "");
-        if (msg.indexOf("is already taken") === -1) {
-          return ensureFileIndexRecordDb(storagePath).then(function() {
-            return createWith(true);
-          }).catch(function(errRef) {
-            var msgRef = String(errRef && errRef.message || errRef || "");
-            if (msgRef.indexOf("is already taken") !== -1) return updateExisting();
-            return Promise.resolve(createWith(false)).catch(function(err2) {
-              var msg2 = String(err2 && err2.message || err2 || "");
-              if (msg2.indexOf("is already taken") === -1) {
-                console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
-                return null;
-              }
-              return updateExisting();
-            });
-          });
-        }
-        return updateExisting();
-      });
-      function updateExisting() {
+      function lookup() {
         return Promise.resolve(S.skapi.getRecords({ service, unique_id: uid })).then(function(found) {
-          var rec = found && found.list && found.list[0];
-          if (!rec || !rec.record_id) return null;
-          var existing = rec.data || {};
-          if (patch.status === "working" && TERMINAL[String(existing.status)]) {
-            var endedAt = typeof existing.finished === "number" ? existing.finished : typeof existing.started === "number" ? existing.started : 0;
-            if (!(typeof patch.started === "number" && patch.started > endedAt)) return null;
-          }
-          return S.skapi.postRecord(null, {
-            service,
-            record_id: rec.record_id,
-            data: patchData(existing)
-          });
+          return found && found.list && found.list[0] || null;
+        }).catch(function() {
+          return null;
+        });
+      }
+      function updateExisting(rec) {
+        var existing = rec.data || {};
+        if (patch.status === "working" && TERMINAL[String(existing.status)]) {
+          var endedAt = typeof existing.finished === "number" ? existing.finished : typeof existing.started === "number" ? existing.started : 0;
+          if (!(typeof patch.started === "number" && patch.started > endedAt)) return Promise.resolve(null);
+        }
+        if (patch.status !== "working" && String(existing.status) === patch.status) return Promise.resolve(null);
+        return Promise.resolve(S.skapi.postRecord(null, {
+          service,
+          record_id: rec.record_id,
+          data: patchData(existing)
+        }));
+      }
+      function settleAsUpdate() {
+        return lookup().then(function(rec) {
+          if (rec && rec.record_id) return updateExisting(rec);
+          return null;
         }).catch(function(err) {
           console.warn("[bunnyquery] upsertIndexRunRecord update failed (non-fatal)", storagePath, String(err && err.message || err || ""));
         });
       }
+      function createChain() {
+        return Promise.resolve(createWith(true)).catch(function(err) {
+          var msg = String(err && err.message || err || "");
+          if (msg.indexOf("is already taken") === -1) {
+            return ensureFileIndexRecordDb(storagePath).then(function() {
+              return createWith(true);
+            }).catch(function(errRef) {
+              var msgRef = String(errRef && errRef.message || errRef || "");
+              if (msgRef.indexOf("is already taken") !== -1) return settleAsUpdate();
+              return Promise.resolve(createWith(false)).catch(function(err2) {
+                var msg2 = String(err2 && err2.message || err2 || "");
+                if (msg2.indexOf("is already taken") === -1) {
+                  console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
+                  return null;
+                }
+                return settleAsUpdate();
+              });
+            });
+          }
+          return settleAsUpdate();
+        });
+      }
+      if (patch.status !== "working") {
+        return lookup().then(function(rec) {
+          if (rec && rec.record_id) return updateExisting(rec);
+          return createChain();
+        });
+      }
+      return createChain();
     }
     function ensureFileIndexRecordDb(storagePath, meta) {
       if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
@@ -8960,11 +9051,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       markerSweep.gen++;
     }
     var STUB_RECHECK_MS = 3e4;
+    var STUB_RECHECK_MAX_ROUNDS = 5;
     var stubRecheckTimer = null;
+    var stubRecheckSig = "";
+    var stubRecheckRounds = 0;
+    var markerSweepSettled = false;
     function armStubRecheck() {
       if (stubRecheckTimer !== null) return;
       stubRecheckTimer = setTimeout(function() {
         stubRecheckTimer = null;
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        stubRecheckRounds++;
         void refreshIndexMarkers();
       }, STUB_RECHECK_MS);
     }
@@ -8972,29 +9069,45 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       try {
         if (markerSweep.svc !== S.projectId) return;
         var lk = session && session.getLiveIndexState().keys || {};
+        var sig = [];
         for (var pth in markerSweep.runs) {
           var r = markerSweep.runs[pth];
-          if (r && r.status === "working" && !lk[pth]) {
-            armStubRecheck();
-            return;
+          if (!r || r.status !== "working" || lk[pth]) continue;
+          var fn = r.filename || pth.split("/").pop() || pth;
+          if (markerSweep.done[pth] || markerSweep.done[fn]) continue;
+          sig.push(pth);
+        }
+        if (!sig.length) {
+          stubRecheckSig = "";
+          stubRecheckRounds = 0;
+          if (stubRecheckTimer !== null) {
+            clearTimeout(stubRecheckTimer);
+            stubRecheckTimer = null;
           }
+          return;
         }
-        if (stubRecheckTimer !== null) {
-          clearTimeout(stubRecheckTimer);
-          stubRecheckTimer = null;
+        var s = sig.sort().join("|");
+        if (s !== stubRecheckSig) {
+          stubRecheckSig = s;
+          stubRecheckRounds = 0;
         }
+        if (stubRecheckRounds >= STUB_RECHECK_MAX_ROUNDS) return;
+        armStubRecheck();
       } catch (e) {
       }
     }
     function refreshIndexMarkers(invalidate) {
       if (invalidate) invalidateIndexMarkerSweep();
       return sweepIndexMarkersDb().then(function(res) {
+        markerSweepSettled = true;
         if (res) {
           maybeArmStubRecheck();
           renderMessages();
         }
         return res;
       }).catch(function() {
+        markerSweepSettled = true;
+        renderMessages();
         return null;
       });
     }
@@ -9118,9 +9231,50 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       else {
         CS.indexGroupsOpen[key] = true;
         hydrateCompactIndexGroup(key);
+        void loadIndexGroupHistory(key);
       }
       renderMessages();
       ensureHistoryFillsViewport();
+    }
+    var INDEX_GROUP_FETCH_MAX_PAGES = 40;
+    var indexGroupFetching = {};
+    function groupNeedsHistory(key) {
+      if (CS.historyEndOfList) return false;
+      try {
+        var entries = buildChatDisplayList(CS.messages, displayListOptions());
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].kind !== "indexing" || entries[i].group.key !== key) continue;
+          return !!(entries[i].group.stub || entries[i].group.mayHaveOlder);
+        }
+      } catch (e) {
+      }
+      return false;
+    }
+    function loadIndexGroupHistory(key) {
+      if (indexGroupFetching[key]) return Promise.resolve();
+      if (!groupNeedsHistory(key)) return Promise.resolve();
+      indexGroupFetching[key] = true;
+      renderMessages();
+      var pages = 0, waits = 0;
+      function step() {
+        if (!CS.indexGroupsOpen[key]) return null;
+        if (!groupNeedsHistory(key)) return null;
+        if (pages >= INDEX_GROUP_FETCH_MAX_PAGES) return null;
+        if (CS.loadingOlderHistory || CS.historyFilling || session.state.bgHistoryLoading) {
+          if (++waits > 240) return null;
+          return new Promise(function(r) {
+            setTimeout(r, 250);
+          }).then(step);
+        }
+        pages++;
+        return fetchOlderHistoryIfNeeded().then(step);
+      }
+      return Promise.resolve(step()).catch(function() {
+      }).then(function() {
+        delete indexGroupFetching[key];
+        hydrateCompactIndexGroup(key);
+        renderMessages();
+      });
     }
     function hydrateCompactIndexGroup(key) {
       try {
@@ -9193,6 +9347,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
         label,
         indexGroupCount(group) ? h("span", { class: "bq-index-count", text: indexGroupCount(group) }) : null,
+        // Spinning arrows while this row's history is being paged in —
+        // separate from the status icon, so a green (done) row spins too.
+        indexGroupFetching[group.key] ? h("span", { class: "bq-index-fetch", html: INDEX_ICON_ACTIVE, title: "Fetching this file's indexing history" }) : null,
         cancelBtn,
         h("span", { class: "bq-index-chevron", text: "\u25B6" })
       );
@@ -9203,11 +9360,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           text: "Could not stop this file: " + group.cancelError
         }));
       }
-      if (isOpen && group.mayHaveOlder) {
+      if (isOpen && indexGroupFetching[group.key]) {
+        el.appendChild(h(
+          "div",
+          { class: "bq-index-note" },
+          h("span", { text: "Loading this file's indexing history" }),
+          h("span", { class: "bq-loader" })
+        ));
+      } else if (isOpen && group.mayHaveOlder) {
         var loadingNow = group.resolvingReason === "history" || group.stub && session.state.bgHistoryLoading;
         el.appendChild(h("div", {
           class: "bq-index-note",
           text: "Earlier passes of this file are further back in the conversation. " + (loadingNow ? "Loading them now." : "Scroll up to load them.")
+        }));
+      } else if (isOpen && !group.visibleMembers.length) {
+        el.appendChild(h("div", {
+          class: "bq-index-note",
+          text: "This file's indexing steps aren't in this chat's history. They may belong to another chat or platform, or the conversation was cleared."
         }));
       }
       return el;
@@ -9298,7 +9467,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       clear(CS.messagesBox);
       CS.messageEls = [];
       if (CS.loadingOlderHistory) CS.messagesBox.appendChild(historyLoadingEl(false));
-      else if (session.state.bgHistoryLoading && CS.messages.length) {
+      else if (session.state.bgHistoryLoading) {
         CS.messagesBox.appendChild(h(
           "div",
           { class: "bq-history-loading" },
@@ -9312,25 +9481,28 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           syncDraftingIndicator();
           return;
         }
-        var greet = h(
-          "div",
-          { class: "bq-message is-assistant bq-empty-greeting" },
-          h(
-            "div",
-            { class: "bq-bubble" },
-            document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") + ".")
-          )
-        );
-        CS.messagesBox.appendChild(greet);
+        var emptyStubEls = [];
         try {
           var emptyEntries = buildChatDisplayList([], displayListOptions());
           for (var ge = 0; ge < emptyEntries.length; ge++) {
             if (emptyEntries[ge].kind !== "indexing") continue;
             var sg = emptyEntries[ge].group;
-            CS.messagesBox.appendChild(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
+            emptyStubEls.push(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
           }
         } catch (e) {
         }
+        if (!emptyStubEls.length && !session.state.bgHistoryLoading && markerSweepSettled) {
+          CS.messagesBox.appendChild(h(
+            "div",
+            { class: "bq-message is-assistant bq-empty-greeting" },
+            h(
+              "div",
+              { class: "bq-bubble" },
+              document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") + ".")
+            )
+          ));
+        }
+        for (var gse = 0; gse < emptyStubEls.length; gse++) CS.messagesBox.appendChild(emptyStubEls[gse]);
         syncDraftingIndicator();
         return;
       }
@@ -9353,6 +9525,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               if (typeof moFirst === "number") moPatch.started = moFirst;
               if (mog.name) moPatch.filename = mog.name;
               void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
+              if (morec) morec.status = "done";
+              else markerSweep.runs[mog.path] = { status: "done" };
             }
           }
         }

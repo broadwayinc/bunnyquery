@@ -2048,7 +2048,13 @@ var BG_COVERAGE_MAX_PAGES = 2;
 var splitHistoryStates = {};
 var splitHistoryLocks = {};
 function freshSplitState() {
-  return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [] };
+  return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [], newestBgId: "" };
+}
+function noteBgIds(state, list) {
+  for (const it of list) {
+    const id = it && typeof it.id === "string" ? it.id : "";
+    if (id && id > state.newestBgId) state.newestBgId = id;
+  }
 }
 function __resetSplitHistoryState(key) {
   if (key !== void 0) {
@@ -2093,6 +2099,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
   const base = { service: params.service, owner: params.owner, platform: params.platform };
   const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
   const limit = fetchOptions && fetchOptions.limit;
+  const firstLoad = !splitHistoryStates[key];
   let headRefresh = false;
   if (!splitHistoryStates[key]) {
     splitHistoryStates[key] = freshSplitState();
@@ -2154,6 +2161,12 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
             if (it && typeof it === "object") it._fromBgChain = true;
             batch.push(it);
           }
+          const prevNewest = state.newestBgId;
+          noteBgIds(state, bList);
+          if (prevNewest && !(b && b.endOfList) && !bList.some((it) => it && it.id === prevNewest)) {
+            state.bgEnd = false;
+            state.bgStarted = true;
+          }
         } else {
           let hops = 0;
           while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
@@ -2167,6 +2180,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
               if (it && typeof it === "object") it._fromBgChain = true;
               batch.push(it);
             }
+            noteBgIds(state, bList);
             state.bgEnd = !!(b && b.endOfList);
             if (!bList.length && !state.bgEnd) break;
             if (state.bgEnd) break;
@@ -2186,6 +2200,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
       // carries the final word for that case.
       endOfList: state.surfaceEnd && state.bgEnd,
       startKeyHistory: surface.startKeyHistory,
+      firstLoad,
       bgPending
     };
   }
@@ -2199,6 +2214,12 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     for (const it of hbList) {
       if (it && typeof it === "object") it._fromBgChain = true;
       state.bgBuffer.push(it);
+    }
+    const prevNewestH = state.newestBgId;
+    noteBgIds(state, hbList);
+    if (prevNewestH && !(hb && hb.endOfList) && !hbList.some((it) => it && it.id === prevNewestH)) {
+      state.bgEnd = false;
+      state.bgStarted = true;
     }
   } else if (boundary !== Infinity || surface.endOfList) {
     let hops = 0;
@@ -2215,6 +2236,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
         if (it && typeof it === "object") it._fromBgChain = true;
         state.bgBuffer.push(it);
       }
+      noteBgIds(state, bList);
       state.bgEnd = !!(b && b.endOfList);
       if (!bList.length && !state.bgEnd) break;
       if (state.bgEnd) break;
@@ -2237,7 +2259,8 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     endOfList: state.surfaceEnd && state.bgEnd && state.bgBuffer.length === 0 && state.surfaceCarry.length === 0,
     // Bookkeeping only (both the consumers and the SDK treat it opaquely);
     // the real cursors are the SDK's internal ones plus this module's state.
-    startKeyHistory: surface.startKeyHistory
+    startKeyHistory: surface.startKeyHistory,
+    firstLoad
   };
 }
 function mapHistoryListToMessages(list, platform, opts) {
@@ -4554,7 +4577,11 @@ var ChatSession = class {
     for (var k in keys) {
       if (keys[k]) return true;
     }
-    return this.historyItemPolls.size > 0;
+    var found = false;
+    this.historyItemPolls.forEach(function(h) {
+      if (h && h.kind === "bg") found = true;
+    });
+    return found;
   }
   /** Any of these ids still queued or still polled, i.e. surviving work. */
   _isTrackingAny(ids) {
@@ -4974,6 +5001,7 @@ var ChatSession = class {
       }).messages;
       self.applyHydratedBodies(mapped);
       var keptOlderPages = false;
+      var keptScreenAwaitingBg = false;
       if (fetchMore) {
         var incomingKeys = {};
         mapped.forEach(function(m) {
@@ -5005,7 +5033,9 @@ var ChatSession = class {
         while (pi < mapped.length) mergedList.push(mapped[pi++]);
         while (ei < existing.length) mergedList.push(existing[ei++]);
         self.state.messages = mergedList;
-      } else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) ; else {
+      } else if (!mapped.length && history && (history.endOfList === false || history.bgPending) && self.state.messages.length) {
+        if (history.endOfList !== false) keptScreenAwaitingBg = true;
+      } else {
         if (self.state.typing) self.state.typingAbort = true;
         var serverIds = {};
         mapped.forEach(function(m) {
@@ -5065,8 +5095,36 @@ var ChatSession = class {
           if (m._fromBgChain) return true;
           return m._serverItemId < retainBoundary;
         });
-        keptOlderPages = retainedOlder.length > 0;
-        self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
+        var prependOlder = [];
+        var interleave = [];
+        retainedOlder.forEach(function(m) {
+          var sid = m._serverItemId;
+          if (serverIds[sid]) return;
+          if (retainBoundary !== void 0 && sid < retainBoundary) prependOlder.push(m);
+          else interleave.push(m);
+        });
+        var page1 = mapped;
+        if (interleave.length) {
+          var mergedP = [];
+          var ii2 = 0, mi2 = 0;
+          while (ii2 < interleave.length && mi2 < mapped.length) {
+            var iv = interleave[ii2], mv = mapped[mi2];
+            var mid2 = typeof mv._serverItemId === "string" ? mv._serverItemId : void 0;
+            if (mid2 === void 0) break;
+            if (iv._serverItemId <= mid2) {
+              mergedP.push(iv);
+              ii2++;
+            } else {
+              mergedP.push(mv);
+              mi2++;
+            }
+          }
+          while (ii2 < interleave.length) mergedP.push(interleave[ii2++]);
+          while (mi2 < mapped.length) mergedP.push(mapped[mi2++]);
+          page1 = mergedP;
+        }
+        keptOlderPages = prependOlder.length > 0 || interleave.length > 0;
+        self.state.messages = prependOlder.length ? prependOlder.concat(page1) : page1;
         rescued.forEach(function(m) {
           self.state.messages.push(m);
         });
@@ -5121,8 +5179,10 @@ var ChatSession = class {
       var bgPending = !fetchMore && history && history.bgPending;
       if (bgPending) {
         var batchId = ++_bgHistoryBatchSeq;
-        self.state.bgHistoryLoading = true;
-        self.host.notify();
+        if (history.endOfList !== true && history.firstLoad === true) {
+          self.state.bgHistoryLoading = true;
+          self.host.notify();
+        }
         var releaseBgFlag = function() {
           if (_bgHistoryBatchSeq === batchId) self.state.bgHistoryLoading = false;
         };
@@ -5149,6 +5209,18 @@ var ChatSession = class {
             formatIndexingLabel: self.host.formatIndexingLabel
           }).messages;
           self.applyHydratedBodies(m2);
+          if (keptScreenAwaitingBg && !m2.length && batch && batch.endOfList === true) {
+            self.state.messages = self.state.messages.filter(function(m) {
+              if (typeof m._serverItemId !== "string") return true;
+              if (m._ownerKey !== void 0 && m._ownerKey !== loadKey) return true;
+              return false;
+            });
+            self.state.historyEndOfList = true;
+            releaseBgFlag();
+            self.updateHistoryCache();
+            self.host.notify();
+            return;
+          }
           var incoming = {};
           m2.forEach(function(m) {
             if (m._serverItemId) incoming[m._serverItemId + "|" + m.role] = true;

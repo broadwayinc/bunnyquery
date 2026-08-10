@@ -2282,54 +2282,78 @@ import {
             if (reference) cfg.reference = "src::" + storagePath;
             return S.skapi.postRecord(null, cfg);
         }
-        return Promise.resolve(createWith(true)).catch(function (err) {
-            var msg = String((err && err.message) || err || "");
-            if (msg.indexOf("is already taken") === -1) {
-                // Not the exists-signal — almost always the src:: record not
-                // existing yet. Mint it and retry WITH the reference (a
-                // reference-less record cannot be cascade-swept on reindex);
-                // only if that still fails does a reference-less create beat
-                // having no record at all.
-                return ensureFileIndexRecordDb(storagePath).then(function () {
-                    return createWith(true);
-                }).catch(function (errRef) {
-                    var msgRef = String((errRef && errRef.message) || errRef || "");
-                    if (msgRef.indexOf("is already taken") !== -1) return updateExisting();
-                    return Promise.resolve(createWith(false)).catch(function (err2) {
-                        var msg2 = String((err2 && err2.message) || err2 || "");
-                        if (msg2.indexOf("is already taken") === -1) {
-                            console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
-                            return null;
-                        }
-                        return updateExisting();
-                    });
-                });
+        // Absent and unfetchable both read as "no record".
+        function lookup() {
+            return Promise.resolve(S.skapi.getRecords({ service: service, unique_id: uid }))
+                .then(function (found) { return (found && found.list && found.list[0]) || null; })
+                .catch(function () { return null; });
+        }
+        function updateExisting(rec) {
+            var existing = rec.data || {};
+            if (patch.status === "working" && TERMINAL[String(existing.status)]) {
+                // A NEW run may reopen a terminal record (orphaned verdict
+                // from the path's previous life); only a LATE create from
+                // the run the record already describes must lose — its
+                // `started` predates the settle that closed it.
+                var endedAt = typeof existing.finished === "number" ? existing.finished
+                    : typeof existing.started === "number" ? existing.started : 0;
+                if (!(typeof patch.started === "number" && patch.started > endedAt)) return Promise.resolve(null);
             }
-            return updateExisting();
-        });
-        function updateExisting() {
-            return Promise.resolve(S.skapi.getRecords({ service: service, unique_id: uid })).then(function (found) {
-                var rec = found && found.list && found.list[0];
-                if (!rec || !rec.record_id) return null;
-                var existing = rec.data || {};
-                if (patch.status === "working" && TERMINAL[String(existing.status)]) {
-                    // A NEW run may reopen a terminal record (orphaned verdict
-                    // from the path's previous life); only a LATE create from
-                    // the run the record already describes must lose — its
-                    // `started` predates the settle that closed it.
-                    var endedAt = typeof existing.finished === "number" ? existing.finished
-                        : typeof existing.started === "number" ? existing.started : 0;
-                    if (!(typeof patch.started === "number" && patch.started > endedAt)) return null;
-                }
-                return S.skapi.postRecord(null, {
-                    service: service,
-                    record_id: rec.record_id,
-                    data: patchData(existing)
-                });
+            // Same terminal verdict already stored: re-writing it on every
+            // stale-sweep re-observation was pure write noise.
+            if (patch.status !== "working" && String(existing.status) === patch.status) return Promise.resolve(null);
+            return Promise.resolve(S.skapi.postRecord(null, {
+                service: service,
+                record_id: rec.record_id,
+                data: patchData(existing)
+            }));
+        }
+        function settleAsUpdate() {
+            return lookup().then(function (rec) {
+                if (rec && rec.record_id) return updateExisting(rec);
+                return null;
             }).catch(function (err) {
                 console.warn("[bunnyquery] upsertIndexRunRecord update failed (non-fatal)", storagePath, String((err && err.message) || err || ""));
             });
         }
+        function createChain() {
+            return Promise.resolve(createWith(true)).catch(function (err) {
+                var msg = String((err && err.message) || err || "");
+                if (msg.indexOf("is already taken") === -1) {
+                    // Not the exists-signal — almost always the src:: record not
+                    // existing yet. Mint it and retry WITH the reference (a
+                    // reference-less record cannot be cascade-swept on reindex);
+                    // only if that still fails does a reference-less create beat
+                    // having no record at all.
+                    return ensureFileIndexRecordDb(storagePath).then(function () {
+                        return createWith(true);
+                    }).catch(function (errRef) {
+                        var msgRef = String((errRef && errRef.message) || errRef || "");
+                        if (msgRef.indexOf("is already taken") !== -1) return settleAsUpdate();
+                        return Promise.resolve(createWith(false)).catch(function (err2) {
+                            var msg2 = String((err2 && err2.message) || err2 || "");
+                            if (msg2.indexOf("is already taken") === -1) {
+                                console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
+                                return null;
+                            }
+                            return settleAsUpdate();
+                        });
+                    });
+                }
+                return settleAsUpdate();
+            });
+        }
+        // Terminal flips usually target an EXISTING record: look it up first, so
+        // the common path never fires the guaranteed-400 create. 'working' mints
+        // usually target a MISSING one (cascade swept it): create straight away
+        // (agent.vue same).
+        if (patch.status !== "working") {
+            return lookup().then(function (rec) {
+                if (rec && rec.record_id) return updateExisting(rec);
+                return createChain();
+            });
+        }
+        return createChain();
     }
     // Create the file's "src::<storagePath>" record BEFORE any indexing pass runs, so every
     // pass has a reference target that is guaranteed to exist (mirrors ai_agent.ts). Without
@@ -3454,11 +3478,21 @@ import {
     // poll, no queue entry, no adoption). Matches the sweep TTL so each tick
     // fetches at most one naturally-fresh sweep.
     var STUB_RECHECK_MS = 30000;
+    var STUB_RECHECK_MAX_ROUNDS = 5;
     var stubRecheckTimer = null;
+    var stubRecheckSig = "";
+    var stubRecheckRounds = 0;
+    // True once the current project's sweep has answered (success or failure):
+    // the empty-chat greeting holds on it (agent.vue markerSweepSettled same).
+    var markerSweepSettled = false;
     function armStubRecheck() {
         if (stubRecheckTimer !== null) return;
         stubRecheckTimer = setTimeout(function () {
             stubRecheckTimer = null;
+            // A tick on a hidden tab defers; the visibility handler's resume
+            // path re-renders, which re-arms via maybeArmStubRecheck.
+            if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+            stubRecheckRounds++;
             void refreshIndexMarkers();
         }, STUB_RECHECK_MS);
     }
@@ -3466,22 +3500,44 @@ import {
         try {
             if (markerSweep.svc !== S.projectId) return;
             var lk = (session && session.getLiveIndexState().keys) || {};
+            var sig = [];
             for (var pth in markerSweep.runs) {
                 var r = markerSweep.runs[pth];
-                // Any unconfirmed 'working' record (fresh or stale — both render
-                // as the grey checking shape now) settles only through a fresh
-                // sweep; live-confirmed ones ride the live-key drain edge instead.
-                if (r && r.status === "working" && !lk[pth]) { armStubRecheck(); return; }
+                // Unconfirmed 'working' records settle only through a fresh
+                // sweep — but a done:: marker already settles the row (the
+                // display's doneKeys disjunct), and live-confirmed ones ride
+                // the live-key drain edge instead.
+                if (!r || r.status !== "working" || lk[pth]) continue;
+                var fn = r.filename || pth.split("/").pop() || pth;
+                if (markerSweep.done[pth] || markerSweep.done[fn]) continue;
+                sig.push(pth);
             }
-            if (stubRecheckTimer !== null) { clearTimeout(stubRecheckTimer); stubRecheckTimer = null; }
+            if (!sig.length) {
+                stubRecheckSig = ""; stubRecheckRounds = 0;
+                if (stubRecheckTimer !== null) { clearTimeout(stubRecheckTimer); stubRecheckTimer = null; }
+                return;
+            }
+            var s = sig.sort().join("|");
+            if (s !== stubRecheckSig) { stubRecheckSig = s; stubRecheckRounds = 0; }
+            // Dead records: the same set has come back unchanged for several
+            // sweeps — stop hammering; any change to the set re-opens the loop.
+            if (stubRecheckRounds >= STUB_RECHECK_MAX_ROUNDS) return;
+            armStubRecheck();
         } catch (e) { /* display-side best effort */ }
     }
     function refreshIndexMarkers(invalidate) {
         if (invalidate) invalidateIndexMarkerSweep();
         return sweepIndexMarkersDb().then(function (res) {
+            markerSweepSettled = true;
             if (res) { maybeArmStubRecheck(); renderMessages(); }
             return res;
-        }).catch(function () { return null; });
+        }).catch(function () {
+            // A failed sweep still SETTLES the greeting hold — better an early
+            // greeting than one that can never appear.
+            markerSweepSettled = true;
+            renderMessages();
+            return null;
+        });
     }
 
     function displayListOptions() {
@@ -3658,11 +3714,60 @@ import {
             // wants to read them. The engine memoizes per chat, so refreshes
             // cannot revert an expanded row to its stub heads.
             hydrateCompactIndexGroup(key);
+            // And an INCOMPLETE row starts paging its history in now — opening
+            // it is the demand signal the lazy split fetch was waiting for
+            // (agent.vue same).
+            void loadIndexGroupHistory(key);
         }
         renderMessages();
         // Collapsing a row can drop the list below one screen, which removes the
         // scroll-to-top pager trigger along with the height.
         ensureHistoryFillsViewport();
+    }
+
+    /* ---- expand-triggered lazy history fetch (agent.vue mirror) ------------
+     * An opened row whose passes are not fully loaded pages older history until
+     * its run is complete on screen, the history ends, or a cap trips. The row
+     * shows a spinner in its head and a loading note in its body throughout —
+     * whatever its status verdict (a green row can be fetching detail). */
+    var INDEX_GROUP_FETCH_MAX_PAGES = 40;
+    var indexGroupFetching = {};
+    function groupNeedsHistory(key) {
+        if (CS.historyEndOfList) return false;
+        try {
+            var entries = buildChatDisplayList(CS.messages, displayListOptions());
+            for (var i = 0; i < entries.length; i++) {
+                if (entries[i].kind !== "indexing" || entries[i].group.key !== key) continue;
+                return !!(entries[i].group.stub || entries[i].group.mayHaveOlder);
+            }
+        } catch (e) { /* fall through */ }
+        return false;
+    }
+    function loadIndexGroupHistory(key) {
+        if (indexGroupFetching[key]) return Promise.resolve();
+        if (!groupNeedsHistory(key)) return Promise.resolve();
+        indexGroupFetching[key] = true;
+        renderMessages();
+        var pages = 0, waits = 0;
+        function step() {
+            if (!CS.indexGroupsOpen[key]) return null;          // closed: stop paying
+            if (!groupNeedsHistory(key)) return null;
+            if (pages >= INDEX_GROUP_FETCH_MAX_PAGES) return null;
+            if (CS.loadingOlderHistory || CS.historyFilling || session.state.bgHistoryLoading) {
+                // Another pager (or the deferred stub batch) owns the wire.
+                // Bounded: a stuck flag must not pin the spinner forever.
+                if (++waits > 240) return null;
+                return new Promise(function (r) { setTimeout(r, 250); }).then(step);
+            }
+            pages++;
+            return fetchOlderHistoryIfNeeded().then(step);
+        }
+        return Promise.resolve(step()).catch(function () { }).then(function () {
+            delete indexGroupFetching[key];
+            // Newly-paged passes may be compact stubs — fetch their bodies.
+            hydrateCompactIndexGroup(key);
+            renderMessages();
+        });
     }
 
     // Map an expanded group's compact passes to their item ids and delegate the
@@ -3759,6 +3864,11 @@ import {
             h("span", { class: "bq-index-icon", html: indexGroupIcon(group) }),
             label,
             indexGroupCount(group) ? h("span", { class: "bq-index-count", text: indexGroupCount(group) }) : null,
+            // Spinning arrows while this row's history is being paged in —
+            // separate from the status icon, so a green (done) row spins too.
+            indexGroupFetching[group.key]
+                ? h("span", { class: "bq-index-fetch", html: INDEX_ICON_ACTIVE, title: "Fetching this file's indexing history" })
+                : null,
             cancelBtn,
             h("span", { class: "bq-index-chevron", text: "▶" }));
 
@@ -3772,13 +3882,27 @@ import {
         // "Scroll up to load them" is an instruction, so it must not be given while
         // the loading it asks for is already in flight: following it does nothing the
         // row is not doing, and reads as the row not having noticed.
-        if (isOpen && group.mayHaveOlder) {
+        if (isOpen && indexGroupFetching[group.key]) {
+            // While the expand-triggered fetch runs, the note IS the progress:
+            // dot-trail loader, not an instruction (agent.vue same).
+            el.appendChild(h("div", { class: "bq-index-note" },
+                h("span", { text: "Loading this file's indexing history" }),
+                h("span", { class: "bq-loader" })));
+        } else if (isOpen && group.mayHaveOlder) {
             var loadingNow = group.resolvingReason === "history" ||
                 (group.stub && session.state.bgHistoryLoading);
             el.appendChild(h("div", {
                 class: "bq-index-note",
                 text: "Earlier passes of this file are further back in the conversation. "
                     + (loadingNow ? "Loading them now." : "Scroll up to load them."),
+            }));
+        } else if (isOpen && !group.visibleMembers.length) {
+            // An open row must NEVER be a void: when the whole history is
+            // walked and the passes still are not here (cleared conversation,
+            // another chat or platform's run), say so (agent.vue same).
+            el.appendChild(h("div", {
+                class: "bq-index-note",
+                text: "This file's indexing steps aren't in this chat's history. They may belong to another chat or platform, or the conversation was cleared.",
             }));
         }
         return el;
@@ -3922,7 +4046,11 @@ import {
         if (CS.loadingOlderHistory) CS.messagesBox.appendChild(historyLoadingEl(false));
         // Deferred indexing-stub batch (first-paint split): conversation is
         // painted, stubs still flying — a thin hint where rows will merge in.
-        else if (session.state.bgHistoryLoading && CS.messages.length) {
+        else if (session.state.bgHistoryLoading) {
+            // No messages.length requirement: an all-bg chat's first paint has
+            // an EMPTY message list while the batch flies, and requiring
+            // messages here left the box completely blank for that window
+            // (agent.vue's bar has no such requirement either).
             CS.messagesBox.appendChild(h("div", { class: "bq-history-loading" },
                 h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" })));
         }
@@ -3937,22 +4065,29 @@ import {
                 syncDraftingIndicator();
                 return;
             }
-            var greet = h("div", { class: "bq-message is-assistant bq-empty-greeting" },
-                h("div", { class: "bq-bubble" },
-                    document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
-                        ".")));
-            CS.messagesBox.appendChild(greet);
             // run:: stub rows render even with no messages (a returning user's
-            // indexed files, or history still loading behind the greeting) —
-            // agent.vue paints the same rows, so the two clients must match.
+            // indexed files) — agent.vue paints the same rows, so the two
+            // clients must match.
+            var emptyStubEls = [];
             try {
                 var emptyEntries = buildChatDisplayList([], displayListOptions());
                 for (var ge = 0; ge < emptyEntries.length; ge++) {
                     if (emptyEntries[ge].kind !== "indexing") continue;
                     var sg = emptyEntries[ge].group;
-                    CS.messagesBox.appendChild(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
+                    emptyStubEls.push(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
                 }
             } catch (e) { /* display-side best effort */ }
+            // Genuinely empty chat ONLY: any content — a stub row here, a stub
+            // batch still in flight, or a marker sweep that has not answered
+            // yet (its stubs may be a beat away) — hides the greeting (it used
+            // to flash over real rows; agent.vue gates identically).
+            if (!emptyStubEls.length && !session.state.bgHistoryLoading && markerSweepSettled) {
+                CS.messagesBox.appendChild(h("div", { class: "bq-message is-assistant bq-empty-greeting" },
+                    h("div", { class: "bq-bubble" },
+                        document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
+                            "."))));
+            }
+            for (var gse = 0; gse < emptyStubEls.length; gse++) CS.messagesBox.appendChild(emptyStubEls[gse]);
             // A first-ever message can be mid-draft under the greeting.
             syncDraftingIndicator();
             return;
@@ -3989,6 +4124,10 @@ import {
                         if (typeof moFirst === "number") moPatch.started = moFirst;
                         if (mog.name) moPatch.filename = mog.name;
                         void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
+                        // Patch the local sweep too, or its TTL-cached 'working'
+                        // re-fires this block on every re-render (agent.vue same).
+                        if (morec) morec.status = "done";
+                        else markerSweep.runs[mog.path] = { status: "done" };
                     }
                 }
             }

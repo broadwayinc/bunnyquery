@@ -223,6 +223,24 @@
    state does not know. A slow fade says "pending" without claiming progress. */
 .bq-index-group.is-resolving .bq-index-icon svg { animation: bq-index-fade 1.6s ease-in-out infinite; }
 @keyframes bq-index-fade { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* Expand-triggered history fetch: spinning arrows in the row head while the
+   run's passes are being paged in. A SEPARATE element from the status icon on
+   purpose — the row keeps its verdict (green check, grey clock) and this only
+   says "fetching more detail about it", whatever that verdict is. */
+.bq-index-fetch {
+    width: 0.85rem;
+    height: 0.85rem;
+    flex: none;
+    margin-left: 0.35rem;
+    color: var(--bq-muted);
+    display: inline-flex;
+}
+.bq-index-fetch svg { width: 100%; height: 100%; display: block; animation: bq-index-spin 1.1s linear infinite; }
+/* The in-row loading note under an OPEN row while its passes stream in. */
+.bq-index-note .bq-loader { margin-left: 0.15rem; }
+@media (prefers-reduced-motion: reduce) {
+    .bq-index-fetch svg { animation-duration: 3s; }
+}
 @media (prefers-reduced-motion: reduce) {
     .bq-index-group.is-active .bq-index-icon svg { animation-duration: 3s; }
     /* A fade has no end state to settle on, so it stops rather than slows. */

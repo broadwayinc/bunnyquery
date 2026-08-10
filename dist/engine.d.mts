@@ -1254,6 +1254,11 @@ type SplitHistoryResult = {
     list: any[];
     endOfList: boolean;
     startKeyHistory: any[];
+    /** True when this chat had never been walked in this session — the first
+     *  paint. Consumers gate the "Loading indexing history" hint on it: a
+     *  mid-walk tab return restarts the walk for cursor safety but must stay
+     *  silent (flashing the hint on every return was the reported bug). */
+    firstLoad?: boolean;
     /** Present only when `deferBg` was requested AND bg work remains: resolves
      *  with the stub batch fetched in the background (the per-key lock is held
      *  until it settles, so no other history call can interleave). The caller

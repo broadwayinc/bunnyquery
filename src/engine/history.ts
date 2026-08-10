@@ -250,6 +250,11 @@ type SplitHistoryState = {
 	 *  strictly-newer surface turns. Prepended to the next page's surface. */
 	surfaceCarry: any[];
 	lastSurfaceKeys: any[];
+	/** Newest bg item id this chain has ever seen. The head refresh compares it
+	 *  against the fresh head page: a FULL head page that no longer contains it
+	 *  means more than one page of bg rows landed while nobody was polling, and
+	 *  the walk must reopen or the gap is unfetchable forever. */
+	newestBgId: string;
 };
 const splitHistoryStates: { [key: string]: SplitHistoryState } = {};
 // Per-key serialization: a token-bumped reload can start a NEW split call
@@ -261,7 +266,15 @@ const splitHistoryStates: { [key: string]: SplitHistoryState } = {};
 const splitHistoryLocks: { [key: string]: Promise<void> } = {};
 
 function freshSplitState(): SplitHistoryState {
-	return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [] };
+	return { bgBuffer: [], bgEnd: false, bgStarted: false, surfaceEnd: false, pendingSurface: null, surfaceCarry: [], lastSurfaceKeys: [], newestBgId: '' };
+}
+
+/** Track the newest bg id the chain has seen (ids are creation-ordered). */
+function noteBgIds(state: SplitHistoryState, list: any[]): void {
+	for (const it of list) {
+		const id = it && typeof it.id === 'string' ? it.id : '';
+		if (id && id > state.newestBgId) state.newestBgId = id;
+	}
 }
 
 /** Test hook: drop split-fetch state (all keys, or one). */
@@ -296,6 +309,11 @@ export type SplitHistoryResult = {
 	list: any[];
 	endOfList: boolean;
 	startKeyHistory: any[];
+	/** True when this chat had never been walked in this session — the first
+	 *  paint. Consumers gate the "Loading indexing history" hint on it: a
+	 *  mid-walk tab return restarts the walk for cursor safety but must stay
+	 *  silent (flashing the hint on every return was the reported bug). */
+	firstLoad?: boolean;
 	/** Present only when `deferBg` was requested AND bg work remains: resolves
 	 *  with the stub batch fetched in the background (the per-key lock is held
 	 *  until it settles, so no other history call can interleave). The caller
@@ -346,6 +364,10 @@ async function _getSplitChatHistoryLocked(
 	// older page the user had already exhausted. Only a FULLY-ended chain is
 	// safe to preserve: its fetchMore path short-circuits without touching the
 	// SDK cursors this page-1 refresh rewinds. A mid-walk chain still restarts.
+	// True when this chat has never been walked in this session at all — the
+	// consumers gate the "Loading indexing history" hint on it, so a mid-walk
+	// tab return (which restarts the walk for cursor safety) stays SILENT.
+	const firstLoad = !splitHistoryStates[key];
 	let headRefresh = false;
 	if (!splitHistoryStates[key]) {
 		splitHistoryStates[key] = freshSplitState();
@@ -420,14 +442,26 @@ async function _getSplitChatHistoryLocked(
 				if (headRefresh) {
 					// One HEAD page only: the walked tail is complete; this
 					// catches bg rows that settled/minted while nobody was
-					// polling. bgEnd/bgStarted are deliberately left alone —
-					// the end-knowledge survives, and the coverage loop (gated
-					// on !bgEnd) never touches the cursor this rewinds.
+					// polling. bgEnd/bgStarted are normally left alone — the
+					// end-knowledge survives, and the coverage loop (gated on
+					// !bgEnd) never touches the cursor this rewinds. ONE
+					// exception: a FULL head page that no longer contains the
+					// newest bg id this chain had seen means more than a page
+					// of bg rows landed while hidden — the gap is unreachable
+					// unless the walk reopens (id-dedup makes re-walking the
+					// tail harmless).
 					const bOpts: any = { fetchMore: false };
 					if (limit) bOpts.limit = limit;
 					const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
 					const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
 					for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; batch.push(it); }
+					const prevNewest = state.newestBgId;
+					noteBgIds(state, bList);
+					if (prevNewest && !(b && b.endOfList) &&
+						!bList.some((it: any) => it && it.id === prevNewest)) {
+						state.bgEnd = false;
+						state.bgStarted = true;
+					}
 				} else {
 					let hops = 0;
 					while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
@@ -438,6 +472,7 @@ async function _getSplitChatHistoryLocked(
 						state.bgStarted = true;
 						const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
 						for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; batch.push(it); }
+						noteBgIds(state, bList);
 						state.bgEnd = !!(b && b.endOfList);
 						if (!bList.length && !state.bgEnd) break;
 						if (state.bgEnd) break;
@@ -457,6 +492,7 @@ async function _getSplitChatHistoryLocked(
 			// carries the final word for that case.
 			endOfList: state.surfaceEnd && state.bgEnd,
 			startKeyHistory: surface.startKeyHistory,
+			firstLoad,
 			bgPending,
 		};
 	}
@@ -477,12 +513,22 @@ async function _getSplitChatHistoryLocked(
 	if (headRefresh) {
 		// Non-deferred head refresh: the same single HEAD page the deferred
 		// branch fetches, under the same rules — new settles are caught, the
-		// end-knowledge (bgEnd/bgStarted) is left untouched.
+		// end-knowledge (bgEnd/bgStarted) is left untouched, EXCEPT when a full
+		// head page no longer contains the newest bg id this chain had seen:
+		// more than a page landed while hidden, and the walk must reopen or the
+		// gap is unfetchable (id-dedup makes re-walking the tail harmless).
 		const hOpts: any = { fetchMore: false };
 		if (limit) hOpts.limit = limit;
 		const hb = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, hOpts);
 		const hbList: any[] = (hb && Array.isArray(hb.list)) ? hb.list : [];
 		for (const it of hbList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; state.bgBuffer.push(it); }
+		const prevNewestH = state.newestBgId;
+		noteBgIds(state, hbList);
+		if (prevNewestH && !(hb && hb.endOfList) &&
+			!hbList.some((it: any) => it && it.id === prevNewestH)) {
+			state.bgEnd = false;
+			state.bgStarted = true;
+		}
 	} else if (boundary !== Infinity || surface.endOfList) {
 		let hops = 0;
 		while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
@@ -499,6 +545,7 @@ async function _getSplitChatHistoryLocked(
 			// surface-frontier logic (retention boundary, clear-horizon) can
 			// tell deep stubs from the conversation's own paging frontier.
 			for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; state.bgBuffer.push(it); }
+			noteBgIds(state, bList);
 			state.bgEnd = !!(b && b.endOfList);
 			if (!bList.length && !state.bgEnd) break; // defensive: server loops past empties
 			if (state.bgEnd) break;
@@ -535,6 +582,7 @@ async function _getSplitChatHistoryLocked(
 		// Bookkeeping only (both the consumers and the SDK treat it opaquely);
 		// the real cursors are the SDK's internal ones plus this module's state.
 		startKeyHistory: surface.startKeyHistory,
+		firstLoad,
 	};
 }
 
