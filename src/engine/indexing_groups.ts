@@ -198,6 +198,15 @@ export type IndexingGroup = {
 	 *  loaded ones. 'status': the queue has not yet said whether this file is still
 	 *  being worked on, which is the only thing that can end a worker-driven run. */
 	resolvingReason?: 'history' | 'status';
+	/** Synthesized from a durable run:: record: none of the run's passes are
+	 *  among the loaded messages (bg history still deferred, or the run is older
+	 *  than the paging cap). Header-and-status only — members/visibleMembers are
+	 *  empty and there is nothing to cancel; the row is replaced by the real
+	 *  group the moment actual passes load (same `key`, so expansion state
+	 *  carries over). */
+	stub?: boolean;
+	/** The run:: record's stored error text, for a stub row's meta line. */
+	stubError?: string;
 };
 
 export type DisplayEntry =
@@ -240,7 +249,40 @@ export type BuildDisplayListOptions = {
 	 *  windowedIndexing). Passed in rather than read from config so this stays a
 	 *  pure function of its inputs and can be exercised for both settings. */
 	windowedIndexing?: boolean;
+	/** Durable run:: records, keyed by STORAGE PATH (the consumer's marker
+	 *  sweep). Each key with no real group in the loaded messages gets a
+	 *  synthesized header-only row (see IndexingGroup.stub), placed by its
+	 *  `started` timestamp. A real group for the same file — matched by key,
+	 *  path, or name — always suppresses the stub: loaded passes are evidence,
+	 *  the record is only a summary. */
+	runStubs?: { [storagePath: string]: RunStubInfo };
+	/** The chat's clear-history horizon (ms epoch). Run records are service-
+	 *  wide and know nothing about a cleared chat, so without this every
+	 *  "Clear chat history" resurrects one row per indexed file. A stub whose
+	 *  run ended (or, unfinished, began) at or before this moment is dropped —
+	 *  unless the queue says the file is live RIGHT NOW, which no horizon can
+	 *  make untrue. */
+	stubClearedAt?: number;
+	/** Clock injection for tests; defaults to Date.now(). Only run-stub
+	 *  staleness reads it. */
+	now?: number;
 };
+
+/** The display-relevant fields of a run:: record (see requests.ts
+ *  runIndexUniqueId for the record's contract). */
+export type RunStubInfo = {
+	status: 'working' | 'done' | 'error' | 'cancelled';
+	filename?: string;
+	started?: number;
+	finished?: number;
+	error?: string;
+};
+
+/** A 'working' run record older than this with no live-queue confirmation is
+ *  treated as unknown rather than live: a chain that died without reaching any
+ *  error path leaves 'working' dangling, and a row must not spin forever on a
+ *  claim nothing can end. */
+export const RUN_RECORD_WORKING_STALE_MS = 6 * 60 * 60 * 1000;
 
 // The indexing label is view-formatted (formatIndexingLabel), so parsing it is
 // the FALLBACK path only: it exists for bubbles restored from a history cache
@@ -707,15 +749,144 @@ export function buildChatDisplayList(
 		}
 	}
 
+	// --- durable run:: stubs ---------------------------------------------------
+	// A run record whose passes are not among the loaded messages still deserves
+	// a row: on a fresh open the bg history is deferred, and a run older than the
+	// paging cap never loads at all. Synthesized as header-only groups and placed
+	// by `started` among the messages' own timestamps; a real group for the same
+	// file always wins (see BuildDisplayListOptions.runStubs).
+	var stubList: { started: number; group: IndexingGroup }[] = [];
+	var runStubs = opts && opts.runStubs;
+	if (runStubs) {
+		var covered: { [k: string]: boolean } = {};
+		for (var ci = 0; ci < order.length; ci++) {
+			var cg = groups[order[ci]];
+			if (cg.key) covered[cg.key] = true;
+			if (cg.path) covered[cg.path] = true;
+			if (cg.name) covered[cg.name] = true;
+		}
+		var now = opts && typeof opts.now === 'number' ? opts.now : Date.now();
+		var stubClearedAt = (opts && typeof opts.stubClearedAt === 'number' && opts.stubClearedAt > 0)
+			? opts.stubClearedAt : 0;
+		for (var sp in runStubs) {
+			var rec = runStubs[sp];
+			if (!sp || !rec || !rec.status || covered[sp]) continue;
+			var fname = rec.filename || sp.split('/').pop() || sp;
+			if (covered[fname]) continue;
+			// Mirrors the real groups' status precedence: a live queue hit outranks
+			// whatever the record says (a lagged update must not paint a verdict over
+			// visible work), then the record's own terminal statuses, and 'working'
+			// only counts while fresh — stale it degrades to the stated-wait shape.
+			var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
+			// Cleared-history horizon: a run that ended at or before the clear is
+			// part of what the user asked to forget. A live queue hit survives it
+			// (see BuildDisplayListOptions.stubClearedAt).
+			if (stubClearedAt && !live && (typeof rec.finished === 'number' ? rec.finished
+				: typeof rec.started === 'number' ? rec.started : 0) <= stubClearedAt) continue;
+			var st: IndexingGroupStatus = 'active';
+			var fin = false;
+			var res = false;
+			var reason: 'history' | 'status' | undefined;
+			if (!live) {
+				// A done:: marker from the same sweep is as terminal as the record's
+				// own 'done' — it settles a dangling 'working' the chain never
+				// flipped (mirrors the real-group doneKeys disjunct).
+				if (rec.status === 'done' || doneKeys[sp] || doneKeys[fname]) { st = 'done'; fin = true; }
+				else if (rec.status === 'error') { st = 'error'; fin = true; }
+				else if (rec.status === 'cancelled') { st = 'cancelled'; fin = true; }
+				else {
+					// 'working' with NO live-queue confirmation is a CLAIM, not
+					// proof — a chain that died without reaching any error path
+					// looks exactly like this (and did, in a real batch). Claiming
+					// yellow off it misinforms; state the wait instead. The queue
+					// answer arrives within about a round trip of the chat opening,
+					// so a genuinely live run flips grey -> yellow almost at once,
+					// and the periodic re-sweep settles dead records to their
+					// terminal status.
+					res = true; reason = 'status';
+				}
+			}
+			var sg: IndexingGroup = {
+				key: sp,
+				runKey: 'stub:' + sp,
+				name: fname,
+				path: sp,
+				mime: undefined,
+				size: undefined,
+				isReindex: false,
+				members: [],
+				passCount: 0,
+				status: st,
+				cancellableIds: [],
+				cancelling: false,
+				stopped: st === 'cancelled',
+				mayHaveOlder: hasMoreHistory,
+				anchorIndex: -1,
+				anchorId: '',
+				visibleMembers: [],
+				driver: !isPagedReadFile(fname, undefined) ? 'single'
+					: isImageVisionFile(fname, undefined) ? 'worker'
+						: (windowedIndexing ? 'worker' : 'client'),
+				finished: fin,
+				resolving: res,
+				resolvingReason: reason,
+				stub: true,
+				stubError: rec.error,
+			};
+			stubList.push({ started: typeof rec.started === 'number' ? rec.started : 0, group: sg });
+		}
+	}
+
+	// --- timestamp-anchor INCOMPLETE real runs ---------------------------------
+	// A real run's row renders at its first LOADED pass, and while older history
+	// pages in (newest-first) that is a moving target: the run first appears at
+	// its newest pass — down by the recent bubbles — then relocates upward as
+	// earlier passes arrive, so the row visibly jumps. The run:: record's
+	// `started` is a stable anchor for exactly that window: emit the row at its
+	// timestamp position instead, and once the true first pass loads
+	// (mayHaveOlder false) emission returns to the anchor, which by then IS the
+	// same spot. Newest run of the file only — the record describes it, and an
+	// older run's passes are already fully placed around it.
+	var suppressAnchor: { [runId: string]: boolean } = {};
+	if (runStubs) {
+		for (var ti2 = 0; ti2 < order.length; ti2++) {
+			var tg = groups[order[ti2]];
+			if (!tg.mayHaveOlder || !newestRunOfKey[order[ti2]]) continue;
+			var trec = (tg.path && runStubs[tg.path]) || runStubs[tg.key];
+			if (!trec || typeof trec.started !== 'number') continue;
+			suppressAnchor[order[ti2]] = true;
+			stubList.push({ started: trec.started, group: tg });
+		}
+	}
+	stubList.sort(function (a, b) { return a.started - b.started; });
+
 	var out: DisplayEntry[] = [];
+	var si = 0;
 	for (var j = 0; j < list.length; j++) {
+		// Splice stubs in by time: everything that started before this message
+		// goes above it. Messages without a timestamp decide nothing.
+		var mts = list[j] && typeof list[j]._ts === 'number' ? (list[j]._ts as number) : undefined;
+		if (mts !== undefined) {
+			while (si < stubList.length && stubList[si].started <= mts) {
+				out.push({ kind: 'indexing', group: stubList[si].group, index: -1 - si });
+				si++;
+			}
+		}
 		var r = runOfIndex[j];
 		if (r === undefined) {
 			out.push({ kind: 'message', msg: list[j], index: j });
 			continue;
 		}
-		// Every other member of the run is represented by the row at the anchor.
-		if (groups[r].anchorIndex === j) out.push({ kind: 'indexing', group: groups[r], index: j });
+		// Every other member of the run is represented by the row at the anchor —
+		// unless the row is timestamp-anchored (incomplete run with a run::
+		// record), in which case the flush above already emitted it.
+		if (groups[r].anchorIndex === j && !suppressAnchor[r]) {
+			out.push({ kind: 'indexing', group: groups[r], index: j });
+		}
+	}
+	while (si < stubList.length) {
+		out.push({ kind: 'indexing', group: stubList[si].group, index: -1 - si });
+		si++;
 	}
 	return out;
 }

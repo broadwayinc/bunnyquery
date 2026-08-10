@@ -35,6 +35,9 @@ import {
 	buildHistoryItemFullId,
 	ANTHROPIC_MESSAGES_API_URL,
 	OPENAI_RESPONSES_API_URL,
+	upsertIndexRunRecordSafe,
+	type IndexRunStatus,
+	type IndexRunPatch,
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
@@ -93,6 +96,11 @@ const INDEXING_DRAIN_IDLE_LOOKS = 2;
 // about. Costs nothing in the normal case, where the queue reports work
 // immediately and the wait is far longer than this anyway.
 const INDEXING_DRAIN_MIN_MS = 8000;
+
+// Ownership sequence for state.bgHistoryLoading (see the deferred-batch handler
+// in loadHistory): the latest minted batch owns the flag; older handlers
+// settling late must neither clear nor keep it.
+let _bgHistoryBatchSeq = 0;
 // Ceiling on that wait. Past it the turn is sent regardless: an answer computed
 // against a partly-indexed file is a poor outcome, but a question that is never
 // asked at all because one chain wedged server-side is a worse one.
@@ -217,6 +225,9 @@ export class ChatSession {
 			typingAbort: false,
 			loadingHistory: false,
 			loadingOlderHistory: false,
+			// A deferred bg stub batch (first-paint split) is still in flight; the
+			// views show a small 'loading indexing history' hint while true.
+			bgHistoryLoading: false,
 			historyEndOfList: false,
 			historyStartKeyHistory: [],
 			historyRequestToken: 0,
@@ -503,7 +514,13 @@ export class ChatSession {
 	 * instead of merely unconfirmed.
 	 */
 	refreshLiveIndexState(): void {
-		this._adoptWorkerIndexingPasses(0);
+		// PASSIVE: this is the first-page/resume refresh, not a settle. One
+		// fresh look (two status queries) always happens; the 2s/6s ladder
+		// climb is reserved for when there is EVIDENCE of live work — the
+		// pass-boundary gap the ladder exists for presumes a chain was alive,
+		// and on an idle tab return the climb was three round trips of asking
+		// a question whose answer had not changed.
+		this._adoptWorkerIndexingPasses(0, true);
 	}
 
 	/** Forget what we know about which files are indexing — but ONLY when the
@@ -1916,6 +1933,32 @@ export class ChatSession {
 				if (e && e.id && self._indexKeyOf(e) === scoped) stoppedIds[e.id] = true;
 			});
 			this.state.stoppedIndexIds = stoppedIds;
+			// Close the durable run:: record too — inside this !finished guard on
+			// purpose, for the same reason as stoppedIndexIds: a stop that landed
+			// after the run was over must not relabel an indexed file as cancelled.
+			// Path over key: `key` degrades to a bare filename for path-less compact
+			// stubs, and run:: is keyed by storage path only — no derivable path
+			// means no record to close (restored stubs of old runs), which is fine.
+			var runPath = group.path || '';
+			if (!runPath) {
+				(group.members || []).some(function (m) {
+					var p = m && m.msg && m.msg._indexFile && m.msg._indexFile.path;
+					if (p) { runPath = p; return true; }
+					return false;
+				});
+			}
+			if (!runPath) {
+				this.bgTaskQueue.some(function (e) {
+					if (e && e.storagePath && self._indexKeyOf(e) === scoped) { runPath = e.storagePath; return true; }
+					return false;
+				});
+			}
+			if (runPath) {
+				var ident = this.host.getIdentity();
+				if (ident && ident.projectId) {
+					upsertIndexRunRecordSafe(ident.projectId, runPath, { status: 'cancelled', finished: Date.now() });
+				}
+			}
 		}
 		// Ask the QUEUE what else is live for this file, and cancel that too.
 		//
@@ -2528,7 +2571,7 @@ export class ChatSession {
 	 * shape that previously looped fetchHistoryPage after an already-DONE index.
 	 */
 	private _adoptingWorkerPasses = false;
-	private _adoptWorkerIndexingPasses(attempt: number): void {
+	private _adoptWorkerIndexingPasses(attempt: number, passive?: boolean): void {
 		var self = this;
 		// One in flight at a time. The query is queue-WIDE, so a second file's pass
 		// settling in the same moment is covered by the query already running.
@@ -2588,6 +2631,15 @@ export class ChatSession {
 			// empty queue for a chain that is very much alive — and with no pass
 			// left to settle, nothing would ever ask again. Look once or twice more
 			// before believing the file is finished.
+			//
+			// PASSIVE calls (first-page/resume refresh) climb only on EVIDENCE of
+			// live work — a queued local entry for this project, a live key the
+			// look above just recorded, or an attached poll. The gap rationale
+			// presumes a chain was alive; with nothing suggesting one, the climb
+			// re-asked an unchanged question three more times on every tab return.
+			// (No nudge here either: a send waiting on indexing implies local
+			// entries, which IS evidence, so the passive stop never starves it.)
+			if (passive && !self._hasLiveIndexEvidence(svcId)) return;
 			if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
 				// The ladder is the only thing that can tell a worker-driven chain has
 				// really ended, and it just did. This is the earliest honest moment to
@@ -2599,9 +2651,22 @@ export class ChatSession {
 				var later = self.host.getIdentity();
 				if (later.projectId !== svcId || later.platform !== platform) return;
 				if (self.isPollingPaused() || !self.host.isViewMounted()) return;
-				self._adoptWorkerIndexingPasses(attempt + 1);
+				self._adoptWorkerIndexingPasses(attempt + 1, passive);
 			}, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
 		}, function () { self._adoptingWorkerPasses = false; });
+	}
+
+	/** Anything at all suggesting THIS project's indexing may be live: a queued
+	 *  local entry, a recorded live key (the adopt look just wrote them), or an
+	 *  attached poll. Gates the passive adopt ladder's climb. */
+	private _hasLiveIndexEvidence(svcId: string): boolean {
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.projectId === svcId) return true;
+		}
+		var keys = this.state.liveIndexKeys || {};
+		for (var k in keys) { if (keys[k]) return true; }
+		return this.historyItemPolls.size > 0;
 	}
 
 	/** Any of these ids still queued or still polled, i.e. surviving work. */
@@ -2714,7 +2779,16 @@ export class ChatSession {
 		for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
 			var e = this.bgTaskQueue[i];
 			if (e.projectId !== svcId || e.platform !== plat) continue;
-			if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
+			if (presentIds[e.id] && !pendingIds[e.id]) {
+				// Settled while nobody was polling (hidden tab, dead poll): the
+				// answer reached the chat as HISTORY, so no settle handler ever
+				// ran for this entry — maybeResumeIndexing's flips included. For
+				// a single-pass file that settle IS the whole run; close its
+				// records off the settled bubbles' own flags before the entry
+				// goes. (8 of 10 files in a real batch hit exactly this.)
+				this._flipRunFromSettledEntry(e);
+				this.bgTaskQueue.splice(i, 1);
+			}
 		}
 		// Poll budget for this drain (see MAX_CONCURRENT_BG_POLLS). bgTaskQueue is
 		// in push order, i.e. oldest first, which is also the order the server
@@ -2838,6 +2912,13 @@ export class ChatSession {
 					// looks into the window where the new pass is not yet in the status
 					// index, which is the same way a nudge on work STARTING went wrong.
 					if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+						// Also close the run record: for a CLIENT-driven file a failed
+						// pass ends the chain on every path, and a removed row reads as
+						// a cancel. Worker-driven files are excluded for the same reason
+						// as the nudge — this catch fires on dropped polls too, and the
+						// worker may be writing the next pass regardless.
+						if (isNotExists) self._flipRunRecord(capturedEntry, 'cancelled');
+						else self._flipRunRecord(capturedEntry, 'error', self._runErrorText(err));
 						self._nudgeIndexingDrain();
 					}
 				}).then(function () {
@@ -2892,6 +2973,62 @@ export class ChatSession {
 		} catch (_e) { /* best-effort */ }
 	}
 
+	/** Short, storable form of an error body for the run:: record. */
+	_runErrorText(response: any): string {
+		var msg = '';
+		try { msg = String(getErrorMessage(response) || ''); } catch (_e) { }
+		msg = msg.replace(/\s+/g, ' ').trim();
+		return msg ? msg.slice(0, 300) : 'Indexing failed.';
+	}
+
+	/** Close the records of a run whose pass settled OFF-POLL — the answer came
+	 *  back as history (hidden tab, dead poll, resume refetch), so none of the
+	 *  poll-side settle handlers ran. Only for SINGLE-PASS files, where one
+	 *  settled pass is deterministically the whole run (the same contract as
+	 *  maybeResumeIndexing's single-pass branch); paged files stay with their
+	 *  drivers. Outcome is read from the settled bubbles' own flags, which is
+	 *  all the history mapping left us. Best-effort and idempotent throughout. */
+	_flipRunFromSettledEntry(entry: BgTaskEntry): void {
+		try {
+			if (!entry || !entry.storagePath || !entry.id || !entry.projectId) return;
+			if (isPagedReadFile(entry.filename, entry.mime)) return;
+			// A stopped run's verdict belongs to the stop funnel — never let a
+			// late clean settle of its pass relabel 'cancelled' as 'done'.
+			if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
+			if (this.state.stoppedIndexIds[entry.id]) return;
+			var userMsg: any = null, replyMsg: any = null;
+			this.state.messages.forEach(function (m: any) {
+				if (m._serverItemId !== entry.id) return;
+				if (m.role === 'user') { if (!userMsg) userMsg = m; }
+				else if (!replyMsg) replyMsg = m;
+			});
+			if ((userMsg && userMsg.isCancelled) || (replyMsg && replyMsg.isCancelled)) {
+				this._flipRunRecord(entry, 'cancelled');
+			} else if (replyMsg && replyMsg.isError) {
+				var errText = typeof replyMsg.content === 'string'
+					? replyMsg.content.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+				this._flipRunRecord(entry, 'error', errText || 'Indexing failed.');
+			} else if (replyMsg) {
+				this._mintDoneMarker(entry);
+				this._flipRunRecord(entry, 'done');
+			}
+			// No reply bubble at all: nothing to judge from — leave the record.
+		} catch (_e) { /* best-effort */ }
+	}
+
+	/** Close the durable run:: record for an ending THIS client observed.
+	 *  service comes from the ENTRY, not the current identity: unlike the done::
+	 *  mint above, a status flip must land even if the user switched projects
+	 *  mid-settle — otherwise the record lies 'working' forever. Best-effort
+	 *  through upsertIndexRunRecordSafe; the consumer's precedence guard keeps
+	 *  repeats and races harmless. */
+	_flipRunRecord(entry: BgTaskEntry, status: IndexRunStatus, error?: string): void {
+		if (!entry || !entry.storagePath || !entry.projectId) return;
+		var patch: IndexRunPatch = { status: status, finished: Date.now() };
+		if (error) patch.error = error;
+		upsertIndexRunRecordSafe(entry.projectId, entry.storagePath, patch);
+	}
+
 	maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void {
 		var self = this;
 		// This client is the ONLY driver of the chains that reach the returns below,
@@ -2921,6 +3058,15 @@ export class ChatSession {
 				// cancelledIndexKeys only records stops issued from THIS tab.
 				if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
 					this._mintDoneMarker(entry);
+					this._flipRunRecord(entry, 'done');
+				} else if (this._isCancelledPollResult(response)) {
+					// Stopped elsewhere (another tab/device): the stopping side
+					// usually wrote 'cancelled' already; writing it again is a
+					// same-value terminal update, and it closes the record when
+					// the stopping tab died before its write landed.
+					this._flipRunRecord(entry, 'cancelled');
+				} else {
+					this._flipRunRecord(entry, 'error', this._runErrorText(response));
 				}
 				endOfClientChain(); return;
 			}
@@ -2931,7 +3077,11 @@ export class ChatSession {
 			// PDFs early-return above. Gated on the flag so the old client-driven path is
 			// untouched when windowing is off.
 			if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
-			if (isErrorResponseBody(response)) { endOfClientChain(); return; } // a failed pass is not "incomplete"
+			if (isErrorResponseBody(response)) {
+				// A failed pass is not "incomplete" — the client-driven chain is over.
+				this._flipRunRecord(entry, 'error', this._runErrorText(response));
+				endOfClientChain(); return;
+			}
 			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '';
 			if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
 				// Client-driven chain, and the model's reply carried the
@@ -2940,12 +3090,28 @@ export class ChatSession {
 				// is the only dispatcher and it is deciding, right now, that no
 				// further pass will run.
 				this._mintDoneMarker(entry);
+				this._flipRunRecord(entry, 'done');
 				endOfClientChain(); return; // fully indexed
 			}
 			var pass = (entry.resumePass || 0) + 1;
-			if (pass > MAX_INDEXING_RESUME_PASSES) { endOfClientChain(); return; } // give up after the cap
+			if (pass > MAX_INDEXING_RESUME_PASSES) {
+				// Gave up after the cap: the file is only partially indexed, and no
+				// further pass will ever run. 'error' rather than 'done' — the badge
+				// must not claim a file the chain abandoned.
+				this._flipRunRecord(entry, 'error', 'Stopped after ' + MAX_INDEXING_RESUME_PASSES + ' passes without finishing.');
+				endOfClientChain(); return;
+			}
 			var id = this.host.getIdentity();
-			if (!id || id.platform === 'none' || id.projectId !== entry.projectId) return;
+			if (!id || id.platform === 'none' || id.projectId !== entry.projectId) {
+				// This client is the only driver of this chain and it just declined
+				// to dispatch the next pass — the chain is over, as an ending, not a
+				// pause: the queue entry is spliced on settle and nothing revisits
+				// it. Close the record (it writes with entry.projectId, so it lands
+				// after a project switch) or it lies 'working' for the stale window.
+				this._flipRunRecord(entry, 'error', 'Indexing stopped: the session or project changed before the file finished.');
+				endOfClientChain();
+				return;
+			}
 			// Counted as live work from here, not from the ack: awaitIndexingDrained
 			// asks the SERVER what is queued, and this pass is not queued until the
 			// call below returns. Without it a chat can slip in between two passes.
@@ -3025,6 +3191,9 @@ export class ChatSession {
 		var projectId = id.projectId, owner = id.owner;
 		var options: any = { fetchMore: fetchMore };
 		if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
+		// First page: paint the CONVERSATION immediately and let the indexing
+		// stubs arrive as a deferred batch (merged below when it lands).
+		if (!fetchMore) options.deferBg = true;
 
 		// Split fetch v2: surface (full bodies, bg queue excluded) + bg compact
 		// stubs, tiled to the surface page's time window with module-level
@@ -3067,18 +3236,38 @@ export class ChatSession {
 			var keptOlderPages = false;
 
 			if (fetchMore) {
-				// Prepend-dedup by server item id: a first-page refresh rewinds
-				// the SDK's cursor chain while retainedOlder keeps deeper pages
-				// on screen, so the next older-page fetch can return a page that
-				// is ALREADY displayed — prepending it raw duplicated (and
-				// misordered) the transcript. Id-less bubbles (staged/local)
-				// only ever live at the bottom and pass through untouched.
-				var onScreenIds: any = {};
-				self.state.messages.forEach(function (m) { if (m._serverItemId) onScreenIds[m._serverItemId + '|' + m.role] = true; });
-				var prepend = mapped.filter(function (m: any) {
-					return !(m._serverItemId && onScreenIds[m._serverItemId + '|' + m.role]);
+				// STRIP-THEN-MERGE keyed on SERVER ITEM ID. Incoming bubbles are
+				// the fresher server state (queued→running→settled transitions),
+				// so existing copies of incoming id|role bubbles are REMOVED first
+				// (in-flight cancel flags carried over), then the page merges by
+				// item id — ids are creation-ordered and BOTH lists are already
+				// id-sorted, unlike _ts (assistant _ts is `updated`, which any
+				// long-running turn makes non-monotonic and would misorder the
+				// walk). Id-less bubbles on screen (staged/local, always the tail)
+				// end the merge region; id-less incoming sorts first (oldest).
+				var incomingKeys: any = {};
+				mapped.forEach(function (m: any) { if (m._serverItemId) incomingKeys[m._serverItemId + '|' + m.role] = m; });
+				var existing = self.state.messages.filter(function (m: any) {
+					if (!m._serverItemId) return true;
+					var inc = incomingKeys[m._serverItemId + '|' + m.role];
+					if (!inc) return true;
+					if (m._cancelling) inc._cancelling = m._cancelling;
+					if (m._cancelError) inc._cancelError = m._cancelError;
+					return false;
 				});
-				self.state.messages = prepend.concat(self.state.messages);
+				var mergedList: ChatMessage[] = [];
+				var pi = 0, ei = 0;
+				while (pi < mapped.length && ei < existing.length) {
+					var pm: any = mapped[pi], em: any = existing[ei];
+					var eid = em._serverItemId;
+					if (typeof eid !== 'string') break; // staged/local tail
+					var pid = pm._serverItemId;
+					if (typeof pid !== 'string' || pid <= eid) { mergedList.push(pm); pi++; }
+					else { mergedList.push(em); ei++; }
+				}
+				while (pi < mapped.length) mergedList.push(mapped[pi++]);
+				while (ei < existing.length) mergedList.push(existing[ei++]);
+				self.state.messages = mergedList;
 			} else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) {
 				// Empty-but-not-end first page (a pure-bg band past every hop
 				// cap): REPLACING with it would blank the chat and overwrite the
@@ -3088,6 +3277,14 @@ export class ChatSession {
 				if (self.state.typing) self.state.typingAbort = true;
 				var serverIds: any = {};
 				mapped.forEach(function (m: any) { if (m._serverItemId) serverIds[m._serverItemId] = 1; });
+				// The retention boundary must be the SURFACE frontier: page 1 also
+				// emits bg stubs reaching arbitrarily deep, and keying retention on
+				// a weeks-old stub id would wipe (or gap) the scrolled-in pages.
+				var surfaceOldestId: string | undefined = undefined;
+				mapped.forEach(function (m: any) {
+					if (typeof m._serverItemId !== 'string' || m._fromBgChain) return;
+					if (surfaceOldestId === undefined || m._serverItemId < surfaceOldestId) surfaceOldestId = m._serverItemId;
+				});
 				var locallyCancelled: any = {};
 				self.state.messages.forEach(function (m) { if (m.isCancelled && m._serverItemId) locallyCancelled[m._serverItemId] = m; });
 				// A cancel the server has not acknowledged yet. Without carrying these
@@ -3157,7 +3354,13 @@ export class ChatSession {
 				var sharesPage1 = self.state.messages.some(function (m) {
 					return typeof m._serverItemId === 'string' && !!serverIds[m._serverItemId as string];
 				});
-				var retainedOlder: ChatMessage[] = (!sharesPage1 || oldestInPage1 === undefined) ? [] : self.state.messages.filter(function (m) {
+				var deferredBg = !!(history && (history as any).bgPending);
+				// Boundary for retention: the SURFACE frontier when page 1 has any
+				// surface item (bg stubs can reach weeks deeper and would otherwise
+				// wipe or gap the scrolled-in pages); whole-page oldest only as the
+				// fallback for a surface-empty page.
+				var retainBoundary: string | undefined = surfaceOldestId !== undefined ? surfaceOldestId : oldestInPage1;
+				var retainedOlder: ChatMessage[] = (!sharesPage1 || retainBoundary === undefined) ? [] : self.state.messages.filter(function (m) {
 					// Settled server history only; in-flight bubbles are the rescue
 					// loop's job below and would otherwise be kept twice.
 					if (typeof m._serverItemId !== 'string') return false;
@@ -3165,7 +3368,16 @@ export class ChatSession {
 					// project's bubbles onto this chat (the cross-project leak fix).
 					// Compare against the snapshotted loadKey, never a live read.
 					if (m._ownerKey !== undefined && m._ownerKey !== loadKey) return false;
-					return (m._serverItemId as string) < (oldestInPage1 as string);
+					// While a deferred stub batch is in flight, KEEP already-loaded
+					// indexing bubbles wherever they sit — the surface-only page has
+					// none, and dropping them here would flicker every row until the
+					// batch lands (its apply strips+re-merges them by id anyway).
+					if (deferredBg && m.isBackgroundTask) return true;
+					// Bg-chain bubbles already on screen stay put regardless of the
+					// boundary — their ids interleave with deep history and the strip
+					// in later merges replaces them when fresher copies arrive.
+					if (m._fromBgChain) return true;
+					return (m._serverItemId as string) < (retainBoundary as string);
 				});
 				keptOlderPages = retainedOlder.length > 0;
 				self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
@@ -3208,9 +3420,16 @@ export class ChatSession {
 				self.state.historyEndOfList = !!(history && history.endOfList);
 				self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
 				var clearedAt = self.host.getClearedAt();
-				if (clearedAt && chatList.length > 0) {
-					var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
-					if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+				if (clearedAt) {
+					// SURFACE items only: page 1 also carries bg stubs reaching far
+					// past the horizon, and reading their age as "the frontier is
+					// pre-horizon" falsely ended the pager with post-horizon surface
+					// pages still unfetched.
+					var surfaceItems = chatList.filter(function (it: any) { return !(it && it._fromBgChain); });
+					if (surfaceItems.length > 0) {
+						var oldestUpdated = Number(surfaceItems[surfaceItems.length - 1] && surfaceItems[surfaceItems.length - 1].updated);
+						if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+					}
 				}
 			}
 			// Clear loading flags BEFORE this render so the final paint is
@@ -3218,6 +3437,69 @@ export class ChatSession {
 			if (self.state.historyRequestToken === token) { self.state.loadingHistory = false; self.state.loadingOlderHistory = false; }
 			self.updateHistoryCache();
 			self.host.notify();
+
+			// ── deferred indexing-stub batch (first-paint split) ──────────────
+			// The conversation is already on screen; when the stub batch lands it
+			// is classified/mapped like any page and STRIP-THEN-MERGED: existing
+			// copies of incoming ids are removed first (retained rows may sit at
+			// provisional positions), then the batch merges by timestamp.
+			var bgPending = !fetchMore && history && (history as any).bgPending;
+			if (bgPending) {
+				// Ownership id for the shared loading flag: a same-token refetch can
+				// mint a SECOND bgPending, and the older handler settling later must
+				// not clear (or keep) the flag the newer batch owns.
+				var batchId = ++_bgHistoryBatchSeq;
+				self.state.bgHistoryLoading = true;
+				self.host.notify();
+				var releaseBgFlag = function () {
+					if (_bgHistoryBatchSeq === batchId) self.state.bgHistoryLoading = false;
+				};
+				(bgPending as Promise<any>).then(function (batch: any) {
+					if (token !== self.state.gateRefreshToken) { releaseBgFlag(); return; }
+					var bList: any[] = (batch && Array.isArray(batch.list)) ? batch.list : [];
+					bList.forEach(function (item: any) {
+						if (isBgIndexingQueue(item.queue_name)) {
+							var t = item.compact ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+							if (isIndexingRequestText(t)) item._isBgTask = true;
+							else item._isOnBgQueue = true;
+						}
+					});
+					var sorted = bList.sort(function (a: any, b: any) {
+						var ai = typeof a.id === 'string' ? a.id : '', bi = typeof b.id === 'string' ? b.id : '';
+						return ai > bi ? -1 : (ai < bi ? 1 : 0);
+					});
+					var m2 = mapHistoryListToMessages(sorted, platform, {
+						clearedAt: self.host.getClearedAt(),
+						projectId: id.projectId,
+						formatIndexingLabel: self.host.formatIndexingLabel,
+					}).messages;
+					self.applyHydratedBodies(m2);
+					var incoming: any = {};
+					m2.forEach(function (m: any) { if (m._serverItemId) incoming[m._serverItemId + '|' + m.role] = true; });
+					var baseList = self.state.messages.filter(function (m: any) { return !(m._serverItemId && incoming[m._serverItemId + '|' + m.role]); });
+					var mergedList: ChatMessage[] = [];
+					var pi2 = 0, ei2 = 0;
+					while (pi2 < m2.length && ei2 < baseList.length) {
+						var pm2: any = m2[pi2], em2: any = baseList[ei2];
+						var eid2 = em2._serverItemId;
+						if (typeof eid2 !== 'string') break; // staged/local tail
+						var pid2 = pm2._serverItemId;
+						if (typeof pid2 !== 'string' || pid2 <= eid2) { mergedList.push(pm2); pi2++; }
+						else { mergedList.push(em2); ei2++; }
+					}
+					while (pi2 < m2.length) mergedList.push(m2[pi2++]);
+					while (ei2 < baseList.length) mergedList.push(baseList[ei2++]);
+					self.state.messages = mergedList;
+					if (batch && batch.endOfList === true) self.state.historyEndOfList = true;
+					releaseBgFlag();
+					self.updateHistoryCache();
+					self.host.notify();
+				}, function () {
+					// Stubs missing until the next refresh re-asks; never fatal.
+					releaseBgFlag();
+					self.host.notify();
+				});
+			}
 
 			if (!fetchMore) {
 				// Ration BACKGROUND polls here exactly as the drain does (see

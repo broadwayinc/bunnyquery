@@ -60,6 +60,33 @@ export interface ChatEngineConfig {
      */
     mintIndexDoneMarker?: (info: { service: string; storagePath: string }) => void;
     /**
+     * Create-or-update the per-file indexing RUN record ("run::<path>",
+     * reference "src::<path>", table __INDEXING__). The record is the durable
+     * "a run exists and this is its status" signal that lets chat rows and
+     * files-page badges paint without scanning bg history.
+     *
+     * The consumer implements upsert semantics (the records API has none):
+     * create, and on "is already taken" look the record up by unique_id and
+     * re-post with its record_id, merging `patch` over the stored data.
+     * Status precedence is the consumer's job too: 'working' must NEVER
+     * overwrite a terminal status (done/error/cancelled) — a late create from
+     * a slow enqueue must not resurrect a run another writer already closed.
+     * Must be best-effort and never throw. Optional: without it the engine
+     * behaves exactly as before (legacy scan/probe path).
+     */
+    upsertIndexRunRecord?: (info: {
+        service: string;
+        storagePath: string;
+        patch: {
+            status: 'working' | 'done' | 'error' | 'cancelled';
+            filename?: string;
+            started?: number;
+            finished?: number;
+            error?: string;
+            queue?: string;
+        };
+    }) => void;
+    /**
      * Single-item csr-poll point lookup (skapi.util.request('csr-poll', {id,
      * service, owner}, {auth:true})). For a RESOLVED item the backend returns
      * the provider response body itself; for a failed one, the resolved error.

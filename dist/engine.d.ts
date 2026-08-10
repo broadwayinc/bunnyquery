@@ -111,6 +111,33 @@ interface ChatEngineConfig {
         storagePath: string;
     }) => void;
     /**
+     * Create-or-update the per-file indexing RUN record ("run::<path>",
+     * reference "src::<path>", table __INDEXING__). The record is the durable
+     * "a run exists and this is its status" signal that lets chat rows and
+     * files-page badges paint without scanning bg history.
+     *
+     * The consumer implements upsert semantics (the records API has none):
+     * create, and on "is already taken" look the record up by unique_id and
+     * re-post with its record_id, merging `patch` over the stored data.
+     * Status precedence is the consumer's job too: 'working' must NEVER
+     * overwrite a terminal status (done/error/cancelled) — a late create from
+     * a slow enqueue must not resurrect a run another writer already closed.
+     * Must be best-effort and never throw. Optional: without it the engine
+     * behaves exactly as before (legacy scan/probe path).
+     */
+    upsertIndexRunRecord?: (info: {
+        service: string;
+        storagePath: string;
+        patch: {
+            status: 'working' | 'done' | 'error' | 'cancelled';
+            filename?: string;
+            started?: number;
+            finished?: number;
+            error?: string;
+            queue?: string;
+        };
+    }) => void;
+    /**
      * Single-item csr-poll point lookup (skapi.util.request('csr-poll', {id,
      * service, owner}, {auth:true})). For a RESOLVED item the backend returns
      * the provider response body itself; for a failed one, the resolved error.
@@ -1042,16 +1069,51 @@ declare const BG_INDEXING_QUEUE_SUFFIX = "-bg";
  *
  * Written by the BACKEND (the polling worker calls the MCP server's
  * /internal/index-complete at the end of an auto_continue chain whose final
- * window reported no more content), never by the model and never by a client.
+ * window reported no more content) and, for completions a client knows
+ * deterministically (single-pass settle, client-chain completion token), by the
+ * consumer's mintIndexDoneMarker hook — never by the model.
  * The marker record carries `reference: "src::<path>"`, so the reindex flow's
  * delete of the src:: record cascades to it and a re-run starts unmarked.
  *
  * Existence semantics: present = the whole file was read to the end. Absent =
  * unknown (still running, failed partway, indexed before this marker existed,
- * or a single-pass run, which never mints one) - callers must fall back to the
- * live-queue probe (fetchLiveIndexingKeys) before reading absence as anything.
+ * or a single-pass run minted before the client hook existed) - callers must
+ * fall back to the live-queue probe (fetchLiveIndexingKeys) before reading
+ * absence as anything.
  */
 declare function indexDoneUniqueId(storagePath: string): string;
+/**
+ * unique_id of the per-file indexing RUN record.
+ *
+ * One record per storage path, newest run wins (a reindex's delete-then-repost
+ * of src:: cascade-deletes the old record first, exactly like done::). Minted
+ * status='working' by the client the moment it enqueues a run's FIRST pass, and
+ * closed (done/error/cancelled) by whichever side observes the ending: the
+ * worker via the MCP internal routes for worker-driven chains, the client for
+ * deterministic settles, cancels, and dispatch failures. It exists so chat rows
+ * and files-page badges can answer "which runs exist and how did they end"
+ * from ONE records query instead of scanning bg history.
+ *
+ * A 'working' record is a claim, not proof: a chain that dies without reaching
+ * any error path leaves it dangling, so readers must treat a stale 'working'
+ * (old `started`, no live-queue confirmation) as unknown, never as live.
+ */
+declare function runIndexUniqueId(storagePath: string): string;
+type IndexRunStatus = 'working' | 'done' | 'error' | 'cancelled';
+type IndexRunPatch = {
+    status: IndexRunStatus;
+    filename?: string;
+    started?: number;
+    finished?: number;
+    error?: string;
+    queue?: string;
+};
+/**
+ * Fire-and-forget wrapper over the consumer's upsertIndexRunRecord hook.
+ * Safe everywhere: missing hook, unconfigured engine, and consumer throws all
+ * reduce to a no-op — a run record must never be able to break the run itself.
+ */
+declare function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch): void;
 /**
  * The one place the background-indexing queue name is spelled out. The backend
  * serialises requests sharing a queue name and runs different names in PARALLEL,
@@ -1188,6 +1250,19 @@ declare function fetchLiveIndexingKeys(params: {
 }>;
 /** Test hook: drop split-fetch state (all keys, or one). */
 declare function __resetSplitHistoryState(key?: string): void;
+type SplitHistoryResult = {
+    list: any[];
+    endOfList: boolean;
+    startKeyHistory: any[];
+    /** Present only when `deferBg` was requested AND bg work remains: resolves
+     *  with the stub batch fetched in the background (the per-key lock is held
+     *  until it settles, so no other history call can interleave). The caller
+     *  merges the batch by timestamp — the same path older pages use. */
+    bgPending?: Promise<{
+        list: any[];
+        endOfList: boolean;
+    }>;
+};
 declare function getSplitChatHistory(params: {
     service: string;
     owner: string;
@@ -1195,11 +1270,7 @@ declare function getSplitChatHistory(params: {
     userId?: string;
 }, fetchOptions: Record<string, any>, 
 /** Test seam: replaces getChatHistory. Not for production callers. */
-_fetchImpl?: typeof getChatHistory): Promise<{
-    list: any[];
-    endOfList: boolean;
-    startKeyHistory: any[];
-}>;
+_fetchImpl?: typeof getChatHistory): Promise<SplitHistoryResult>;
 type MapHistoryOptions = {
     clearedAt: number;
     projectId: string;
@@ -1419,6 +1490,10 @@ interface ChatMessage {
      *  which is how an 88-page file once "finished" at page 15. */
     _indexComplete?: boolean;
     _useBgQueue?: boolean;
+    /** Mapped from an item delivered by the bg chain of the split history fetch
+     *  (stubs or deferred chats). Surface-frontier logic (retention boundary,
+     *  clear-horizon) skips these — their ids reach arbitrarily deep. */
+    _fromBgChain?: boolean;
     /** Local id of a turn STAGED at Send time while its attachments upload. The
      *  bubble exists before any server request does, so it is never matched by
      *  _serverItemId and is never promoted/cancelled by the queue machinery —
@@ -1458,6 +1533,9 @@ interface ChatState {
     typingAbort: boolean;
     loadingHistory: boolean;
     loadingOlderHistory: boolean;
+    /** A deferred bg stub batch (first-paint split fetch) is still in flight;
+     *  views show a small 'loading indexing history' hint while true. */
+    bgHistoryLoading: boolean;
     historyEndOfList: boolean;
     historyStartKeyHistory: string[];
     historyRequestToken: number;
@@ -1761,6 +1839,15 @@ type IndexingGroup = {
      *  loaded ones. 'status': the queue has not yet said whether this file is still
      *  being worked on, which is the only thing that can end a worker-driven run. */
     resolvingReason?: 'history' | 'status';
+    /** Synthesized from a durable run:: record: none of the run's passes are
+     *  among the loaded messages (bg history still deferred, or the run is older
+     *  than the paging cap). Header-and-status only — members/visibleMembers are
+     *  empty and there is nothing to cancel; the row is replaced by the real
+     *  group the moment actual passes load (same `key`, so expansion state
+     *  carries over). */
+    stub?: boolean;
+    /** The run:: record's stored error text, for a stub row's meta line. */
+    stubError?: string;
 };
 type DisplayEntry = {
     kind: 'message';
@@ -1813,7 +1900,40 @@ type BuildDisplayListOptions = {
      *  windowedIndexing). Passed in rather than read from config so this stays a
      *  pure function of its inputs and can be exercised for both settings. */
     windowedIndexing?: boolean;
+    /** Durable run:: records, keyed by STORAGE PATH (the consumer's marker
+     *  sweep). Each key with no real group in the loaded messages gets a
+     *  synthesized header-only row (see IndexingGroup.stub), placed by its
+     *  `started` timestamp. A real group for the same file — matched by key,
+     *  path, or name — always suppresses the stub: loaded passes are evidence,
+     *  the record is only a summary. */
+    runStubs?: {
+        [storagePath: string]: RunStubInfo;
+    };
+    /** The chat's clear-history horizon (ms epoch). Run records are service-
+     *  wide and know nothing about a cleared chat, so without this every
+     *  "Clear chat history" resurrects one row per indexed file. A stub whose
+     *  run ended (or, unfinished, began) at or before this moment is dropped —
+     *  unless the queue says the file is live RIGHT NOW, which no horizon can
+     *  make untrue. */
+    stubClearedAt?: number;
+    /** Clock injection for tests; defaults to Date.now(). Only run-stub
+     *  staleness reads it. */
+    now?: number;
 };
+/** The display-relevant fields of a run:: record (see requests.ts
+ *  runIndexUniqueId for the record's contract). */
+type RunStubInfo = {
+    status: 'working' | 'done' | 'error' | 'cancelled';
+    filename?: string;
+    started?: number;
+    finished?: number;
+    error?: string;
+};
+/** A 'working' run record older than this with no live-queue confirmation is
+ *  treated as unknown rather than live: a chain that died without reaching any
+ *  error path leaves 'working' dangling, and a row must not spin forever on a
+ *  claim nothing can end. */
+declare const RUN_RECORD_WORKING_STALE_MS: number;
 declare function parseIndexingLabel(content: string): {
     name: string;
     path?: string;
@@ -2400,6 +2520,10 @@ declare class ChatSession {
      */
     private _adoptingWorkerPasses;
     private _adoptWorkerIndexingPasses;
+    /** Anything at all suggesting THIS project's indexing may be live: a queued
+     *  local entry, a recorded live key (the adopt look just wrote them), or an
+     *  attached poll. Gates the passive adopt ladder's climb. */
+    private _hasLiveIndexEvidence;
     /** Any of these ids still queued or still polled, i.e. surviving work. */
     private _isTrackingAny;
     /** One live bg-queue item -> a BgTaskEntry, if it is an indexing pass this
@@ -2416,6 +2540,23 @@ declare class ChatSession {
      *  maybeResumeIndexing). Best-effort by contract; identity-checked so a
      *  project switch mid-settle cannot stamp the wrong service. */
     _mintDoneMarker(entry: BgTaskEntry): void;
+    /** Short, storable form of an error body for the run:: record. */
+    _runErrorText(response: any): string;
+    /** Close the records of a run whose pass settled OFF-POLL — the answer came
+     *  back as history (hidden tab, dead poll, resume refetch), so none of the
+     *  poll-side settle handlers ran. Only for SINGLE-PASS files, where one
+     *  settled pass is deterministically the whole run (the same contract as
+     *  maybeResumeIndexing's single-pass branch); paged files stay with their
+     *  drivers. Outcome is read from the settled bubbles' own flags, which is
+     *  all the history mapping left us. Best-effort and idempotent throughout. */
+    _flipRunFromSettledEntry(entry: BgTaskEntry): void;
+    /** Close the durable run:: record for an ending THIS client observed.
+     *  service comes from the ENTRY, not the current identity: unlike the done::
+     *  mint above, a status flip must land even if the user switched projects
+     *  mid-settle — otherwise the record lies 'working' forever. Best-effort
+     *  through upsertIndexRunRecordSafe; the consumer's precedence guard keeps
+     *  repeats and races harmless. */
+    _flipRunRecord(entry: BgTaskEntry, status: IndexRunStatus, error?: string): void;
     maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void;
     loadHistory(fetchMore?: boolean, token?: number): Promise<void>;
     uploadSingleAttachment(att: any, stageId?: string): Promise<Array<{
@@ -2432,4 +2573,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, type RenderableInlineLink, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };

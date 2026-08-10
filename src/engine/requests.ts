@@ -716,6 +716,36 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	// A CONTINUE pass resumes a large file that a previous pass could not finish.
 	const continuing = !!info.continueIndexing;
 
+	// Durable run record, minted the moment a run's FIRST pass is enqueued (every
+	// first-pass site funnels through this function, so one mint covers them all;
+	// resume passes belong to the existing run and must not touch it). Ordering is
+	// safe by construction: every caller runs its delete-then-repost + src:: mint
+	// BEFORE calling here, so the record's `reference: src::<path>` resolves. The
+	// dispatch promise is tapped below so an enqueue that never reached the queue
+	// closes the record as an error instead of leaving 'working' dangling.
+	if (!continuing) {
+		upsertIndexRunRecordSafe(service, attachment.storagePath, {
+			status: 'working',
+			filename: attachment.name,
+			started: Date.now(),
+			queue: bgIndexingQueueName(info.userId, service),
+		});
+	}
+	const tapDispatchFailure = (p: Promise<any>): Promise<any> => {
+		if (continuing) return p;
+		return p.then(
+			(ack: any) => ack,
+			(err: any) => {
+				upsertIndexRunRecordSafe(service, attachment.storagePath, {
+					status: 'error',
+					finished: Date.now(),
+					error: (err && (err.message || String(err))) || 'The indexing request could not be enqueued.',
+				});
+				throw err;
+			},
+		);
+	};
+
 	// VISION files (PDFs) are delivered as rendered page IMAGES injected into the message by
 	// the worker (`_skapi_render`), because tool-result images render on neither provider.
 	// Both the first pass and every resume pass use this; renderFrom advances the page window.
@@ -845,7 +875,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	if (platform === 'openai') {
 		const resolvedModel = info.model || DEFAULT_OPENAI_MODEL;
 		const imageDetail = getOpenAIImageDetail(resolvedModel);
-		return clientSecretRequest({
+		return tapDispatchFailure(clientSecretRequest({
 			clientSecretName: 'openai',
 			queue: bgIndexingQueueName(info.userId, service),
 			service,
@@ -890,11 +920,11 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 						: []),
 				],
 			},
-		});
+		}));
 	}
 
 	const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-	return clientSecretRequest({
+	return tapDispatchFailure(clientSecretRequest({
 		clientSecretName: 'claude',
 		queue: bgIndexingQueueName(info.userId, service),
 		service,
@@ -949,7 +979,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				},
 			],
 		},
-	});
+	}));
 }
 
 export function extractClaudeText(response: any) {
@@ -1043,17 +1073,67 @@ export const BG_INDEXING_QUEUE_SUFFIX = '-bg';
  *
  * Written by the BACKEND (the polling worker calls the MCP server's
  * /internal/index-complete at the end of an auto_continue chain whose final
- * window reported no more content), never by the model and never by a client.
+ * window reported no more content) and, for completions a client knows
+ * deterministically (single-pass settle, client-chain completion token), by the
+ * consumer's mintIndexDoneMarker hook — never by the model.
  * The marker record carries `reference: "src::<path>"`, so the reindex flow's
  * delete of the src:: record cascades to it and a re-run starts unmarked.
  *
  * Existence semantics: present = the whole file was read to the end. Absent =
  * unknown (still running, failed partway, indexed before this marker existed,
- * or a single-pass run, which never mints one) - callers must fall back to the
- * live-queue probe (fetchLiveIndexingKeys) before reading absence as anything.
+ * or a single-pass run minted before the client hook existed) - callers must
+ * fall back to the live-queue probe (fetchLiveIndexingKeys) before reading
+ * absence as anything.
  */
 export function indexDoneUniqueId(storagePath: string): string {
 	return 'done::' + storagePath;
+}
+
+/**
+ * unique_id of the per-file indexing RUN record.
+ *
+ * One record per storage path, newest run wins (a reindex's delete-then-repost
+ * of src:: cascade-deletes the old record first, exactly like done::). Minted
+ * status='working' by the client the moment it enqueues a run's FIRST pass, and
+ * closed (done/error/cancelled) by whichever side observes the ending: the
+ * worker via the MCP internal routes for worker-driven chains, the client for
+ * deterministic settles, cancels, and dispatch failures. It exists so chat rows
+ * and files-page badges can answer "which runs exist and how did they end"
+ * from ONE records query instead of scanning bg history.
+ *
+ * A 'working' record is a claim, not proof: a chain that dies without reaching
+ * any error path leaves it dangling, so readers must treat a stale 'working'
+ * (old `started`, no live-queue confirmation) as unknown, never as live.
+ */
+export function runIndexUniqueId(storagePath: string): string {
+	return 'run::' + storagePath;
+}
+
+export type IndexRunStatus = 'working' | 'done' | 'error' | 'cancelled';
+
+export type IndexRunPatch = {
+	status: IndexRunStatus;
+	filename?: string;
+	started?: number;
+	finished?: number;
+	error?: string;
+	queue?: string;
+};
+
+/**
+ * Fire-and-forget wrapper over the consumer's upsertIndexRunRecord hook.
+ * Safe everywhere: missing hook, unconfigured engine, and consumer throws all
+ * reduce to a no-op — a run record must never be able to break the run itself.
+ */
+export function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch): void {
+	if (!service || !storagePath) return;
+	try {
+		const hook = chatEngineConfig().upsertIndexRunRecord;
+		if (typeof hook !== 'function') return;
+		hook({ service, storagePath, patch });
+	} catch (e) {
+		// best-effort by contract
+	}
 }
 
 /**

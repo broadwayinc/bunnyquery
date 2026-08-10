@@ -28,6 +28,7 @@
 .bq-message.is-assistant { justify-content: flex-start; }
 
 .bq-bubble {
+    max-width: 100%;
     padding: 0.55rem 0.7rem;
     border: 1px solid var(--bq-line);
     white-space: pre-wrap;
@@ -484,3 +485,38 @@
 .bq-md strong { font-weight: 600; }
 .bq-md em { font-style: italic; }
 .bq-md del { text-decoration: line-through; }
+/* ---- host-page insulation -------------------------------------------------*/
+/* The markdown above renders into whatever page this chat sits in: the admin
+   app with its own global stylesheet, or - for the embedded widget - a HOST
+   page with arbitrary CSS. Element-level globals leak straight into it, and
+   form controls are the class nothing above styles on purpose: the admin app
+   styles every <input> as a 3rem bordered mono text field, which turned a GFM
+   task-list checkbox into a giant text box. `revert` rolls each property back
+   to the BROWSER default (as if no author CSS existed), which is the honest
+   baseline for a control the markdown produced; `initial`/`unset` would
+   instead strip even the user-agent's own control styling. */
+.bq-md input,
+.bq-md select,
+.bq-md textarea,
+.bq-md button {
+    all: revert;
+}
+/* GFM task list: `- [x] item` renders as a disabled checkbox in the list item.
+   Re-state the little we DO want on top of the revert: sit on the text
+   baseline with a small gap, brand accent. The geometry (width/height/
+   min-height/padding) is pinned explicitly, at higher specificity than the
+   revert rule, so a host sheet whose input rules are more specific than
+   `.bq-md input` still loses the properties that actually break layout. */
+.bq-md input[type="checkbox"] {
+    width: auto;
+    height: auto;
+    min-height: 0;
+    padding: 0;
+    margin: 0 0.4em 0.1em 0;
+    vertical-align: middle;
+    accent-color: var(--bq-main);
+}
+/* GitHub-style: a task-list item shows the checkbox INSTEAD of a bullet, not
+   next to one. :has() is safe here - every supported browser ships it, and a
+   miss only means a redundant bullet. */
+.bq-md li:has(> input[type="checkbox"]:first-child) { list-style: none; }

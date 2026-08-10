@@ -100,6 +100,8 @@ export {
 	type IndexingGroup,
 	type IndexingGroupStatus,
 	type BuildDisplayListOptions,
+	type RunStubInfo,
+	RUN_RECORD_WORKING_STALE_MS,
 } from './indexing_groups';
 
 export {
@@ -112,6 +114,10 @@ export {
 	bgIndexingQueueName,
 	isBgIndexingQueue,
 	indexDoneUniqueId,
+	runIndexUniqueId,
+	upsertIndexRunRecordSafe,
+	type IndexRunStatus,
+	type IndexRunPatch,
 	MCP_NAME,
 	DEFAULT_CLAUDE_MODEL,
 	DEFAULT_OPENAI_MODEL,

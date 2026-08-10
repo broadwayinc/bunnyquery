@@ -1632,6 +1632,28 @@ async function notifyAgentContinueIndexing(info) {
 async function notifyAgentSaveAttachment(info) {
   const { platform, service, owner, attachment, parsedContent } = info;
   const continuing = !!info.continueIndexing;
+  if (!continuing) {
+    upsertIndexRunRecordSafe(service, attachment.storagePath, {
+      status: "working",
+      filename: attachment.name,
+      started: Date.now(),
+      queue: bgIndexingQueueName(info.userId, service)
+    });
+  }
+  const tapDispatchFailure = (p) => {
+    if (continuing) return p;
+    return p.then(
+      (ack) => ack,
+      (err) => {
+        upsertIndexRunRecordSafe(service, attachment.storagePath, {
+          status: "error",
+          finished: Date.now(),
+          error: err && (err.message || String(err)) || "The indexing request could not be enqueued."
+        });
+        throw err;
+      }
+    );
+  };
   const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
   const renderFrom = Math.max(0, info.renderFrom || 0);
   const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
@@ -1706,7 +1728,7 @@ async function notifyAgentSaveAttachment(info) {
   if (platform === "openai") {
     const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
     const imageDetail = getOpenAIImageDetail(resolvedModel2);
-    return clientSecretRequest({
+    return tapDispatchFailure(clientSecretRequest({
       clientSecretName: "openai",
       queue: bgIndexingQueueName(info.userId, service),
       service,
@@ -1749,10 +1771,10 @@ async function notifyAgentSaveAttachment(info) {
           ] 
         ]
       }
-    });
+    }));
   }
   const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-  return clientSecretRequest({
+  return tapDispatchFailure(clientSecretRequest({
     clientSecretName: "claude",
     queue: bgIndexingQueueName(info.userId, service),
     service,
@@ -1807,7 +1829,7 @@ async function notifyAgentSaveAttachment(info) {
         }
       ]
     }
-  });
+  }));
 }
 function extractClaudeText(response) {
   if (!Array.isArray(response?.content)) {
@@ -1870,6 +1892,18 @@ async function listOpenAIModels(service, owner) {
 var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 function indexDoneUniqueId(storagePath) {
   return "done::" + storagePath;
+}
+function runIndexUniqueId(storagePath) {
+  return "run::" + storagePath;
+}
+function upsertIndexRunRecordSafe(service, storagePath, patch) {
+  if (!service || !storagePath) return;
+  try {
+    const hook = chatEngineConfig().upsertIndexRunRecord;
+    if (typeof hook !== "function") return;
+    hook({ service, storagePath, patch });
+  } catch (e) {
+  }
 }
 function bgIndexingQueueName(userId, service) {
   return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
@@ -2010,7 +2044,7 @@ async function fetchLiveIndexingKeys(params) {
   }
   return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
 }
-var BG_COVERAGE_MAX_PAGES = 8;
+var BG_COVERAGE_MAX_PAGES = 2;
 var splitHistoryStates = {};
 var splitHistoryLocks = {};
 function freshSplitState() {
@@ -2041,26 +2075,44 @@ var SURFACE_EMPTY_MAX_PAGES = 10;
 async function getSplitChatHistory(params, fetchOptions, _fetchImpl) {
   const key = [params.service, params.owner, params.platform, params.userId || ""].join("|");
   const prev = splitHistoryLocks[key] || Promise.resolve();
-  const run = () => _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl);
+  let releaseLock;
+  const lockTail = new Promise((r) => {
+    releaseLock = r;
+  });
+  const run = () => _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock, _fetchImpl);
   const p = prev.then(run, run);
-  splitHistoryLocks[key] = p.then(() => void 0, () => void 0);
+  p.then((res) => {
+    if (!res || !res.bgPending) releaseLock();
+  }, () => releaseLock());
+  splitHistoryLocks[key] = p.then(() => lockTail, () => lockTail);
   return p;
 }
-async function _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl) {
+async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock, _fetchImpl) {
   const fetch = _fetchImpl || getChatHistory;
   const bgQueue = bgIndexingQueueName(params.userId, params.service);
   const base = { service: params.service, owner: params.owner, platform: params.platform };
   const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
   const limit = fetchOptions && fetchOptions.limit;
-  if (!fetchMore || !splitHistoryStates[key]) {
+  let headRefresh = false;
+  if (!splitHistoryStates[key]) {
     splitHistoryStates[key] = freshSplitState();
+  } else if (!fetchMore) {
+    const prev = splitHistoryStates[key];
+    if (prev.surfaceEnd && prev.bgEnd) {
+      headRefresh = true;
+      prev.pendingSurface = null;
+      prev.surfaceCarry = [];
+      prev.bgBuffer = [];
+    } else {
+      splitHistoryStates[key] = freshSplitState();
+    }
   }
   const state = splitHistoryStates[key];
   if (state.pendingSurface && state.pendingSurface.forFetchMore !== fetchMore) {
     state.pendingSurface = null;
   }
   if (!state.pendingSurface) {
-    if (state.surfaceEnd) {
+    if (state.surfaceEnd && !headRefresh) {
       state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys, forFetchMore: fetchMore };
     } else {
       const sOpts = { fetchMore };
@@ -2082,9 +2134,73 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl)
     }
   }
   const surface = state.pendingSurface;
+  if (fetchOptions && fetchOptions.deferBg && (!state.bgEnd || headRefresh)) {
+    const surfaceList0 = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
+    state.surfaceCarry = [];
+    const emitNow = surfaceList0.concat(state.bgBuffer);
+    state.bgBuffer = [];
+    if (!headRefresh) state.surfaceEnd = surface.endOfList;
+    state.lastSurfaceKeys = surface.startKeyHistory;
+    state.pendingSurface = null;
+    const bgPending = (async () => {
+      try {
+        const batch = [];
+        if (headRefresh) {
+          const bOpts = { fetchMore: false };
+          if (limit) bOpts.limit = limit;
+          const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+          const bList = b && Array.isArray(b.list) ? b.list : [];
+          for (const it of bList) {
+            if (it && typeof it === "object") it._fromBgChain = true;
+            batch.push(it);
+          }
+        } else {
+          let hops = 0;
+          while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
+            hops++;
+            const bOpts = { fetchMore: state.bgStarted };
+            if (limit) bOpts.limit = limit;
+            const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+            state.bgStarted = true;
+            const bList = b && Array.isArray(b.list) ? b.list : [];
+            for (const it of bList) {
+              if (it && typeof it === "object") it._fromBgChain = true;
+              batch.push(it);
+            }
+            state.bgEnd = !!(b && b.endOfList);
+            if (!bList.length && !state.bgEnd) break;
+            if (state.bgEnd) break;
+          }
+        }
+        return { list: batch, endOfList: state.surfaceEnd && state.bgEnd };
+      } finally {
+        releaseLock();
+      }
+    })();
+    return {
+      list: emitNow,
+      // A head-refreshed ended chain KNOWS it is still ended — reporting
+      // the hardcoded false here was what un-gated the fill loop on every
+      // tab return. Mid-walk it computes to false exactly as before (this
+      // branch is only entered with bgEnd false then); the bg batch still
+      // carries the final word for that case.
+      endOfList: state.surfaceEnd && state.bgEnd,
+      startKeyHistory: surface.startKeyHistory,
+      bgPending
+    };
+  }
   const surfaceList = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
   const boundary = surface.endOfList ? -Infinity : oldestCreated(surfaceList);
-  if (boundary !== Infinity || surface.endOfList) {
+  if (headRefresh) {
+    const hOpts = { fetchMore: false };
+    if (limit) hOpts.limit = limit;
+    const hb = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, hOpts);
+    const hbList = hb && Array.isArray(hb.list) ? hb.list : [];
+    for (const it of hbList) {
+      if (it && typeof it === "object") it._fromBgChain = true;
+      state.bgBuffer.push(it);
+    }
+  } else if (boundary !== Infinity || surface.endOfList) {
     let hops = 0;
     while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
       const bufOldest = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
@@ -2095,49 +2211,25 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl)
       const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
       state.bgStarted = true;
       const bList = b && Array.isArray(b.list) ? b.list : [];
-      for (const it of bList) state.bgBuffer.push(it);
+      for (const it of bList) {
+        if (it && typeof it === "object") it._fromBgChain = true;
+        state.bgBuffer.push(it);
+      }
       state.bgEnd = !!(b && b.endOfList);
       if (!bList.length && !state.bgEnd) break;
       if (state.bgEnd) break;
     }
   }
-  const bufOldestNow = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
-  const uncovered = !state.bgEnd && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
-  const effBoundary = uncovered ? bufOldestNow : boundary;
-  let emitSurface;
-  if (uncovered) {
-    emitSurface = [];
-    const carry = [];
-    for (const it of surfaceList) {
-      const c = createdOf(it);
-      if (isNaN(c) || c >= effBoundary) emitSurface.push(it);
-      else carry.push(it);
-    }
-    state.surfaceCarry = carry;
-  } else {
-    emitSurface = surfaceList;
-    state.surfaceCarry = [];
-  }
-  let emitBg;
-  if (effBoundary === -Infinity) {
-    emitBg = state.bgBuffer;
-    state.bgBuffer = [];
-  } else {
-    emitBg = [];
-    const keep = [];
-    for (const it of state.bgBuffer) {
-      const c = createdOf(it);
-      if (isNaN(c) || c >= effBoundary) emitBg.push(it);
-      else keep.push(it);
-    }
-    state.bgBuffer = keep;
-  }
+  const emitSurface = surfaceList;
+  state.surfaceCarry = [];
+  const emitBg = state.bgBuffer;
+  state.bgBuffer = [];
   const seen = {};
   for (const it of emitSurface) {
     if (it && typeof it.id === "string") seen[it.id] = true;
   }
   const merged = emitSurface.concat(emitBg.filter((it) => !(it && typeof it.id === "string" && seen[it.id])));
-  state.surfaceEnd = surface.endOfList;
+  if (!headRefresh) state.surfaceEnd = surface.endOfList;
   state.lastSurfaceKeys = surface.startKeyHistory;
   state.pendingSurface = null;
   return {
@@ -2193,6 +2285,7 @@ function mapHistoryListToMessages(list, platform, opts) {
         displayContent = sanitizeAttachmentLinksForHistory(userText, opts.projectId);
       }
       var userMsg = { role: "user", content: displayContent };
+      if (item._fromBgChain) userMsg._fromBgChain = true;
       if (isInProcess) userMsg.isPendingInProcess = true;
       if (isQueued) userMsg.isPendingQueued = true;
       if (isCancelledItem) userMsg.isCancelled = true;
@@ -2206,6 +2299,8 @@ function mapHistoryListToMessages(list, platform, opts) {
     }
     if (isCancelledItem) ; else if (isInProcess) {
       var ph = { role: "assistant", content: "", isPending: true, isPendingInProcess: true };
+      if (userTs !== void 0) ph._ts = userTs;
+      if (item._fromBgChain) ph._fromBgChain = true;
       if (item._isBgTask) ph.isBackgroundTask = true;
       if (serverItemId !== void 0) {
         ph._serverItemId = serverItemId;
@@ -2214,12 +2309,14 @@ function mapHistoryListToMessages(list, platform, opts) {
       mapped.push(ph);
     } else if (isQueued) ; else if (isErrorResponse) {
       var em = { role: "assistant", content: getErrorMessage(response), isError: true };
+      if (item._fromBgChain) em._fromBgChain = true;
       if (item._isBgTask) em.isBackgroundTask = true;
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
       if (replyTs !== void 0) em._ts = replyTs;
       mapped.push(em);
     } else if (assistantText || reportedComplete) {
       var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
+      if (item._fromBgChain) okm._fromBgChain = true;
       if (item._isBgTask) okm.isBackgroundTask = true;
       if (isCompact) okm._compact = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
@@ -2345,6 +2442,7 @@ var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
 var INDEXING_DRAIN_IDLE_LOOKS = 2;
 var INDEXING_DRAIN_MIN_MS = 8e3;
+var _bgHistoryBatchSeq = 0;
 var INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1e3;
 var INDEXING_DRAIN_LOOK_TIMEOUT_MS = 45e3;
 var INDEXING_DRAIN_NUDGE_MIN_GAP_MS = 1500;
@@ -2414,6 +2512,9 @@ var ChatSession = class {
       typingAbort: false,
       loadingHistory: false,
       loadingOlderHistory: false,
+      // A deferred bg stub batch (first-paint split) is still in flight; the
+      // views show a small 'loading indexing history' hint while true.
+      bgHistoryLoading: false,
       historyEndOfList: false,
       historyStartKeyHistory: [],
       historyRequestToken: 0,
@@ -2660,7 +2761,7 @@ var ChatSession = class {
    * instead of merely unconfirmed.
    */
   refreshLiveIndexState() {
-    this._adoptWorkerIndexingPasses(0);
+    this._adoptWorkerIndexingPasses(0, true);
   }
   /** Forget what we know about which files are indexing — but ONLY when the
    *  snapshot was taken for a different chat than the one on screen now. For a
@@ -3850,6 +3951,32 @@ var ChatSession = class {
         if (e && e.id && self._indexKeyOf(e) === scoped) stoppedIds[e.id] = true;
       });
       this.state.stoppedIndexIds = stoppedIds;
+      var runPath = group.path || "";
+      if (!runPath) {
+        (group.members || []).some(function(m) {
+          var p = m && m.msg && m.msg._indexFile && m.msg._indexFile.path;
+          if (p) {
+            runPath = p;
+            return true;
+          }
+          return false;
+        });
+      }
+      if (!runPath) {
+        this.bgTaskQueue.some(function(e) {
+          if (e && e.storagePath && self._indexKeyOf(e) === scoped) {
+            runPath = e.storagePath;
+            return true;
+          }
+          return false;
+        });
+      }
+      if (runPath) {
+        var ident = this.host.getIdentity();
+        if (ident && ident.projectId) {
+          upsertIndexRunRecordSafe(ident.projectId, runPath, { status: "cancelled", finished: Date.now() });
+        }
+      }
     }
     this._adoptWorkerIndexingPasses(0);
     var ids = group.cancellableIds || [];
@@ -4363,7 +4490,7 @@ var ChatSession = class {
     if (isImageVisionFile(filename, mime)) return true;
     return windowedIndexingEnabled() && isWindowedReadFile(filename, mime);
   }
-  _adoptWorkerIndexingPasses(attempt) {
+  _adoptWorkerIndexingPasses(attempt, passive) {
     var self = this;
     if (this._adoptingWorkerPasses) return;
     var id = this.host.getIdentity();
@@ -4400,6 +4527,7 @@ var ChatSession = class {
         self.drainBgTaskQueue();
         if (self._isTrackingAny(adoptedIds)) return;
       }
+      if (passive && !self._hasLiveIndexEvidence(svcId)) return;
       if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
         self._nudgeIndexingDrain();
         return;
@@ -4408,11 +4536,25 @@ var ChatSession = class {
         var later = self.host.getIdentity();
         if (later.projectId !== svcId || later.platform !== platform) return;
         if (self.isPollingPaused() || !self.host.isViewMounted()) return;
-        self._adoptWorkerIndexingPasses(attempt + 1);
+        self._adoptWorkerIndexingPasses(attempt + 1, passive);
       }, WORKER_PASS_ADOPT_ATTEMPTS[attempt + 1]);
     }, function() {
       self._adoptingWorkerPasses = false;
     });
+  }
+  /** Anything at all suggesting THIS project's indexing may be live: a queued
+   *  local entry, a recorded live key (the adopt look just wrote them), or an
+   *  attached poll. Gates the passive adopt ladder's climb. */
+  _hasLiveIndexEvidence(svcId) {
+    for (var i = 0; i < this.bgTaskQueue.length; i++) {
+      var e = this.bgTaskQueue[i];
+      if (e && e.projectId === svcId) return true;
+    }
+    var keys = this.state.liveIndexKeys || {};
+    for (var k in keys) {
+      if (keys[k]) return true;
+    }
+    return this.historyItemPolls.size > 0;
   }
   /** Any of these ids still queued or still polled, i.e. surviving work. */
   _isTrackingAny(ids) {
@@ -4504,7 +4646,10 @@ var ChatSession = class {
     for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
       var e = this.bgTaskQueue[i];
       if (e.projectId !== svcId || e.platform !== plat) continue;
-      if (presentIds[e.id] && !pendingIds[e.id]) this.bgTaskQueue.splice(i, 1);
+      if (presentIds[e.id] && !pendingIds[e.id]) {
+        this._flipRunFromSettledEntry(e);
+        this.bgTaskQueue.splice(i, 1);
+      }
     }
     var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
     var injectedAny = false;
@@ -4578,6 +4723,8 @@ var ChatSession = class {
           self.host.notify();
           self.updateHistoryCache();
           if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+            if (isNotExists) self._flipRunRecord(capturedEntry, "cancelled");
+            else self._flipRunRecord(capturedEntry, "error", self._runErrorText(err));
             self._nudgeIndexingDrain();
           }
         }).then(function() {
@@ -4623,6 +4770,60 @@ var ChatSession = class {
     } catch (_e) {
     }
   }
+  /** Short, storable form of an error body for the run:: record. */
+  _runErrorText(response) {
+    var msg = "";
+    try {
+      msg = String(getErrorMessage(response) || "");
+    } catch (_e) {
+    }
+    msg = msg.replace(/\s+/g, " ").trim();
+    return msg ? msg.slice(0, 300) : "Indexing failed.";
+  }
+  /** Close the records of a run whose pass settled OFF-POLL — the answer came
+   *  back as history (hidden tab, dead poll, resume refetch), so none of the
+   *  poll-side settle handlers ran. Only for SINGLE-PASS files, where one
+   *  settled pass is deterministically the whole run (the same contract as
+   *  maybeResumeIndexing's single-pass branch); paged files stay with their
+   *  drivers. Outcome is read from the settled bubbles' own flags, which is
+   *  all the history mapping left us. Best-effort and idempotent throughout. */
+  _flipRunFromSettledEntry(entry) {
+    try {
+      if (!entry || !entry.storagePath || !entry.id || !entry.projectId) return;
+      if (isPagedReadFile(entry.filename, entry.mime)) return;
+      if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
+      if (this.state.stoppedIndexIds[entry.id]) return;
+      var userMsg = null, replyMsg = null;
+      this.state.messages.forEach(function(m) {
+        if (m._serverItemId !== entry.id) return;
+        if (m.role === "user") {
+          if (!userMsg) userMsg = m;
+        } else if (!replyMsg) replyMsg = m;
+      });
+      if (userMsg && userMsg.isCancelled || replyMsg && replyMsg.isCancelled) {
+        this._flipRunRecord(entry, "cancelled");
+      } else if (replyMsg && replyMsg.isError) {
+        var errText = typeof replyMsg.content === "string" ? replyMsg.content.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+        this._flipRunRecord(entry, "error", errText || "Indexing failed.");
+      } else if (replyMsg) {
+        this._mintDoneMarker(entry);
+        this._flipRunRecord(entry, "done");
+      }
+    } catch (_e) {
+    }
+  }
+  /** Close the durable run:: record for an ending THIS client observed.
+   *  service comes from the ENTRY, not the current identity: unlike the done::
+   *  mint above, a status flip must land even if the user switched projects
+   *  mid-settle — otherwise the record lies 'working' forever. Best-effort
+   *  through upsertIndexRunRecordSafe; the consumer's precedence guard keeps
+   *  repeats and races harmless. */
+  _flipRunRecord(entry, status, error) {
+    if (!entry || !entry.storagePath || !entry.projectId) return;
+    var patch = { status, finished: Date.now() };
+    if (error) patch.error = error;
+    upsertIndexRunRecordSafe(entry.projectId, entry.storagePath, patch);
+  }
   maybeResumeIndexing(entry, response, platform) {
     var self = this;
     var endOfClientChain = function() {
@@ -4634,6 +4835,11 @@ var ChatSession = class {
       if (!isPagedReadFile(entry.filename, entry.mime)) {
         if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
           this._mintDoneMarker(entry);
+          this._flipRunRecord(entry, "done");
+        } else if (this._isCancelledPollResult(response)) {
+          this._flipRunRecord(entry, "cancelled");
+        } else {
+          this._flipRunRecord(entry, "error", this._runErrorText(response));
         }
         endOfClientChain();
         return;
@@ -4641,22 +4847,29 @@ var ChatSession = class {
       if (isImageVisionFile(entry.filename, entry.mime)) return;
       if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
       if (isErrorResponseBody(response)) {
+        this._flipRunRecord(entry, "error", this._runErrorText(response));
         endOfClientChain();
         return;
       }
       var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
       if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
         this._mintDoneMarker(entry);
+        this._flipRunRecord(entry, "done");
         endOfClientChain();
         return;
       }
       var pass = (entry.resumePass || 0) + 1;
       if (pass > MAX_INDEXING_RESUME_PASSES) {
+        this._flipRunRecord(entry, "error", "Stopped after " + MAX_INDEXING_RESUME_PASSES + " passes without finishing.");
         endOfClientChain();
         return;
       }
       var id = this.host.getIdentity();
-      if (!id || id.platform === "none" || id.projectId !== entry.projectId) return;
+      if (!id || id.platform === "none" || id.projectId !== entry.projectId) {
+        this._flipRunRecord(entry, "error", "Indexing stopped: the session or project changed before the file finished.");
+        endOfClientChain();
+        return;
+      }
       this.trackIndexDispatch(notifyAgentContinueIndexing({
         platform: id.platform,
         model: id.model,
@@ -4733,6 +4946,7 @@ var ChatSession = class {
     var projectId = id.projectId, owner = id.owner;
     var options = { fetchMore };
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
+    if (!fetchMore) options.deferBg = true;
     var fetchHistory = function() {
       return getSplitChatHistory({ service: projectId, owner, platform, userId: id.userId }, options);
     };
@@ -4761,19 +4975,46 @@ var ChatSession = class {
       self.applyHydratedBodies(mapped);
       var keptOlderPages = false;
       if (fetchMore) {
-        var onScreenIds = {};
-        self.state.messages.forEach(function(m) {
-          if (m._serverItemId) onScreenIds[m._serverItemId + "|" + m.role] = true;
+        var incomingKeys = {};
+        mapped.forEach(function(m) {
+          if (m._serverItemId) incomingKeys[m._serverItemId + "|" + m.role] = m;
         });
-        var prepend = mapped.filter(function(m) {
-          return !(m._serverItemId && onScreenIds[m._serverItemId + "|" + m.role]);
+        var existing = self.state.messages.filter(function(m) {
+          if (!m._serverItemId) return true;
+          var inc = incomingKeys[m._serverItemId + "|" + m.role];
+          if (!inc) return true;
+          if (m._cancelling) inc._cancelling = m._cancelling;
+          if (m._cancelError) inc._cancelError = m._cancelError;
+          return false;
         });
-        self.state.messages = prepend.concat(self.state.messages);
+        var mergedList = [];
+        var pi = 0, ei = 0;
+        while (pi < mapped.length && ei < existing.length) {
+          var pm = mapped[pi], em = existing[ei];
+          var eid = em._serverItemId;
+          if (typeof eid !== "string") break;
+          var pid = pm._serverItemId;
+          if (typeof pid !== "string" || pid <= eid) {
+            mergedList.push(pm);
+            pi++;
+          } else {
+            mergedList.push(em);
+            ei++;
+          }
+        }
+        while (pi < mapped.length) mergedList.push(mapped[pi++]);
+        while (ei < existing.length) mergedList.push(existing[ei++]);
+        self.state.messages = mergedList;
       } else if (!mapped.length && history && history.endOfList === false && self.state.messages.length) ; else {
         if (self.state.typing) self.state.typingAbort = true;
         var serverIds = {};
         mapped.forEach(function(m) {
           if (m._serverItemId) serverIds[m._serverItemId] = 1;
+        });
+        var surfaceOldestId = void 0;
+        mapped.forEach(function(m) {
+          if (typeof m._serverItemId !== "string" || m._fromBgChain) return;
+          if (surfaceOldestId === void 0 || m._serverItemId < surfaceOldestId) surfaceOldestId = m._serverItemId;
         });
         var locallyCancelled = {};
         self.state.messages.forEach(function(m) {
@@ -4815,10 +5056,14 @@ var ChatSession = class {
         var sharesPage1 = self.state.messages.some(function(m) {
           return typeof m._serverItemId === "string" && !!serverIds[m._serverItemId];
         });
-        var retainedOlder = !sharesPage1 || oldestInPage1 === void 0 ? [] : self.state.messages.filter(function(m) {
+        var deferredBg = !!(history && history.bgPending);
+        var retainBoundary = surfaceOldestId !== void 0 ? surfaceOldestId : oldestInPage1;
+        var retainedOlder = !sharesPage1 || retainBoundary === void 0 ? [] : self.state.messages.filter(function(m) {
           if (typeof m._serverItemId !== "string") return false;
           if (m._ownerKey !== void 0 && m._ownerKey !== loadKey) return false;
-          return m._serverItemId < oldestInPage1;
+          if (deferredBg && m.isBackgroundTask) return true;
+          if (m._fromBgChain) return true;
+          return m._serverItemId < retainBoundary;
         });
         keptOlderPages = retainedOlder.length > 0;
         self.state.messages = keptOlderPages ? retainedOlder.concat(mapped) : mapped;
@@ -4857,9 +5102,14 @@ var ChatSession = class {
         self.state.historyEndOfList = !!(history && history.endOfList);
         self.state.historyStartKeyHistory = history && Array.isArray(history.startKeyHistory) ? history.startKeyHistory : [];
         var clearedAt = self.host.getClearedAt();
-        if (clearedAt && chatList.length > 0) {
-          var oldestUpdated = Number(chatList[chatList.length - 1] && chatList[chatList.length - 1].updated);
-          if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+        if (clearedAt) {
+          var surfaceItems = chatList.filter(function(it) {
+            return !(it && it._fromBgChain);
+          });
+          if (surfaceItems.length > 0) {
+            var oldestUpdated = Number(surfaceItems[surfaceItems.length - 1] && surfaceItems[surfaceItems.length - 1].updated);
+            if (isFinite(oldestUpdated) && oldestUpdated <= clearedAt) self.state.historyEndOfList = true;
+          }
         }
       }
       if (self.state.historyRequestToken === token) {
@@ -4868,6 +5118,71 @@ var ChatSession = class {
       }
       self.updateHistoryCache();
       self.host.notify();
+      var bgPending = !fetchMore && history && history.bgPending;
+      if (bgPending) {
+        var batchId = ++_bgHistoryBatchSeq;
+        self.state.bgHistoryLoading = true;
+        self.host.notify();
+        var releaseBgFlag = function() {
+          if (_bgHistoryBatchSeq === batchId) self.state.bgHistoryLoading = false;
+        };
+        bgPending.then(function(batch) {
+          if (token !== self.state.gateRefreshToken) {
+            releaseBgFlag();
+            return;
+          }
+          var bList = batch && Array.isArray(batch.list) ? batch.list : [];
+          bList.forEach(function(item) {
+            if (isBgIndexingQueue(item.queue_name)) {
+              var t = item.compact ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+              if (isIndexingRequestText(t)) item._isBgTask = true;
+              else item._isOnBgQueue = true;
+            }
+          });
+          var sorted = bList.sort(function(a, b) {
+            var ai = typeof a.id === "string" ? a.id : "", bi = typeof b.id === "string" ? b.id : "";
+            return ai > bi ? -1 : ai < bi ? 1 : 0;
+          });
+          var m2 = mapHistoryListToMessages(sorted, platform, {
+            clearedAt: self.host.getClearedAt(),
+            projectId: id.projectId,
+            formatIndexingLabel: self.host.formatIndexingLabel
+          }).messages;
+          self.applyHydratedBodies(m2);
+          var incoming = {};
+          m2.forEach(function(m) {
+            if (m._serverItemId) incoming[m._serverItemId + "|" + m.role] = true;
+          });
+          var baseList = self.state.messages.filter(function(m) {
+            return !(m._serverItemId && incoming[m._serverItemId + "|" + m.role]);
+          });
+          var mergedList2 = [];
+          var pi2 = 0, ei2 = 0;
+          while (pi2 < m2.length && ei2 < baseList.length) {
+            var pm2 = m2[pi2], em2 = baseList[ei2];
+            var eid2 = em2._serverItemId;
+            if (typeof eid2 !== "string") break;
+            var pid2 = pm2._serverItemId;
+            if (typeof pid2 !== "string" || pid2 <= eid2) {
+              mergedList2.push(pm2);
+              pi2++;
+            } else {
+              mergedList2.push(em2);
+              ei2++;
+            }
+          }
+          while (pi2 < m2.length) mergedList2.push(m2[pi2++]);
+          while (ei2 < baseList.length) mergedList2.push(baseList[ei2++]);
+          self.state.messages = mergedList2;
+          if (batch && batch.endOfList === true) self.state.historyEndOfList = true;
+          releaseBgFlag();
+          self.updateHistoryCache();
+          self.host.notify();
+        }, function() {
+          releaseBgFlag();
+          self.host.notify();
+        });
+      }
       if (!fetchMore) {
         var bgAllow = {};
         var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
@@ -5195,6 +5510,7 @@ var ChatSession = class {
 };
 
 // src/engine/indexing_groups.ts
+var RUN_RECORD_WORKING_STALE_MS = 6 * 60 * 60 * 1e3;
 var INDEXING_LABEL_RE = /^(Re)?[Ii]ndexing(\s*\(continuing\))?\s*:?\s+(.+)$/;
 var LEADING_MD_LINK_RE = /^\[([^\]]+)\]\(([^)]+)\)/;
 function parseIndexingLabel(content) {
@@ -5440,18 +5756,112 @@ function buildChatDisplayList(messages, opts) {
       grp.resolving = false;
     }
   }
+  var stubList = [];
+  var runStubs = opts && opts.runStubs;
+  if (runStubs) {
+    var covered = {};
+    for (var ci = 0; ci < order.length; ci++) {
+      var cg = groups[order[ci]];
+      if (cg.key) covered[cg.key] = true;
+      if (cg.path) covered[cg.path] = true;
+      if (cg.name) covered[cg.name] = true;
+    }
+    opts && typeof opts.now === "number" ? opts.now : Date.now();
+    var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
+    for (var sp in runStubs) {
+      var rec = runStubs[sp];
+      if (!sp || !rec || !rec.status || covered[sp]) continue;
+      var fname = rec.filename || sp.split("/").pop() || sp;
+      if (covered[fname]) continue;
+      var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
+      if (stubClearedAt && !live && (typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : 0) <= stubClearedAt) continue;
+      var st = "active";
+      var fin = false;
+      var res = false;
+      var reason;
+      if (!live) {
+        if (rec.status === "done" || doneKeys[sp] || doneKeys[fname]) {
+          st = "done";
+          fin = true;
+        } else if (rec.status === "error") {
+          st = "error";
+          fin = true;
+        } else if (rec.status === "cancelled") {
+          st = "cancelled";
+          fin = true;
+        } else {
+          res = true;
+          reason = "status";
+        }
+      }
+      var sg = {
+        key: sp,
+        runKey: "stub:" + sp,
+        name: fname,
+        path: sp,
+        mime: void 0,
+        size: void 0,
+        isReindex: false,
+        members: [],
+        passCount: 0,
+        status: st,
+        cancellableIds: [],
+        cancelling: false,
+        stopped: st === "cancelled",
+        mayHaveOlder: hasMoreHistory,
+        anchorIndex: -1,
+        anchorId: "",
+        visibleMembers: [],
+        driver: !isPagedReadFile(fname, void 0) ? "single" : isImageVisionFile(fname, void 0) ? "worker" : windowedIndexing ? "worker" : "client",
+        finished: fin,
+        resolving: res,
+        resolvingReason: reason,
+        stub: true,
+        stubError: rec.error
+      };
+      stubList.push({ started: typeof rec.started === "number" ? rec.started : 0, group: sg });
+    }
+  }
+  var suppressAnchor = {};
+  if (runStubs) {
+    for (var ti2 = 0; ti2 < order.length; ti2++) {
+      var tg = groups[order[ti2]];
+      if (!tg.mayHaveOlder || !newestRunOfKey[order[ti2]]) continue;
+      var trec = tg.path && runStubs[tg.path] || runStubs[tg.key];
+      if (!trec || typeof trec.started !== "number") continue;
+      suppressAnchor[order[ti2]] = true;
+      stubList.push({ started: trec.started, group: tg });
+    }
+  }
+  stubList.sort(function(a, b) {
+    return a.started - b.started;
+  });
   var out = [];
+  var si = 0;
   for (var j = 0; j < list.length; j++) {
+    var mts = list[j] && typeof list[j]._ts === "number" ? list[j]._ts : void 0;
+    if (mts !== void 0) {
+      while (si < stubList.length && stubList[si].started <= mts) {
+        out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
+        si++;
+      }
+    }
     var r = runOfIndex[j];
     if (r === void 0) {
       out.push({ kind: "message", msg: list[j], index: j });
       continue;
     }
-    if (groups[r].anchorIndex === j) out.push({ kind: "indexing", group: groups[r], index: j });
+    if (groups[r].anchorIndex === j && !suppressAnchor[r]) {
+      out.push({ kind: "indexing", group: groups[r], index: j });
+    }
+  }
+  while (si < stubList.length) {
+    out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
+    si++;
   }
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

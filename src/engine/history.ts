@@ -223,7 +223,13 @@ export async function fetchLiveIndexingKeys(params: {
 // then includes bg items with bodies (exactly today's single fetch), the bg
 // call returns duplicates, and dedup-by-id (surface wins) degrades to current
 // behavior plus one redundant query, never to data loss.
-const BG_COVERAGE_MAX_PAGES = 8;
+// Per-call bg fetches. Depth is LAZY: the consumers merge prepended pages by
+// timestamp, so older stubs can arrive on any later page and still land at
+// their true position — there is no need to drain the bg queue eagerly, and
+// doing so is exactly what made first paint slow (bg windows are ~1MB of RAW
+// rows, i.e. a handful of stubs per round trip). Two fetches keep the nearby
+// stubs in the same paint; scroll-up/viewport-fill pages pull the rest.
+const BG_COVERAGE_MAX_PAGES = 2;
 
 type SplitHistoryState = {
 	/** Fetched bg items not yet emitted (older than the last page's boundary). */
@@ -286,17 +292,35 @@ const oldestCreated = (lst: any[]): number => {
 // chat). Each hop here is one more lambda call.
 const SURFACE_EMPTY_MAX_PAGES = 10;
 
+export type SplitHistoryResult = {
+	list: any[];
+	endOfList: boolean;
+	startKeyHistory: any[];
+	/** Present only when `deferBg` was requested AND bg work remains: resolves
+	 *  with the stub batch fetched in the background (the per-key lock is held
+	 *  until it settles, so no other history call can interleave). The caller
+	 *  merges the batch by timestamp — the same path older pages use. */
+	bgPending?: Promise<{ list: any[]; endOfList: boolean }>;
+};
+
 export async function getSplitChatHistory(
 	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
 	fetchOptions: Record<string, any>,
 	/** Test seam: replaces getChatHistory. Not for production callers. */
 	_fetchImpl?: typeof getChatHistory,
-): Promise<{ list: any[]; endOfList: boolean; startKeyHistory: any[] }> {
+): Promise<SplitHistoryResult> {
 	const key = [params.service, params.owner, params.platform, params.userId || ''].join('|');
 	const prev = splitHistoryLocks[key] || Promise.resolve();
-	const run = () => _getSplitChatHistoryLocked(key, params, fetchOptions, _fetchImpl);
+	// The lock resolves when the WHOLE call — including a deferred bg batch —
+	// has settled, so queued calls never interleave with background work. A
+	// call that returns WITHOUT a bgPending (or throws) releases immediately;
+	// a deferred call releases in the bg batch's own finally.
+	let releaseLock: () => void;
+	const lockTail = new Promise<void>((r) => { releaseLock = r; });
+	const run = () => _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock!, _fetchImpl);
 	const p = prev.then(run, run);
-	splitHistoryLocks[key] = p.then(() => undefined, () => undefined);
+	p.then((res: any) => { if (!res || !res.bgPending) releaseLock(); }, () => releaseLock());
+	splitHistoryLocks[key] = p.then(() => lockTail, () => lockTail);
 	return p;
 }
 
@@ -304,19 +328,40 @@ async function _getSplitChatHistoryLocked(
 	key: string,
 	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
 	fetchOptions: Record<string, any>,
+	releaseLock: () => void,
 	_fetchImpl?: typeof getChatHistory,
-): Promise<{ list: any[]; endOfList: boolean; startKeyHistory: any[] }> {
+): Promise<SplitHistoryResult> {
 	const fetch = _fetchImpl || getChatHistory;
 	const bgQueue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform };
 	const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
 	const limit = fetchOptions && fetchOptions.limit;
 
-	if (!fetchMore || !splitHistoryStates[key]) {
-		// First page (or a fetchMore with no chain, e.g. after a code swap):
-		// start a fresh chain. The underlying fetchMore:false calls below reset
-		// the SDK's own cursors to match.
+	// HEAD refresh: a repeat first-page call on a chain that already walked BOTH
+	// queues to their end (tab return, poll-side page-1 refresh). Page 1 must be
+	// re-fetched for new settles, but what the chain LEARNED about the older
+	// tail — "all history fetched" — survives. Wiping it here was the tab-return
+	// bug: every return re-pulled the bg stub pages from scratch, reported
+	// endOfList false, and that un-gated the viewport fill into re-walking every
+	// older page the user had already exhausted. Only a FULLY-ended chain is
+	// safe to preserve: its fetchMore path short-circuits without touching the
+	// SDK cursors this page-1 refresh rewinds. A mid-walk chain still restarts.
+	let headRefresh = false;
+	if (!splitHistoryStates[key]) {
 		splitHistoryStates[key] = freshSplitState();
+	} else if (!fetchMore) {
+		const prev = splitHistoryStates[key];
+		if (prev.surfaceEnd && prev.bgEnd) {
+			headRefresh = true;
+			prev.pendingSurface = null;
+			prev.surfaceCarry = [];
+			prev.bgBuffer = []; // fully drained by construction; defensive
+		} else {
+			// Mid-walk chain: the page-1 refresh genuinely restarts the walk
+			// (the underlying fetchMore:false calls below reset the SDK's own
+			// cursors to match), exactly as before.
+			splitHistoryStates[key] = freshSplitState();
+		}
 	}
 	const state = splitHistoryStates[key];
 
@@ -328,7 +373,10 @@ async function _getSplitChatHistoryLocked(
 
 	// ── surface page ────────────────────────────────────────────────────────
 	if (!state.pendingSurface) {
-		if (state.surfaceEnd) {
+		// The ended-chain short-circuit serves FETCHMORE only: a head refresh
+		// re-fetches page 1 for real (new settles live there), and the
+		// preserved surfaceEnd keeps every later fetchMore off the wire.
+		if (state.surfaceEnd && !headRefresh) {
 			state.pendingSurface = { list: [], endOfList: true, startKeyHistory: state.lastSurfaceKeys, forFetchMore: fetchMore };
 		} else {
 			const sOpts: any = { fetchMore };
@@ -351,6 +399,68 @@ async function _getSplitChatHistoryLocked(
 		}
 	}
 	const surface = state.pendingSurface;
+
+	// ── deferred bg (first-paint mode) ──────────────────────────────────────
+	// The caller paints the CONVERSATION from this return immediately; the
+	// stub fetch happens behind the resolved promise, under the same lock.
+	// Anything already buffered ships now (it costs nothing).
+	if (fetchOptions && fetchOptions.deferBg && (!state.bgEnd || headRefresh)) {
+		const surfaceList0 = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
+		state.surfaceCarry = [];
+		const emitNow: any[] = surfaceList0.concat(state.bgBuffer);
+		state.bgBuffer = [];
+		// A head refresh must not let page 1's "more pages exist" clobber the
+		// preserved end-knowledge: those pages are the tail already walked.
+		if (!headRefresh) state.surfaceEnd = surface.endOfList;
+		state.lastSurfaceKeys = surface.startKeyHistory;
+		state.pendingSurface = null;
+		const bgPending = (async () => {
+			try {
+				const batch: any[] = [];
+				if (headRefresh) {
+					// One HEAD page only: the walked tail is complete; this
+					// catches bg rows that settled/minted while nobody was
+					// polling. bgEnd/bgStarted are deliberately left alone —
+					// the end-knowledge survives, and the coverage loop (gated
+					// on !bgEnd) never touches the cursor this rewinds.
+					const bOpts: any = { fetchMore: false };
+					if (limit) bOpts.limit = limit;
+					const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+					const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
+					for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; batch.push(it); }
+				} else {
+					let hops = 0;
+					while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
+						hops++;
+						const bOpts: any = { fetchMore: state.bgStarted };
+						if (limit) bOpts.limit = limit;
+						const b = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, bOpts);
+						state.bgStarted = true;
+						const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
+						for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; batch.push(it); }
+						state.bgEnd = !!(b && b.endOfList);
+						if (!bList.length && !state.bgEnd) break;
+						if (state.bgEnd) break;
+					}
+				}
+				return { list: batch, endOfList: state.surfaceEnd && state.bgEnd };
+			} finally {
+				releaseLock();
+			}
+		})();
+		return {
+			list: emitNow,
+			// A head-refreshed ended chain KNOWS it is still ended — reporting
+			// the hardcoded false here was what un-gated the fill loop on every
+			// tab return. Mid-walk it computes to false exactly as before (this
+			// branch is only entered with bgEnd false then); the bg batch still
+			// carries the final word for that case.
+			endOfList: state.surfaceEnd && state.bgEnd,
+			startKeyHistory: surface.startKeyHistory,
+			bgPending,
+		};
+	}
+
 	// Carried-over surface items (held back by an uncovered boundary on the
 	// previous page) lead this page's surface list.
 	const surfaceList = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
@@ -364,7 +474,16 @@ async function _getSplitChatHistoryLocked(
 	const boundary = surface.endOfList ? -Infinity : oldestCreated(surfaceList);
 
 	// ── bg coverage ─────────────────────────────────────────────────────────
-	if (boundary !== Infinity || surface.endOfList) {
+	if (headRefresh) {
+		// Non-deferred head refresh: the same single HEAD page the deferred
+		// branch fetches, under the same rules — new settles are caught, the
+		// end-knowledge (bgEnd/bgStarted) is left untouched.
+		const hOpts: any = { fetchMore: false };
+		if (limit) hOpts.limit = limit;
+		const hb = await fetch({ ...base, queue: bgQueue, queue_exact: true, compact: true }, hOpts);
+		const hbList: any[] = (hb && Array.isArray(hb.list)) ? hb.list : [];
+		for (const it of hbList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; state.bgBuffer.push(it); }
+	} else if (boundary !== Infinity || surface.endOfList) {
 		let hops = 0;
 		while (!state.bgEnd && hops < BG_COVERAGE_MAX_PAGES) {
 			const bufOldest = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
@@ -376,57 +495,26 @@ async function _getSplitChatHistoryLocked(
 			state.bgStarted = true;
 			const bList: any[] = (b && Array.isArray(b.list)) ? b.list : [];
 			// Buffer IMMEDIATELY: the SDK cursor has advanced; this is what a
-			// retry resumes from.
-			for (const it of bList) state.bgBuffer.push(it);
+			// retry resumes from. Tagged as bg-chain items so the consumers'
+			// surface-frontier logic (retention boundary, clear-horizon) can
+			// tell deep stubs from the conversation's own paging frontier.
+			for (const it of bList) { if (it && typeof it === 'object') (it as any)._fromBgChain = true; state.bgBuffer.push(it); }
 			state.bgEnd = !!(b && b.endOfList);
 			if (!bList.length && !state.bgEnd) break; // defensive: server loops past empties
 			if (state.bgEnd) break;
 		}
 	}
 
-	// ── emit: tile to the COVERED window ────────────────────────────────────
-	// If the hop cap fired with the bg side still short of the surface
-	// boundary, the covered window ends at the bg buffer's oldest item:
-	// surface items older than that are HELD (surfaceCarry) so the uncovered
-	// bg stubs can never land on a later page above newer surface turns.
-	// Applies to the surface-ENDED case too (boundary -Infinity): while the bg
-	// side still has undrained pages, surface items older than the bg buffer's
-	// oldest must wait, or the next page's stubs would land above them.
-	const bufOldestNow = state.bgBuffer.length ? oldestCreated(state.bgBuffer) : Infinity;
-	const uncovered = !state.bgEnd && state.bgBuffer.length > 0 && isFinite(bufOldestNow) && bufOldestNow > boundary;
-	const effBoundary = uncovered ? bufOldestNow : boundary;
-
-	let emitSurface: any[];
-	if (uncovered) {
-		emitSurface = [];
-		const carry: any[] = [];
-		for (const it of surfaceList) {
-			const c = createdOf(it);
-			if (isNaN(c) || c >= effBoundary) emitSurface.push(it);
-			else carry.push(it);
-		}
-		state.surfaceCarry = carry;
-	} else {
-		emitSurface = surfaceList;
-		state.surfaceCarry = [];
-	}
-
-	let emitBg: any[];
-	if (effBoundary === -Infinity) {
-		emitBg = state.bgBuffer;
-		state.bgBuffer = [];
-	} else {
-		emitBg = [];
-		const keep: any[] = [];
-		for (const it of state.bgBuffer) {
-			const c = createdOf(it);
-			// Timestamp-less items cannot be placed relative to the boundary —
-			// emit them now rather than risk holding them forever.
-			if (isNaN(c) || c >= effBoundary) emitBg.push(it);
-			else keep.push(it);
-		}
-		state.bgBuffer = keep;
-	}
+	// ── emit ────────────────────────────────────────────────────────────────
+	// Everything fetched ships NOW — surface items are never withheld and the
+	// bg buffer drains into every page. Ordering across pages is the
+	// consumers' job (stable timestamp merge on prepend), which is what
+	// removed the old tiling/withholding machinery: it delayed the
+	// CONVERSATION behind a full bg drain on every first visit.
+	const emitSurface: any[] = surfaceList;
+	state.surfaceCarry = [];
+	const emitBg: any[] = state.bgBuffer;
+	state.bgBuffer = [];
 
 	// Dedup by item id, surface copy (full bodies) winning — the old-backend
 	// degradation path, and a guard against any range overlap.
@@ -435,7 +523,9 @@ async function _getSplitChatHistoryLocked(
 	const merged = emitSurface.concat(emitBg.filter((it: any) => !(it && typeof it.id === 'string' && seen[it.id])));
 
 	// ── deliver ─────────────────────────────────────────────────────────────
-	state.surfaceEnd = surface.endOfList;
+	// Same head-refresh rule as the deferred branch: page 1's own "more pages
+	// exist" must not clobber a preserved end-knowledge.
+	if (!headRefresh) state.surfaceEnd = surface.endOfList;
 	state.lastSurfaceKeys = surface.startKeyHistory;
 	state.pendingSurface = null;
 
@@ -535,6 +625,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 				displayContent = sanitizeAttachmentLinksForHistory(userText, opts.projectId);
 			}
 			var userMsg: any = { role: 'user', content: displayContent };
+			if (item._fromBgChain) userMsg._fromBgChain = true;
 			if (isInProcess) userMsg.isPendingInProcess = true;
 			if (isQueued) userMsg.isPendingQueued = true;
 			if (isCancelledItem) userMsg.isCancelled = true;
@@ -549,12 +640,17 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		if (isCancelledItem) { /* no assistant bubble */ }
 		else if (isInProcess) {
 			var ph: any = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true };
+			// _ts matters even on a placeholder: the consumers' merge and any
+			// display fallback must be able to place it without its user bubble.
+			if (userTs !== undefined) ph._ts = userTs;
+			if (item._fromBgChain) ph._fromBgChain = true;
 			if (item._isBgTask) ph.isBackgroundTask = true;
 			if (serverItemId !== undefined) { ph._serverItemId = serverItemId; runningItemIds.push(serverItemId); }
 			mapped.push(ph);
 		} else if (isQueued) { /* no assistant placeholder */ }
 		else if (isErrorResponse) {
 			var em: any = { role: 'assistant', content: getErrorMessage(response), isError: true };
+			if (item._fromBgChain) em._fromBgChain = true;
 			if (item._isBgTask) em.isBackgroundTask = true;
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			if (replyTs !== undefined) em._ts = replyTs;
@@ -567,6 +663,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			// Safe db-only sanitize (forAssistant) so a volatile db url the model
 			// emitted renders as a re-mintable `_expired_.url` link, not a dead one.
 			var okm: any = { role: 'assistant', content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
+			if (item._fromBgChain) okm._fromBgChain = true;
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (isCompact) okm._compact = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;

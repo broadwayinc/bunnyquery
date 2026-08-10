@@ -34,6 +34,7 @@ import {
     extractOpenAIText,
     getChatHistory,
     indexDoneUniqueId,
+    runIndexUniqueId,
     composeUserMessage,
     groupAttachmentFailures,
     notifyAgentSaveAttachment,
@@ -2217,12 +2218,118 @@ import {
         // Also drop the backend's "indexing finished" marker (done::<path>): it
         // references the src:: record so the cascade normally sweeps it, but a
         // record from before the cascade flag has no cascade, and a re-index must
-        // never start with a stale "finished" verdict standing.
+        // never start with a stale "finished" verdict standing. Same for the
+        // run:: record — a rerun must never inherit the old run's verdict.
         var doneDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: indexDoneUniqueId(storagePath) })
+            .catch(function () { });
+        var runDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: runIndexUniqueId(storagePath) })
             .catch(function () { });
         return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
             .catch(function () { })
-            .then(function () { return doneDelete; });
+            .then(function () { return doneDelete; })
+            .then(function () { return runDelete; });
+    }
+    // Mint the durable "indexing finished" marker (done::<path>) for a run whose
+    // completion THIS client knows deterministically — the engine's
+    // mintIndexDoneMarker hook decides when. Mirrors www's mintIndexDoneMarker;
+    // the widget never wired the hook before, so its single-pass completions
+    // relied on queue inference alone. Best-effort: "is already taken" is a
+    // redelivered settle, i.e. completion, not a failure.
+    function mintIndexDoneMarkerDb(service, storagePath) {
+        if (!service || !storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
+        return Promise.resolve(S.skapi.postRecord(null, {
+            service: service,
+            unique_id: indexDoneUniqueId(storagePath),
+            table: { name: "__INDEXING__", access_group: "authorized" },
+            reference: "src::" + storagePath,
+            data: { source: storagePath, completed_at: Date.now() }
+        })).catch(function (err) {
+            var msg = String((err && err.message) || err || "");
+            if (msg.indexOf("is already taken") === -1) {
+                console.warn("[bunnyquery] mintIndexDoneMarker failed (non-fatal)", storagePath, msg);
+            }
+        });
+    }
+    // Create-or-update the per-file indexing RUN record ("run::<path>") — the
+    // widget half of www's upsertIndexRunRecord; see that implementation for the
+    // full contract. No native upsert exists: create, and on "is already taken"
+    // fetch the record and re-post with its record_id, merging the patch over
+    // the stored data. A 'working' write never overwrites a terminal status.
+    function upsertIndexRunRecordDb(service, storagePath, patch) {
+        if (!service || !storagePath || !patch || !patch.status) return Promise.resolve();
+        if (!S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
+        var uid = runIndexUniqueId(storagePath);
+        var TERMINAL = { done: true, error: true, cancelled: true };
+        function patchData(base) {
+            var d = {};
+            for (var k in (base || {})) d[k] = base[k];
+            d.source = storagePath;
+            d.status = patch.status;
+            if (patch.filename) d.filename = patch.filename;
+            if (typeof patch.started === "number") d.started = patch.started;
+            if (typeof patch.finished === "number") d.finished = patch.finished;
+            if (patch.error) d.error = patch.error;
+            if (patch.queue) d.queue = patch.queue;
+            return d;
+        }
+        function createWith(reference) {
+            var cfg = {
+                service: service,
+                unique_id: uid,
+                table: { name: "__INDEXING__", access_group: "authorized" },
+                data: patchData(null)
+            };
+            if (reference) cfg.reference = "src::" + storagePath;
+            return S.skapi.postRecord(null, cfg);
+        }
+        return Promise.resolve(createWith(true)).catch(function (err) {
+            var msg = String((err && err.message) || err || "");
+            if (msg.indexOf("is already taken") === -1) {
+                // Not the exists-signal — almost always the src:: record not
+                // existing yet. Mint it and retry WITH the reference (a
+                // reference-less record cannot be cascade-swept on reindex);
+                // only if that still fails does a reference-less create beat
+                // having no record at all.
+                return ensureFileIndexRecordDb(storagePath).then(function () {
+                    return createWith(true);
+                }).catch(function (errRef) {
+                    var msgRef = String((errRef && errRef.message) || errRef || "");
+                    if (msgRef.indexOf("is already taken") !== -1) return updateExisting();
+                    return Promise.resolve(createWith(false)).catch(function (err2) {
+                        var msg2 = String((err2 && err2.message) || err2 || "");
+                        if (msg2.indexOf("is already taken") === -1) {
+                            console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
+                            return null;
+                        }
+                        return updateExisting();
+                    });
+                });
+            }
+            return updateExisting();
+        });
+        function updateExisting() {
+            return Promise.resolve(S.skapi.getRecords({ service: service, unique_id: uid })).then(function (found) {
+                var rec = found && found.list && found.list[0];
+                if (!rec || !rec.record_id) return null;
+                var existing = rec.data || {};
+                if (patch.status === "working" && TERMINAL[String(existing.status)]) {
+                    // A NEW run may reopen a terminal record (orphaned verdict
+                    // from the path's previous life); only a LATE create from
+                    // the run the record already describes must lose — its
+                    // `started` predates the settle that closed it.
+                    var endedAt = typeof existing.finished === "number" ? existing.finished
+                        : typeof existing.started === "number" ? existing.started : 0;
+                    if (!(typeof patch.started === "number" && patch.started > endedAt)) return null;
+                }
+                return S.skapi.postRecord(null, {
+                    service: service,
+                    record_id: rec.record_id,
+                    data: patchData(existing)
+                });
+            }).catch(function (err) {
+                console.warn("[bunnyquery] upsertIndexRunRecord update failed (non-fatal)", storagePath, String((err && err.message) || err || ""));
+            });
+        }
     }
     // Create the file's "src::<storagePath>" record BEFORE any indexing pass runs, so every
     // pass has a reference target that is guaranteed to exist (mirrors ai_agent.ts). Without
@@ -3250,6 +3357,8 @@ import {
     // Passes LOADED, never a server-side total: history pages newest-first, so a
     // scroll-up can always reveal more. "+" marks a run whose start is unpaged.
     function indexGroupCount(group) {
+        // A run:: stub has NO loaded passes — "0+ passes" is noise (agent.vue same).
+        if (group.stub) return "";
         if (group.passCount <= 1 && !group.mayHaveOlder) return "";
         return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
     }
@@ -3258,8 +3367,144 @@ import {
     // renderMessages draws the rows from it and the stop dialog re-resolves its
     // target from it, and the two asking different questions is a bug the dialog
     // already had (see findCancellableIndexGroup).
+    /* ---- indexing marker sweep (done:: + run::) ----------------------------
+     * Widget twin of www's sweepIndexMarkers (file.ts): ONE records query on
+     * the __INDEXING__ table answers, for the whole project, both "which files
+     * are confirmed fully indexed" (done:: markers) and "which runs exist and
+     * how did they end" (run:: records with status). Cached with a short TTL,
+     * in-flight deduped, keyed to the project it was fetched for. The results
+     * feed displayListOptions synchronously; refreshIndexMarkers re-renders
+     * when a fresh sweep lands. */
+    var markerSweep = { svc: "", at: 0, gen: 0, done: {}, runs: {}, partial: false, inflight: null };
+    var MARKER_SWEEP_TTL_MS = 30000;
+    // Records, not ids: up to TWO per file (done:: + run::), 10 pages of 1000.
+    var MARKER_SWEEP_MAX_PAGES = 10;
+    function sweepIndexMarkersDb() {
+        if (!S.skapi || !S.projectId || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+        var svc = S.projectId;
+        if (markerSweep.svc === svc && markerSweep.at && Date.now() - markerSweep.at < MARKER_SWEEP_TTL_MS) {
+            return Promise.resolve(markerSweep);
+        }
+        if (markerSweep.inflight) {
+            // An invalidation AFTER this sweep started means its snapshot is
+            // already suspect: serve the current sweep to its own callers, but
+            // chain one fresh sweep behind it for this caller instead of
+            // adopting the pre-invalidation data as fresh.
+            if (!markerSweep.at) {
+                return markerSweep.inflight.then(function () { return sweepIndexMarkersDb(); });
+            }
+            return markerSweep.inflight;
+        }
+        var gen = markerSweep.gen;
+        var done = {}; var runs = {}; var partial = false;
+        function page(fetchMore, n) {
+            return Promise.resolve(S.skapi.getRecords(
+                { service: svc, table: { name: "__INDEXING__", access_group: "authorized" } },
+                { limit: 1000, fetchMore: fetchMore, ascending: false }
+            )).then(function (res) {
+                var list = (res && res.list) || [];
+                for (var i = 0; i < list.length; i++) {
+                    var uid = String((list[i] && list[i].unique_id) || "");
+                    if (uid.indexOf("done::") === 0) {
+                        done[uid.slice(6)] = true;
+                    } else if (uid.indexOf("run::") === 0) {
+                        var path = uid.slice(5);
+                        var d = (list[i] && list[i].data) || {};
+                        var st = String(d.status || "");
+                        // Newest-first listing: the first record seen for a path wins.
+                        if (path && !runs[path] &&
+                            (st === "working" || st === "done" || st === "error" || st === "cancelled")) {
+                            runs[path] = {
+                                status: st,
+                                filename: typeof d.filename === "string" ? d.filename : undefined,
+                                started: typeof d.started === "number" ? d.started : undefined,
+                                finished: typeof d.finished === "number" ? d.finished : undefined,
+                                error: typeof d.error === "string" ? d.error : undefined,
+                                owner: (list[i] && typeof list[i].user_id === "string") ? list[i].user_id : undefined,
+                            };
+                        }
+                    }
+                }
+                if (res && res.endOfList === false) {
+                    if (n < MARKER_SWEEP_MAX_PAGES - 1) return page(true, n + 1);
+                    partial = true; // cap hit: the done-set is incomplete
+                }
+                return null;
+            });
+        }
+        var p = page(false, 0).then(function () {
+            // A project switch mid-sweep must not stamp another project's
+            // markers, and an invalidation mid-sweep must not stamp a
+            // pre-invalidation snapshot as fresh (gen moved on).
+            if (S.projectId !== svc || markerSweep.gen !== gen) return markerSweep;
+            markerSweep.svc = svc;
+            markerSweep.at = Date.now();
+            markerSweep.done = done;
+            markerSweep.runs = runs;
+            markerSweep.partial = partial;
+            return markerSweep;
+        });
+        markerSweep.inflight = p;
+        p.then(function () { markerSweep.inflight = null; }, function () { markerSweep.inflight = null; });
+        return p;
+    }
+    function invalidateIndexMarkerSweep() { markerSweep.at = 0; markerSweep.gen++; }
+    // Re-sweep cadence while a fresh 'working' run record has no live-queue
+    // confirmation: nothing else can ever settle its stub row in-session (no
+    // poll, no queue entry, no adoption). Matches the sweep TTL so each tick
+    // fetches at most one naturally-fresh sweep.
+    var STUB_RECHECK_MS = 30000;
+    var stubRecheckTimer = null;
+    function armStubRecheck() {
+        if (stubRecheckTimer !== null) return;
+        stubRecheckTimer = setTimeout(function () {
+            stubRecheckTimer = null;
+            void refreshIndexMarkers();
+        }, STUB_RECHECK_MS);
+    }
+    function maybeArmStubRecheck() {
+        try {
+            if (markerSweep.svc !== S.projectId) return;
+            var lk = (session && session.getLiveIndexState().keys) || {};
+            for (var pth in markerSweep.runs) {
+                var r = markerSweep.runs[pth];
+                // Any unconfirmed 'working' record (fresh or stale — both render
+                // as the grey checking shape now) settles only through a fresh
+                // sweep; live-confirmed ones ride the live-key drain edge instead.
+                if (r && r.status === "working" && !lk[pth]) { armStubRecheck(); return; }
+            }
+            if (stubRecheckTimer !== null) { clearTimeout(stubRecheckTimer); stubRecheckTimer = null; }
+        } catch (e) { /* display-side best effort */ }
+    }
+    function refreshIndexMarkers(invalidate) {
+        if (invalidate) invalidateIndexMarkerSweep();
+        return sweepIndexMarkersDb().then(function (res) {
+            if (res) { maybeArmStubRecheck(); renderMessages(); }
+            return res;
+        }).catch(function () { return null; });
+    }
+
     function displayListOptions() {
         var liveIndex = session.getLiveIndexState();
+        // svc match only — NOT `at`: an invalidation zeroes `at` to force the
+        // next fetch, and dropping already-rendered markers for that window
+        // would blink every stub row out and back (agent.vue keeps
+        // last-known-good the same way). svc is only ever stamped by a sweep
+        // for the current project.
+        var fresh = markerSweep.svc === S.projectId;
+        // Stub rows are per-CHAT and this chat belongs to the signed-in end
+        // user: another user's runs must not splice rows into it. Ownerless
+        // records (pre-owner sweeps) are kept.
+        var stubs = undefined;
+        if (fresh) {
+            stubs = {};
+            var myId = (S.user && S.user.user_id) || "";
+            for (var rp in markerSweep.runs) {
+                var rr = markerSweep.runs[rp];
+                if (rr && rr.owner && myId && rr.owner !== myId) continue;
+                stubs[rp] = rr;
+            }
+        }
         return {
             hasMoreHistory: !CS.historyEndOfList,
             // Older pages coming in RIGHT NOW. CS.historyFilling, not just the
@@ -3273,6 +3518,14 @@ import {
             // cancelled bubble behind (that pass finishes and answers normally), so
             // without this the row reports the stop as a finished "Indexed".
             stoppedIndexIds: session.getStoppedIndexIds(),
+            // Durable completion markers + run records (one sweep, see above).
+            // doneKeys settle worker-run greens without a queue round trip;
+            // runStubs paint rows for runs whose passes are not loaded yet.
+            doneKeys: fresh ? markerSweep.done : undefined,
+            runStubs: stubs,
+            // Records are service-wide and horizon-blind; without this every
+            // "Clear chat history" resurrected one row per indexed file.
+            stubClearedAt: getClearedAt(),
         };
     }
 
@@ -3301,7 +3554,10 @@ import {
     // queue; `resolving` keeps it from being asked before anything is known.
     // agent.vue's indexGroupStoppable is the same predicate.
     function indexGroupStoppable(group) {
-        return !!group && !group.finished && !group.resolving && !group.stopped && !group.cancelling;
+        // A run:: STUB is never stoppable: its passes are not loaded, and the
+        // record may describe ANOTHER user's run, whose queue this client's
+        // cancel cannot reach (agent.vue same).
+        return !!group && !group.stub && !group.finished && !group.resolving && !group.stopped && !group.cancelling;
     }
 
     // The group the open dialog is about, or null once there is nothing left to
@@ -3517,10 +3773,12 @@ import {
         // the loading it asks for is already in flight: following it does nothing the
         // row is not doing, and reads as the row not having noticed.
         if (isOpen && group.mayHaveOlder) {
+            var loadingNow = group.resolvingReason === "history" ||
+                (group.stub && session.state.bgHistoryLoading);
             el.appendChild(h("div", {
                 class: "bq-index-note",
                 text: "Earlier passes of this file are further back in the conversation. "
-                    + (group.resolvingReason === "history" ? "Loading them now." : "Scroll up to load them."),
+                    + (loadingNow ? "Loading them now." : "Scroll up to load them."),
             }));
         }
         return el;
@@ -3649,6 +3907,12 @@ import {
         // panel both take the row (and its Stop) off screen while the confirm this
         // opened is still sitting on top of the widget.
         syncStopIndexModal();
+        // Live-key set shrinking = a run just ended, so a fresh done::/run::
+        // marker may exist — re-sweep (agent.vue watches the same edge).
+        var _lk = session.getLiveIndexState().keys || {};
+        var _lc = 0; for (var _k in _lk) _lc++;
+        if (CS._lastLiveKeyCount > 0 && _lc < CS._lastLiveKeyCount) void refreshIndexMarkers(true);
+        CS._lastLiveKeyCount = _lc;
         if (!CS.messagesBox) return;
         if (CS.chatSettingsOpen) return; // the settings panel occupies the messages area
         var anchor = captureScrollAnchor();
@@ -3656,6 +3920,12 @@ import {
         CS.messageEls = [];
         // "Fetching history..." pinned at the top while paginating older history (scroll-up).
         if (CS.loadingOlderHistory) CS.messagesBox.appendChild(historyLoadingEl(false));
+        // Deferred indexing-stub batch (first-paint split): conversation is
+        // painted, stubs still flying — a thin hint where rows will merge in.
+        else if (session.state.bgHistoryLoading && CS.messages.length) {
+            CS.messagesBox.appendChild(h("div", { class: "bq-history-loading" },
+                h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" })));
+        }
         if (!CS.messages.length) {
             // Initial load: show "Fetching history..." instead of the greeting.
             if (CS.loadingHistory && !CS.loadingOlderHistory) {
@@ -3672,6 +3942,17 @@ import {
                     document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
                         ".")));
             CS.messagesBox.appendChild(greet);
+            // run:: stub rows render even with no messages (a returning user's
+            // indexed files, or history still loading behind the greeting) —
+            // agent.vue paints the same rows, so the two clients must match.
+            try {
+                var emptyEntries = buildChatDisplayList([], displayListOptions());
+                for (var ge = 0; ge < emptyEntries.length; ge++) {
+                    if (emptyEntries[ge].kind !== "indexing") continue;
+                    var sg = emptyEntries[ge].group;
+                    CS.messagesBox.appendChild(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
+                }
+            } catch (e) { /* display-side best effort */ }
             // A first-ever message can be mid-draft under the greeting.
             syncDraftingIndicator();
             return;
@@ -3680,6 +3961,38 @@ import {
         // into one status row. An expanded row's own turns are emitted as ordinary
         // message rows right after it, so buildMessageEl stays the single source.
         var rows = buildChatDisplayList(CS.messages, displayListOptions());
+        // Mint-on-observe (mirror of agent.vue's recordChatIndexVerdicts tail):
+        // a loaded REAL row proving a run deterministically over — single-pass
+        // settled clean, or a done:: marker — while its run:: record still says
+        // 'working' means no client ever observed the settle (tab closed
+        // mid-run, or a pre-flip record). Flip it once per path.
+        try {
+            if (markerSweep.svc === S.projectId) {
+                var moSeen = S._mintObserved || (S._mintObserved = {});
+                for (var moi = 0; moi < rows.length; moi++) {
+                    var moe = rows[moi];
+                    if (moe.kind !== "indexing" || moe.group.stub) continue;
+                    var mog = moe.group;
+                    if (!mog.path || !mog.finished || mog.status !== "done" || mog.resolving) continue;
+                    if (!(mog.driver === "single" || markerSweep.done[mog.path])) continue;
+                    // Existing-but-unobserved 'working' AND missing-entirely
+                    // (LEGACY run, pre-run::) both mint: same deterministic
+                    // authority as the done:: marker, and the create is what
+                    // moves a legacy run onto the fast path (agent.vue same).
+                    var morec = markerSweep.runs[mog.path];
+                    if ((!morec || morec.status === "working") && !moSeen[mog.path]) {
+                        moSeen[mog.path] = true;
+                        var moFirst = mog.members && mog.members[0] && mog.members[0].msg && mog.members[0].msg._ts;
+                        var moLast = mog.members && mog.members.length &&
+                            mog.members[mog.members.length - 1].msg && mog.members[mog.members.length - 1].msg._ts;
+                        var moPatch = { status: "done", finished: typeof moLast === "number" ? moLast : Date.now() };
+                        if (typeof moFirst === "number") moPatch.started = moFirst;
+                        if (mog.name) moPatch.filename = mog.name;
+                        void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
+                    }
+                }
+            }
+        } catch (e) { /* best-effort */ }
         rows.forEach(function (row) {
             if (row.kind === "indexing") {
                 var isOpen = !!CS.indexGroupsOpen[row.group.key];
@@ -3883,6 +4196,9 @@ import {
         });
 
         if (S.aiPlatform === "none") return;
+        // Durable index markers, in parallel with the history fetch: run::
+        // stubs let indexing rows paint before any bg history arrives.
+        void refreshIndexMarkers();
         // load markdown renderer, then show history
         loadMarked().then(function () {
             renderMessages();
@@ -4179,6 +4495,14 @@ import {
             // compact history stub's real body when an indexing row expands.
             csrHistoryItemLookup: function (fullId, service, owner) {
                 return S.skapi.util.request('csr-poll', { id: fullId, service: service, owner: owner }, { auth: true });
+            },
+            // Durable index markers. Both read S lazily at call time — S.skapi /
+            // S.projectId are not set yet when init() runs.
+            mintIndexDoneMarker: function (info) {
+                void mintIndexDoneMarkerDb(info.service, info.storagePath);
+            },
+            upsertIndexRunRecord: function (info) {
+                void upsertIndexRunRecordDb(info.service, info.storagePath, info.patch);
             },
             mcpBaseUrl: mcpBaseUrl(),
             poll: 0,

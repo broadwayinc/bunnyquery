@@ -97,6 +97,10 @@ export interface ChatMessage {
 	 *  which is how an 88-page file once "finished" at page 15. */
 	_indexComplete?: boolean;
 	_useBgQueue?: boolean;
+	/** Mapped from an item delivered by the bg chain of the split history fetch
+	 *  (stubs or deferred chats). Surface-frontier logic (retention boundary,
+	 *  clear-horizon) skips these — their ids reach arbitrarily deep. */
+	_fromBgChain?: boolean;
 	/** Local id of a turn STAGED at Send time while its attachments upload. The
 	 *  bubble exists before any server request does, so it is never matched by
 	 *  _serverItemId and is never promoted/cancelled by the queue machinery —
@@ -143,6 +147,9 @@ export interface ChatState {
 	typingAbort: boolean;
 	loadingHistory: boolean;
 	loadingOlderHistory: boolean;
+	/** A deferred bg stub batch (first-paint split fetch) is still in flight;
+	 *  views show a small 'loading indexing history' hint while true. */
+	bgHistoryLoading: boolean;
 	historyEndOfList: boolean;
 	historyStartKeyHistory: string[];
 	historyRequestToken: number;
