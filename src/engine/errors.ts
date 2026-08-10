@@ -139,3 +139,41 @@ export function isAuthExpiredError(input: any): boolean {
 		hay.indexOf('unauthorized') !== -1 || hay.indexOf('not authorized') !== -1 ||
 		(hay.indexOf('invalid_request') !== -1 && hay.indexOf('token') !== -1);
 }
+
+/**
+ * True when the AI PROVIDER rejected the project's own API key.
+ *
+ * Deliberately narrow, and deliberately NOT the same question as
+ * isAuthExpiredError: that one is about OUR session/MCP bearer going stale,
+ * which the client fixes by refreshing and resending. This one means the key
+ * the project owner pasted is wrong or revoked, which only a human can fix.
+ *
+ * A bare 401 is NOT enough to conclude it (the MCP bearer expiring is also a
+ * 401), so this matches only the provider's key-specific markers:
+ *   Anthropic -> `authentication_error`, "invalid x-api-key"
+ *   OpenAI    -> `invalid_api_key`, "Incorrect API key provided"
+ * Accepts a response object, a thrown error, or the message string those get
+ * reduced to by getErrorMessage, because the view usually only keeps the text.
+ */
+export function isProviderApiKeyError(input: any): boolean {
+	if (!input) return false;
+	var blobs: string[] = [];
+	var push = function (v: any) { if (typeof v === 'string' && v) blobs.push(v); };
+	if (typeof input === 'string') push(input);
+	else {
+		push(input.message); push(input.code); push(input.type);
+		if (input.error) { push(input.error.message); push(input.error.code); push(input.error.type); }
+		if (input.body) {
+			push(input.body.message); push(input.body.type);
+			if (input.body.error) { push(input.body.error.message); push(input.body.error.code); push(input.body.error.type); }
+		}
+	}
+	var hay = blobs.join(' | ').toLowerCase();
+	if (!hay) return false;
+	return hay.indexOf('authentication_error') !== -1 ||
+		hay.indexOf('invalid_api_key') !== -1 ||
+		hay.indexOf('invalid x-api-key') !== -1 ||
+		hay.indexOf('incorrect api key') !== -1 ||
+		hay.indexOf('invalid api key') !== -1 ||
+		hay.indexOf('no api key provided') !== -1;
+}

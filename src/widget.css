@@ -757,7 +757,7 @@
     cursor: pointer;
     z-index: 1;
 }
-.bq-attach-btn:hover:not(:disabled) { color: var(--bq-main); }
+.bq-attach-btn:hover:not(:disabled) { color: var(--bq-main);transform: none; }
 .bq-attach-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .bq-attach-input { display: none; }
 .bq-input {

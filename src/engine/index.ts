@@ -43,7 +43,7 @@ export * from './prompts';
 
 // Pure helpers (Tier-1.5): error detection, token budgeting, link/path
 // normalization, and history mapping — shared so both consumers stay identical.
-export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError } from './errors';
+export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, isProviderApiKeyError } from './errors';
 export * from './budget';
 // Per-format UTF-8 declaration for files offered as a download. Shared so a fenced
 // block and a server-published file open identically in Excel, Word and a browser.

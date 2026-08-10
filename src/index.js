@@ -1896,7 +1896,14 @@ import {
             // turn with attachments always goes on the "-bg" queue: that is the
             // queue its files were indexed on, so it is the only one where being
             // enqueued last means running last.
-            var c = composeUserMessage(job.text, attachmentUrls);
+            // inlineExtractedContent: false — these files were just indexed
+            // (we awaited the drain above), so their content is already in the
+            // database. Inlining it would make the worker download and re-parse
+            // every attachment a SECOND time, which looks like the file being
+            // indexed all over again, and would re-send the whole text as prompt
+            // tokens. The agent reads the records instead (see the system
+            // prompt), or readFileContent for exact raw text.
+            var c = composeUserMessage(job.text, attachmentUrls, { inlineExtractedContent: false });
             session.dispatchComposedMessage(c.composed, true, c.composedForLlm, c.extractContent, c.fileUrls, job.pinned);
         });
     }

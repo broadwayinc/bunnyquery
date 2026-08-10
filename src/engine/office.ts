@@ -231,7 +231,28 @@ export interface ComposedUserMessage {
 export function composeUserMessage(
 	text: string,
 	attachmentUrls: Array<{ name: string; url: string; storagePath?: string }>,
+	opts?: {
+		/**
+		 * Inline each server-extractable attachment's whole text into the
+		 * prompt (the `_skapi_extract` directives + BEGIN/END FILE CONTENT
+		 * block). Default true, which is right when the file's content is
+		 * nowhere else yet.
+		 *
+		 * Pass FALSE when the turn is dispatched AFTER the file's indexing run
+		 * has drained. Extraction is the same server-side download+parse the
+		 * indexing pass already performed, so inlining repeats it: the worker
+		 * fetches and re-parses every attachment a second time (which reads,
+		 * from the outside, exactly like the file being indexed again), and the
+		 * whole file text is re-sent as prompt tokens. It is also the WORSE
+		 * copy for anything large, because inline extraction truncates at
+		 * MAX_EXTRACTED_CHARS while the indexed records cover the file end to
+		 * end. The model reaches the content through the records
+		 * (getRecords with reference "src::<path>") or readFileContent.
+		 */
+		inlineExtractedContent?: boolean;
+	},
 ): ComposedUserMessage {
+	const inlineExtracted = opts?.inlineExtractedContent !== false;
 	let composed = text;
 	let composedForLlm = composed;
 	if (attachmentUrls.length > 0) {
@@ -242,7 +263,9 @@ export function composeUserMessage(
 	let extractContent: ExtractDirective[] | undefined;
 	let fileUrls: FileUrlDirective[] | undefined;
 	if (attachmentUrls.length > 0) {
-		const extractFiles = attachmentUrls.filter((u) => isServerExtractable(u.name));
+		const extractFiles = inlineExtracted
+			? attachmentUrls.filter((u) => isServerExtractable(u.name))
+			: [];
 		if (extractFiles.length > 0) {
 			const directives: ExtractDirective[] = [];
 			const sections = extractFiles.map((u) => {
