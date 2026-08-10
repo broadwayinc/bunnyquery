@@ -1793,6 +1793,7 @@ async function notifyAgentSaveAttachment(info) {
       save_media: !continuing
     }))
   } : {};
+  const skapiFileUrls = attachment.url && attachment.storagePath ? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] } : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
@@ -1828,6 +1829,7 @@ async function notifyAgentSaveAttachment(info) {
         ...skapiExtract,
         ...skapiRender,
         ...skapiWindow,
+        ...skapiFileUrls,
         input: [
           { role: "system", content: systemPrompt },
           {
@@ -1874,6 +1876,7 @@ async function notifyAgentSaveAttachment(info) {
       ...skapiExtract,
       ...skapiRender,
       ...skapiWindow,
+      ...skapiFileUrls,
       system: [
         {
           type: "text",

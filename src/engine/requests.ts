@@ -849,6 +849,25 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			}
 			: {};
 
+	// Ask the worker to re-sign this file's url at EXECUTION time.
+	//
+	// The url below was minted when the file was uploaded. Indexing for a project
+	// runs on ONE FIFO group, one pass at a time, so a row queued behind a bulk
+	// upload can wait hours or days before it fires - by which point that url can
+	// be dead, the provider's fetch returns nothing, and the file is recorded as
+	// indexed with an empty index behind it. The worker rebuilds the body from the
+	// row on every delivery, so re-signing there means the url only has to outlive
+	// ONE invocation however long the wait was.
+	//
+	// Sent for every indexing pass, including CONTINUE passes: a chain spanning
+	// days is exactly where the baked url is oldest. Harmless where the file's
+	// content arrives another way (server-side extraction, rendered pages) - the
+	// url still appears as the attachment link, and a dead link in front of the
+	// model is worth avoiding either way.
+	const skapiFileUrls = attachment.url && attachment.storagePath
+		? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] }
+		: {};
+
 	const userMessage = (visionFile && renderPlaceholder)
 		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
 		: (windowedRead && windowPlaceholder)
@@ -898,6 +917,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				...skapiExtract,
 				...skapiRender,
 				...skapiWindow,
+				...skapiFileUrls,
 				input: [
 					{ role: 'system', content: systemPrompt },
 					{
@@ -947,6 +967,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			...skapiExtract,
 			...skapiRender,
 			...skapiWindow,
+			...skapiFileUrls,
 			system: [
 				{
 					type: 'text',
