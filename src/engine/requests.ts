@@ -13,6 +13,9 @@
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, pollOpt, windowedIndexingEnabled } from './config';
+// Output sizing lives in budget.ts so the request cap and the reserve the input
+// budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
+import { getMaxOutputTokens } from './budget';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODELS_API_URL = 'https://api.anthropic.com/v1/models';
@@ -26,7 +29,6 @@ const WEB_FETCH_MAX_CONTENT_TOKENS = 200000;
 
 export const OPENAI_RESPONSES_API_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_MODELS_API_URL = 'https://api.openai.com/v1/models';
-const MAX_TOKENS = 25000;
 const DEFAULT_OPENAI_IMAGE_DETAIL = 'auto';
 const OPENAI_WEB_SEARCH_ENABLED = true;
 const OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
@@ -205,7 +207,7 @@ const isOldestNano = (model?: string) => {
 // full one.
 //
 // This is the lever that does not risk a 400. The output budget is one number for the whole
-// pass (MAX_TOKENS, and reasoning is billed against it), so a window of 5 dense pages leaves
+// pass (getMaxOutputTokens, and reasoning is billed against it), so a window of 5 dense pages leaves
 // a small model a couple of thousand tokens per page and it starts sampling rows instead of
 // transcribing them - which is exactly the "saved 5 line items" on a page holding twenty.
 // Halving the window does not raise the cap, it just stops dividing it so many ways, and the
@@ -554,7 +556,7 @@ export async function callClaudeWithPublicMcp(
 		owner,
 		userId,
 		model: model || DEFAULT_CLAUDE_MODEL,
-		maxTokens: MAX_TOKENS,
+		maxTokens: getMaxOutputTokens('claude', model || DEFAULT_CLAUDE_MODEL),
 		system,
 		extractContent,
 		fileUrls,
@@ -622,7 +624,7 @@ export async function callOpenAIWithPublicMcp(
 		},
 		data: {
 			model: resolvedModel,
-			max_output_tokens: MAX_TOKENS,
+			max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
 				: {}),
@@ -729,6 +731,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			filename: attachment.name,
 			started: Date.now(),
 			queue: bgIndexingQueueName(info.userId, service),
+			platform: platform,
 		});
 	}
 	const tapDispatchFailure = (p: Promise<any>): Promise<any> => {
@@ -889,7 +892,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			},
 			data: {
 				model: resolvedModel,
-				max_output_tokens: MAX_TOKENS,
+				max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
 				// Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
 				...variantIndexingOptions(resolvedModel),
 				...skapiExtract,
@@ -940,7 +943,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		},
 		data: {
 			model: resolvedModel,
-			max_tokens: MAX_TOKENS,
+			max_tokens: getMaxOutputTokens('claude', resolvedModel),
 			...skapiExtract,
 			...skapiRender,
 			...skapiWindow,
@@ -1118,6 +1121,11 @@ export type IndexRunPatch = {
 	finished?: number;
 	error?: string;
 	queue?: string;
+	/** Chat that owns this run. A run:: record is keyed by storage path alone,
+	 *  but a chat is per (project, platform) — without this the Claude chat's
+	 *  runs surfaced as rows in the same project's ChatGPT chat, where their
+	 *  passes can never load and the queue probe can never see them. */
+	platform?: 'claude' | 'openai';
 };
 
 /**

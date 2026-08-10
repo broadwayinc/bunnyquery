@@ -840,32 +840,84 @@ function truncateLabelForDisplay(label) {
 // src/engine/budget.ts
 var CONTEXT_WINDOW_DEFAULT = { claude: 2e5, openai: 128e3 };
 var CONTEXT_WINDOW_BY_MODEL = {
-  // exact ids
+  // claude, exact ids
+  "claude-fable-5": 1e6,
   "claude-opus-5": 1e6,
   "claude-opus-4-8": 1e6,
   "claude-opus-4-7": 1e6,
+  "claude-opus-4-6": 1e6,
+  "claude-opus-4-5": 2e5,
   "claude-sonnet-5": 1e6,
   "claude-sonnet-4-6": 1e6,
+  "claude-sonnet-4-5": 1e6,
   "claude-sonnet-4": 2e5,
   "claude-haiku-4-5": 2e5,
-  "gpt-5.4": 128e3,
-  "gpt-5.6-luna": 128e3,
+  "claude-3-5-sonnet": 2e5,
+  // openai, exact ids
+  "gpt-5.6-sol": 105e4,
+  "gpt-5.6-terra": 105e4,
+  "gpt-5.6-luna": 105e4,
+  "gpt-5.5": 1e6,
+  "gpt-5.4": 105e4,
+  "gpt-5.4-mini": 4e5,
+  "gpt-5.4-nano": 4e5,
+  "gpt-4.1": 104e4,
+  "gpt-4o": 128e3,
+  "o1": 2e5,
+  "o1-pro": 2e5,
   // family keys
+  "claude-fable": 1e6,
   "claude-opus": 1e6,
   "claude-sonnet": 1e6,
   "claude-haiku": 2e5,
+  "gpt-5.6": 105e4,
+  "gpt-5": 128e3
+};
+var MAX_OUTPUT_BY_MODEL = {
+  // claude
+  "claude-fable-5": 128e3,
+  "claude-opus-5": 128e3,
+  "claude-opus-4-8": 128e3,
+  "claude-sonnet-5": 128e3,
+  "claude-sonnet-4-6": 64e3,
+  "claude-haiku-4-5": 64e3,
+  "claude-3-5-sonnet": 8e3,
+  // openai
+  "gpt-5.6-sol": 128e3,
+  "gpt-5.6-terra": 128e3,
+  "gpt-5.6-luna": 128e3,
+  "gpt-5.5": 128e3,
+  "gpt-5.4": 128e3,
+  "gpt-5.4-mini": 128e3,
+  "gpt-5.4-nano": 128e3,
+  "gpt-4.1": 16e3,
+  "gpt-4o": 4e3,
+  "o1": 1e5,
+  "o1-pro": 1e5,
+  // family keys
+  "claude-fable": 128e3,
+  "claude-opus": 128e3,
+  "claude-sonnet": 64e3,
+  "claude-haiku": 64e3,
   "gpt-5.6": 128e3,
   "gpt-5": 128e3
 };
+var DEFAULT_CONTEXT_WINDOW = 88e4;
 var apiReportedContextWindows = {};
+var apiReportedMaxOutput = {};
 function registerModelContextWindows(models) {
   if (!Array.isArray(models)) return;
   for (var i = 0; i < models.length; i++) {
     var m = models[i];
     var id = (m && m.id ? String(m.id) : "").trim().toLowerCase();
+    if (!id) continue;
     var reported = m ? Number(m.max_input_tokens) : NaN;
-    if (id && Number.isFinite(reported) && reported > 0) {
+    if (Number.isFinite(reported) && reported > 0) {
       apiReportedContextWindows[id] = Math.floor(reported);
+    }
+    var out = m ? Number(m.max_tokens) : NaN;
+    if (Number.isFinite(out) && out > 0) {
+      apiReportedMaxOutput[id] = Math.floor(out);
     }
   }
 }
@@ -881,13 +933,16 @@ function getProjectContextWindow(projectId) {
   var key = (projectId || "").trim();
   return key && projectContextWindows[key] ? projectContextWindows[key] : null;
 }
-var OUTPUT_TOKEN_RESERVE = 22e3;
+var MAX_OUTPUT_TOKENS = 25e3;
+var OUTPUT_TOKEN_RESERVE = MAX_OUTPUT_TOKENS;
 var TOOL_AND_RESPONSE_BUFFER = 4e3;
 var MIN_INPUT_TOKEN_BUDGET = 8e3;
-var CLAUDE_PER_REQUEST_INPUT_CAP = 28e3;
+var MIN_PER_REQUEST_INPUT_CAP = 28e3;
+var CLAUDE_PER_REQUEST_INPUT_CAP = MIN_PER_REQUEST_INPUT_CAP;
 var MAX_HISTORY_MESSAGES = 20;
 var HISTORY_TOKEN_BUDGET = 8e3;
-var CLAUDE_INPUT_CAP_RATIO = 0.16;
+var INPUT_CAP_RATIO = 0.16;
+var CLAUDE_INPUT_CAP_RATIO = INPUT_CAP_RATIO;
 var HISTORY_BUDGET_RATIO = 0.08;
 function estimateTextTokens(text) {
   return Math.ceil((text || "").length / 3);
@@ -895,38 +950,61 @@ function estimateTextTokens(text) {
 function estimateMessageTokens(msg) {
   return estimateTextTokens(msg.content) + estimateTextTokens(msg.role) + 6;
 }
-function getContextWindow(platform, model, projectId) {
-  var override = projectId ? getProjectContextWindow(projectId) : null;
-  if (override) return override;
+function resolveByModelId(apiTable, staticTable, model) {
   var normalized = (model || "").trim().toLowerCase();
-  if (normalized) {
-    if (apiReportedContextWindows[normalized]) return apiReportedContextWindows[normalized];
-    if (CONTEXT_WINDOW_BY_MODEL[normalized]) return CONTEXT_WINDOW_BY_MODEL[normalized];
-    var parts = normalized.split("-");
-    for (var end = parts.length - 1; end > 0; end--) {
-      var family = parts.slice(0, end).join("-");
-      if (CONTEXT_WINDOW_BY_MODEL[family]) return CONTEXT_WINDOW_BY_MODEL[family];
-    }
+  if (!normalized) return 0;
+  if (apiTable[normalized]) return apiTable[normalized];
+  if (staticTable[normalized]) return staticTable[normalized];
+  var parts = normalized.split("-");
+  for (var end = parts.length - 1; end > 0; end--) {
+    var family = parts.slice(0, end).join("-");
+    if (staticTable[family]) return staticTable[family];
   }
-  return CONTEXT_WINDOW_DEFAULT[platform];
+  return 0;
+}
+function getModelContextWindow(platform, model) {
+  return resolveByModelId(apiReportedContextWindows, CONTEXT_WINDOW_BY_MODEL, model) || CONTEXT_WINDOW_DEFAULT[platform];
+}
+function getMaxOutputTokens(platform, model) {
+  var cap = resolveByModelId(apiReportedMaxOutput, MAX_OUTPUT_BY_MODEL, model);
+  return cap ? Math.min(MAX_OUTPUT_TOKENS, cap) : MAX_OUTPUT_TOKENS;
+}
+function getContextWindow(platform, model, projectId) {
+  var ceiling = getModelContextWindow(platform, model);
+  var override = projectId ? getProjectContextWindow(projectId) : null;
+  return Math.min(override || DEFAULT_CONTEXT_WINDOW, ceiling);
+}
+function contextBasedBudgetFor(platform, model, projectId) {
+  var contextWindow = getContextWindow(platform, model, projectId);
+  return Math.max(
+    MIN_INPUT_TOKEN_BUDGET,
+    contextWindow - getMaxOutputTokens(platform, model) - TOOL_AND_RESPONSE_BUFFER
+  );
+}
+function getInputTokenBudget(platform, model, projectId) {
+  var contextBasedBudget = contextBasedBudgetFor(platform, model, projectId);
+  return Math.min(
+    contextBasedBudget,
+    Math.max(MIN_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * INPUT_CAP_RATIO))
+  );
 }
 function stripFileBlocksFromHistory(content) {
   if (!content) return content;
   return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
 }
 function buildBoundedChatMessages(options) {
-  var contextWindow = getContextWindow(options.platform, options.model, options.projectId);
-  var contextBasedBudget = Math.max(
-    MIN_INPUT_TOKEN_BUDGET,
-    contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER
-  );
-  var scaled = !!(options.projectId && getProjectContextWindow(options.projectId));
-  var claudeInputCap = scaled ? Math.max(CLAUDE_PER_REQUEST_INPUT_CAP, Math.round(contextBasedBudget * CLAUDE_INPUT_CAP_RATIO)) : CLAUDE_PER_REQUEST_INPUT_CAP;
-  var availableInputBudget = options.platform === "claude" ? Math.min(contextBasedBudget, claudeInputCap) : contextBasedBudget;
+  var contextBasedBudget = contextBasedBudgetFor(options.platform, options.model, options.projectId);
+  var availableInputBudget = getInputTokenBudget(options.platform, options.model, options.projectId);
   var systemCost = estimateTextTokens(options.systemPrompt) + 12;
-  var historyAllowance = scaled ? Math.max(HISTORY_TOKEN_BUDGET, Math.round(contextBasedBudget * HISTORY_BUDGET_RATIO)) : HISTORY_TOKEN_BUDGET;
+  var historyAllowance = Math.max(
+    HISTORY_TOKEN_BUDGET,
+    Math.round(contextBasedBudget * HISTORY_BUDGET_RATIO)
+  );
   var budgetForHistory = Math.max(1e3, Math.min(historyAllowance, availableInputBudget - systemCost));
-  var maxHistoryMessages = scaled ? Math.max(MAX_HISTORY_MESSAGES, Math.round(MAX_HISTORY_MESSAGES * (budgetForHistory / HISTORY_TOKEN_BUDGET))) : MAX_HISTORY_MESSAGES;
+  var maxHistoryMessages = Math.max(
+    MAX_HISTORY_MESSAGES,
+    Math.round(MAX_HISTORY_MESSAGES * (budgetForHistory / HISTORY_TOKEN_BUDGET))
+  );
   var windowed = options.history.slice(-maxHistoryMessages);
   var latestIndex = windowed.length - 1;
   var trimmed = windowed.map(function(m, i2) {
@@ -1319,7 +1397,6 @@ var WEB_FETCH_MAX_USES = 40;
 var WEB_FETCH_MAX_CONTENT_TOKENS = 2e5;
 var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
 var OPENAI_MODELS_API_URL = "https://api.openai.com/v1/models";
-var MAX_TOKENS = 25e3;
 var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
 var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
 var MCP_NAME = "BunnyQuery";
@@ -1559,7 +1636,7 @@ async function callClaudeWithPublicMcp(prompt, service, owner, messages, system,
     owner,
     userId,
     model: model || DEFAULT_CLAUDE_MODEL,
-    maxTokens: MAX_TOKENS,
+    maxTokens: getMaxOutputTokens("claude", model || DEFAULT_CLAUDE_MODEL),
     system,
     extractContent,
     fileUrls,
@@ -1604,7 +1681,7 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
     },
     data: {
       model: resolvedModel,
-      max_output_tokens: MAX_TOKENS,
+      max_output_tokens: getMaxOutputTokens("openai", resolvedModel),
       ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
       ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
       input: responseInput,
@@ -1639,7 +1716,8 @@ async function notifyAgentSaveAttachment(info) {
       status: "working",
       filename: attachment.name,
       started: Date.now(),
-      queue: bgIndexingQueueName(info.userId, service)
+      queue: bgIndexingQueueName(info.userId, service),
+      platform
     });
   }
   const tapDispatchFailure = (p) => {
@@ -1744,7 +1822,7 @@ async function notifyAgentSaveAttachment(info) {
       },
       data: {
         model: resolvedModel2,
-        max_output_tokens: MAX_TOKENS,
+        max_output_tokens: getMaxOutputTokens("openai", resolvedModel2),
         // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
         ...variantIndexingOptions(resolvedModel2),
         ...skapiExtract,
@@ -1792,7 +1870,7 @@ async function notifyAgentSaveAttachment(info) {
     },
     data: {
       model: resolvedModel,
-      max_tokens: MAX_TOKENS,
+      max_tokens: getMaxOutputTokens("claude", resolvedModel),
       ...skapiExtract,
       ...skapiRender,
       ...skapiWindow,
@@ -2350,6 +2428,10 @@ function mapHistoryListToMessages(list, platform, opts) {
       mapped.push(okm);
     }
   });
+  if (opts.projectId) {
+    var ownerKey = opts.projectId + "#" + platform;
+    for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
+  }
   return { messages: mapped, runningItemIds };
 }
 
@@ -5035,7 +5117,9 @@ var ChatSession = class {
         while (pi < mapped.length) mergedList.push(mapped[pi++]);
         while (ei < existing.length) mergedList.push(existing[ei++]);
         self.state.messages = mergedList;
-      } else if (!mapped.length && history && (history.endOfList === false || history.bgPending) && self.state.messages.length) {
+      } else if (!mapped.length && history && (history.endOfList === false || history.bgPending) && self.state.messages.some(function(m) {
+        return m._ownerKey === void 0 || m._ownerKey === loadKey;
+      })) {
         if (history.endOfList !== false) keptScreenAwaitingBg = true;
       } else {
         if (self.state.typing) self.state.typingAbort = true;
@@ -5353,7 +5437,7 @@ var ChatSession = class {
     var self = this;
     var id = this.host.getIdentity();
     att.status = "uploading";
-    att.progress = 0;
+    att.progress = null;
     att.errorMessage = "";
     att.errorCode = "";
     att.errorDetail = "";
@@ -5644,6 +5728,7 @@ function buildChatDisplayList(messages, opts) {
   var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
   var hasMoreHistory = !!(opts && opts.hasMoreHistory);
   var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
+  var stubPlatform = opts && opts.stubPlatform;
   var groups = {};
   var order = [];
   var runOfIndex = new Array(list.length);
@@ -5833,22 +5918,27 @@ function buildChatDisplayList(messages, opts) {
   var stubList = [];
   var runStubs = opts && opts.runStubs;
   if (runStubs) {
-    var covered = {};
+    var coveredPaths = {};
+    var coveredPathlessNames = {};
     for (var ci = 0; ci < order.length; ci++) {
       var cg = groups[order[ci]];
-      if (cg.key) covered[cg.key] = true;
-      if (cg.path) covered[cg.path] = true;
-      if (cg.name) covered[cg.name] = true;
+      if (cg.path) {
+        coveredPaths[cg.path] = true;
+        if (cg.key) coveredPaths[cg.key] = true;
+      } else if (cg.name) coveredPathlessNames[cg.name] = true;
+      else if (cg.key) coveredPaths[cg.key] = true;
     }
-    opts && typeof opts.now === "number" ? opts.now : Date.now();
+    var now = opts && typeof opts.now === "number" ? opts.now : Date.now();
     var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
     for (var sp in runStubs) {
       var rec = runStubs[sp];
-      if (!sp || !rec || !rec.status || covered[sp]) continue;
+      if (!sp || !rec || !rec.status || coveredPaths[sp]) continue;
       var fname = rec.filename || sp.split("/").pop() || sp;
-      if (covered[fname]) continue;
+      if (coveredPathlessNames[fname]) continue;
+      if (stubPlatform && rec.platform && rec.platform !== stubPlatform) continue;
       var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
-      if (stubClearedAt && !live && (typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : 0) <= stubClearedAt) continue;
+      var recWhen = typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : void 0;
+      if (stubClearedAt && !live && recWhen !== void 0 && recWhen <= stubClearedAt) continue;
       var st = "active";
       var fin = false;
       var res = false;
@@ -5863,6 +5953,12 @@ function buildChatDisplayList(messages, opts) {
         } else if (rec.status === "cancelled") {
           st = "cancelled";
           fin = true;
+        } else if (liveIndexChecked) {
+          st = "done";
+          fin = true;
+        } else if (typeof rec.started === "number" && now - rec.started > RUN_RECORD_WORKING_STALE_MS) {
+          st = "error";
+          fin = true;
         } else {
           res = true;
           reason = "status";
@@ -5870,7 +5966,12 @@ function buildChatDisplayList(messages, opts) {
       }
       var sg = {
         key: sp,
-        runKey: "stub:" + sp,
+        // ONE identity for the run whether it renders from the record or
+        // from its loaded passes: the views key the DOM off runKey, so a
+        // 'stub:'-prefixed key meant every handoff was an unmount plus a
+        // remount somewhere else. Named after the record's start, which
+        // the real group below reuses when it has one.
+        runKey: "run:" + sp + "#" + (typeof rec.started === "number" ? rec.started : "n"),
         name: fname,
         path: sp,
         mime: void 0,
@@ -5891,19 +5992,21 @@ function buildChatDisplayList(messages, opts) {
         resolving: res,
         resolvingReason: reason,
         stub: true,
-        stubError: rec.error
+        stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0)
       };
-      stubList.push({ started: typeof rec.started === "number" ? rec.started : 0, group: sg });
+      stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
     }
   }
   var suppressAnchor = {};
   if (runStubs) {
     for (var ti2 = 0; ti2 < order.length; ti2++) {
       var tg = groups[order[ti2]];
-      if (!tg.mayHaveOlder || !newestRunOfKey[order[ti2]]) continue;
+      if (!newestRunOfKey[order[ti2]]) continue;
       var trec = tg.path && runStubs[tg.path] || runStubs[tg.key];
       if (!trec || typeof trec.started !== "number") continue;
+      if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
       suppressAnchor[order[ti2]] = true;
+      tg.runKey = "run:" + (tg.path || tg.key) + "#" + trec.started;
       stubList.push({ started: trec.started, group: tg });
     }
   }
@@ -5945,6 +6048,7 @@ exports.CONTEXT_WINDOW_BY_MODEL = CONTEXT_WINDOW_BY_MODEL;
 exports.CONTEXT_WINDOW_DEFAULT = CONTEXT_WINDOW_DEFAULT;
 exports.ChatSession = ChatSession;
 exports.DEFAULT_CLAUDE_MODEL = DEFAULT_CLAUDE_MODEL;
+exports.DEFAULT_CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW;
 exports.DEFAULT_OPENAI_MODEL = DEFAULT_OPENAI_MODEL;
 exports.EMPTY_INDEXING_REPLY = EMPTY_INDEXING_REPLY;
 exports.EXPIRED_ATTACHMENT_URL_HOST = EXPIRED_ATTACHMENT_URL_HOST;
@@ -5961,14 +6065,18 @@ exports.INDEXING_COMPLETE_MARKER = INDEXING_COMPLETE_MARKER;
 exports.INLINE_LINK_GLYPH = INLINE_LINK_GLYPH;
 exports.INLINE_LINK_UNAVAILABLE_GLYPH = INLINE_LINK_UNAVAILABLE_GLYPH;
 exports.INLINE_LINK_UNAVAILABLE_SUFFIX = INLINE_LINK_UNAVAILABLE_SUFFIX;
+exports.INPUT_CAP_RATIO = INPUT_CAP_RATIO;
 exports.LINK_LABEL_MAX_DISPLAY_CHARS = LINK_LABEL_MAX_DISPLAY_CHARS;
 exports.LINK_REFRESH_WINDOW_MS = LINK_REFRESH_WINDOW_MS;
 exports.MAX_CONCURRENT_BG_POLLS = MAX_CONCURRENT_BG_POLLS;
 exports.MAX_HISTORY_FILL_PAGES = MAX_HISTORY_FILL_PAGES;
 exports.MAX_HISTORY_MESSAGES = MAX_HISTORY_MESSAGES;
+exports.MAX_OUTPUT_BY_MODEL = MAX_OUTPUT_BY_MODEL;
+exports.MAX_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS;
 exports.MAX_PARSED_CONTENT_CHARS = MAX_PARSED_CONTENT_CHARS;
 exports.MCP_NAME = MCP_NAME;
 exports.MIN_INPUT_TOKEN_BUDGET = MIN_INPUT_TOKEN_BUDGET;
+exports.MIN_PER_REQUEST_INPUT_CAP = MIN_PER_REQUEST_INPUT_CAP;
 exports.OUTPUT_TOKEN_RESERVE = OUTPUT_TOKEN_RESERVE;
 exports.POLL_INTERVAL = POLL_INTERVAL;
 exports.PREVIEWABLE_IMAGE_CONTENT_TYPES = PREVIEWABLE_IMAGE_CONTENT_TYPES;
@@ -6028,6 +6136,9 @@ exports.getChatHistory = getChatHistory;
 exports.getContextWindow = getContextWindow;
 exports.getErrorMessage = getErrorMessage;
 exports.getExpiredAttachmentVisiblePath = getExpiredAttachmentVisiblePath;
+exports.getInputTokenBudget = getInputTokenBudget;
+exports.getMaxOutputTokens = getMaxOutputTokens;
+exports.getModelContextWindow = getModelContextWindow;
 exports.getProjectContextWindow = getProjectContextWindow;
 exports.getSplitChatHistory = getSplitChatHistory;
 exports.getVisionProfile = getVisionProfile;

@@ -3278,7 +3278,8 @@ export class ChatSession {
 				while (pi < mapped.length) mergedList.push(mapped[pi++]);
 				while (ei < existing.length) mergedList.push(existing[ei++]);
 				self.state.messages = mergedList;
-			} else if (!mapped.length && history && (history.endOfList === false || (history as any).bgPending) && self.state.messages.length) {
+			} else if (!mapped.length && history && (history.endOfList === false || (history as any).bgPending)
+				&& self.state.messages.some(function (m: any) { return m._ownerKey === undefined || m._ownerKey === loadKey; })) {
 				// Empty first page that cannot judge the chat empty: either
 				// empty-but-not-end (a pure-bg band past every hop cap), or an
 				// empty DEFERRED page whose bg batch is still flying — a chat
@@ -3714,7 +3715,12 @@ export class ChatSession {
 	uploadSingleAttachment(att: any, stageId?: string): Promise<Array<{ name: string; url: string; storagePath: string }>> {
 		var self = this;
 		var id = this.host.getIdentity();
-		att.status = 'uploading'; att.progress = 0; att.errorMessage = '';
+		// progress stays null until the first byte-progress event. Every upload
+		// opens with a get-signed-url round trip that reports nothing, so a chip
+		// initialised to 0 rendered an empty, motionless bar for the whole
+		// preparing phase and read as hung. null is the signal for "preparing"
+		// (barber pole); a number means bytes are actually moving (real bar).
+		att.status = 'uploading'; att.progress = null; att.errorMessage = '';
 		att.errorCode = ''; att.errorDetail = ''; // clear any prior failure (retry)
 		this.host.renderAttachmentChips();
 		var members = (att.kind === 'folder')

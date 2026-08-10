@@ -363,23 +363,37 @@ declare function isAuthExpiredError(input: any): boolean;
 
 declare var CONTEXT_WINDOW_DEFAULT: Record<string, number>;
 declare var CONTEXT_WINDOW_BY_MODEL: Record<string, number>;
+declare var MAX_OUTPUT_BY_MODEL: Record<string, number>;
+declare var DEFAULT_CONTEXT_WINDOW: number;
 /**
- * Record context windows from a provider models listing. Accepts the raw list
- * items and reads `max_input_tokens` (Anthropic); items without it are skipped,
- * so passing an OpenAI listing is a no-op rather than an error.
+ * Record context windows and output caps from a provider models listing. Reads
+ * `max_input_tokens` and `max_tokens` (Anthropic); items without them are
+ * skipped, so passing an OpenAI listing is a no-op rather than an error.
+ *
+ * Note the asymmetry against the static table: Anthropic reports
+ * `max_input_tokens` (input only) where CONTEXT_WINDOW_BY_MODEL holds totals, so
+ * a registered Claude window is treated as a total and loses its output cap
+ * worth of budget. That is deliberate — under-spending the window is safe, and
+ * with no compaction beta enabled overrunning it is a hard error.
  */
 declare function registerModelContextWindows(models: Array<{
     id?: string;
     max_input_tokens?: number;
+    max_tokens?: number;
 }> | null | undefined): void;
 declare function setProjectContextWindow(projectId: string, tokens: number | null | undefined): void;
 declare function getProjectContextWindow(projectId: string): number | null;
+declare var MAX_OUTPUT_TOKENS: number;
 declare var OUTPUT_TOKEN_RESERVE: number;
 declare var TOOL_AND_RESPONSE_BUFFER: number;
 declare var MIN_INPUT_TOKEN_BUDGET: number;
+declare var MIN_PER_REQUEST_INPUT_CAP: number;
+/** @deprecated renamed to {@link MIN_PER_REQUEST_INPUT_CAP} (no longer Claude-only). */
 declare var CLAUDE_PER_REQUEST_INPUT_CAP: number;
 declare var MAX_HISTORY_MESSAGES: number;
 declare var HISTORY_TOKEN_BUDGET: number;
+declare var INPUT_CAP_RATIO: number;
+/** @deprecated renamed to {@link INPUT_CAP_RATIO} (no longer Claude-only). */
 declare var CLAUDE_INPUT_CAP_RATIO: number;
 declare var HISTORY_BUDGET_RATIO: number;
 declare function estimateTextTokens(text: string): number;
@@ -387,20 +401,21 @@ declare function estimateMessageTokens(msg: {
     role: string;
     content: string;
 }): number;
+declare function getModelContextWindow(platform: string, model?: string): number;
 /**
- * Resolve a model's context window, most specific source first:
- *   1. per-project override (project settings)
- *   2. the provider's own models listing (Anthropic `max_input_tokens`)
- *   3. an exact entry in CONTEXT_WINDOW_BY_MODEL
- *   4. a family entry, by dropping trailing '-' segments off the id
- *   5. the platform default
- *
- * Step 4 is why a new or suffixed id no longer drops straight to the platform
- * default: 'gpt-5.6-luna' resolves via 'gpt-5.6', and a dated Claude snapshot
- * such as 'claude-opus-4-7-20260101' resolves via 'claude-opus-4-7'. The walk
- * stops at the first hit, so a more specific entry always wins over its family.
+ * How many output tokens to ask for. We never want more than MAX_OUTPUT_TOKENS,
+ * but a model whose own cap is lower rejects the request outright, so clamp to
+ * whichever is smaller. Models with no known cap keep MAX_OUTPUT_TOKENS.
+ */
+declare function getMaxOutputTokens(platform: string, model?: string): number;
+/**
+ * The window a request is actually budgeted at: the per-project override when
+ * one is set, otherwise DEFAULT_CONTEXT_WINDOW. Both are clamped to the model's
+ * hard ceiling, because a budget above the ceiling builds a request the provider
+ * rejects, and a stored override outlives the model it was chosen under.
  */
 declare function getContextWindow(platform: string, model?: string, projectId?: string): number;
+declare function getInputTokenBudget(platform: string, model?: string, projectId?: string): number;
 declare function stripFileBlocksFromHistory(content: string): string;
 type BoundedChatOptions = {
     platform: string;
@@ -1107,6 +1122,11 @@ type IndexRunPatch = {
     finished?: number;
     error?: string;
     queue?: string;
+    /** Chat that owns this run. A run:: record is keyed by storage path alone,
+     *  but a chat is per (project, platform) — without this the Claude chat's
+     *  runs surfaced as rows in the same project's ChatGPT chat, where their
+     *  passes can never load and the queue probe can never see them. */
+    platform?: 'claude' | 'openai';
 };
 /**
  * Fire-and-forget wrapper over the consumer's upsertIndexRunRecord hook.
@@ -1914,6 +1934,14 @@ type BuildDisplayListOptions = {
     runStubs?: {
         [storagePath: string]: RunStubInfo;
     };
+    /** The platform whose chat this list is for. run:: records are per-FILE,
+     *  but a chat is per (project, platform): a run started under Claude has
+     *  its passes in the Claude conversation and is invisible to the
+     *  OpenAI-scoped queue probe, so its stub could never be covered and never
+     *  be confirmed — it just sat there, in a chat it did not belong to.
+     *  Records minted before this was stamped carry no platform and are shown
+     *  in both, which keeps the leak to the historical set. */
+    stubPlatform?: 'claude' | 'openai';
     /** The chat's clear-history horizon (ms epoch). Run records are service-
      *  wide and know nothing about a cleared chat, so without this every
      *  "Clear chat history" resurrects one row per indexed file. A stub whose
@@ -1933,6 +1961,9 @@ type RunStubInfo = {
     started?: number;
     finished?: number;
     error?: string;
+    /** Chat that owns this run. Absent on records minted before it was
+     *  stamped; see BuildDisplayListOptions.stubPlatform. */
+    platform?: 'claude' | 'openai';
 };
 /** A 'working' run record older than this with no live-queue confirmation is
  *  treated as unknown rather than live: a chain that died without reaching any
@@ -2578,4 +2609,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };

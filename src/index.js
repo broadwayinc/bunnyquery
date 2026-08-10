@@ -47,11 +47,10 @@ import {
     isAuthExpiredError,
     getContextWindow,
     buildBoundedChatMessages,
-    // budget constants used by the view-side attachment-warning calc (currentInputTokenBudget)
-    MIN_INPUT_TOKEN_BUDGET,
-    OUTPUT_TOKEN_RESERVE,
-    TOOL_AND_RESPONSE_BUFFER,
-    CLAUDE_PER_REQUEST_INPUT_CAP,
+    // The view-side attachment-warning calc (currentInputTokenBudget) calls this
+    // rather than re-deriving the budget from the constants, which is how the
+    // two drifted apart before.
+    getInputTokenBudget,
     createInlineLinkRegex,
     extractRemotePathFromAttachmentHref,
     normalizeAttachmentPathCandidate,
@@ -2270,6 +2269,8 @@ import {
             if (typeof patch.finished === "number") d.finished = patch.finished;
             if (patch.error) d.error = patch.error;
             if (patch.queue) d.queue = patch.queue;
+            // Chat that owns the run (project + platform); see agent.vue twin.
+            if (patch.platform) d.platform = patch.platform;
             return d;
         }
         function createWith(reference) {
@@ -2506,9 +2507,10 @@ import {
     function currentInputTokenBudget() {
         var platform = S.aiPlatform;
         if (platform !== "claude" && platform !== "openai") return 0;
-        var contextWindow = getContextWindow(platform, S.aiModel);
-        var contextBased = Math.max(MIN_INPUT_TOKEN_BUDGET, contextWindow - OUTPUT_TOKEN_RESERVE - TOOL_AND_RESPONSE_BUFFER);
-        return platform === "claude" ? Math.min(contextBased, CLAUDE_PER_REQUEST_INPUT_CAP) : contextBased;
+        // Passes S.projectId so the guard honours the project's context-window
+        // setting. The local re-derivation this replaced did not, so a project
+        // configured for a large window still warned at the 28,000 floor.
+        return getInputTokenBudget(platform, S.aiModel, S.projectId);
     }
     function formatTokenCount(tokens) {
         if (tokens >= 1000) { var k = tokens / 1000; return (k >= 10 ? Math.round(k) : k.toFixed(1)) + "k"; }
@@ -2768,15 +2770,22 @@ import {
             // indeterminate fill instead of freezing at 100% (mirror of
             // agent.vue's is-finalizing treatment).
             var finalizing = att.status === "uploading" && (att.progress || 0) >= 100;
+            // No byte-progress event yet: the get-signed-url round trip is still
+            // in flight, so there is no percentage to show. Barber pole rather
+            // than a bar frozen at 0%, which reads as a stalled upload.
+            var preparing = att.status === "uploading" && att.progress == null;
             var cls = "bq-attachment";
             if (att.status === "uploading") cls += " is-uploading";
-            if (finalizing) cls += " is-finalizing";
+            if (preparing) cls += " is-preparing";
+            else if (finalizing) cls += " is-finalizing";
             else if (att.status === "error") cls += " is-error";            // red: upload failed
             else if (att.status === "indexError") cls += " is-index-error"; // yellow: indexing failed
             else if (att.status === "done") cls += " is-done";              // green: uploaded + indexed
             if (clickable) cls += " is-clickable";
             var chip = h("div", { class: cls });
-            if (att.status === "uploading") chip.style.setProperty("--att-progress", (att.progress || 0) + "%");
+            // Only bind the bar width once there IS a percentage; while preparing
+            // the barber pole owns the fill and a stale width would fight it.
+            if (att.status === "uploading" && att.progress != null) chip.style.setProperty("--att-progress", att.progress + "%");
             // Hover title: failure explanation, or open-hint for finished files.
             chip.title = att.status === "error" ? "File upload has failed"
                 : att.status === "indexError" ? "File indexing failed"
@@ -2788,8 +2797,9 @@ import {
             chip.appendChild(h("span", { class: "bq-attachment-name", text: att.name, title: att.name }));
             var meta = att.status === "error" ? "(Failed)"
                 : att.status === "indexError" ? "(Error)"
+                : preparing ? "Preparing"
                 : finalizing ? "Finalizing"
-                : att.status === "uploading" ? (att.progress || 0) + "%"
+                : att.status === "uploading" ? att.progress + "%"
                 : isFolder ? "(" + (att.files ? att.files.length : 0) + ")"
                 : formatBytes(att.file ? att.file.size : att.size);
             chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
@@ -3444,6 +3454,7 @@ import {
                                 started: typeof d.started === "number" ? d.started : undefined,
                                 finished: typeof d.finished === "number" ? d.finished : undefined,
                                 error: typeof d.error === "string" ? d.error : undefined,
+                                platform: (d.platform === "claude" || d.platform === "openai") ? d.platform : undefined,
                                 owner: (list[i] && typeof list[i].user_id === "string") ? list[i].user_id : undefined,
                             };
                         }
@@ -3558,7 +3569,10 @@ import {
             for (var rp in markerSweep.runs) {
                 var rr = markerSweep.runs[rp];
                 if (rr && rr.owner && myId && rr.owner !== myId) continue;
-                stubs[rp] = rr;
+                // Copy: the sweep cache owns these objects and patches them in
+                // place, which would change a rendered row invisibly.
+                stubs[rp] = { status: rr.status, filename: rr.filename, started: rr.started,
+                    finished: rr.finished, error: rr.error, platform: rr.platform, owner: rr.owner };
             }
         }
         return {
@@ -3582,6 +3596,8 @@ import {
             // Records are service-wide and horizon-blind; without this every
             // "Clear chat history" resurrected one row per indexed file.
             stubClearedAt: getClearedAt(),
+            // A run:: record is per FILE; a chat is per (project, PLATFORM).
+            stubPlatform: (S.aiPlatform === "claude" || S.aiPlatform === "openai") ? S.aiPlatform : undefined,
         };
     }
 

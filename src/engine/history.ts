@@ -720,5 +720,15 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			mapped.push(okm);
 		}
 	});
+	// Stamp the CHAT every bubble belongs to. Every cross-project guard in the
+	// consumers reads `_ownerKey` and is written "undefined means unknown, keep
+	// it" — and the mapper never set it, so SERVER-history bubbles (which is all
+	// of them, including every indexing row) passed every one of those filters
+	// unchallenged. That is what let one project's transcript survive on screen
+	// into another project and be persisted under its key.
+	if (opts.projectId) {
+		var ownerKey = opts.projectId + '#' + platform;
+		for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
+	}
 	return { messages: mapped, runningItemIds: runningItemIds };
 }

@@ -256,6 +256,14 @@ export type BuildDisplayListOptions = {
 	 *  path, or name — always suppresses the stub: loaded passes are evidence,
 	 *  the record is only a summary. */
 	runStubs?: { [storagePath: string]: RunStubInfo };
+	/** The platform whose chat this list is for. run:: records are per-FILE,
+	 *  but a chat is per (project, platform): a run started under Claude has
+	 *  its passes in the Claude conversation and is invisible to the
+	 *  OpenAI-scoped queue probe, so its stub could never be covered and never
+	 *  be confirmed — it just sat there, in a chat it did not belong to.
+	 *  Records minted before this was stamped carry no platform and are shown
+	 *  in both, which keeps the leak to the historical set. */
+	stubPlatform?: 'claude' | 'openai';
 	/** The chat's clear-history horizon (ms epoch). Run records are service-
 	 *  wide and know nothing about a cleared chat, so without this every
 	 *  "Clear chat history" resurrects one row per indexed file. A stub whose
@@ -276,6 +284,9 @@ export type RunStubInfo = {
 	started?: number;
 	finished?: number;
 	error?: string;
+	/** Chat that owns this run. Absent on records minted before it was
+	 *  stamped; see BuildDisplayListOptions.stubPlatform. */
+	platform?: 'claude' | 'openai';
 };
 
 /** A 'working' run record older than this with no live-queue confirmation is
@@ -381,6 +392,7 @@ export function buildChatDisplayList(
 		: windowedIndexingEnabled();
 	var hasMoreHistory = !!(opts && opts.hasMoreHistory);
 	var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
+	var stubPlatform = opts && opts.stubPlatform;
 
 	// One entry per RUN (see IndexingGroup.runKey), addressed by an internal id
 	// while the list is being walked; runKey is assigned at the end, once the
@@ -758,31 +770,53 @@ export function buildChatDisplayList(
 	var stubList: { started: number; group: IndexingGroup }[] = [];
 	var runStubs = opts && opts.runStubs;
 	if (runStubs) {
-		var covered: { [k: string]: boolean } = {};
+		// Two namespaces, deliberately NOT one map: storage paths are
+		// project-relative and folder trees repeat basenames routinely, so a
+		// flat map let a real group for "2025/report.pdf" delete the stub for
+		// "2026/report.pdf" with nothing replacing it. A bare NAME only covers
+		// a stub when the group itself has no path (the legacy compact-label
+		// case) and the record has no filename of its own to disambiguate.
+		var coveredPaths: { [k: string]: boolean } = {};
+		var coveredPathlessNames: { [k: string]: boolean } = {};
 		for (var ci = 0; ci < order.length; ci++) {
 			var cg = groups[order[ci]];
-			if (cg.key) covered[cg.key] = true;
-			if (cg.path) covered[cg.path] = true;
-			if (cg.name) covered[cg.name] = true;
+			if (cg.path) { coveredPaths[cg.path] = true; if (cg.key) coveredPaths[cg.key] = true; }
+			else if (cg.name) coveredPathlessNames[cg.name] = true;
+			else if (cg.key) coveredPaths[cg.key] = true;
 		}
 		var now = opts && typeof opts.now === 'number' ? opts.now : Date.now();
 		var stubClearedAt = (opts && typeof opts.stubClearedAt === 'number' && opts.stubClearedAt > 0)
 			? opts.stubClearedAt : 0;
 		for (var sp in runStubs) {
 			var rec = runStubs[sp];
-			if (!sp || !rec || !rec.status || covered[sp]) continue;
+			if (!sp || !rec || !rec.status || coveredPaths[sp]) continue;
 			var fname = rec.filename || sp.split('/').pop() || sp;
-			if (covered[fname]) continue;
+			// A PATHLESS group (legacy compact label) can only be matched by
+			// name, and that is still the right match: the file already has a
+			// row, so suppressing avoids a duplicate rather than creating a
+			// void. What is gone is the reverse — a group WITH a path no longer
+			// writes into the name namespace, so it can no longer delete a
+			// same-basename stub from another folder.
+			if (coveredPathlessNames[fname]) continue;
+			// A run recorded under the OTHER platform's chat belongs to that
+			// conversation: its passes live in that history (so no real group
+			// can ever cover this stub) and the queue probe is platform-scoped
+			// (so it can never confirm it). Records with no platform are
+			// legacy and keep the old behaviour rather than vanishing.
+			if (stubPlatform && rec.platform && rec.platform !== stubPlatform) continue;
 			// Mirrors the real groups' status precedence: a live queue hit outranks
 			// whatever the record says (a lagged update must not paint a verdict over
-			// visible work), then the record's own terminal statuses, and 'working'
-			// only counts while fresh — stale it degrades to the stated-wait shape.
+			// visible work), then the record's own terminal statuses, then the
+			// queue's authoritative ABSENCE, and only then the stated wait.
 			var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
 			// Cleared-history horizon: a run that ended at or before the clear is
 			// part of what the user asked to forget. A live queue hit survives it
-			// (see BuildDisplayListOptions.stubClearedAt).
-			if (stubClearedAt && !live && (typeof rec.finished === 'number' ? rec.finished
-				: typeof rec.started === 'number' ? rec.started : 0) <= stubClearedAt) continue;
+			// (see BuildDisplayListOptions.stubClearedAt). A record carrying NO
+			// timestamp at all is unplaceable, not old — the horizon cannot judge
+			// it, so it is never dropped by one.
+			var recWhen = typeof rec.finished === 'number' ? rec.finished
+				: typeof rec.started === 'number' ? rec.started : undefined;
+			if (stubClearedAt && !live && recWhen !== undefined && recWhen <= stubClearedAt) continue;
 			var st: IndexingGroupStatus = 'active';
 			var fin = false;
 			var res = false;
@@ -794,21 +828,32 @@ export function buildChatDisplayList(
 				if (rec.status === 'done' || doneKeys[sp] || doneKeys[fname]) { st = 'done'; fin = true; }
 				else if (rec.status === 'error') { st = 'error'; fin = true; }
 				else if (rec.status === 'cancelled') { st = 'cancelled'; fin = true; }
-				else {
-					// 'working' with NO live-queue confirmation is a CLAIM, not
-					// proof — a chain that died without reaching any error path
-					// looks exactly like this (and did, in a real batch). Claiming
-					// yellow off it misinforms; state the wait instead. The queue
-					// answer arrives within about a round trip of the chat opening,
-					// so a genuinely live run flips grey -> yellow almost at once,
-					// and the periodic re-sweep settles dead records to their
-					// terminal status.
+				else if (liveIndexChecked) {
+					// 'working' is a CLAIM. The queue has now answered, untruncated,
+					// and holds nothing for this file — the same proof the real-group
+					// ladder settles on. Without this disjunct a stub had no
+					// terminator at all: worker-driven runs are never flipped by this
+					// client, so the row sat grey forever (the reported "checking
+					// status that never resolves").
+					st = 'done'; fin = true;
+				} else if (typeof rec.started === 'number' && now - rec.started > RUN_RECORD_WORKING_STALE_MS) {
+					// Older than any real run and still unconfirmed: a dead claim, not
+					// an open question. Same horizon the files page applies.
+					st = 'error'; fin = true;
+				} else {
+					// Genuinely unanswered — the queue reply is one round trip away
+					// and this self-heals the moment it lands.
 					res = true; reason = 'status';
 				}
 			}
 			var sg: IndexingGroup = {
 				key: sp,
-				runKey: 'stub:' + sp,
+				// ONE identity for the run whether it renders from the record or
+				// from its loaded passes: the views key the DOM off runKey, so a
+				// 'stub:'-prefixed key meant every handoff was an unmount plus a
+				// remount somewhere else. Named after the record's start, which
+				// the real group below reuses when it has one.
+				runKey: 'run:' + sp + '#' + (typeof rec.started === 'number' ? rec.started : 'n'),
 				name: fname,
 				path: sp,
 				mime: undefined,
@@ -831,9 +876,14 @@ export function buildChatDisplayList(
 				resolving: res,
 				resolvingReason: reason,
 				stub: true,
-				stubError: rec.error,
+				stubError: rec.error || (st === 'error' && !rec.error
+					? 'Indexing did not finish.' : undefined),
 			};
-			stubList.push({ started: typeof rec.started === 'number' ? rec.started : 0, group: sg });
+			// A record with no `started` cannot be placed in the conversation.
+			// Infinity sorts it to the END (nearest the newest turns) instead of
+			// above every message the user has ever sent — the row is about
+			// something recent, not about the beginning of time.
+			stubList.push({ started: typeof rec.started === 'number' ? rec.started : Infinity, group: sg });
 		}
 	}
 
@@ -847,14 +897,23 @@ export function buildChatDisplayList(
 	// (mayHaveOlder false) emission returns to the anchor, which by then IS the
 	// same spot. Newest run of the file only — the record describes it, and an
 	// older run's passes are already fully placed around it.
+	//
+	// NOT gated on mayHaveOlder: that made the position depend on WHICH passes
+	// happened to be loaded, so a row moved when the sweep resolved, again when
+	// the first pass paged in, and again when paging ended. A record with a
+	// `started` places the run at ONE spot for as long as the record exists.
 	var suppressAnchor: { [runId: string]: boolean } = {};
 	if (runStubs) {
 		for (var ti2 = 0; ti2 < order.length; ti2++) {
 			var tg = groups[order[ti2]];
-			if (!tg.mayHaveOlder || !newestRunOfKey[order[ti2]]) continue;
+			if (!newestRunOfKey[order[ti2]]) continue;
 			var trec = (tg.path && runStubs[tg.path]) || runStubs[tg.key];
 			if (!trec || typeof trec.started !== 'number') continue;
+			if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
 			suppressAnchor[order[ti2]] = true;
+			// Same identity the stub form uses, so a row that upgrades from
+			// record-only to loaded-passes keeps its DOM node and its position.
+			tg.runKey = 'run:' + (tg.path || tg.key) + '#' + trec.started;
 			stubList.push({ started: trec.started, group: tg });
 		}
 	}
