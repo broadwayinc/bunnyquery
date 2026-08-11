@@ -22,6 +22,24 @@ export var LINK_LABEL_MAX_DISPLAY_CHARS = 32;
 export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
 
 /**
+ * Lifetime of the url minted for an inline image PREVIEW.
+ *
+ * Longer than the click url above, and for a different reason. A click hands the
+ * user a url they may keep, so it stays short. A preview url is consumed by the
+ * page itself and never leaves it, and it is the ONE lever on how long the
+ * downloaded picture stays reusable: get_signed_url will not cache a mint for
+ * longer than the credential inside it survives, so `browser_cache` cannot buy
+ * local availability that `expires` has not paid for. Twenty minutes meant every
+ * image re-downloaded three times an hour of ordinary reading.
+ *
+ * An hour, giving 55 minutes of cache once the server's five minute headroom is
+ * taken off. Short enough that a leaked preview url is not a standing grant, long
+ * enough that a conversation does not re-fetch its own pictures while the user is
+ * still reading it.
+ */
+export var PREVIEW_URL_EXPIRES_SECONDS = 60 * 60;
+
+/**
  * Seconds the browser may reuse a minted preview url (`browser_cache`).
  *
  * A presigned url is a fresh SigV4 query string on every mint, so it can never
@@ -30,12 +48,17 @@ export var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = 20 * 60;
  * url comes back out of the browser cache, so the body already on disk stays
  * addressable.
  *
- * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
- * that is the whole trick: the url is short-lived while the file stays available
- * locally for a WEEK. What keeps an image painting is the cached BODY, not a live
- * url. Once the browser evicts that body it refetches with a url that has since
- * expired, gets a 403, and the error path re-mints with `refresh`. That path is
- * therefore load-bearing, not a rare fallback.
+ * A CEILING, not a promise. get_signed_url caps what it grants at the lifetime of
+ * the url inside the response (expires minus headroom, so 15 minutes for the
+ * platform's 20 minute url), because a mint cached for longer than its own
+ * credential is a guaranteed 403 that the browser keeps serving from its own
+ * store. Asking for the week is still right: it says what this client would
+ * reuse if the url were stable by construction, and the server decides.
+ *
+ * What keeps an image painting is the cached BODY, not a live url. Once the
+ * browser evicts that body it refetches with a url that has since expired, gets a
+ * 403, and the error path re-mints with `refresh` and mintCacheBustStamp. That
+ * path is load-bearing, not a rare fallback.
  *
  * A week is the platform default for reading a private file, not a number chosen
  * here: skapi-js reads every private record file with
@@ -59,6 +82,102 @@ export var PREVIEW_BROWSER_CACHE_SECONDS = 7 * 24 * 60 * 60;
  * dead url with no way to notice; deriving it makes that unrepresentable.
  */
 export var LINK_REFRESH_WINDOW_MS = (EXPIRED_LINK_REFRESH_EXPIRES_SECONDS - 5 * 60) * 1000;
+
+/**
+ * Cache generation for the mint request url. BUMP THIS to abandon every mint
+ * response browsers are currently holding.
+ *
+ * Generation 2 retires the entries written before 2026-08-11. Those were stored
+ * with `max-age=604800` around a presign that dies in twenty minutes, so from
+ * minute 21 each one is a guaranteed 403 that the browser keeps serving from its
+ * own store for the rest of the week. The server no longer grants a lifetime a
+ * url cannot back (get_signed_url resolve_browser_cache), but that fixes what is
+ * written from now on and cannot reach what is already stored on a user's
+ * device. Changing the url is the only thing that can: an entry nobody requests
+ * again is an entry that cannot answer again.
+ */
+export var MINT_CACHE_GENERATION = 2;
+
+/**
+ * Window stamp for a REFRESH mint.
+ *
+ * WINDOWED, not Date.now(): a per-call stamp is a new cache key per image per
+ * retry, which is what made the original `nocache` parameter worse than the
+ * disease. One stamp per refresh window means every repair inside those minutes
+ * shares a single entry, and it rotates before the url it carries can die.
+ */
+export function mintCacheBustStamp(now?: number): number {
+	return Math.floor((now == null ? Date.now() : now) / LINK_REFRESH_WINDOW_MS);
+}
+
+/**
+ * The `nocache` value for a preview mint: the generation, plus a window stamp
+ * when this mint is a repair.
+ *
+ * A repair MUST reach the origin, and the request header the clients used to
+ * rely on cannot do it. `Cache-Control: no-cache` is not a CORS-safelisted
+ * request header, and the record gateway's preflight answers
+ * `Access-Control-Allow-Headers` WITHOUT it (verified against the live api on
+ * 2026-08-11), so a mint carrying that header is rejected by the browser before
+ * it is ever sent. Every repair therefore failed, in every browser, and the chip
+ * went straight to "(unavailable)". Only a phone noticed, because only a phone
+ * drops image bodies often enough to need the repair at all.
+ *
+ * A query parameter has no such problem: it is part of the url, so it needs no
+ * preflight and no cooperation from the cache.
+ */
+export function previewMintCacheToken(refresh?: boolean): string {
+	if (!refresh) return String(MINT_CACHE_GENERATION);
+	return MINT_CACHE_GENERATION + '.' + mintCacheBustStamp();
+}
+
+/**
+ * How long before a presign dies we stop handing it out.
+ *
+ * A url served with one second left is a 403 with extra steps: the request still
+ * has to reach S3, and an image body still has to start arriving.
+ */
+export var PRESIGN_SAFETY_MARGIN_MS = 60 * 1000;
+
+/**
+ * When the url in hand actually dies, read out of the url itself, or null if it
+ * carries no expiry we recognise.
+ *
+ * Every client-side cache here ages a url from the moment it ARRIVED, which is
+ * only the same thing as its lifetime when the mint went to the network. Once
+ * mint responses are cacheable that assumption breaks: a mint answered from the
+ * browser's store can be nearly as old as its own max-age, and the client then
+ * adds its own reuse window on top, so a 20 minute credential can be handed to an
+ * <img> half an hour after it was signed. Asking the url when it dies removes the
+ * stacking instead of trying to budget for it.
+ *
+ * Both signature versions, because the platform mints SigV2 through the host
+ * bucket and SigV4 elsewhere.
+ */
+export function presignExpiryEpochMs(url: string): number | null {
+	if (!url) return null;
+	var q = url.indexOf('?');
+	if (q < 0) return null;
+	var params: URLSearchParams;
+	try { params = new URLSearchParams(url.slice(q + 1)); }
+	catch (e) { return null; }
+
+	// SigV2: Expires is an absolute epoch in seconds.
+	var v2 = params.get('Expires');
+	if (v2 && /^\d+$/.test(v2)) return parseInt(v2, 10) * 1000;
+
+	// SigV4: signing time plus a duration.
+	var signed = params.get('X-Amz-Date');
+	var lifetime = params.get('X-Amz-Expires');
+	if (signed && lifetime && /^\d+$/.test(lifetime)) {
+		var m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(signed);
+		if (m) {
+			var at = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+			return at + parseInt(lifetime, 10) * 1000;
+		}
+	}
+	return null;
+}
 
 // The two "balanced parens" groups match ONE CHARACTER per step, never a `+`
 // run, so each position has exactly one way to be matched: `[^()\n]` cannot
@@ -543,6 +662,24 @@ export function linkUnavailableKeyForPath(remotePath: string): string {
 
 export function linkUnavailableKeyForHref(href: string): string {
 	return 'href:' + (href || '');
+}
+
+/**
+ * Every key a stored file can be marked under, given only its path.
+ *
+ * Marking writes ONE key (whichever identifier the failing call had) and the
+ * lookup ORs all of them, which is fine in one direction and wrong in the other:
+ * a view that later learns the file is reachable knows only the path, and
+ * clearing `path:` alone leaves a chip greyed by a failed CLICK (which marks
+ * `href:` too) exactly as dead as before. The placeholder href is derived from
+ * the path, so both keys can be rebuilt from it.
+ */
+export function linkUnavailableKeysForPath(remotePath: string): string[] {
+	if (!remotePath) return [];
+	return [
+		linkUnavailableKeyForPath(remotePath),
+		linkUnavailableKeyForHref(buildDisplayExpiredAttachmentHref(remotePath)),
+	];
 }
 
 export function isLinkUnavailable(

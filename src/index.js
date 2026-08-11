@@ -79,8 +79,13 @@ import {
     extOf,
     EXT_CONTENT_TYPES,
     EXPIRED_LINK_REFRESH_EXPIRES_SECONDS,
+    PREVIEW_URL_EXPIRES_SECONDS,
     PREVIEW_BROWSER_CACHE_SECONDS,
     LINK_REFRESH_WINDOW_MS,
+    // Which url a cacheable mint uses (cache generation, plus a window stamp on
+    // a repair), and every key a file's chips can be marked unavailable under.
+    previewMintCacheToken,
+    linkUnavailableKeysForPath,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
@@ -2424,10 +2429,13 @@ import {
             // two different signed urls and downloads the same image twice. The
             // dashboard never had this because it passes a full endpoint url.
             reqOpts.stableGateway = true;
-            // REPLACE the cached mint rather than route around it: a `nocache`
-            // query param is a different url, so the poisoned entry survives and
-            // keeps answering every ordinary mint for the rest of the week.
-            if (opts.refresh) reqOpts.revalidate = true;
+            // Cache generation, plus a window stamp when this mint is a repair.
+            // NOT `revalidate`: that sends Cache-Control: no-cache as a REQUEST
+            // header, which is not CORS-safelisted and which the record gateway's
+            // preflight does not allow, so the browser refused to send the repair
+            // at all and the preview died as unavailable. A query parameter is
+            // part of the url, so nothing can veto it.
+            body.nocache = previewMintCacheToken(opts.refresh);
             body.browser_cache = opts.browserCache;
             // Partitions the browser cache per user: a cache is keyed by url
             // alone and shared by everyone using the profile, so without this a
@@ -2970,15 +2978,41 @@ import {
     // renderMessages rebuilds every bubble in the list. Marking is idempotent, so
     // the repaint only happens for keys that are actually new.
     var unavailableRepaintQueued = false;
+    function queueUnavailableRepaint() {
+        if (unavailableRepaintQueued) return;
+        unavailableRepaintQueued = true;
+        setTimeout(function () { unavailableRepaintQueued = false; renderMessages(); }, 0);
+    }
     function markLinkUnavailable(key) {
         if (!key || unavailableLinkMap[key]) return;
         unavailableLinkMap[key] = true;
         // Nothing has necessarily minted successfully yet, so the boundary timer
         // that clears this map may not be running.
         if (!refreshedLinkExpiryTimer) scheduleNextLinkExpiryBoundary();
-        if (unavailableRepaintQueued) return;
-        unavailableRepaintQueued = true;
-        setTimeout(function () { unavailableRepaintQueued = false; renderMessages(); }, 0);
+        queueUnavailableRepaint();
+    }
+
+    // A preview for this file just painted, so it is reachable and no chip for it
+    // should still read (unavailable).
+    //
+    // A RACE GUARD, not the general recovery: once a key is marked the chip
+    // renders with no <img> at all (renderInlineLinkHtml drops the preview so a
+    // re-render cannot re-mint and re-fail forever), so nothing for that file can
+    // paint again and reach this. What it catches is one element failing while a
+    // second element for the same file is still loading. A settled mark still
+    // recovers on the LINK_REFRESH_WINDOW_MS boundary.
+    //
+    // Clears EVERY key the file can be marked under, because a failed chip click
+    // marks the href key as well as the path key.
+    function clearLinkUnavailable(keys) {
+        var changed = false;
+        for (var i = 0; i < (keys || []).length; i++) {
+            var k = keys[i];
+            if (!k || !unavailableLinkMap[k]) continue;
+            delete unavailableLinkMap[k];
+            changed = true;
+        }
+        if (changed) queueUnavailableRepaint();
     }
 
     // Inline image previews. The same plain presign the link chips use, with the
@@ -2991,14 +3025,23 @@ import {
         return {
             scope: S.projectId || "default",
             mint: function (remotePath, contentType, refresh) {
-                return getTemporaryUrlDb(remotePath, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, false, contentType, {
+                // PREVIEW ttl, not the click ttl: this url never leaves the page,
+                // and its length is what decides how long the picture stays
+                // locally reusable (the server will not cache a mint past the
+                // life of the credential in it).
+                return getTemporaryUrlDb(remotePath, PREVIEW_URL_EXPIRES_SECONDS, false, contentType, {
                     browserCache: PREVIEW_BROWSER_CACHE_SECONDS,
                     refresh: refresh,
                 });
             },
             // An image arriving late pushes the conversation down under the
-            // viewport. Re-pin only if the user was already at the bottom.
-            onLoad: function () { scrollToBottomIfSticky(false); },
+            // viewport. Re-pin only if the user was already at the bottom. A
+            // paint is also proof the file is reachable, so it lifts any mark an
+            // earlier failure left on this file's chips.
+            onLoad: function (path) {
+                clearLinkUnavailable(linkUnavailableKeysForPath(path));
+                scrollToBottomIfSticky(false);
+            },
             // The mint was refused, or the url it minted would not load. Either
             // way there is no url for this file, so the caption chip left behind
             // must not keep offering a click that opens a dead tab.

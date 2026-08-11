@@ -590,6 +590,23 @@ declare var LINK_LABEL_MAX_DISPLAY_CHARS: number;
  */
 declare var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS: number;
 /**
+ * Lifetime of the url minted for an inline image PREVIEW.
+ *
+ * Longer than the click url above, and for a different reason. A click hands the
+ * user a url they may keep, so it stays short. A preview url is consumed by the
+ * page itself and never leaves it, and it is the ONE lever on how long the
+ * downloaded picture stays reusable: get_signed_url will not cache a mint for
+ * longer than the credential inside it survives, so `browser_cache` cannot buy
+ * local availability that `expires` has not paid for. Twenty minutes meant every
+ * image re-downloaded three times an hour of ordinary reading.
+ *
+ * An hour, giving 55 minutes of cache once the server's five minute headroom is
+ * taken off. Short enough that a leaked preview url is not a standing grant, long
+ * enough that a conversation does not re-fetch its own pictures while the user is
+ * still reading it.
+ */
+declare var PREVIEW_URL_EXPIRES_SECONDS: number;
+/**
  * Seconds the browser may reuse a minted preview url (`browser_cache`).
  *
  * A presigned url is a fresh SigV4 query string on every mint, so it can never
@@ -598,12 +615,17 @@ declare var EXPIRED_LINK_REFRESH_EXPIRES_SECONDS: number;
  * url comes back out of the browser cache, so the body already on disk stays
  * addressable.
  *
- * Deliberately far longer than EXPIRED_LINK_REFRESH_EXPIRES_SECONDS above, and
- * that is the whole trick: the url is short-lived while the file stays available
- * locally for a WEEK. What keeps an image painting is the cached BODY, not a live
- * url. Once the browser evicts that body it refetches with a url that has since
- * expired, gets a 403, and the error path re-mints with `refresh`. That path is
- * therefore load-bearing, not a rare fallback.
+ * A CEILING, not a promise. get_signed_url caps what it grants at the lifetime of
+ * the url inside the response (expires minus headroom, so 15 minutes for the
+ * platform's 20 minute url), because a mint cached for longer than its own
+ * credential is a guaranteed 403 that the browser keeps serving from its own
+ * store. Asking for the week is still right: it says what this client would
+ * reuse if the url were stable by construction, and the server decides.
+ *
+ * What keeps an image painting is the cached BODY, not a live url. Once the
+ * browser evicts that body it refetches with a url that has since expired, gets a
+ * 403, and the error path re-mints with `refresh` and mintCacheBustStamp. That
+ * path is load-bearing, not a rare fallback.
  *
  * A week is the platform default for reading a private file, not a number chosen
  * here: skapi-js reads every private record file with
@@ -626,6 +648,69 @@ declare var PREVIEW_BROWSER_CACHE_SECONDS: number;
  * dead url with no way to notice; deriving it makes that unrepresentable.
  */
 declare var LINK_REFRESH_WINDOW_MS: number;
+/**
+ * Cache generation for the mint request url. BUMP THIS to abandon every mint
+ * response browsers are currently holding.
+ *
+ * Generation 2 retires the entries written before 2026-08-11. Those were stored
+ * with `max-age=604800` around a presign that dies in twenty minutes, so from
+ * minute 21 each one is a guaranteed 403 that the browser keeps serving from its
+ * own store for the rest of the week. The server no longer grants a lifetime a
+ * url cannot back (get_signed_url resolve_browser_cache), but that fixes what is
+ * written from now on and cannot reach what is already stored on a user's
+ * device. Changing the url is the only thing that can: an entry nobody requests
+ * again is an entry that cannot answer again.
+ */
+declare var MINT_CACHE_GENERATION: number;
+/**
+ * Window stamp for a REFRESH mint.
+ *
+ * WINDOWED, not Date.now(): a per-call stamp is a new cache key per image per
+ * retry, which is what made the original `nocache` parameter worse than the
+ * disease. One stamp per refresh window means every repair inside those minutes
+ * shares a single entry, and it rotates before the url it carries can die.
+ */
+declare function mintCacheBustStamp(now?: number): number;
+/**
+ * The `nocache` value for a preview mint: the generation, plus a window stamp
+ * when this mint is a repair.
+ *
+ * A repair MUST reach the origin, and the request header the clients used to
+ * rely on cannot do it. `Cache-Control: no-cache` is not a CORS-safelisted
+ * request header, and the record gateway's preflight answers
+ * `Access-Control-Allow-Headers` WITHOUT it (verified against the live api on
+ * 2026-08-11), so a mint carrying that header is rejected by the browser before
+ * it is ever sent. Every repair therefore failed, in every browser, and the chip
+ * went straight to "(unavailable)". Only a phone noticed, because only a phone
+ * drops image bodies often enough to need the repair at all.
+ *
+ * A query parameter has no such problem: it is part of the url, so it needs no
+ * preflight and no cooperation from the cache.
+ */
+declare function previewMintCacheToken(refresh?: boolean): string;
+/**
+ * How long before a presign dies we stop handing it out.
+ *
+ * A url served with one second left is a 403 with extra steps: the request still
+ * has to reach S3, and an image body still has to start arriving.
+ */
+declare var PRESIGN_SAFETY_MARGIN_MS: number;
+/**
+ * When the url in hand actually dies, read out of the url itself, or null if it
+ * carries no expiry we recognise.
+ *
+ * Every client-side cache here ages a url from the moment it ARRIVED, which is
+ * only the same thing as its lifetime when the mint went to the network. Once
+ * mint responses are cacheable that assumption breaks: a mint answered from the
+ * browser's store can be nearly as old as its own max-age, and the client then
+ * adds its own reuse window on top, so a 20 minute credential can be handed to an
+ * <img> half an hour after it was signed. Asking the url when it dies removes the
+ * stacking instead of trying to budget for it.
+ *
+ * Both signature versions, because the platform mints SigV2 through the host
+ * bucket and SigV4 elsewhere.
+ */
+declare function presignExpiryEpochMs(url: string): number | null;
 declare function createInlineLinkRegex(): RegExp;
 declare function safeDecodeURIComponent(v: string): string;
 declare function encodePathSegments(path: string): string;
@@ -782,6 +867,17 @@ declare function classifyInlineLink(full: string, groups: Array<string | undefin
  */
 declare function linkUnavailableKeyForPath(remotePath: string): string;
 declare function linkUnavailableKeyForHref(href: string): string;
+/**
+ * Every key a stored file can be marked under, given only its path.
+ *
+ * Marking writes ONE key (whichever identifier the failing call had) and the
+ * lookup ORs all of them, which is fine in one direction and wrong in the other:
+ * a view that later learns the file is reachable knows only the path, and
+ * clearing `path:` alone leaves a chip greyed by a failed CLICK (which marks
+ * `href:` too) exactly as dead as before. The placeholder href is derived from
+ * the path, so both keys can be rebuilt from it.
+ */
+declare function linkUnavailableKeysForPath(remotePath: string): string[];
 declare function isLinkUnavailable(link: {
     href?: string;
     expiredHref?: string;
@@ -2644,4 +2740,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, previewImageContentType, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_URL_EXPIRES_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
