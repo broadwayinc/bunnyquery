@@ -462,7 +462,7 @@
     background: rgba(127, 127, 127, 0.08);
 }
 .bq-md hr { border: none; border-top: 1px solid var(--bq-line); margin: 0.8em 0; }
-.bq-md a { color: var(--bq-main); text-decoration: underline; }
+.bq-md a { color: var(--bq-main); text-decoration: underline;vertical-align: text-bottom; }
 .bq-md a:hover { text-decoration: none; }
 .bq-md code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
