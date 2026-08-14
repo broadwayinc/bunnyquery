@@ -56,7 +56,11 @@
    cancelled bubbles, indexing passes (the collapsed rows' members), and the
    empty-chat greeting. Inlined data URI so both consumers get it without
    markup or asset-hosting changes. */
-.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass):not(.bq-empty-greeting) .bq-bubble::before {
+/* The greeting is NOT excluded here any more. It used to be
+   (:not(.bq-empty-greeting)), because it was a one-off notice shown only to an
+   empty chat. It is now a permanent first message in every conversation, so it
+   is an assistant bubble like any other and wears the same face. */
+.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass) .bq-bubble::before {
     content: "";
     /* block, not float: the bunny takes the first line by itself and the
        message starts on the next line below it */
@@ -71,12 +75,12 @@
 /* While the reply is still "Thinking..." the bubble holds only the dot-trail
    loader: put the bunny INLINE with the dots instead of stacking above them.
    Settled replies keep the block bunny with the message on the next line. */
-.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass):not(.bq-empty-greeting) .bq-bubble:has(> .bq-loader)::before {
+.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass) .bq-bubble:has(> .bq-loader)::before {
     display: inline-block;
     vertical-align: middle;
     margin-right: 0.4rem;
 }
-.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass):not(.bq-empty-greeting) .bq-bubble:has(> .bq-loader) > .bq-loader {
+.bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass) .bq-bubble:has(> .bq-loader) > .bq-loader {
     vertical-align: middle;
 }
 

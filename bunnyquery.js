@@ -276,10 +276,10 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 
   // src/engine/prompts/chat_system_prompt.ts
   function buildChatSystemPrompt(params) {
-    const { projectId, serviceName, serviceDescription } = params;
+    const { projectId, serviceName, serviceDescription, greeting, canUpload} = params;
     let systemPrompt = `
 You are a dedicated assistant for the project ID: "${projectId}".
-Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage.
+Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
 Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized" (where the indexer writes; pass access_group explicitly, including 0, to search another group), while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
@@ -309,6 +309,16 @@ Mushrooms,41,$73.80
 Zucchini,29,$43.50
 \`\`\`
 The same pattern applies to any format - name the block after the file you intend: \`\`\`my-data.json, \`\`\`index.html, \`\`\`sample.txt, and so on.`;
+    systemPrompt += `
+About BunnyQuery (this app - questions about it are in scope):
+You are the assistant inside BunnyQuery, an AI assistant for the user's own business data. Instead of digging through folders, dashboards and files, the user uploads their documents, spreadsheets, images, notes and records, BunnyQuery indexes them into this project's database, and you answer questions, write reports and summarize from THAT data rather than from the open internet. Each project has its own data, its own AI platform (ChatGPT or Claude, powered by the project owner's own API key) and its own base prompt. BunnyQuery is built on Skapi (www.skapi.com), so the same project database is also reachable over MCP from any MCP-compatible AI client (mcp.broadwayinc.computer), and this chat can be embedded in a website as a widget with one script tag. Answer product questions from the facts in this section. If you are asked something about BunnyQuery that is NOT stated here - pricing, plan limits, a roadmap, a feature you cannot see - say you are not certain and point the user at the project owner or the BunnyQuery site, rather than inventing it.
+How data gets in: ${canUpload === false ? `this user CANNOT upload in this session (they are not signed in, or the project's database is frozen for non-admins), and the attach affordances are hidden from them. Never instruct them to attach, drag in or upload a file, and never blame a missing answer on them not having uploaded it. Answer from what is already indexed, and when something genuinely is not in the project, say so and suggest asking the project's owner to add it.` : `the user attaches files to a chat message with the paperclip button in the composer, or drags and drops them onto the chat (whole folders work; up to 20 files per message). Uploaded files land in this project's file storage and are indexed automatically: read end to end and turned into database records. "Indexed" means exactly that, and it is why you can only answer from a file once its indexing has finished. While a file indexes, the chat shows a status row for it: yellow while it is working, green when it is indexed, red if it failed. A large file is indexed in windows over several passes, which takes longer; indexing runs on the server, so it keeps going if the user closes the page and the row is still there when they come back. The user can also paste plain text straight into the chat and ask you to save it - store it with the postRecords tool. BunnyQuery reads over 50 formats: office documents (.docx, .xlsx, .pptx, .hwp, .hwpx, .odt, .ods, .odp, .epub), PDFs, images, .csv/.tsv, .json, .xml, .html, .txt/.md and source code. Images and scanned PDFs are read with vision at index time.`}
+Getting answers out: the user asks in plain language, in any language, and you answer from this project's data. You can also produce reports and downloadable files (CSV and the rest) as described in the File generation rules above, and any stored file can be handed back as a link, with images rendering inline in the chat.${""}${`
+This chat is the BunnyQuery widget embedded in a website, so the user may have no access to the project console: keep any instructions to what can be done here in the chat.` }`;
+    if (greeting) {
+      systemPrompt += `
+Your opening message: this chat always opens with a fixed line from you, reading """${greeting}""". It is rendered by the client and is NOT part of the message history you receive, so the user can reply to it ("which files?", "what do you mean by indexed?", "what can you do?") with nothing in the transcript to refer back to. Treat that line as something you said, and answer the follow-up from this section.`;
+    }
     if (serviceDescription) {
       systemPrompt += `
 Project name: "${serviceName ?? ""}"
@@ -453,6 +463,14 @@ Records for the earlier windows/pages of this file are ALREADY saved (they refer
  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
  - Text: the cursor is the character offset already read.
 Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. A \xABPHOTO <cell>\xBB marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. Do NOT re-save windows that are already saved. Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
+  }
+
+  // src/engine/greeting.ts
+  function buildChatGreeting(params) {
+    const name = params.projectName ? '"' + params.projectName + '"' : "";
+    const lead = params.canUpload === false ? "Hi! Ask me anything about the data in your project" : "Hi! Start by attaching the files related to your project";
+    const tail = params.canUpload === false ? "." : ", or pasting plain text into the chat. Once they are indexed, ask me anything about that data.";
+    return { lead, name, tail, text: lead + (name ? " " + name : "") + tail };
   }
 
   // src/engine/errors.ts
@@ -7816,8 +7834,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return buildChatSystemPrompt({
         projectId: promptProjectId,
         serviceName: S.serviceName,
-        serviceDescription: S.serviceDescription
-      });
+        serviceDescription: S.serviceDescription,
+        // The opening bubble never enters the history (it is DOM the client
+        // paints), so the model is told what it opened with. Same call as
+        // buildGreetingEl, so the two can never disagree.
+        greeting: greetingParts().text,
+        canUpload: !uploadsFrozenForUser()});
     }
     function refreshSkapiSession() {
       return S.skapi.getProfile({ refreshToken: true }).then(function() {
@@ -9218,7 +9240,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var stubRecheckTimer = null;
     var stubRecheckSig = "";
     var stubRecheckRounds = 0;
-    var markerSweepSettled = false;
     function armStubRecheck() {
       if (stubRecheckTimer !== null) return;
       stubRecheckTimer = setTimeout(function() {
@@ -9262,14 +9283,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function refreshIndexMarkers(invalidate) {
       if (invalidate) invalidateIndexMarkerSweep();
       return sweepIndexMarkersDb().then(function(res) {
-        markerSweepSettled = true;
         if (res) {
           maybeArmStubRecheck();
           renderMessages();
         }
         return res;
       }).catch(function() {
-        markerSweepSettled = true;
         renderMessages();
         return null;
       });
@@ -9554,6 +9573,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return el;
     }
+    function greetingParts() {
+      return buildChatGreeting({ projectName: S.serviceName, canUpload: !uploadsFrozenForUser() });
+    }
+    function buildGreetingEl() {
+      var parts = greetingParts();
+      var name = parts.name ? [document.createTextNode(" "), h("strong", { translate: "no", text: parts.name })] : null;
+      var bubble = h("div", { class: "bq-bubble" });
+      append(bubble, parts.lead);
+      append(bubble, name);
+      append(bubble, parts.tail);
+      return h("div", { class: "bq-message is-assistant bq-empty-greeting" }, bubble);
+    }
     function historyLoadingEl(initial) {
       if (initial) {
         return h(
@@ -9648,6 +9679,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           h("span", { class: "bq-loader" })
         ));
       }
+      CS.messagesBox.appendChild(buildGreetingEl());
       if (!CS.messages.length) {
         if (CS.loadingHistory && !CS.loadingOlderHistory) {
           CS.messagesBox.appendChild(historyLoadingEl(true));
@@ -9663,17 +9695,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             emptyStubEls.push(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
           }
         } catch (e) {
-        }
-        if (!emptyStubEls.length && !session.state.bgHistoryLoading && markerSweepSettled) {
-          CS.messagesBox.appendChild(h(
-            "div",
-            { class: "bq-message is-assistant bq-empty-greeting" },
-            h(
-              "div",
-              { class: "bq-bubble" },
-              document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") + ".")
-            )
-          ));
         }
         for (var gse = 0; gse < emptyStubEls.length; gse++) CS.messagesBox.appendChild(emptyStubEls[gse]);
         syncDraftingIndicator();

@@ -41,6 +41,10 @@ export {
 
 export * from './prompts';
 
+// The opening bubble's sentence, shared so the two clients cannot fork it and
+// so the assistant can be told what it opened with (see greeting.ts).
+export { buildChatGreeting, type ChatGreetingParams, type ChatGreetingParts } from './greeting';
+
 // Pure helpers (Tier-1.5): error detection, token budgeting, link/path
 // normalization, and history mapping — shared so both consumers stay identical.
 export { getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, isProviderApiKeyError } from './errors';

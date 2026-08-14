@@ -39,6 +39,7 @@ import {
     groupAttachmentFailures,
     notifyAgentSaveAttachment,
     buildChatSystemPrompt,
+    buildChatGreeting,
     setProjectContextWindow,
     parseAiAgentValue as engineParseAiAgentValue,
     // pure helpers (Tier-1.5) — error detection, token budget, link/path, history mapping
@@ -1794,6 +1795,12 @@ import {
             projectId: promptProjectId,
             serviceName: S.serviceName,
             serviceDescription: S.serviceDescription,
+            // The opening bubble never enters the history (it is DOM the client
+            // paints), so the model is told what it opened with. Same call as
+            // buildGreetingEl, so the two can never disagree.
+            greeting: greetingParts().text,
+            canUpload: !uploadsFrozenForUser(),
+            client: "widget",
         });
     }
 
@@ -3974,6 +3981,33 @@ import {
         return el;
     }
 
+    /** The opening line, from the engine so agent.vue cannot say something else.
+     *  It leads with the UPLOAD, not with "ask me anything": a project with no
+     *  indexed files has nothing to answer from, and inviting questions first
+     *  reads as a promise the box cannot keep. When the user cannot upload at
+     *  all (anonymous session, or a frozen database for a non-admin, both
+     *  uploadsFrozenForUser) that instruction would be a dead end, so those
+     *  sessions get the ask-first line instead. buildSystemPrompt sends this
+     *  same text to the model, which never sees the bubble itself. */
+    function greetingParts() {
+        return buildChatGreeting({ projectName: S.serviceName, canUpload: !uploadsFrozenForUser() });
+    }
+    /** The permanent opening bubble. An ordinary assistant message: same class,
+     *  same bubble, so it wears the bunny face chat.css gives every one of them. */
+    function buildGreetingEl() {
+        var parts = greetingParts();
+        // The project name is user data: translate="no" keeps a browser's auto
+        // translator from rewriting it (same as agent.vue's <strong>).
+        var name = parts.name
+            ? [document.createTextNode(" "), h("strong", { translate: "no", text: parts.name })]
+            : null;
+        var bubble = h("div", { class: "bq-bubble" });
+        append(bubble, parts.lead);
+        append(bubble, name);
+        append(bubble, parts.tail);
+        return h("div", { class: "bq-message is-assistant bq-empty-greeting" }, bubble);
+    }
+
     function historyLoadingEl(initial) {
         // Initial (empty messages area) load gets the jumping bunny, matching
         // www.bunnyquery.com's .bq-gate-loading. Older-history pagination keeps the
@@ -4120,6 +4154,14 @@ import {
             CS.messagesBox.appendChild(h("div", { class: "bq-history-loading" },
                 h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" })));
         }
+        // ALWAYS, and always first. The greeting is the opening line of the
+        // conversation, not a placeholder for an empty one: it goes in before any
+        // history so a long chat simply carries it at the top of its scrollback.
+        // It used to be appended only in the empty-chat branch below, so the one
+        // message that says what this box is for disappeared the moment someone
+        // used it. Mirrored in agent.vue.
+        CS.messagesBox.appendChild(buildGreetingEl());
+
         if (!CS.messages.length) {
             // Initial load: show "Fetching history..." instead of the greeting.
             if (CS.loadingHistory && !CS.loadingOlderHistory) {
@@ -4143,16 +4185,6 @@ import {
                     emptyStubEls.push(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
                 }
             } catch (e) { /* display-side best effort */ }
-            // Genuinely empty chat ONLY: any content — a stub row here, a stub
-            // batch still in flight, or a marker sweep that has not answered
-            // yet (its stubs may be a beat away) — hides the greeting (it used
-            // to flash over real rows; agent.vue gates identically).
-            if (!emptyStubEls.length && !session.state.bgHistoryLoading && markerSweepSettled) {
-                CS.messagesBox.appendChild(h("div", { class: "bq-message is-assistant bq-empty-greeting" },
-                    h("div", { class: "bq-bubble" },
-                        document.createTextNode("Hi! Ask me anything about " + (S.serviceName ? '"' + S.serviceName + '"' : "your project") +
-                            "."))));
-            }
             for (var gse = 0; gse < emptyStubEls.length; gse++) CS.messagesBox.appendChild(emptyStubEls[gse]);
             // A first-ever message can be mid-draft under the greeting.
             syncDraftingIndicator();
