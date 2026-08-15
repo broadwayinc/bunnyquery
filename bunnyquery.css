@@ -1018,6 +1018,15 @@
     .bq-input-row { flex-direction: column; padding: 0.65rem 0.75rem 0.75rem; }
     .bq-input-wrap { width: 100%; flex: 0 0 auto; }
     .bq-input-row .btn { width: 100%; }
+    /* `flex-basis: 100%` on these two means FULL WIDTH only while the row is a
+       row. The line above flips it to a column, where the main axis is vertical
+       and the same declaration claims the container's full HEIGHT: the chips
+       then fill the column, and since the row still wraps, the input and Send
+       wrap into a SECOND COLUMN, off to the right of the screen. That is the
+       attachment bug, and it is why it never appeared on the dashboard, whose
+       own mobile block already carries these two lines (agent.vue). */
+    .bq-attachments { flex-basis: auto; width: 100%; }
+    .bq-attachment-warning { flex-basis: auto; width: 100%; }
     .bq-bubble { max-width: 100%; }
     .bq-page { padding: 2rem 1.25rem; }
     .bq-section-title { padding: 0.75rem; }
