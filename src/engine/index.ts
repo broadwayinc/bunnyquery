@@ -68,6 +68,11 @@ export {
 	// read it the same way or the two will not group together.
 	isIndexingRequestText,
 	parseIndexingRequestText,
+	// One rule for which locally-pushed bubbles survive a first-page refetch.
+	// Shared because the failure mode when the two clients drift is a turn
+	// rendered twice and then persisted into the history cache.
+	shouldRescueInFlightMessage,
+	type RescueDecisionContext,
 	// One bounded look at the bg-indexing queue: which files still have a live
 	// pass. The dbfile browser's "indexed" badge uses this so a file only goes
 	// green once the run is confirmed over, not when its src:: record appears.
@@ -82,6 +87,18 @@ export {
 // a box too short to scroll strands the user on page 1 — the normal state once a
 // page of history collapses into one indexing row. Shared so both chatboxes page
 // their way out of it identically.
+// Holding the reader's place while the list mutates underneath them. Shared so
+// an older page, an indexing row, a re-parsed chip and a decoded image preview
+// are all absorbed the same way in both chatboxes.
+export {
+	createScrollAnchor,
+	type ScrollAnchor,
+	type ScrollAnchorOptions,
+	type RowAnchor,
+	type AnchorBoxEl,
+	type AnchorRowEl,
+} from './scroll_anchor';
+
 export {
 	fillHistoryViewport,
 	createHistoryFiller,

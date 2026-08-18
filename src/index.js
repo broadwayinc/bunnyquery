@@ -92,6 +92,13 @@ import {
     buildChatDisplayList,
     createHistoryFiller,
     HISTORY_FILL_SLACK_PX,
+    // Holding the reader's place while the list mutates underneath them. Shared
+    // with agent.vue so the two cannot drift on the one behaviour a reader
+    // notices most.
+    createScrollAnchor,
+    // The element a preview's own transitions actually resize (the anchor, not the
+    // <img>). Shared so both this and the engine's layout hook measure one node.
+    previewLayoutBox,
 } from "./engine";
 
 (function () {
@@ -127,9 +134,6 @@ import {
     var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
     var DEFAULT_OPENAI_MODEL = "gpt-5.4";
 
-    // Keep in step with POLL_INTERVAL in src/engine/requests.ts (agent.vue reads
-    // the engine's copy, this is the widget's).
-    var POLL_INTERVAL = 3000;
     var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
@@ -1990,14 +1994,54 @@ import {
             else CS.messagesBox.scrollTop = CS.messagesBox.scrollHeight;
         });
     }
+    // Where the box was at the previous scroll event. Only used to tell a scroll
+    // DOWN from the browser clamping scrollTop after content above the reader
+    // shrank.
+    var lastHistoryScrollTop = 0;
     function onHistoryScroll() {
         if (!CS.messagesBox || CS.chatSettingsOpen) return;
         var el = CS.messagesBox;
-        CS.stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
+        // Re-sticking requires having moved DOWN. Content shrinking above the
+        // reader - a group collapsing, a re-render, an image failing back to
+        // nothing - makes the browser CLAMP scrollTop to the new maximum, which is
+        // "at the bottom" by definition and fires a scroll event indistinguishable
+        // from the reader arriving there. Read as sticky, that pinned someone who
+        // was mid-history to the newest message and re-pinned them on every poll
+        // after. A clamp can only ever LOWER scrollTop, so this separates the two
+        // exactly. (agent.vue does the same.)
+        var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
+        if (!atBottom) CS.stickToBottom = false;
+        else if (el.scrollTop >= lastHistoryScrollTop) CS.stickToBottom = true;
+        lastHistoryScrollTop = el.scrollTop;
+        // This is where the reader's place comes from. Every scroll - theirs, and
+        // every programmatic one - lands here, so the anchor is always the
+        // position the box is actually at, and chatScrollAnchor.hold() can put it
+        // back after anything that resolves in the background. Cheap: one pass
+        // over the rows, and it stops at the first one on screen.
+        chatScrollAnchor.remember();
         // Not a single page: keep going until the scroll-up revealed something,
         // or a page of pure indexing passes (which collapses into a row already
         // on screen) leaves the user pinned at the top with nothing new.
         if (el.scrollTop <= 60) pageOlderHistoryUntilTaller();
+    }
+    // An <img> (or anything else that loads) inside the list just settled and
+    // changed its own box. Hold the reader's place; scrollToBottomIfSticky covers
+    // the reader who is pinned to the bottom instead, and the two are exclusive.
+    function onMessagesFontsSettled() { chatScrollAnchor.hold(); }
+    function onMessagesImageSettled(e) {
+        var t = e && e.target;
+        if (!t || t.tagName !== "IMG") return;
+        // absorb, not hold: an image inside the anchored row (a reply taller than
+        // the viewport, a picture higher up in it) moves every line the reader is
+        // on WITHOUT moving the row's own top, which is the one thing hold()
+        // measures. absorb compensates by the element's own delta instead, and
+        // only while the element's top is above the fold, so the two can never
+        // both pay for the same pixel.
+        //
+        // previewLayoutBox, so this and the engine's own onLayoutChange hook key
+        // absorb's per-element memo on the SAME node: the box that resizes is the
+        // anchor (picture + dot-trail loader + caption chip), not the <img> alone.
+        chatScrollAnchor.absorb(previewLayoutBox(t));
     }
     // Explicit user scroll-UP intent. wheel/touch fire synchronously on the
     // user's action (and never for programmatic scrolls), so releasing
@@ -2452,7 +2496,7 @@ import {
             if (uid) body.uid = uid;
         }
 
-        return S.skapi.util.request("get-signed-url", body, reqOpts).then(function (res) {
+        function unwrap(res) {
             var u = typeof res === "string" ? res : (res && res.url);
             if (!u) throw new Error("No temporary URL returned.");
             // ONLY the cdn branch returns a bare path to prepend the db host to.
@@ -2462,7 +2506,15 @@ import {
             // cdn:false mint (image previews, expired-chip clicks) was dead.
             if (/^https?:\/\//i.test(u)) return u;
             return "https://db." + hostDomain() + "/" + u;
-        });
+        }
+
+        // The backend already resolves this. get_signed_url/index.py:1154 runs
+        // resolve_existing_key() on every "get" request, which head_objects the NFC and
+        // NFD variants and signs whichever exists (added 2026-07-08, "fix multilang texts").
+        // A client-side retry here would also be INERT: when no variant exists the backend
+        // falls back "as-given" and signs it anyway, so the mint resolves 200 and the .catch
+        // never fires. The failure surfaces later as a 404 on image load, handled by onError.
+        return S.skapi.util.request("get-signed-url", body, reqOpts).then(unwrap);
     }
 
 
@@ -3049,6 +3101,12 @@ import {
                 clearLinkUnavailable(linkUnavailableKeysForPath(path));
                 scrollToBottomIfSticky(false);
             },
+            // The resizes an <img> makes with no event of its own to announce
+            // them: the src landing, and the src being dropped for a retry (which
+            // collapses an already-painted picture to nothing). load and error are
+            // covered by the listener on the message box, which also catches the
+            // markdown images this module never sees.
+            onLayoutChange: function (img) { chatScrollAnchor.absorb(img); },
             // The mint was refused, or the url it minted would not load. Either
             // way there is no url for this file, so the caption chip left behind
             // must not keep offering a click that opens a dead tab.
@@ -3074,21 +3132,31 @@ import {
     // cached href can never outlive the url behind it. Without this the widget
     // held a fresh href for the life of the page.
     var refreshedLinkExpiryTimer = null;
+    // Returns whether anything actually changed, because the caller's answer to
+    // "yes" is a full teardown of the message list.
     function expireAllRefreshedLinks() {
-        for (var k in refreshedExpiredLinkMap) delete refreshedExpiredLinkMap[k];
+        var changed = false;
+        for (var k in refreshedExpiredLinkMap) { delete refreshedExpiredLinkMap[k]; changed = true; }
         // Failures expire on the same boundary. A mint can fail because the file
         // is gone, but it can also fail because the network blinked, and a chip
         // greyed out by a five-second outage that stays grey for the life of the
         // page is its own bug. The boundary already re-renders.
-        for (var u in unavailableLinkMap) delete unavailableLinkMap[u];
+        for (var u in unavailableLinkMap) { delete unavailableLinkMap[u]; changed = true; }
+        return changed;
     }
     function scheduleNextLinkExpiryBoundary() {
         if (refreshedLinkExpiryTimer) clearTimeout(refreshedLinkExpiryTimer);
         var now = Date.now();
         var next = Math.ceil(now / LINK_REFRESH_WINDOW_MS) * LINK_REFRESH_WINDOW_MS;
         refreshedLinkExpiryTimer = setTimeout(function () {
-            expireAllRefreshedLinks();
-            renderMessages();
+            // Only when a chip's markup can have changed. This fires on a
+            // wall-clock boundary with no user action behind it, and a
+            // renderMessages destroys and re-creates every <img> in the
+            // conversation: with nothing to expire that is a periodic collapse and
+            // re-decode of every picture on screen, in exchange for no change at
+            // all. (agent.vue's map assignments are already guarded the same way,
+            // so its reactivity does not re-render either.)
+            if (expireAllRefreshedLinks()) renderMessages();
             scheduleNextLinkExpiryBoundary();
         }, Math.max(1, next - now));
     }
@@ -4060,51 +4128,27 @@ import {
     function indexGroupAnchorId(group) {
         return group.anchorId || "";
     }
-    function captureScrollAnchor() {
-        var box = CS.messagesBox;
-        // Pinned to the bottom: the bottom IS the anchor (see restore below).
-        if (!box || CS.stickToBottom) return null;
-        var boxTop = box.getBoundingClientRect().top;
-        var kids = box.children;
-        var fallback = null;
-        for (var i = 0; i < kids.length; i++) {
-            if (!kids[i].getAttribute) continue;
-            var key = kids[i].getAttribute("data-row-key");
-            if (!key) continue; // the sticky "Fetching history..." bar
-            var top = kids[i].getBoundingClientRect().top - boxTop;
-            // Rows still (partly) on screen. The offset from the top of the
-            // viewport is what has to be preserved; it is negative when the row
-            // starts above the fold.
-            if (top + kids[i].offsetHeight <= 0) continue;
-            var cand = { key: key, top: top, scrollTop: box.scrollTop, pos: kids[i].getAttribute("data-row-pos") };
-            if (cand.pos === null) return cand;      // an ordinary row: use it
-            if (!fallback) fallback = cand;          // a group row: only if nothing better
-        }
-        return fallback || { key: null, top: 0, scrollTop: box.scrollTop };
-    }
+    // One implementation, shared with agent.vue (engine/scroll_anchor.ts).
+    // rawFallback, unlike there: this view REBUILDS the list, and the teardown
+    // clamps scrollTop to 0, so when the anchored row cannot be found again the
+    // raw offset is strictly better than the clamp it would be left with.
+    var chatScrollAnchor = createScrollAnchor({
+        getBox: function () { return CS.messagesBox; },
+        isStuck: function () { return !!CS.stickToBottom; },
+        rawFallback: true,
+    });
+    function captureScrollAnchor() { return chatScrollAnchor.capture(); }
     function restoreScrollAnchor(anchor) {
         var box = CS.messagesBox;
         if (!box) return;
         // A reader pinned to the bottom stays pinned. This matters most for the
         // viewport fill: prepending older history onto a list that was too short
         // to scroll would otherwise leave the user staring at the OLDEST message,
-        // because the teardown above clamped scrollTop to 0.
-        if (!anchor || CS.stickToBottom) { box.scrollTop = box.scrollHeight; return; }
-        var boxTop = box.getBoundingClientRect().top;
-        var kids = box.children;
-        for (var i = 0; anchor.key && i < kids.length; i++) {
-            if (!kids[i].getAttribute || kids[i].getAttribute("data-row-key") !== anchor.key) continue;
-            // A collapsed indexing row that MOVED (a new pass re-anchored it to the
-            // file's newest turn) must not be pinned: doing so would drag the
-            // reader along with it, to the bottom of the chat.
-            if (anchor.pos && kids[i].getAttribute("data-row-pos") !== anchor.pos) break;
-            box.scrollTop += (kids[i].getBoundingClientRect().top - boxTop) - anchor.top;
-            return;
-        }
-        // The anchor row is gone (history replaced, its group collapsed) or it
-        // relocated. Falling back to the raw offset is at least no worse than the
-        // clamp to 0 that the teardown would otherwise leave.
-        box.scrollTop = anchor.scrollTop;
+        // because the teardown above clamped scrollTop to 0. The shared anchor
+        // no-ops while pinned (there the bottom IS the anchor), so re-pinning has
+        // to happen at this call site.
+        if (CS.stickToBottom) { box.scrollTop = box.scrollHeight; return; }
+        chatScrollAnchor.restore(anchor);
     }
 
     // Local "you are typing" indicator: while the composer holds text, the list
@@ -4171,6 +4215,13 @@ import {
                 // so a rebuild here must not silently drop it (a later
                 // keystroke cannot restore it; CS.drafting does not change).
                 syncDraftingIndicator();
+                // Every exit that leaves a list on screen has to put the reader
+                // back: this branch rebuilt the box just as thoroughly as the main
+                // one did, and the teardown above clamped scrollTop to 0. An empty
+                // surface conversation is not an empty SCREEN — a chat that is all
+                // background indexing renders one stub row per file, which
+                // overflows easily.
+                restoreScrollAnchor(anchor);
                 return;
             }
             // run:: stub rows render even with no messages (a returning user's
@@ -4182,12 +4233,21 @@ import {
                 for (var ge = 0; ge < emptyEntries.length; ge++) {
                     if (emptyEntries[ge].kind !== "indexing") continue;
                     var sg = emptyEntries[ge].group;
-                    emptyStubEls.push(buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]));
+                    var stubEl = buildIndexGroupEl(sg, !!CS.indexGroupsOpen[sg.key]);
+                    // Keyed exactly as the main path keys a group row. These are
+                    // the ONLY rows on screen in this branch, so without the
+                    // attributes the anchor has nothing to hold and the reader is
+                    // dropped at the top of the file list on every re-render.
+                    stubEl.setAttribute("data-row-key", "g" + sg.runKey);
+                    stubEl.setAttribute("data-row-pos", indexGroupAnchorId(sg));
+                    emptyStubEls.push(stubEl);
                 }
             } catch (e) { /* display-side best effort */ }
             for (var gse = 0; gse < emptyStubEls.length; gse++) CS.messagesBox.appendChild(emptyStubEls[gse]);
             // A first-ever message can be mid-draft under the greeting.
             syncDraftingIndicator();
+            // Same contract as the branch above and as the main exit below.
+            restoreScrollAnchor(anchor);
             return;
         }
         // Rows, not raw messages: a file's many background-indexing turns collapse
@@ -4303,10 +4363,17 @@ import {
         // No node means the message is folded into a collapsed indexing row; its
         // text is not on screen, so there is nothing to patch.
         if (!oldEl || !oldEl.parentNode) return;
-        var newEl = buildMessageEl(CS.messages[idx], idx);
-        if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
-        oldEl.parentNode.replaceChild(newEl, oldEl);
-        CS.messageEls[idx] = newEl;
+        // Bracketed, like renderMessages: this swaps ONE bubble for a taller or
+        // shorter one, and when that bubble is above the viewport (a chip
+        // re-parsed unavailable, a settled turn growing its timestamp) everything
+        // below it slides. renderMessages anchors because it tears the list down;
+        // this anchors because the replacement changes a height in place.
+        chatScrollAnchor.preserve(function () {
+            var newEl = buildMessageEl(CS.messages[idx], idx);
+            if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
+            oldEl.parentNode.replaceChild(newEl, oldEl);
+            CS.messageEls[idx] = newEl;
+        });
         hydrateMessageImagePreviews();
     }
 
@@ -4315,6 +4382,8 @@ import {
         // Preview urls are keyed by project, and an identity-blind cache is how
         // one project's content has reached another project's chat before.
         clearImagePreviewCache(S.projectId || "default");
+        // The reader's place belongs to the conversation that is going away.
+        chatScrollAnchor.forget();
         // Same reason, and the same blast radius: a "this file has no url" mark
         // is keyed by a project-relative storage path.
         for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
@@ -4365,6 +4434,23 @@ import {
             box.addEventListener("wheel", onMessagesWheel, { passive: true });
             box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
             box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
+            // Any image inside the list finishing (or failing) is a height change
+            // nobody asked for, and for a reader scrolled up into history it is a
+            // jump mid-sentence. Delegated and in the CAPTURE phase because `load`
+            // does not bubble; on the box rather than per element because this has
+            // to cover the images the preview machinery never sees - a markdown
+            // `![alt](url)` the model wrote is a plain <img> with a live src, with
+            // no state attribute, no hydration and no hook of its own.
+            box.addEventListener("load", onMessagesImageSettled, true);
+            box.addEventListener("error", onMessagesImageSettled, true);
+            // A late web font re-wraps every bubble at once, with no DOM mutation
+            // and no event any other hook is bound to - and with native scroll
+            // anchoring off (see .bq-messages in widget.css) nothing else would
+            // absorb it. "loadingdone", not document.fonts.ready: ready resolves
+            // once and misses every later arrival.
+            if (document.fonts && document.fonts.addEventListener) {
+                document.fonts.addEventListener("loadingdone", onMessagesFontsSettled);
+            }
             CS.messagesBox = box;
 
             var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Ask anything about: " + (S.serviceName || "your project") });

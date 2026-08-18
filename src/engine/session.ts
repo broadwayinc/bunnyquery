@@ -46,7 +46,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
-import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory } from './history';
+import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
@@ -87,6 +87,13 @@ const WORKER_PASS_ADOPT_ATTEMPTS = [0, 2000, 6000];
 // asking often (an indexing pass takes tens of seconds, and a big file can hold
 // the queue for many minutes), but once the queue looks empty the confirming
 // look is all that stands between the user and their answer.
+// Early point-lookups for a foreground reply, before the flat POLL_INTERVAL tick lands.
+// Widening on purpose: the first two catch a short reply (a greeting, a one-line answer) that
+// would otherwise idle until 3s, and after ~1.7s a reply is long enough that the 3s interval is
+// no longer the dominant cost, so probing further would just add requests. Three probes is at
+// most three extra point lookups per turn, and none of them fire once the reply has landed.
+const EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
+
 const INDEXING_DRAIN_BUSY_POLL_MS = 8000;
 const INDEXING_DRAIN_CONFIRM_POLL_MS = 3000;
 const INDEXING_DRAIN_IDLE_LOOKS = 2;
@@ -595,7 +602,96 @@ export class ChatSession {
 	 *
 	 * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
 	 * poll simply cannot be stopped and is left running — see pausePolling.
+	 *
+	 * (This block documents _trackPoll, further down. The two methods below sit between it
+	 * and its subject.)
 	 */
+	/**
+	 * Foreground poll with an early-probe race.
+	 *
+	 * skapi's poll() is a bare setInterval(fn, latency) with NO check at t=0, so the earliest a
+	 * reply can be observed is one full POLL_INTERVAL (3s) after dispatch. For a long generation
+	 * that granularity is free. For a SHORT one it is nearly pure dead time: a greeting that the
+	 * provider finishes in 1s still waits until the 3s tick, which measured as a large share of a
+	 * 5s "yo" round trip.
+	 *
+	 * So keep the 3s interval as the steady state, and additionally point-look-up the item a few
+	 * times early, on a widening schedule. Whichever answers first wins and the other is stopped.
+	 * The probe uses the csrHistoryItemLookup hook both clients already implement; without it this
+	 * degrades to exactly the old behaviour.
+	 *
+	 * FOREGROUND ONLY. Background indexing polls keep the flat cadence: nobody is watching them,
+	 * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
+	 * the request budget the cap exists to protect.
+	 */
+	attachForegroundPoll(source: any, itemId: string, opts?: any): any {
+		return this._fgPollWithEarlyProbe(source, itemId, opts);
+	}
+
+	private _fgPollWithEarlyProbe(source: any, itemId: string, opts?: any): any {
+		var self = this;
+		// Callbacks ride along on the interval path exactly as before; the probe path below
+		// fires onResponse itself, because a caller that only reacts through the callback
+		// (the history drain does) would otherwise never learn the probe won.
+		var base = source.poll(Object.assign({ latency: POLL_INTERVAL }, opts || {}));
+
+		var lookup = chatEngineConfig().csrHistoryItemLookup;
+		var ident = this.host.getIdentity();
+		var platform = ident && ident.platform;
+		if (!lookup || !itemId || !ident || !ident.projectId
+			|| (platform !== 'claude' && platform !== 'openai')) {
+			return base;
+		}
+
+		var settled = false;
+		var timers: any[] = [];
+		var clearProbes = function () {
+			for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+			timers = [];
+		};
+		var stopBase = base && typeof base.stop === 'function' ? base.stop.bind(base) : null;
+
+		var raced: any = new Promise(function (resolve, reject) {
+			base.then(function (res: any) {
+				if (settled) return;
+				settled = true; clearProbes(); resolve(res);
+			}, function (err: any) {
+				if (settled) return;
+				settled = true; clearProbes(); reject(err);
+			});
+
+			var fullId = buildHistoryItemFullId(platform as 'claude' | 'openai', ident.projectId, itemId);
+			EARLY_PROBE_SCHEDULE_MS.forEach(function (delay) {
+				timers.push(setTimeout(function () {
+					if (settled) return;
+					Promise.resolve(lookup!(fullId, ident.projectId, ident.owner)).then(function (body: any) {
+						if (settled || !body || typeof body !== 'object') return;
+						// Still working: leave it to the next probe or the interval.
+						if (body.status === 'pending' || body.status === 'running') return;
+						// A stop is not a result; the normal stop path handles that.
+						if (isPollStopped(body)) return;
+						settled = true;
+						clearProbes();
+						// The interval would otherwise keep firing against a finished item.
+						if (stopBase) { try { stopBase(); } catch (e) { /* already gone */ } }
+						if (opts && typeof opts.onResponse === 'function') {
+							try { opts.onResponse(body); } catch (e) { /* caller's problem, not the poll's */ }
+						}
+						resolve(body);
+					}, function () { /* probe failures are not errors: the interval is the source of truth */ });
+				}, delay));
+			});
+		});
+
+		// _trackPoll and the cancel path both reach for .stop, so the wrapper has to carry it.
+		raced.stop = function () {
+			settled = true;
+			clearProbes();
+			if (stopBase) stopBase();
+		};
+		return raced;
+	}
+
 	private _trackPoll(id: string, kind: 'fg' | 'bg', p: any): any {
 		var stop = p && typeof p.stop === 'function' ? p.stop.bind(p) : undefined;
 		if (!stop) {
@@ -817,6 +913,73 @@ export class ChatSession {
 	}
 
 	/**
+	 * Give the immediate-send pair the server's id for their turn, the moment the
+	 * dispatch learns it.
+	 *
+	 * WHY THIS EXISTS. An immediate send pushes its user bubble and its
+	 * "Thinking..." placeholder locally, and until now neither ever carried a
+	 * _serverItemId — only the QUEUED path stamped one, off its ack. So for the
+	 * whole life of the turn there was no way to tell the local copy and the
+	 * server's copy of the SAME turn apart, and the history merge fell back to a
+	 * heuristic: rescue the local pair unless the freshly-fetched page happens to
+	 * contain a pending assistant.
+	 *
+	 * That heuristic has a hole exactly one poll interval wide. The server settles
+	 * the request; for up to POLL_INTERVAL the client has not noticed, so
+	 * `state.sending` is still true and the local pair is still on screen — while a
+	 * history fetch issued in that window returns the turn ALREADY SETTLED, with no
+	 * pending assistant in it. The rescue then re-appends the local pair below the
+	 * server's copy (the question, twice), and when the poll finally resolves,
+	 * typewriteLatestReply writes the answer into the rescued placeholder because it
+	 * is the only pending assistant left (the answer, twice). updateHistoryCache
+	 * persists the result, so it survives every later visit.
+	 *
+	 * Navigating away while waiting and coming back is what lands a fetch in that
+	 * window: a remount runs refreshGate -> a fresh first page, at an arbitrary
+	 * moment relative to the 3s poll.
+	 *
+	 * With the id on the bubbles, both clients' rescue loops skip them through the
+	 * dedup they already have (`_serverItemId is in this page`), the reply the
+	 * dispatch caches inherits the id too, and nothing needs a new special case.
+	 *
+	 * Matched by _localId, never by index: a file's indexing rows are spliced in
+	 * above these bubbles while the request is in flight.
+	 */
+	private _stampTurnWithItemId(key: string, userLid: string | undefined, placeholderLid: string | undefined, itemId: string): void {
+		// placeholderLid is undefined for a QUEUED send: that path has no
+		// "Thinking..." bubble of its own until promoteNextQueuedToRunning makes one,
+		// and that copies the user bubble's id itself.
+		if (!itemId) return;
+		var changed = false;
+		var stamp = function (list: ChatMessage[]) {
+			var hit = false;
+			for (var i = 0; i < list.length; i++) {
+				var m = list[i];
+				if (!m || !m._localId) continue;
+				if (m._localId !== userLid && m._localId !== placeholderLid) continue;
+				if (m._serverItemId === itemId) continue;
+				list[i] = Object.assign({}, m, { _serverItemId: itemId });
+				hit = true;
+			}
+			return hit;
+		};
+		changed = stamp(this.state.messages);
+		// And in the cache, which is what a remount renders BEFORE the fetch lands.
+		// A cached copy still missing the id would be rescued by the very merge this
+		// is here to satisfy.
+		var cached = key ? this.aiChatHistoryCache[key] : undefined;
+		if (cached) {
+			var msgs = cached.messages.slice();
+			if (stamp(msgs)) {
+				this.aiChatHistoryCache[key] = {
+					messages: msgs, endOfList: cached.endOfList, startKeyHistory: cached.startKeyHistory,
+				};
+			}
+		}
+		if (changed) this.host.notify();
+	}
+
+	/**
 	 * Land a resolved reply in the history cache of a chat that is NOT currently
 	 * visible, without touching state.messages. Mirrors the cache-only path in
 	 * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
@@ -918,8 +1081,12 @@ export class ChatSession {
 					if (initial.id) {
 						if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
 						dispatchItemId = initial.id;
+						// Hand the id to the caller so the bubbles already on screen can
+						// carry it. An auth-refresh retry re-enters here with a NEW id,
+						// so this reports every time, not once.
+						if (typeof params.onItemId === 'function') params.onItemId(initial.id);
 					}
-					var dp = initial.poll({ latency: POLL_INTERVAL });
+					var dp = self._fgPollWithEarlyProbe(initial, initial.id);
 					if (initial.id) self._trackPoll(initial.id, 'fg', dp);
 					return dp;
 				}
@@ -954,38 +1121,30 @@ export class ChatSession {
 				// if the chatbox unmounted mid-request.
 				delete self.pendingAgentRequests[params.key];
 				if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
-				var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
+				if (dispatchItemId) reply._serverItemId = dispatchItemId;
 
 				// REPLACE the trailing pending "Thinking..." bubble in the cache with
-				// the answer (falling back to append when none is present), regardless
-				// of whether this chat is the currently-visible view. The cache must
-				// NEVER retain a pending "Thinking..." bubble: even when the chatbox is
-				// showing this chat, typewriteLatestReply swaps the bubble only in
-				// state.messages and NEVER re-snapshots the cache — so appending a
-				// duplicate here would leave the cached copy stuck pending, and a later
-				// cache-first remount (agent.vue's loadChatHistory) would re-render that
-				// "Thinking..." forever. typewriteLatestReply still finds this reply (it
-				// reads the latest non-pending assistant from the cache), so replacing is
-				// correct for the visible case too. The next fresh history fetch
-				// reconciles it either way.
-				var msgs = existing.messages.slice();
-				var idx = -1;
-				for (var i = msgs.length - 1; i >= 0; i--) {
-					var m = msgs[i];
-					if (m && m.isPending && m.role === 'assistant' && !m.isBackgroundTask) { idx = i; break; }
-				}
-				if (idx !== -1) {
-					reply._serverItemId = msgs[idx]._serverItemId;
-					msgs[idx] = reply;
-				} else {
-					msgs.push(reply);
-				}
-				self.aiChatHistoryCache[params.key] = {
-					messages: msgs,
-					endOfList: existing.endOfList,
-					startKeyHistory: existing.startKeyHistory,
-				};
+				// the answer, regardless of whether this chat is the currently-visible
+				// view. The cache must NEVER retain a pending "Thinking..." bubble: even
+				// when the chatbox is showing this chat, typewriteLatestReply swaps the
+				// bubble only in state.messages and NEVER re-snapshots the cache — so
+				// leaving a pending copy here would have a later cache-first remount
+				// re-render that "Thinking..." forever. typewriteLatestReply still finds
+				// this reply (it reads the latest non-pending assistant from the cache),
+				// so replacing is correct for the visible case too.
+				//
+				// _applyReplyToCache rather than an inline copy of it. This used to be
+				// its own loop with the same replace-or-append shape MINUS the
+				// dedup-before-append its twin already had, and the append is reachable:
+				// once the local pair carries its server id (_stampTurnWithItemId), a
+				// first-page fetch that lands after the server settles the item
+				// correctly drops both local copies and re-snapshots a cache with no
+				// pending placeholder left to replace. The blind push then wrote the
+				// answer in a SECOND time, with no id on it, and the cache is rendered
+				// verbatim on the next mount — so the fix that stopped the turn
+				// duplicating on screen would have moved the duplicate into the cache.
+				self._applyReplyToCache(params.key, reply, dispatchItemId);
 				return result;
 			});
 		this.pendingAgentRequests[params.key] = run;
@@ -1416,9 +1575,10 @@ export class ChatSession {
 			} else {
 				this.state.messages.push(queuedBubble);
 			}
-			this.host.notify(); this.updateHistoryCache(); this.host.scrollToBottom(true);
+			this.host.notify(); this.updateHistoryCache(); this.scrollForDispatch(stageId);
 
 			var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
+			var capturedQueuedLid = queuedBubble._localId;
 			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner))
 				.then(function (result: any) {
 					// Only ack a bubble that belongs to THIS chat — the search is
@@ -1438,10 +1598,19 @@ export class ChatSession {
 						if (serverId) upd._serverItemId = serverId;
 						self.state.messages[sendingIdx] = upd; self.host.notify();
 					}
+					// And into the CACHE, which the block above never touched: a remount
+					// renders the cache first, so an unstamped copy there is a bubble the
+					// first-page merge cannot recognise as the turn the server just sent
+					// back — which is how a queued turn came back doubled. Keyed to
+					// capturedKey and matched by _localId, so it lands correctly even
+					// when the user has already moved to another project (plain
+					// updateHistoryCache writes under the LIVE key, which by then is a
+					// different chat).
+					if (serverId) self._stampTurnWithItemId(capturedKey, capturedQueuedLid, undefined, serverId);
 					if (result && result.poll && (result.status === 'pending' || result.status === 'running')) {
 						// Track this queued item's poll so a remount/refetch dedups
 						// against it instead of attaching a duplicate history poll.
-						var qp = result.poll({ latency: POLL_INTERVAL });
+						var qp = self._fgPollWithEarlyProbe(result, serverId);
 						if (serverId) self._trackPoll(serverId, 'fg', qp);
 						return qp
 							.then(function (res: any) { if (isPollStopped(res)) return; return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
@@ -1463,7 +1632,10 @@ export class ChatSession {
 		// indexing row spliced in above renumbers it — and a view that keys an id-less
 		// bubble by index would tear it down and rebuild it on every uploaded file.
 		var immediateUser: ChatMessage = { role: 'user', content: composed, _localId: this._newLocalId(), _ts: wallClockNow(), ...(key ? { _ownerKey: key } : {}) };
-		var immediatePlaceholder: ChatMessage = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true, ...(key ? { _ownerKey: key } : {}) };
+		// _localId on the placeholder too. It is how the server item id finds these
+		// two bubbles again once the dispatch reports it (see onItemId below), and
+		// indexing rows spliced in above move both of them, so an index will not do.
+		var immediatePlaceholder: ChatMessage = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true, _localId: this._newLocalId(), ...(key ? { _ownerKey: key } : {}) };
 		var iStage = this._stageIndex(this.state.messages, stageId);
 		if (iStage !== -1) {
 			// Replace IN PLACE — see the queued branch above for why nothing moves.
@@ -1478,7 +1650,7 @@ export class ChatSession {
 			this.state.messages.push(immediateUser);
 			this.state.messages.push(immediatePlaceholder);
 		}
-		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.host.scrollToBottom(true);
+		this.host.notify(); this.updateHistoryCache(); this.state.sending = true; this.scrollForDispatch(stageId);
 
 		// Same filter as the offChat and isQueuedSend paths above. It must drop the
 		// pending flags too: the `isPending` placeholder pushed two lines up is the
@@ -1515,10 +1687,17 @@ export class ChatSession {
 			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, projectId: id.projectId,
 			history: historyForLlm,
 		});
+		var immediateUserLid = immediateUser._localId, immediatePlaceholderLid = immediatePlaceholder._localId;
 		var run = this.dispatchAgentRequest({
 			key: key, projectId: id.projectId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 			systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,
 			extractContent: extractContent, fileUrls: fileUrls,
+			// THE fix for a turn rendering twice after navigate-away-and-back. Until
+			// this existed the immediate-send pair carried no server id for its whole
+			// life (only the QUEUED path stamped one, off its ack), so nothing could
+			// tell the local copy and the server's copy of the same turn apart. See
+			// _stampTurnWithItemId.
+			onItemId: function (itemId: string) { self._stampTurnWithItemId(key, immediateUserLid, immediatePlaceholderLid, itemId); },
 		});
 		// Render the reply into the "Thinking..." bubble whenever the chatbox is
 		// CURRENTLY showing this chat — even after an unmount/remount. The old
@@ -1543,6 +1722,29 @@ export class ChatSession {
 			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
 			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottomIfSticky(true); });
 		});
+	}
+
+	/**
+	 * Scroll for a dispatch that is going out NOW, but never for one arriving late.
+	 *
+	 * A turn with attachments does not dispatch when the user hits Send: it waits out
+	 * its uploads and then its whole indexing chain, which is minutes
+	 * (awaitIndexingDrained). By then the reader has very often scrolled up into
+	 * history to pass the time, and the forcing scrollToBottom yanked them out of it
+	 * — and worse, force-pinned stickToBottom, which no-ops every method on the
+	 * scroll anchor and re-arms the queue-detect poll whose only bail is
+	 * !stickToBottom.
+	 *
+	 * `stageId` is the exact marker for that case: only the attachment path ever
+	 * produces one. The gesture itself was already paid for at stage time, where
+	 * stageOutgoingMessage forces the scroll while the user is still looking at the
+	 * composer. Deliberately NOT gated on "did we find the staged bubble" — a remount
+	 * rebuilds from the cache and the turn is appended rather than replaced, which is
+	 * just as late and just as unrequested.
+	 */
+	private scrollForDispatch(stageId?: string): void {
+		if (stageId) this.host.scrollToBottomIfSticky(true);
+		else this.host.scrollToBottom(true);
 	}
 
 	promoteNextBgQueuedToRunning(): void {
@@ -1700,6 +1902,31 @@ export class ChatSession {
 		else this.state.messages.push(msg);
 	}
 
+	/**
+	 * The server's OWN copy of this turn is already on screen.
+	 *
+	 * A first-page fetch can land between the server settling the item and this
+	 * poll's tick, and now that the local bubbles carry the item id
+	 * (_stampTurnWithItemId) the rescue correctly drops them and renders the
+	 * server's settled pair instead. There is then nothing left to resolve: the
+	 * -1 fallback would push the answer in a SECOND time at the bottom of the list,
+	 * and the positional fallbacks would hijack some other turn's bubble.
+	 *
+	 * The USER bubble counts, not just a settled assistant: an item whose answer is
+	 * empty produces no assistant bubble at all in the mapper, and that variant
+	 * would otherwise still bottom-push "No text response received...". While a turn
+	 * is genuinely live its user bubble is always pending (the queued branch sets
+	 * isPendingQueued, promoteNextQueuedToRunning sets isPendingInProcess), so this
+	 * cannot fire early.
+	 */
+	private _turnAlreadyRendered(serverId?: string): boolean {
+		if (!serverId) return false;
+		return this.state.messages.some(function (m) {
+			return m._serverItemId === serverId &&
+				!m.isPending && !m.isPendingQueued && !m.isPendingInProcess;
+		});
+	}
+
 	onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void {
 		if (serverId) this.historyItemPolls.delete(serverId);
 		// This turn resolved while a DIFFERENT chat is on screen (the user moved to
@@ -1714,6 +1941,10 @@ export class ChatSession {
 			this._applyReplyToCache(ownerKey, offReply, serverId);
 			if (serverId) this.cancelledServerIds.delete(serverId);
 			return;
+		}
+		if (this._turnAlreadyRendered(serverId)) {
+			if (serverId) this.cancelledServerIds.delete(serverId);
+			this.host.notify(); this.updateHistoryCache(); return;
 		}
 		var targetIdx = this.resolveQueuedUserBubble(serverId);
 		if (targetIdx === undefined) { this.host.notify(); this.updateHistoryCache(); return; }
@@ -1756,6 +1987,14 @@ export class ChatSession {
 				: { role: 'assistant', content: getErrorMessage(err), isError: true }, serverId);
 			if (serverId) this.cancelledServerIds.delete(serverId);
 			return;
+		}
+		// Same reason as onQueuedSendResponse: with the server's settled copy already
+		// on screen there is no pending bubble left that belongs to this turn, and
+		// every fallback below would write onto some other turn's — or push a second
+		// bubble at the bottom.
+		if (this._turnAlreadyRendered(serverId)) {
+			if (serverId) this.cancelledServerIds.delete(serverId);
+			this.host.notify(); this.updateHistoryCache(); return;
 		}
 		var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
 		if (isNotExists) {
@@ -3324,30 +3563,18 @@ export class ChatSession {
 				var mappedHasPendingAssistant = mapped.some(function (m: any) {
 					return m.isPending && m.role === 'assistant' && !m.isBackgroundTask;
 				});
+				// One rule, shared with agent.vue's own fetchHistoryPage — see
+				// shouldRescueInFlightMessage for what it decides and why.
 				var rescued: ChatMessage[] = [];
 				for (var ri = 0; ri < self.state.messages.length; ri++) {
 					var mm = self.state.messages[ri];
-					if (mm.isBackgroundTask) continue;
-					// Belongs to a different chat (another project, or another
-					// platform on this one) — it must not be carried onto THIS
-					// chat's freshly-fetched history.
-					if (mm._ownerKey !== undefined && mm._ownerKey !== loadKey) continue;
-					if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
-					if (!mm._serverItemId) {
-						// A staged turn (files still uploading) has no server request
-						// yet, so nothing in `mapped` can stand for it — rescue it
-						// unconditionally. The mappedHasPendingAssistant skip below is
-						// about a turn the server ALREADY has; applying it here would
-						// delete the user's message mid-upload whenever some other
-						// turn happened to be in flight.
-						if (mm._stageId) { rescued.push(mm); continue; }
-						if (mappedHasPendingAssistant) continue;
-						if (mm.isSendingToServer || mm.isPendingQueued || mm.isPendingInProcess || mm.isPending) rescued.push(mm);
-						else if (self.state.sending && mm.role === 'user') {
-							var next = self.state.messages[ri + 1];
-							if (next && !next.isBackgroundTask && next.isPending && !next._serverItemId) rescued.push(mm);
-						}
-					}
+					if (shouldRescueInFlightMessage(mm, {
+						hasServerId: function (sid) { return !!serverIds[sid]; },
+						pageHasPendingAssistant: mappedHasPendingAssistant,
+						sending: !!self.state.sending,
+						next: self.state.messages[ri + 1],
+						loadKey: loadKey,
+					})) rescued.push(mm);
 				}
 				// PRESERVE already-loaded older pages. `mapped` is only page 1, so a
 				// blind replace threw away every page the user had scrolled in. This
@@ -3428,7 +3655,15 @@ export class ChatSession {
 				}
 				keptOlderPages = prependOlder.length > 0 || interleave.length > 0;
 				self.state.messages = prependOlder.length ? prependOlder.concat(page1) : page1;
-				rescued.forEach(function (m) { self.state.messages.push(m); });
+				rescued.forEach(function (m) {
+					// Rescue can now carry a bubble that has a server id, and the
+					// retained-older merge above carries ids too. One turn must not
+					// arrive down both routes.
+					if (m._serverItemId && self.state.messages.some(function (x) {
+						return x._serverItemId === m._serverItemId && x.role === m.role;
+					})) return;
+					self.state.messages.push(m);
+				});
 				if (Object.keys(locallyCancelled).length) {
 					for (var ci = 0; ci < self.state.messages.length; ci++) {
 						var c = self.state.messages[ci];
@@ -3627,8 +3862,12 @@ export class ChatSession {
 					// it up once an attached poll settles and frees a slot.
 					if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
 					var capturedId = item.id;
-					var pp = item.poll({
-						latency: POLL_INTERVAL,
+					var isBg = !!(item._isBgTask || item._isOnBgQueue);
+					// A foreground item here is a reply the user is still waiting on (a reload or a tab
+					// return re-attaches it), so it gets the same early probe as a fresh send. Background
+					// items keep the flat cadence: nobody is watching, and they are what the
+					// MAX_CONCURRENT_BG_POLLS budget exists to protect.
+					var pollOpts = {
 						onResponse: function (response: any) { if (isPollStopped(response)) return; self.handleHistoryItemResolution(capturedId, response, platform); },
 						onError: function (err: any) {
 							self.historyItemPolls.delete(capturedId);
@@ -3669,7 +3908,10 @@ export class ChatSession {
 								self.host.notify(); self.updateHistoryCache();
 							}
 						},
-					});
+					};
+					var pp = isBg
+						? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts))
+						: self._fgPollWithEarlyProbe(item, capturedId, pollOpts);
 					// Anything on the BACKGROUND queue is pausable, not just items whose
 					// prompt text we recognise as an indexing task. _isBgTask vs
 					// _isOnBgQueue is a DISPLAY distinction ("Indexing: file" vs a normal

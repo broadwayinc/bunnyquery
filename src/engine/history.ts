@@ -7,6 +7,7 @@
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
 import { sanitizeAttachmentLinksForHistory } from './links';
+import type { ChatMessage } from './host';
 
 export function filterListByClearHorizon(list: any[], clearedAt: number): any[] {
 	if (!clearedAt) return list;
@@ -731,4 +732,67 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
 	}
 	return { messages: mapped, runningItemIds: runningItemIds };
+}
+
+/* ---- rescuing in-flight bubbles across a first-page refetch ---------------
+ *
+ * A first-page fetch REPLACES the message list, and the list may hold bubbles the
+ * server does not know about yet: a turn whose request is still in flight, a
+ * staged turn whose files are still uploading, a queued turn waiting for its ack.
+ * Those have to survive the replace, and nothing else may.
+ *
+ * The rule lived twice — agent.vue's own fetchHistoryPage and the engine's
+ * loadHistory — and the two had to be edited in lockstep to stay honest. It is one
+ * function now, because the failure mode when they drift is a turn rendered twice
+ * and then PERSISTED into the history cache, where it survives every later visit.
+ */
+
+export interface RescueDecisionContext {
+	/** Is this `_serverItemId` in the page that was just fetched? */
+	hasServerId: (id: string) => boolean;
+	/**
+	 * The fetched page already shows a non-background pending assistant.
+	 *
+	 * Only meaningful for a bubble with NO server id, where it is the sole
+	 * available answer to "is this turn already represented?". For a bubble that
+	 * HAS one, hasServerId answers exactly the same question exactly, and applying
+	 * this on top of it would drop an in-flight turn whose server copy simply is
+	 * not in the page that was fetched.
+	 */
+	pageHasPendingAssistant: boolean;
+	/** state.sending: an immediate send is in flight for this chat. */
+	sending: boolean;
+	/** The bubble directly after this one in the local list. */
+	next?: ChatMessage | null;
+	/** The chat this fetch is FOR. A bubble stamped for another must not cross. */
+	loadKey?: string;
+}
+
+export function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecisionContext): boolean {
+	if (!m) return false;
+	// Background indexing bubbles come back through their own merge.
+	if (m.isBackgroundTask) return false;
+	// Never carry another project's (or another platform's) bubbles onto this chat.
+	if (m._ownerKey !== undefined && ctx.loadKey !== undefined && m._ownerKey !== ctx.loadKey) return false;
+	// The page carries a fresher copy of this exact turn.
+	if (m._serverItemId && ctx.hasServerId(m._serverItemId)) return false;
+	// A staged turn has no server request yet, so nothing in the page can stand for
+	// it. Unconditional: applying the pending-assistant test here would delete the
+	// user's message mid-upload whenever some other turn happened to be in flight.
+	if (m._stageId) return true;
+	if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
+	// In flight by its own flags, id or no id. The immediate-send pair is stamped
+	// with its server id as soon as the dispatch reports one, and that id is there
+	// to let the check above recognise the server's copy — not to disqualify the
+	// bubble from being kept when there is no such copy.
+	if (m.isSendingToServer || m.isPendingQueued || m.isPendingInProcess || m.isPending) return true;
+	// An immediate-send user bubble carries no flags of its own (its in-flight-ness
+	// lives in state.sending); what identifies it is its own unanswered placeholder
+	// directly below it.
+	if (ctx.sending && m.role === 'user') {
+		var next = ctx.next;
+		if (!next || next.isBackgroundTask || !next.isPending) return false;
+		return next._serverItemId === undefined || next._serverItemId === m._serverItemId;
+	}
+	return false;
 }

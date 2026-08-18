@@ -656,12 +656,37 @@ export function classifyInlineLink(
  * the placeholder href), so marking writes one key and the lookup tries all of
  * them.
  */
+/**
+ * Unicode form is not stable across the places a storage path travels through.
+ *
+ * macOS hands the browser a DECOMPOSED (NFD) filename, so a Korean name like
+ * 운전면허-김대현.jpg arrives as 24 codepoints where the composed (NFC) form is 12.
+ * Nothing in this engine normalized either way, so the SAME file could be keyed under
+ * two different strings depending on which path it travelled: a mark left by a failed
+ * mint under one form would never be cleared by a successful load under the other, and
+ * the chip stayed greyed out as "(unavailable)" forever.
+ *
+ * NFC is the canonical choice: it is what the Unicode standard recommends for
+ * interchange, and it is the shorter, more common form on the wire.
+ */
+export function canonicalizePathForm(value: string): string {
+	if (!value) return value;
+	try { return value.normalize('NFC'); } catch (e) { return value; }
+}
+
 export function linkUnavailableKeyForPath(remotePath: string): string {
-	return 'path:' + (remotePath || '');
+	// Canonicalized so the NFC and NFD spellings of one file share ONE key.
+	return 'path:' + canonicalizePathForm(remotePath || '');
 }
 
 export function linkUnavailableKeyForHref(href: string): string {
-	return 'href:' + (href || '');
+	// An `_expired_.url` placeholder carries the storage path percent-encoded, so NFC and
+	// NFD spellings of one file produce two different href strings and therefore two
+	// different keys. Route those through the path key instead, so a file has ONE key
+	// however it is spelled and whichever carrier it arrived on.
+	var carried = readExpiredAttachmentHref(href);
+	if (carried) return linkUnavailableKeyForPath(carried);
+	return 'href:' + canonicalizePathForm(href || '');
 }
 
 /**
@@ -676,10 +701,13 @@ export function linkUnavailableKeyForHref(href: string): string {
  */
 export function linkUnavailableKeysForPath(remotePath: string): string[] {
 	if (!remotePath) return [];
-	return [
+	var keys = [
 		linkUnavailableKeyForPath(remotePath),
 		linkUnavailableKeyForHref(buildDisplayExpiredAttachmentHref(remotePath)),
 	];
+	// Both now canonicalize to the same key for a placeholder href, so drop the duplicate
+	// rather than marking and clearing the same entry twice.
+	return keys.filter(function (k, i) { return keys.indexOf(k) === i; });
 }
 
 export function isLinkUnavailable(

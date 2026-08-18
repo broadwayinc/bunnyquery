@@ -113,7 +113,15 @@ export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLi
 		'<img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '"' +
 		' data-bq-img-path="' + escapeInlineHtml(link.remotePath || '') + '"' +
 		' data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : '') + '"' +
-		' loading="lazy" decoding="async">' +
+		// decoding="async" but NOT loading="lazy". Lazy guarantees the bytes arrive
+		// exactly when the image is near the viewport, which is the one case the
+		// scroll anchor deliberately declines to compensate for (growth at or below
+		// the fold happened on screen, under a line the reader is looking at) — so it
+		// shoved up to 320px of text under their eyes on every scroll toward it. It
+		// saved no mint either: hydration mints for every preview in the DOM
+		// regardless of viewport. It was also what turned the widget's per-notify
+		// teardown into a 13x amplifier (6224px vs 450px measured).
+		' decoding="async">' +
 		// Minting the url is a network round trip before the image even starts
 		// downloading, so the wait is real and needs a state. Inline load, so the
 		// dot trail, never the jumping bunny. CSS hides it the moment the <img>

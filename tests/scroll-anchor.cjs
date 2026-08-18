@@ -1,0 +1,597 @@
+/**
+ * Holding the reader's place while the chat mutates underneath them.
+ *
+ * Observed failure: a reader scrolled up into history, reading. An older page
+ * lands, or a poll resolves, or an image preview finishes decoding somewhere
+ * above them, and the sentence they were on slides away. The browser is doing
+ * exactly what it is supposed to (keep scrollTop), which is why every one of
+ * those is a jump: the content ABOVE the viewport got taller or shorter.
+ *
+ * The fake DOM below is deliberately dumb: rows are boxes with a height, the box
+ * has a scrollTop, and a row's client rect is derived from the two. That is the
+ * whole of the geometry the anchor uses, so it is enough to reproduce every case
+ * (a prepend, an in-place growth, an image expanding, a row relocating) without
+ * a browser.
+ *
+ * Run: node ./tests/scroll-anchor.cjs
+ */
+
+const assert = require('assert');
+const { createScrollAnchor } = require('../dist/engine.cjs');
+
+/* ---- a scroll container that behaves like the real one ------------------- */
+
+function row(key, height, pos) {
+    return {
+        _key: key === null ? null : String(key),
+        _pos: pos === undefined ? null : pos,
+        _h: height,
+        _box: null,
+        get offsetHeight() { return this._h; },
+        getAttribute(name) {
+            if (name === 'data-row-key') return this._key;
+            if (name === 'data-row-pos') return this._pos;
+            return null;
+        },
+        get parentNode() { return this._box; },
+        getBoundingClientRect() {
+            const box = this._box;
+            // Rows stack from the top of the content; the box's own top edge is
+            // an arbitrary constant (BOX_TOP) so the code cannot get away with
+            // treating viewport and content coordinates as the same thing.
+            let y = box._top - box.scrollTop;
+            for (const kid of box.children) {
+                if (kid === this) break;
+                y += kid._h;
+            }
+            return { top: y };
+        },
+    };
+}
+
+const BOX_TOP = 100;   // where the message box sits on the page
+function makeBox(rows, clientHeight) {
+    const box = {
+        _top: BOX_TOP,
+        children: [],
+        clientHeight: clientHeight,
+        scrollTop: 0,
+        get scrollHeight() { return this.children.reduce((n, r) => n + r._h, 0); },
+        getBoundingClientRect() { return { top: this._top }; },
+        set(rows) {
+            // Detached rows must stop claiming this box as their parent, exactly
+            // as a real removal nulls parentNode. The anchor caches the element it
+            // pinned and re-checks that it is still in the box before trusting it,
+            // so a fake that keeps the link would let a stale node answer.
+            for (const r of this.children) if (rows.indexOf(r) === -1) r._box = null;
+            this.children = rows;
+            for (const r of rows) r._box = this;
+        },
+    };
+    box.set(rows);
+    return box;
+}
+
+const results = [];
+function test(name, fn) {
+    try { fn(); results.push([true, name]); }
+    catch (err) { results.push([false, name, err && err.message]); }
+}
+
+// The reader's viewport, expressed the way a reader experiences it: which row is
+// under the top edge of the box, and how far into it they are.
+function topRowKeyAndOffset(box) {
+    for (const r of box.children) {
+        const top = r.getBoundingClientRect().top - box._top;
+        if (top + r._h > 0) return { key: r._key, top: top };
+    }
+    return null;
+}
+
+/* ---- the cases -----------------------------------------------------------*/
+
+test('an older page prepended above the reader does not move the reader', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    let stuck = false;
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => stuck });
+    box.scrollTop = 250;                       // reading 50px into row b
+    const before = topRowKeyAndOffset(box);
+    assert.strictEqual(before.key, 'b');
+
+    anchor.preserve(() => box.set([row('old1', 400), row('old2', 400), ...box.children]));
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, 'b');
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 250 + 800);
+});
+
+test('a ROW growing above the reader is absorbed by hold()', () => {
+    const img = row('img', 0);                 // src-less preview: display:none
+    const box = makeBox([row('a', 200), img, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    anchor.remember();                         // what the scroll handler does
+    const before = topRowKeyAndOffset(box);
+    assert.strictEqual(before.key, 'b');
+
+    img._h = 320;                              // the picture paints
+    anchor.hold();                             // what the load event does
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, 'b');
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 570);
+});
+
+test('a ROW shrinking above the reader is absorbed too', () => {
+    const img = row('img', 320);
+    const box = makeBox([row('a', 200), img, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 570;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    img._h = 0;                                // the src is dropped for a retry
+    anchor.hold();
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('several rows settling one after another each start from a valid anchor', () => {
+    const i1 = row('i1', 0), i2 = row('i2', 0);
+    const box = makeBox([i1, i2, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 50;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+    assert.strictEqual(before.key, 'b');
+
+    i1._h = 300; anchor.hold();
+    i2._h = 150; anchor.hold();
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, 'b');
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('a bracketed restore re-arms hold(), so a later image still compensates', () => {
+    // The widget's real sequence: renderMessages tears the list down and rebuilds
+    // it with src-less (zero-height) previews, restores the anchor against THAT
+    // layout, and only then hydrates. Without restore() re-stamping the
+    // remembered anchor, every image that decodes afterwards would find a stale
+    // scrollTop and be skipped.
+    const box = makeBox([row('a', 200), row('img', 320), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false, rawFallback: true });
+    box.scrollTop = 570;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+    assert.strictEqual(before.key, 'b');
+
+    const rebuilt = [row('a', 200), row('img', 0), row('b', 200), row('c', 200)];
+    anchor.preserve(() => { box.scrollTop = 0; box.set(rebuilt); });   // teardown clamps to 0
+    assert.strictEqual(topRowKeyAndOffset(box).key, 'b');
+
+    rebuilt[1]._h = 320;                       // the warm-cache image decodes
+    anchor.hold();
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, 'b');
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 570);
+});
+
+test('hold() does not drag the reader back after they scroll themselves', () => {
+    const img = row('img', 0);
+    const box = makeBox([row('a', 200), img, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    anchor.remember();
+
+    box.scrollTop = 40;                        // the reader scrolls up; no remember() yet
+    img._h = 320;
+    anchor.hold();                             // must re-measure, not restore
+
+    assert.strictEqual(box.scrollTop, 40);
+});
+
+test('nothing happens while the reader is pinned to the bottom', () => {
+    const img = row('img', 0);
+    const box = makeBox([row('a', 200), img, row('b', 200)], 300);
+    let stuck = true;
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => stuck });
+    box.scrollTop = 100;
+    anchor.remember();
+    assert.strictEqual(anchor.capture(), null);
+    img._h = 320;
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 100);    // scrollToBottom* owns this case
+});
+
+test('the "Fetching history..." bar taking height at the top is absorbed', () => {
+    // Sticky, therefore still in flow, therefore it really does add height above
+    // every row. It carries no data-row-key, so it is never anchored ON.
+    const bar = row(null, 40);
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    anchor.preserve(() => box.set([bar, ...box.children]));
+
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 290);
+});
+
+test('a collapsed indexing row that RELOCATED is not pinned', () => {
+    // data-row-pos names the turn the row currently renders at. When an older
+    // page moves the run's start, the row itself moves; pinning it would drag the
+    // reader to wherever the run now begins. The group row is last here, which is
+    // what "nothing better on screen" means: an ordinary row after it would win.
+    const grp = row('g', 30, 'turn-9');
+    const box = makeBox([row('a', 200), grp], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 210;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'g');
+    assert.strictEqual(a.pos, 'turn-9');
+
+    grp._pos = 'turn-2';                       // re-anchored to the run's first pass
+    box.set([row('old', 500), box.children[0], grp]);
+    anchor.restore(a);
+
+    // Not dragged along to wherever the run now starts. The row cannot be held,
+    // but the page that moved it is 500px of new content ABOVE the reader, and
+    // paying that keeps them on the same content they were looking at.
+    assert.strictEqual(box.scrollTop, 710);
+});
+
+test('the anchor is the topmost VISIBLE row, not the first ordinary row anywhere', () => {
+    // A screenful of collapsed indexing rows with the conversation below it: the
+    // preference for an ordinary row must not walk past the viewport to find one.
+    const rows = [];
+    for (let i = 0; i < 12; i++) rows.push(row('g' + i, 30, 'turn-' + i));
+    rows.push(row('msg', 400));
+    const box = makeBox(rows, 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 0;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'g0');
+    assert.strictEqual(a.pos, 'turn-0');
+});
+
+test('an EMPTY data-row-pos is "cannot tell", not a relocation', () => {
+    // A run:: stub has no anchorId until its real group loads, so it renders
+    // data-row-pos="". Reading that as a position made every stub -> real-group
+    // handoff look like the row had moved, and aborted the anchor — on a fresh open
+    // that is a background resolution the reader hits every time.
+    const stub = row('g', 30, '');
+    const box = makeBox([row('a', 200), stub], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 210;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'g');
+
+    stub._pos = 'turn-2';          // the real group arrives and names its turn
+    stub._h = 60;                  // and the row grows a line
+    anchor.restore(a);
+    assert.strictEqual(box.scrollTop, 210);  // held, not abandoned
+});
+
+test('a row that had a position and now reports none is not treated as moved either', () => {
+    const grp = row('g', 30, 'turn-9');
+    const box = makeBox([row('a', 200), grp], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 210;
+    const a = anchor.capture();
+    grp._pos = '';
+    anchor.restore(a);
+    assert.strictEqual(box.scrollTop, 210);
+});
+
+test('an ordinary row inside the viewport still wins over a group row above it', () => {
+    const box = makeBox([row('g', 30, 'turn-9'), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 0;
+    assert.strictEqual(anchor.capture().key, 'b');
+});
+
+test('a row that RELOCATED across the conversation is not followed', () => {
+    // A background refetch merges a run's passes into the middle of page 1, which
+    // moves the anchored bubble thousands of pixels with almost no new content.
+    // Following it would carry the reader clean across the chat.
+    const moved = row('m', 100);
+    const box = makeBox([row('a', 300), moved, row('c', 300)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 300;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'm');
+
+    // Same total height give or take, but the row is now 5000px down.
+    box.set([row('a', 300), row('filler', 5000), moved, row('c', 300)]);
+    anchor.restore(a);
+
+    // 5000 of growth is paid as a prepend (that is what it looks like from here),
+    // never the row's own 5000px relocation on top of it.
+    assert.strictEqual(box.scrollTop, 300 + 5000);
+});
+
+test('rows entirely above the fold are skipped', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 400;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'c');
+    assert.strictEqual(a.top, 0);
+});
+
+test('a vanished anchor row still gets the prepend paid for it', () => {
+    // The pager's own page can carry the pass that re-identifies a collapsed row,
+    // so the row the reader was held by is not there afterwards. Missing this
+    // costs them a whole page of history in one jump.
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    const a = anchor.capture();
+    box.set([row('older', 700), row('x', 200), row('y', 200), row('z', 200)]);
+    anchor.restore(a);
+    assert.strictEqual(box.scrollTop, 950);
+});
+
+test('rawFallback restores the raw offset when nothing was gained', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const withFallback = createScrollAnchor({ getBox: () => box, isStuck: () => false, rawFallback: true });
+    box.scrollTop = 250;
+    const a = withFallback.capture();
+    box.scrollTop = 0;                                    // a teardown clamps to 0
+    box.set([row('x', 200), row('y', 200), row('z', 200)]);
+    withFallback.restore(a);
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('without rawFallback, and nothing gained, a missing anchor row is left alone', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const plain = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    const a = plain.capture();
+    box.set([row('x', 200), row('y', 200), row('z', 200)]);
+    plain.restore(a);
+    // Vue patches in place, so the browser already kept a sane position and
+    // re-imposing a stale offset would be worse than nothing.
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('forget() drops the reader place so the next chat starts clean', () => {
+    const img = row('img', 0);
+    const box = makeBox([row('a', 200), img, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    anchor.remember();
+    anchor.forget();
+    img._h = 320;
+    anchor.hold();                             // re-measures rather than restoring
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('a growing bubble ABOVE the reader is absorbed; one below is not touched', () => {
+    const above = row('a', 100), below = row('c', 100);
+    const box = makeBox([above, row('b', 200), below], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 150;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    above._h = 260;                            // a compact bubble hydrates
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 310);
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+
+    below._h = 900;                            // growth below costs nothing
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 310);
+});
+
+/* ---- absorb(): one element's own resize, including inside the anchored row --*/
+
+// An <img> living inside a row. Its rect is the row's top plus whatever sits
+// above it in that row, and the row's height grows with it.
+function imgIn(box, rowEl, offsetInRow) {
+    return {
+        _h: 0,
+        get offsetHeight() { return this._h; },
+        getBoundingClientRect() {
+            return { top: rowEl.getBoundingClientRect().top + offsetInRow };
+        },
+        grow(h) { rowEl._h += h - this._h; this._h = h; },
+    };
+}
+
+test('an image INSIDE the anchored row, above the fold, is absorbed', () => {
+    // The case the row anchor structurally cannot see: the reader is partway
+    // through a reply taller than the viewport, so that reply IS the anchor row,
+    // and a picture higher up inside it moves every line they are reading without
+    // moving the row's own top by a pixel.
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    anchor.absorb(img);                        // first sight: record 0, change nothing
+    box.scrollTop = 600;                       // reading 600px into the reply
+    anchor.remember();
+    assert.strictEqual(anchor.capture().key, 'tall');
+
+    img.grow(320);
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 600);    // the row's top never moved: hold() is blind here
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 920);    // absorb sees the element itself
+});
+
+test('an image BELOW the fold is left alone', () => {
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 700);
+    anchor.absorb(img);
+    box.scrollTop = 100;                       // the image is well below the reader
+    anchor.remember();
+
+    img.grow(320);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 100);
+});
+
+test('an image whose TOP is above the fold is absorbed even if it now straddles', () => {
+    // A resize never moves the element's own top, so what decides is whether that
+    // top is above the fold: everything below it (all of the reader's screen)
+    // slid by exactly delta, however tall the element ended up.
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    anchor.absorb(img);
+    box.scrollTop = 200;                       // the image starts above the fold
+    anchor.remember();
+
+    img.grow(320);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 520);
+});
+
+test('an image starting exactly at the fold is left alone', () => {
+    // It grows on screen, under a line the reader is looking at. Moving them is
+    // what would be the jump.
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    anchor.absorb(img);
+    box.scrollTop = 100;                       // image top lands exactly on boxTop
+    anchor.remember();
+
+    img.grow(320);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 100);
+});
+
+test('an image never seen before counts as zero (markdown images have no hook)', () => {
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    box.scrollTop = 600;
+    anchor.remember();
+
+    img.grow(260);
+    anchor.absorb(img);                        // straight from the load event
+    assert.strictEqual(box.scrollTop, 860);
+});
+
+test('a collapsing image (src dropped for a retry) is absorbed the other way', () => {
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    img.grow(320);
+    anchor.absorb(img);
+    box.scrollTop = 700;
+    anchor.remember();
+
+    img.grow(0);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 380);
+});
+
+test('absorb keeps the remembered anchor usable afterwards', () => {
+    // absorb WRITES scrollTop, which hold() would otherwise read as "the reader
+    // scrolled" and answer by throwing the anchor away.
+    const imgRow = row('imgrow', 0);
+    const box = makeBox([imgRow, row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, imgRow, 0);
+    anchor.absorb(img);
+    box.scrollTop = 50;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    img.grow(300);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 350);
+
+    // Something non-image now changes above, on the anchor that absorb just
+    // re-stamped: a stale scrollTop here would make hold() discard it instead.
+    const laterImg = imgIn(box, imgRow, 0);
+    laterImg._h = 0;
+    imgRow._h += 120; anchor.hold();           // the row itself grows
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 470);
+});
+
+test('a later hold() does not undo an absorb inside the anchored row', () => {
+    // The anchored row's own top never moves when something inside it resizes, so
+    // an anchor left holding its pre-absorb offset would faithfully scroll the
+    // correction back off again on the next settle.
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    const img = imgIn(box, tall, 100);
+    anchor.absorb(img);
+    box.scrollTop = 600;
+    anchor.remember();
+
+    img.grow(320);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 920);
+
+    anchor.hold();
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 920);
+});
+
+test('absorb does nothing while the reader is pinned to the bottom', () => {
+    const tall = row('tall', 900);
+    const box = makeBox([tall], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => true });
+    const img = imgIn(box, tall, 100);
+    anchor.absorb(img);
+    box.scrollTop = 600;
+    img.grow(320);
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 600);
+});
+
+test('a no-op update does not write scrollTop (sub-pixel noise is not a jump)', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    anchor.remember();
+    let writes = 0;
+    let raw = box.scrollTop;
+    Object.defineProperty(box, 'scrollTop', {
+        get() { return raw; },
+        set(v) { writes++; raw = v; },
+    });
+    anchor.hold();
+    anchor.hold();
+    assert.strictEqual(writes, 0);
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+/* ---- report --------------------------------------------------------------*/
+
+let failed = 0;
+for (const [ok, name, msg] of results) {
+    console.log((ok ? 'ok   ' : 'FAIL ') + ' ' + name + (ok ? '' : '\n      ' + msg));
+    if (!ok) failed++;
+}
+console.log('\n' + (results.length - failed) + '/' + results.length + ' passed');
+process.exit(failed ? 1 : 0);

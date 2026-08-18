@@ -650,6 +650,14 @@
     position: relative;
     overflow-y: auto;
     overflow-x: hidden;
+    /* Exactly ONE compensator. Blink and Gecko run their own scroll anchoring on
+       this scroller, and it fires at the very layout the JS anchor's absorb()
+       forces when it reads offsetHeight - so an image growing above the fold was
+       corrected by the browser and then paid for a second time in JS. Measured on
+       one background re-render: 6224px of jump with both live, 0 with this.
+       Deleting absorb() instead is not an option (15000px of drift on WebKit,
+       which has no native anchoring at all). See engine/scroll_anchor.ts. */
+    overflow-anchor: none;
     flex: 1;
     min-height: 0;
     padding: 0.25rem 1.25rem;

@@ -920,6 +920,20 @@ declare function classifyInlineLink(full: string, groups: Array<string | undefin
  * the placeholder href), so marking writes one key and the lookup tries all of
  * them.
  */
+/**
+ * Unicode form is not stable across the places a storage path travels through.
+ *
+ * macOS hands the browser a DECOMPOSED (NFD) filename, so a Korean name like
+ * 운전면허-김대현.jpg arrives as 24 codepoints where the composed (NFC) form is 12.
+ * Nothing in this engine normalized either way, so the SAME file could be keyed under
+ * two different strings depending on which path it travelled: a mark left by a failed
+ * mint under one form would never be cleared by a successful load under the other, and
+ * the chip stayed greyed out as "(unavailable)" forever.
+ *
+ * NFC is the canonical choice: it is what the Unicode standard recommends for
+ * interchange, and it is the shorter, more common form on the wire.
+ */
+declare function canonicalizePathForm(value: string): string;
 declare function linkUnavailableKeyForPath(remotePath: string): string;
 declare function linkUnavailableKeyForHref(href: string): string;
 /**
@@ -1040,6 +1054,26 @@ interface ImagePreviewContext {
     onLoad?: (remotePath: string) => void;
     /** A preview gave up. The caption chip is now the whole answer. */
     onError?: (remotePath: string, err: unknown) => void;
+    /**
+     * This element's box just changed size, and nothing asked it to.
+     *
+     * Fires at the points where a preview resizes with NO DOM event of its own to
+     * announce it: the src lands (a src-less <img> is hidden, so this is where it
+     * starts taking space), and the src is dropped for a retry, or a mint fails
+     * outright, where an already-painted picture collapses back to nothing.
+     * `load` and `error` are deliberately NOT routed through here — both views
+     * listen for those on the message box itself, which is also how they cover the
+     * images this module never sees, a markdown `![alt](url)` among them.
+     *
+     * Each of these slides everything below the element, and for a reader scrolled
+     * up into history that is a jump in the middle of a sentence. onLoad cannot
+     * stand in for it: both views answer that with a scroll-to-bottom-if-pinned,
+     * which by definition does nothing for the reader this hurts.
+     *
+     * Views wire this to their scroll anchor's absorb(). Called SYNCHRONOUSLY, so
+     * the measurement it takes is the one the reader is looking at.
+     */
+    onLayoutChange?: (img: PreviewImageEl, remotePath: string) => void;
 }
 /**
  * Drop cached preview urls, for one project or all of them.
@@ -1091,6 +1125,9 @@ declare function markImagePreviewStale(scope: string, remotePath: string): void;
  * querySelectorAll to an IntersectionObserver without an engine change.
  */
 declare function hydrateImagePreviews(imgs: ArrayLike<PreviewImageEl>, ctx: ImagePreviewContext): void;
+declare var PREVIEW_LAYOUT_BOX_SELECTOR: string;
+/** The element whose height a preview's own transitions actually change. */
+declare function previewLayoutBox<T extends PreviewImageEl>(img: T): T;
 
 /**
  * Chat timestamp formatting, shared so agent.vue and the widget render an
@@ -1396,217 +1433,6 @@ declare function getChatHistory(params: {
 declare function buildHistoryItemFullId(platform: 'claude' | 'openai', service: string, itemId: string): string;
 
 /**
- * History mapping (pure). Moved verbatim from the chatbox. The clear-horizon
- * timestamp and the "Indexing: …" display label are INJECTED (clearedAt param,
- * formatIndexingLabel callback) so the engine touches neither localStorage nor
- * view-specific display formatting. projectId is passed for link sanitization.
- */
-
-declare function filterListByClearHorizon(list: any[], clearedAt: number): any[];
-declare function normalizeTextContent(content: any): string;
-declare function extractLastUserTextFromRequest(requestBody: any): string;
-/** The two openings an indexing prompt can have. A bg-queue item that starts with
- *  neither is an ordinary chat that happened to be routed onto that queue. */
-declare function isIndexingRequestText(userText: any): boolean;
-type IndexingRequestRef = {
-    name: string;
-    path?: string;
-    mime?: string;
-    size?: number;
-    /** A CONTINUE pass rather than the run's first. */
-    continued: boolean;
-};
-/**
- * The file an indexing prompt is about, read back out of the prompt itself.
- *
- * The prompt is the only description of the pass that survives on the server, so
- * this is how BOTH a history rebuild and a worker-minted pass the client never
- * dispatched (ChatSession._adoptWorkerIndexingPasses) recover the file. Shared so
- * the two produce the same `_indexFile`, which is what makes them group together.
- */
-declare function parseIndexingRequestText(userText: any): IndexingRequestRef | null;
-/**
- * One bounded look at the background-indexing queue: which files still have a
- * pass pending or running? This is the same negative signal ChatSession's
- * display layer relies on - for a worker-driven (auto_continue) run, only the
- * queue can say the run is over, because the worker enqueues continuation
- * passes the client never dispatched.
- *
- * Returns every storage path AND file name found on live passes (both, because
- * older prompts may lack the storage-path line), plus `checked`: false when a
- * page came back full, in which case absence from `keys` proves nothing and
- * the caller must keep whatever state it already had.
- *
- * SCOPE: the probed queue is "<userId>-bg" - THIS user's dispatches only. A
- * chain launched by another collaborator or a widget end-user lives on their
- * queue and is invisible here, so "idle" must never be read as "nobody is
- * indexing this file", only as "this user's runs are over". The durable done::
- * marker (indexDoneUniqueId) is the cross-user signal.
- */
-declare function fetchLiveIndexingKeys(params: {
-    service: string;
-    owner: string;
-    platform: 'claude' | 'openai';
-    /** Same value the dispatch used - see bgIndexingQueueName. */
-    userId?: string;
-}): Promise<{
-    keys: Set<string>;
-    checked: boolean;
-    at: number;
-}>;
-/** Test hook: drop split-fetch state (all keys, or one). */
-declare function __resetSplitHistoryState(key?: string): void;
-type SplitHistoryResult = {
-    list: any[];
-    endOfList: boolean;
-    startKeyHistory: any[];
-    /** True when this chat had never been walked in this session — the first
-     *  paint. Consumers gate the "Loading indexing history" hint on it: a
-     *  mid-walk tab return restarts the walk for cursor safety but must stay
-     *  silent (flashing the hint on every return was the reported bug). */
-    firstLoad?: boolean;
-    /** Present only when `deferBg` was requested AND bg work remains: resolves
-     *  with the stub batch fetched in the background (the per-key lock is held
-     *  until it settles, so no other history call can interleave). The caller
-     *  merges the batch by timestamp — the same path older pages use. */
-    bgPending?: Promise<{
-        list: any[];
-        endOfList: boolean;
-    }>;
-};
-declare function getSplitChatHistory(params: {
-    service: string;
-    owner: string;
-    platform: 'claude' | 'openai';
-    userId?: string;
-}, fetchOptions: Record<string, any>, 
-/** Test seam: replaces getChatHistory. Not for production callers. */
-_fetchImpl?: typeof getChatHistory): Promise<SplitHistoryResult>;
-type MapHistoryOptions = {
-    clearedAt: number;
-    projectId: string;
-    /** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
-    formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
-};
-declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions): {
-    messages: any[];
-    runningItemIds: string[];
-};
-
-/**
- * Keep older history REACHABLE by paging until the message box actually gains
- * something to scroll to.
- *
- * Older history is paged in by one trigger only: the user scrolling to the top
- * of the message box. That trigger has two ways to die, and collapsed indexing
- * rows cause both:
- *
- *   1. The box never scrolls. A file's every indexing pass (the first plus every
- *      CONTINUE pass, request AND response bubble each) folds into ONE row, so a
- *      full history page — twenty-plus messages — can render as a single line.
- *      Content shorter than the viewport fires no scroll event, so page 2 is
- *      never requested and any conversation the user had before that upload is
- *      permanently out of reach.
- *   2. The fetched page adds no height. A page that is entirely the same file's
- *      earlier passes joins the collapsed row already on screen and renders
- *      nothing new. The user, sitting at scrollTop 0, scrolls up again — and
- *      because the position never changed, no further scroll event fires.
- *
- * Both are the same shape: fetch, re-measure, and keep going until the user
- * genuinely gained reachable content, history ran out, or the pager stopped
- * advancing. `isSatisfied` is what differs between the two (can the box scroll
- * at all / did it grow), so the loop below takes it as a predicate.
- *
- * DOM-free like the rest of the engine — the caller supplies the measurement and
- * awaits its own render before measuring, so agent.vue and the widget run the
- * identical loop over their own pagers.
- */
-/** Overflow (px) that counts as "the user can scroll here". Comfortably more
- *  than the 60px top threshold that triggers the next page, so a filled box has
- *  real room to scroll rather than sitting one pixel from the trigger. */
-declare const HISTORY_FILL_SLACK_PX = 64;
-/** Pages one fill pass will request before giving up. Reached only by a chat
- *  whose history really is dozens of pages of one file's indexing passes; the
- *  cap exists so a pager that stops advancing can never spin forever. */
-declare const MAX_HISTORY_FILL_PAGES = 24;
-type FillHistoryViewportOptions = {
-    /** The user has reachable content and paging can stop. Called AFTER the
-     *  caller's own render has settled (nextTick / rAF), since only the caller
-     *  knows when its view has painted — hence the allowance for a promise. */
-    isSatisfied: () => boolean | Promise<boolean>;
-    /** All history is loaded — nothing left to page in. */
-    isEndOfList: () => boolean;
-    /** A history request is already in flight. Waited out, not treated as a stop
-     *  condition: a background first-page refresh (the queue-detect tick fires one
-     *  every couple of seconds while a file is indexing) would otherwise swallow
-     *  the user's scroll-up entirely, and scrolling up again from scrollTop 0
-     *  produces no second event to retry with. */
-    isLoading: () => boolean;
-    /** Messages currently loaded. Used to detect a page that added nothing, which
-     *  means the pager is not advancing and looping would never terminate. */
-    messageCount: () => number;
-    /** Fetch ONE older page (the caller's own fetchMore path, scroll-restore and
-     *  all). Return `false` when the request was NOT issued (the caller's own
-     *  single-flight guard swallowed it) so the loop retries instead of reading
-     *  the unchanged message count as an exhausted pager. Anything else, including
-     *  undefined, means it was attempted. */
-    fetchOlder: () => Promise<boolean | void | any>;
-    /** The chat this fill was started for is gone (project switched, view
-     *  unmounted, gate token bumped). Checked between pages so a stale fill can
-     *  never keep paging another chat's history. */
-    isStale?: () => boolean;
-    maxPages?: number;
-};
-/**
- * Page older history until `isSatisfied`, until history runs out, or until the
- * pager stops advancing. Never throws: a failed page ends the fill, and the
- * user's own scrolling remains the fallback trigger.
- */
-declare function fillHistoryViewport(opts: FillHistoryViewportOptions): Promise<void>;
-/**
- * One fill loop per view, with predicates COMBINED rather than dropped.
- *
- * Fills come from several places at once — a first page finishing, a window
- * resize, a row being collapsed, and the user's own scroll to the top — and a
- * plain "one at a time, drop the rest" guard picks the wrong winner: a resize
- * fill (satisfied the moment the box can scroll at all) would swallow the user's
- * scroll-up (which needs content specifically ABOVE them), and the scroll-up
- * cannot be retried, because a reader parked at scrollTop 0 produces no further
- * scroll event. Dropping the guard entirely is no better: every frame of a
- * window drag would start its own 24-page loop.
- *
- * So a request that arrives mid-loop ANDs its predicate into the running one:
- * the loop then keeps paging until EVERY caller is satisfied. Predicates that
- * come true are dropped as it goes, so the cost stays flat.
- */
-declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isSatisfied'> & {
-    /** Fired when the loop starts FETCHING and when it stops, and only on a real
-     *  change.
-     *
-     *  This — not the caller's own per-request `isLoading` — is what "older
-     *  history is still coming in" means to a view. A fill is many pages, and
-     *  `isLoading` drops to false between every one of them, so anything
-     *  rendered off it flickers once per page for the whole loop. A collapsed
-     *  indexing row whose run begins above the loaded window renders exactly
-     *  that ("still loading this run" vs a status it cannot know yet), which is
-     *  why the loop has to publish its own span.
-     *
-     *  Fetching, NOT requested. Most fills fetch nothing: they are fired on every
-     *  window resize, every row a user collapses, and every first-page load, and
-     *  the overwhelmingly common outcome is `isSatisfied` returning true on the
-     *  first look. Announcing at request time published a true/false pair for
-     *  each of those, and the widget's own satisfied-check spans two animation
-     *  frames — long enough for the browser to PAINT the intermediate state. Every
-     *  collapsed row strobed through "loading" on every resize tick. So the span
-     *  opens at the first actual page request, which is also the first moment the
-     *  claim is true. */
-    onRunningChange?: (running: boolean) => void;
-}): {
-    fill: (isSatisfied: () => boolean | Promise<boolean>) => Promise<void>;
-    isRunning: () => boolean;
-};
-
-/**
  * ChatSession host adapter + state types.
  *
  * ChatSession is DOM-free and Vue-free; the consumer (bunnyquery widget or the
@@ -1848,6 +1674,356 @@ interface ChatHost {
     /** Enable/disable composer controls during an upload batch. */
     updateComposerControls(): void;
 }
+
+/**
+ * History mapping (pure). Moved verbatim from the chatbox. The clear-horizon
+ * timestamp and the "Indexing: …" display label are INJECTED (clearedAt param,
+ * formatIndexingLabel callback) so the engine touches neither localStorage nor
+ * view-specific display formatting. projectId is passed for link sanitization.
+ */
+
+declare function filterListByClearHorizon(list: any[], clearedAt: number): any[];
+declare function normalizeTextContent(content: any): string;
+declare function extractLastUserTextFromRequest(requestBody: any): string;
+/** The two openings an indexing prompt can have. A bg-queue item that starts with
+ *  neither is an ordinary chat that happened to be routed onto that queue. */
+declare function isIndexingRequestText(userText: any): boolean;
+type IndexingRequestRef = {
+    name: string;
+    path?: string;
+    mime?: string;
+    size?: number;
+    /** A CONTINUE pass rather than the run's first. */
+    continued: boolean;
+};
+/**
+ * The file an indexing prompt is about, read back out of the prompt itself.
+ *
+ * The prompt is the only description of the pass that survives on the server, so
+ * this is how BOTH a history rebuild and a worker-minted pass the client never
+ * dispatched (ChatSession._adoptWorkerIndexingPasses) recover the file. Shared so
+ * the two produce the same `_indexFile`, which is what makes them group together.
+ */
+declare function parseIndexingRequestText(userText: any): IndexingRequestRef | null;
+/**
+ * One bounded look at the background-indexing queue: which files still have a
+ * pass pending or running? This is the same negative signal ChatSession's
+ * display layer relies on - for a worker-driven (auto_continue) run, only the
+ * queue can say the run is over, because the worker enqueues continuation
+ * passes the client never dispatched.
+ *
+ * Returns every storage path AND file name found on live passes (both, because
+ * older prompts may lack the storage-path line), plus `checked`: false when a
+ * page came back full, in which case absence from `keys` proves nothing and
+ * the caller must keep whatever state it already had.
+ *
+ * SCOPE: the probed queue is "<userId>-bg" - THIS user's dispatches only. A
+ * chain launched by another collaborator or a widget end-user lives on their
+ * queue and is invisible here, so "idle" must never be read as "nobody is
+ * indexing this file", only as "this user's runs are over". The durable done::
+ * marker (indexDoneUniqueId) is the cross-user signal.
+ */
+declare function fetchLiveIndexingKeys(params: {
+    service: string;
+    owner: string;
+    platform: 'claude' | 'openai';
+    /** Same value the dispatch used - see bgIndexingQueueName. */
+    userId?: string;
+}): Promise<{
+    keys: Set<string>;
+    checked: boolean;
+    at: number;
+}>;
+/** Test hook: drop split-fetch state (all keys, or one). */
+declare function __resetSplitHistoryState(key?: string): void;
+type SplitHistoryResult = {
+    list: any[];
+    endOfList: boolean;
+    startKeyHistory: any[];
+    /** True when this chat had never been walked in this session — the first
+     *  paint. Consumers gate the "Loading indexing history" hint on it: a
+     *  mid-walk tab return restarts the walk for cursor safety but must stay
+     *  silent (flashing the hint on every return was the reported bug). */
+    firstLoad?: boolean;
+    /** Present only when `deferBg` was requested AND bg work remains: resolves
+     *  with the stub batch fetched in the background (the per-key lock is held
+     *  until it settles, so no other history call can interleave). The caller
+     *  merges the batch by timestamp — the same path older pages use. */
+    bgPending?: Promise<{
+        list: any[];
+        endOfList: boolean;
+    }>;
+};
+declare function getSplitChatHistory(params: {
+    service: string;
+    owner: string;
+    platform: 'claude' | 'openai';
+    userId?: string;
+}, fetchOptions: Record<string, any>, 
+/** Test seam: replaces getChatHistory. Not for production callers. */
+_fetchImpl?: typeof getChatHistory): Promise<SplitHistoryResult>;
+type MapHistoryOptions = {
+    clearedAt: number;
+    projectId: string;
+    /** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
+    formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
+};
+declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions): {
+    messages: any[];
+    runningItemIds: string[];
+};
+interface RescueDecisionContext {
+    /** Is this `_serverItemId` in the page that was just fetched? */
+    hasServerId: (id: string) => boolean;
+    /**
+     * The fetched page already shows a non-background pending assistant.
+     *
+     * Only meaningful for a bubble with NO server id, where it is the sole
+     * available answer to "is this turn already represented?". For a bubble that
+     * HAS one, hasServerId answers exactly the same question exactly, and applying
+     * this on top of it would drop an in-flight turn whose server copy simply is
+     * not in the page that was fetched.
+     */
+    pageHasPendingAssistant: boolean;
+    /** state.sending: an immediate send is in flight for this chat. */
+    sending: boolean;
+    /** The bubble directly after this one in the local list. */
+    next?: ChatMessage | null;
+    /** The chat this fetch is FOR. A bubble stamped for another must not cross. */
+    loadKey?: string;
+}
+declare function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecisionContext): boolean;
+
+/**
+ * Hold the reader's place in the message list.
+ *
+ * A chat box mutates constantly WITHOUT the reader asking for it: an older page
+ * prepends, a poll resolves, an indexing row splices in or changes label, a link
+ * chip goes grey, an image preview finishes decoding, the "Fetching history..."
+ * bar appears and disappears. Every one of those changes the height of something
+ * that may sit ABOVE the viewport, and the browser answers by keeping scrollTop —
+ * which slides the sentence the user was reading out from under them.
+ *
+ * Both clients had their own copy of a row anchor for the ONE case each could
+ * bracket (agent.vue watched its row-key list, the widget bracketed its full
+ * re-render). Everything else — anything that changed a height without changing
+ * the row SET, and everything asynchronous — was uncovered in both. This is the
+ * single implementation, and it covers both shapes:
+ *
+ *   preserve(fn) / capture() + restore(a)
+ *       A mutation you can bracket. Measures immediately before and immediately
+ *       after, so it is exact even when the mutation tears the list down.
+ *
+ *   remember() + hold()
+ *       A layout change you CANNOT bracket — an image decoding, a font arriving,
+ *       a re-parse triggered from a promise. `remember()` runs from the view's
+ *       scroll handler, so the anchor is always the reader's own last position;
+ *       `hold()` puts that position back whenever something settles.
+ *
+ * The staleness rule is what makes the unbracketed half safe. A layout change
+ * above the viewport does NOT change scrollTop — the browser preserves it, which
+ * is precisely why the content appears to jump. So a remembered anchor is still
+ * valid exactly while `box.scrollTop` equals the value it was captured at. If it
+ * differs, something moved the box on purpose (the user scrolled, a clamp fired,
+ * or the browser's own scroll anchoring already compensated), and `hold()`
+ * re-captures rather than dragging the reader back to a position they left.
+ *
+ * DOM-free like the rest of the engine: the element shapes below are structural,
+ * so real DOM nodes satisfy them while this file imports nothing from lib.dom.
+ */
+interface AnchorRect {
+    top: number;
+}
+interface AnchorRowEl {
+    getAttribute(name: string): string | null;
+    getBoundingClientRect(): AnchorRect;
+    offsetHeight: number;
+    parentNode: unknown;
+}
+/** Anything inside the list that resizes on its own schedule. See absorb(). */
+interface AnchorGrowableEl {
+    getBoundingClientRect(): AnchorRect;
+    offsetHeight: number;
+}
+interface AnchorBoxEl {
+    children: ArrayLike<AnchorRowEl>;
+    getBoundingClientRect(): AnchorRect;
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+}
+interface RowAnchor {
+    /** data-row-key of the anchored row, or null when nothing was anchorable. */
+    key: string | null;
+    /** Offset of that row from the top of the viewport. Negative above the fold. */
+    top: number;
+    /** data-row-pos, present only on rows that can RELOCATE (see below). */
+    pos: string | null;
+    /** scrollTop at capture time. The staleness check, and the raw fallback. */
+    scrollTop: number;
+    /**
+     * scrollHeight at capture time. How much the list GREW is the best available
+     * answer when the anchored row itself cannot be found again, and the bound on
+     * how far a correction can legitimately be.
+     */
+    scrollHeight: number;
+    /**
+     * The anchored element itself. A view that patches in place (Vue) keeps the
+     * same node across an update, so restore is one rect read instead of a scan;
+     * a view that rebuilds the list (the widget) drops it and falls back to the
+     * key. Never trusted without re-checking that it is still in the box.
+     */
+    el: AnchorRowEl | null;
+}
+interface ScrollAnchorOptions {
+    /** The scrolling message box, or null when it is not mounted. */
+    getBox: () => AnchorBoxEl | null;
+    /**
+     * The reader is pinned to the bottom. There the bottom IS the anchor and the
+     * scrollToBottom* paths own the position, so every method here no-ops.
+     */
+    isStuck: () => boolean;
+    /**
+     * Fall back to the raw scrollTop when the anchored row cannot be found again.
+     *
+     * For a view that REBUILDS the list (the widget's renderMessages), detaching
+     * every child collapses scrollHeight and the browser clamps scrollTop to 0,
+     * so the raw offset is strictly better than the clamp it would otherwise be
+     * left with. For a view that patches in place (Vue) the browser has already
+     * kept a sane position and re-imposing a stale offset is worse than nothing.
+     */
+    rawFallback?: boolean;
+}
+interface ScrollAnchor {
+    /** Measure the reader's current place. Null while pinned to the bottom. */
+    capture: () => RowAnchor | null;
+    /** Put a captured place back. Safe to call with null. */
+    restore: (anchor: RowAnchor | null) => void;
+    /** capture -> mutate -> restore, for a mutation you can bracket. */
+    preserve: <T>(mutate: () => T) => T;
+    /** Record the reader's place. Call from the box's scroll handler. */
+    remember: () => void;
+    /** Put the remembered place back, if it is still the reader's own. */
+    hold: () => void;
+    /** Absorb one element's own resize. See below. */
+    absorb: (el: AnchorGrowableEl | null | undefined) => void;
+    /** Drop the remembered place (chat switch, unmount). */
+    forget: () => void;
+}
+declare function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor;
+
+/**
+ * Keep older history REACHABLE by paging until the message box actually gains
+ * something to scroll to.
+ *
+ * Older history is paged in by one trigger only: the user scrolling to the top
+ * of the message box. That trigger has two ways to die, and collapsed indexing
+ * rows cause both:
+ *
+ *   1. The box never scrolls. A file's every indexing pass (the first plus every
+ *      CONTINUE pass, request AND response bubble each) folds into ONE row, so a
+ *      full history page — twenty-plus messages — can render as a single line.
+ *      Content shorter than the viewport fires no scroll event, so page 2 is
+ *      never requested and any conversation the user had before that upload is
+ *      permanently out of reach.
+ *   2. The fetched page adds no height. A page that is entirely the same file's
+ *      earlier passes joins the collapsed row already on screen and renders
+ *      nothing new. The user, sitting at scrollTop 0, scrolls up again — and
+ *      because the position never changed, no further scroll event fires.
+ *
+ * Both are the same shape: fetch, re-measure, and keep going until the user
+ * genuinely gained reachable content, history ran out, or the pager stopped
+ * advancing. `isSatisfied` is what differs between the two (can the box scroll
+ * at all / did it grow), so the loop below takes it as a predicate.
+ *
+ * DOM-free like the rest of the engine — the caller supplies the measurement and
+ * awaits its own render before measuring, so agent.vue and the widget run the
+ * identical loop over their own pagers.
+ */
+/** Overflow (px) that counts as "the user can scroll here". Comfortably more
+ *  than the 60px top threshold that triggers the next page, so a filled box has
+ *  real room to scroll rather than sitting one pixel from the trigger. */
+declare const HISTORY_FILL_SLACK_PX = 64;
+/** Pages one fill pass will request before giving up. Reached only by a chat
+ *  whose history really is dozens of pages of one file's indexing passes; the
+ *  cap exists so a pager that stops advancing can never spin forever. */
+declare const MAX_HISTORY_FILL_PAGES = 24;
+type FillHistoryViewportOptions = {
+    /** The user has reachable content and paging can stop. Called AFTER the
+     *  caller's own render has settled (nextTick / rAF), since only the caller
+     *  knows when its view has painted — hence the allowance for a promise. */
+    isSatisfied: () => boolean | Promise<boolean>;
+    /** All history is loaded — nothing left to page in. */
+    isEndOfList: () => boolean;
+    /** A history request is already in flight. Waited out, not treated as a stop
+     *  condition: a background first-page refresh (the queue-detect tick fires one
+     *  every couple of seconds while a file is indexing) would otherwise swallow
+     *  the user's scroll-up entirely, and scrolling up again from scrollTop 0
+     *  produces no second event to retry with. */
+    isLoading: () => boolean;
+    /** Messages currently loaded. Used to detect a page that added nothing, which
+     *  means the pager is not advancing and looping would never terminate. */
+    messageCount: () => number;
+    /** Fetch ONE older page (the caller's own fetchMore path, scroll-restore and
+     *  all). Return `false` when the request was NOT issued (the caller's own
+     *  single-flight guard swallowed it) so the loop retries instead of reading
+     *  the unchanged message count as an exhausted pager. Anything else, including
+     *  undefined, means it was attempted. */
+    fetchOlder: () => Promise<boolean | void | any>;
+    /** The chat this fill was started for is gone (project switched, view
+     *  unmounted, gate token bumped). Checked between pages so a stale fill can
+     *  never keep paging another chat's history. */
+    isStale?: () => boolean;
+    maxPages?: number;
+};
+/**
+ * Page older history until `isSatisfied`, until history runs out, or until the
+ * pager stops advancing. Never throws: a failed page ends the fill, and the
+ * user's own scrolling remains the fallback trigger.
+ */
+declare function fillHistoryViewport(opts: FillHistoryViewportOptions): Promise<void>;
+/**
+ * One fill loop per view, with predicates COMBINED rather than dropped.
+ *
+ * Fills come from several places at once — a first page finishing, a window
+ * resize, a row being collapsed, and the user's own scroll to the top — and a
+ * plain "one at a time, drop the rest" guard picks the wrong winner: a resize
+ * fill (satisfied the moment the box can scroll at all) would swallow the user's
+ * scroll-up (which needs content specifically ABOVE them), and the scroll-up
+ * cannot be retried, because a reader parked at scrollTop 0 produces no further
+ * scroll event. Dropping the guard entirely is no better: every frame of a
+ * window drag would start its own 24-page loop.
+ *
+ * So a request that arrives mid-loop ANDs its predicate into the running one:
+ * the loop then keeps paging until EVERY caller is satisfied. Predicates that
+ * come true are dropped as it goes, so the cost stays flat.
+ */
+declare function createHistoryFiller(base: Omit<FillHistoryViewportOptions, 'isSatisfied'> & {
+    /** Fired when the loop starts FETCHING and when it stops, and only on a real
+     *  change.
+     *
+     *  This — not the caller's own per-request `isLoading` — is what "older
+     *  history is still coming in" means to a view. A fill is many pages, and
+     *  `isLoading` drops to false between every one of them, so anything
+     *  rendered off it flickers once per page for the whole loop. A collapsed
+     *  indexing row whose run begins above the loaded window renders exactly
+     *  that ("still loading this run" vs a status it cannot know yet), which is
+     *  why the loop has to publish its own span.
+     *
+     *  Fetching, NOT requested. Most fills fetch nothing: they are fired on every
+     *  window resize, every row a user collapses, and every first-page load, and
+     *  the overwhelmingly common outcome is `isSatisfied` returning true on the
+     *  first look. Announcing at request time published a true/false pair for
+     *  each of those, and the widget's own satisfied-check spans two animation
+     *  frames — long enough for the browser to PAINT the intermediate state. Every
+     *  collapsed row strobed through "loading" on every resize tick. So the span
+     *  opens at the first actual page request, which is also the first moment the
+     *  claim is true. */
+    onRunningChange?: (running: boolean) => void;
+}): {
+    fill: (isSatisfied: () => boolean | Promise<boolean>) => Promise<void>;
+    isRunning: () => boolean;
+};
 
 /**
  * Background file-indexing turns, collapsed into ONE row per file.
@@ -2419,7 +2595,30 @@ declare class ChatSession {
      *
      * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
      * poll simply cannot be stopped and is left running — see pausePolling.
+     *
+     * (This block documents _trackPoll, further down. The two methods below sit between it
+     * and its subject.)
      */
+    /**
+     * Foreground poll with an early-probe race.
+     *
+     * skapi's poll() is a bare setInterval(fn, latency) with NO check at t=0, so the earliest a
+     * reply can be observed is one full POLL_INTERVAL (3s) after dispatch. For a long generation
+     * that granularity is free. For a SHORT one it is nearly pure dead time: a greeting that the
+     * provider finishes in 1s still waits until the 3s tick, which measured as a large share of a
+     * 5s "yo" round trip.
+     *
+     * So keep the 3s interval as the steady state, and additionally point-look-up the item a few
+     * times early, on a widening schedule. Whichever answers first wins and the other is stopped.
+     * The probe uses the csrHistoryItemLookup hook both clients already implement; without it this
+     * degrades to exactly the old behaviour.
+     *
+     * FOREGROUND ONLY. Background indexing polls keep the flat cadence: nobody is watching them,
+     * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
+     * the request budget the cap exists to protect.
+     */
+    attachForegroundPoll(source: any, itemId: string, opts?: any): any;
+    private _fgPollWithEarlyProbe;
     private _trackPoll;
     /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
      *  Counts the registry rather than a separate tally so it cannot drift: every
@@ -2473,6 +2672,40 @@ declare class ChatSession {
      *  still render) and a later expand retries. */
     hydrateCompactItems(itemIds: string[]): Promise<void>;
     updateHistoryCache(): void;
+    /**
+     * Give the immediate-send pair the server's id for their turn, the moment the
+     * dispatch learns it.
+     *
+     * WHY THIS EXISTS. An immediate send pushes its user bubble and its
+     * "Thinking..." placeholder locally, and until now neither ever carried a
+     * _serverItemId — only the QUEUED path stamped one, off its ack. So for the
+     * whole life of the turn there was no way to tell the local copy and the
+     * server's copy of the SAME turn apart, and the history merge fell back to a
+     * heuristic: rescue the local pair unless the freshly-fetched page happens to
+     * contain a pending assistant.
+     *
+     * That heuristic has a hole exactly one poll interval wide. The server settles
+     * the request; for up to POLL_INTERVAL the client has not noticed, so
+     * `state.sending` is still true and the local pair is still on screen — while a
+     * history fetch issued in that window returns the turn ALREADY SETTLED, with no
+     * pending assistant in it. The rescue then re-appends the local pair below the
+     * server's copy (the question, twice), and when the poll finally resolves,
+     * typewriteLatestReply writes the answer into the rescued placeholder because it
+     * is the only pending assistant left (the answer, twice). updateHistoryCache
+     * persists the result, so it survives every later visit.
+     *
+     * Navigating away while waiting and coming back is what lands a fetch in that
+     * window: a remount runs refreshGate -> a fresh first page, at an arbitrary
+     * moment relative to the 3s poll.
+     *
+     * With the id on the bubbles, both clients' rescue loops skip them through the
+     * dedup they already have (`_serverItemId is in this page`), the reply the
+     * dispatch caches inherits the id too, and nothing needs a new special case.
+     *
+     * Matched by _localId, never by index: a file's indexing rows are spliced in
+     * above these bubbles while the request is in flight.
+     */
+    private _stampTurnWithItemId;
     /**
      * Land a resolved reply in the history cache of a chat that is NOT currently
      * visible, without touching state.messages. Mirrors the cache-only path in
@@ -2575,6 +2808,25 @@ declare class ChatSession {
      */
     settleStagedMessage(stageId: string): void;
     dispatchComposedMessage(composed: string, useBgQueue?: boolean, composedForLlm?: string, extractContent?: any, fileUrls?: any, pinned?: PinnedDispatchContext): void;
+    /**
+     * Scroll for a dispatch that is going out NOW, but never for one arriving late.
+     *
+     * A turn with attachments does not dispatch when the user hits Send: it waits out
+     * its uploads and then its whole indexing chain, which is minutes
+     * (awaitIndexingDrained). By then the reader has very often scrolled up into
+     * history to pass the time, and the forcing scrollToBottom yanked them out of it
+     * — and worse, force-pinned stickToBottom, which no-ops every method on the
+     * scroll anchor and re-arms the queue-detect poll whose only bail is
+     * !stickToBottom.
+     *
+     * `stageId` is the exact marker for that case: only the attachment path ever
+     * produces one. The gesture itself was already paid for at stage time, where
+     * stageOutgoingMessage forces the scroll while the user is still looking at the
+     * composer. Deliberately NOT gated on "did we find the staged bubble" — a remount
+     * rebuilds from the cache and the turn is appended rather than replaced, which is
+     * just as late and just as unrequested.
+     */
+    private scrollForDispatch;
     promoteNextBgQueuedToRunning(): void;
     promoteNextQueuedToRunning(): void;
     /**
@@ -2593,6 +2845,24 @@ declare class ChatSession {
     private _ownThinkingIndex;
     resolveQueuedUserBubble(serverId?: string): number | undefined;
     insertAtTarget(msg: ChatMessage, targetIdx: number): void;
+    /**
+     * The server's OWN copy of this turn is already on screen.
+     *
+     * A first-page fetch can land between the server settling the item and this
+     * poll's tick, and now that the local bubbles carry the item id
+     * (_stampTurnWithItemId) the rescue correctly drops them and renders the
+     * server's settled pair instead. There is then nothing left to resolve: the
+     * -1 fallback would push the answer in a SECOND time at the bottom of the list,
+     * and the positional fallbacks would hijack some other turn's bubble.
+     *
+     * The USER bubble counts, not just a settled assistant: an item whose answer is
+     * empty produces no assistant bubble at all in the mapper, and that variant
+     * would otherwise still bottom-push "No text response received...". While a turn
+     * is genuinely live its user bubble is always pending (the queued branch sets
+     * isPendingQueued, promoteNextQueuedToRunning sets isPendingInProcess), so this
+     * cannot fire early.
+     */
+    private _turnAlreadyRendered;
     onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
     onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
@@ -2795,4 +3065,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_URL_EXPIRES_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RunStubInfo, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RowAnchor, type RunStubInfo, type ScrollAnchor, type ScrollAnchorOptions, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, shouldRescueInFlightMessage, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };

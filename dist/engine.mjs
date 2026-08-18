@@ -899,18 +899,31 @@ function classifyInlineLink(full, groups, ctx) {
     part: { type: "link", label: truncateLabelForDisplay(urlLabel), fullLabel: urlLabel, href: originalHref, expired: false }
   });
 }
+function canonicalizePathForm(value) {
+  if (!value) return value;
+  try {
+    return value.normalize("NFC");
+  } catch (e) {
+    return value;
+  }
+}
 function linkUnavailableKeyForPath(remotePath) {
-  return "path:" + (remotePath || "");
+  return "path:" + canonicalizePathForm(remotePath || "");
 }
 function linkUnavailableKeyForHref(href) {
-  return "href:" + (href || "");
+  var carried = readExpiredAttachmentHref(href);
+  if (carried) return linkUnavailableKeyForPath(carried);
+  return "href:" + canonicalizePathForm(href || "");
 }
 function linkUnavailableKeysForPath(remotePath) {
   if (!remotePath) return [];
-  return [
+  var keys = [
     linkUnavailableKeyForPath(remotePath),
     linkUnavailableKeyForHref(buildDisplayExpiredAttachmentHref(remotePath))
   ];
+  return keys.filter(function(k, i) {
+    return keys.indexOf(k) === i;
+  });
 }
 function isLinkUnavailable(link, map) {
   if (!link || !map) return false;
@@ -1311,7 +1324,7 @@ function renderInlineLinkHtml(link, opts) {
   if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
   if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
   if (!preview) return "<a " + attrs.join(" ") + ">" + escapeInlineHtml(labelText) + "</a>";
-  return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" loading="lazy" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + "</span></a>";
+  return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + "</span></a>";
 }
 
 // src/engine/image_preview.ts
@@ -1397,30 +1410,47 @@ function hydrateOne(img, ctx) {
   var warm = peekImagePreviewUrl(ctx, path);
   if (warm) {
     img.setAttribute("src", warm);
+    notifyLayoutChange(img, ctx, path);
     return;
   }
   resolveImagePreviewUrl(ctx, path, type).then(function(url) {
     if (img.getAttribute("data-bq-img-state") !== "loading") return;
     img.setAttribute("src", url);
+    notifyLayoutChange(img, ctx, path);
   }, function(e) {
     img.setAttribute("data-bq-img-state", "error");
+    notifyLayoutChange(img, ctx, path);
     if (ctx.onError) ctx.onError(path, e);
   });
 }
 function onImageError(img, ctx, path, type) {
   if (img.getAttribute("data-bq-img-retry") === "1") {
     img.setAttribute("data-bq-img-state", "error");
+    notifyLayoutChange(img, ctx, path);
     if (ctx.onError) ctx.onError(path, new Error("image preview failed to load"));
     return;
   }
   img.setAttribute("data-bq-img-retry", "1");
   img.removeAttribute("src");
+  notifyLayoutChange(img, ctx, path);
   resolveImagePreviewUrl(ctx, path, type, true).then(function(url) {
     img.setAttribute("src", url);
+    notifyLayoutChange(img, ctx, path);
   }, function(e) {
     img.setAttribute("data-bq-img-state", "error");
+    notifyLayoutChange(img, ctx, path);
     if (ctx.onError) ctx.onError(path, e);
   });
+}
+function notifyLayoutChange(img, ctx, path) {
+  if (!ctx.onLayoutChange) return;
+  ctx.onLayoutChange(previewLayoutBox(img), path);
+}
+var PREVIEW_LAYOUT_BOX_SELECTOR = "a.bq-link-button.is-image-preview";
+function previewLayoutBox(img) {
+  var closest = img.closest;
+  if (typeof closest !== "function") return img;
+  return closest.call(img, PREVIEW_LAYOUT_BOX_SELECTOR) || img;
 }
 
 // src/engine/time.ts
@@ -2529,6 +2559,169 @@ function mapHistoryListToMessages(list, platform, opts) {
   }
   return { messages: mapped, runningItemIds };
 }
+function shouldRescueInFlightMessage(m, ctx) {
+  if (!m) return false;
+  if (m.isBackgroundTask) return false;
+  if (m._ownerKey !== void 0 && ctx.loadKey !== void 0 && m._ownerKey !== ctx.loadKey) return false;
+  if (m._serverItemId && ctx.hasServerId(m._serverItemId)) return false;
+  if (m._stageId) return true;
+  if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
+  if (m.isSendingToServer || m.isPendingQueued || m.isPendingInProcess || m.isPending) return true;
+  if (ctx.sending && m.role === "user") {
+    var next = ctx.next;
+    if (!next || next.isBackgroundTask || !next.isPending) return false;
+    return next._serverItemId === void 0 || next._serverItemId === m._serverItemId;
+  }
+  return false;
+}
+
+// src/engine/scroll_anchor.ts
+var ROW_KEY_ATTR = "data-row-key";
+var ROW_POS_ATTR = "data-row-pos";
+var UNKNOWN_ROW_POS = "\0?";
+function createScrollAnchor(options) {
+  var held = null;
+  var seen = typeof WeakMap === "function" ? /* @__PURE__ */ new WeakMap() : null;
+  function capture() {
+    var box = options.getBox();
+    if (!box || options.isStuck()) return null;
+    var boxTop = box.getBoundingClientRect().top;
+    var kids = box.children;
+    var fallback = null;
+    for (var i = 0; i < kids.length; i++) {
+      var el = kids[i];
+      if (!el || typeof el.getAttribute !== "function") continue;
+      var key = el.getAttribute(ROW_KEY_ATTR);
+      if (!key) continue;
+      var top = el.getBoundingClientRect().top - boxTop;
+      if (top + el.offsetHeight <= 0) continue;
+      if (top >= box.clientHeight) break;
+      var rawPos = el.getAttribute(ROW_POS_ATTR);
+      var pos = rawPos === null ? null : rawPos || UNKNOWN_ROW_POS;
+      var cand = {
+        key,
+        top,
+        pos,
+        scrollTop: box.scrollTop,
+        scrollHeight: box.scrollHeight,
+        el
+      };
+      if (rawPos === null) return cand;
+      if (!fallback) fallback = cand;
+    }
+    return fallback || {
+      key: null,
+      top: 0,
+      pos: null,
+      scrollTop: box.scrollTop,
+      scrollHeight: box.scrollHeight,
+      el: null
+    };
+  }
+  function findRow(box, anchor) {
+    var el = anchor.el;
+    if (el && el.parentNode === box) return el;
+    if (!anchor.key) return null;
+    var kids = box.children;
+    for (var i = 0; i < kids.length; i++) {
+      var kid = kids[i];
+      if (!kid || typeof kid.getAttribute !== "function") continue;
+      if (kid.getAttribute(ROW_KEY_ATTR) === anchor.key) return kid;
+    }
+    return null;
+  }
+  function restore(anchor) {
+    var box = options.getBox();
+    if (!box || !anchor || options.isStuck()) return;
+    var el = findRow(box, anchor);
+    if (el) {
+      var livePos = el.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
+      if (anchor.pos !== null && anchor.pos !== UNKNOWN_ROW_POS && livePos !== UNKNOWN_ROW_POS && livePos !== anchor.pos) {
+        lost(box, anchor);
+        return;
+      }
+      var boxTop = box.getBoundingClientRect().top;
+      var delta = el.getBoundingClientRect().top - boxTop - anchor.top;
+      var slack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
+      if (delta > slack || delta < -slack) {
+        lost(box, anchor);
+        return;
+      }
+      if (delta >= 1 || delta <= -1) box.scrollTop += delta;
+      held = {
+        key: anchor.key,
+        top: anchor.top,
+        pos: anchor.pos,
+        scrollTop: box.scrollTop,
+        scrollHeight: box.scrollHeight,
+        el
+      };
+      return;
+    }
+    lost(box, anchor);
+  }
+  function lost(box, anchor) {
+    held = null;
+    var grew = box.scrollHeight - anchor.scrollHeight;
+    if (grew > 0) {
+      box.scrollTop = anchor.scrollTop + grew;
+      return;
+    }
+    if (options.rawFallback) box.scrollTop = anchor.scrollTop;
+  }
+  function preserve(mutate) {
+    var anchor = capture();
+    var result = mutate();
+    restore(anchor);
+    return result;
+  }
+  function remember() {
+    held = capture();
+  }
+  function hold() {
+    var box = options.getBox();
+    if (!box || options.isStuck()) {
+      held = null;
+      return;
+    }
+    if (!held) {
+      held = capture();
+      return;
+    }
+    if (box.scrollTop !== held.scrollTop) {
+      held = capture();
+      return;
+    }
+    restore(held);
+  }
+  function absorb(el) {
+    if (!el) return;
+    var box = options.getBox();
+    if (!box) return;
+    var h = el.offsetHeight;
+    var prev = seen ? seen.get(el) : void 0;
+    if (seen) seen.set(el, h);
+    if (options.isStuck()) return;
+    if (prev === void 0) prev = 0;
+    var delta = h - prev;
+    if (delta === 0) return;
+    if (el.getBoundingClientRect().top >= box.getBoundingClientRect().top) return;
+    box.scrollTop += delta;
+    if (held) held = capture();
+  }
+  function forget() {
+    held = null;
+  }
+  return {
+    capture,
+    restore,
+    preserve,
+    remember,
+    hold,
+    absorb,
+    forget
+  };
+}
 
 // src/engine/viewport_fill.ts
 var HISTORY_FILL_SLACK_PX = 64;
@@ -2640,6 +2833,7 @@ var WORKER_PASS_ADOPT_LIMIT = 20;
 var LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5e3;
 var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
+var EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
 var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
 var INDEXING_DRAIN_IDLE_LOOKS = 2;
@@ -3035,7 +3229,93 @@ var ChatSession = class {
    *
    * `stop` comes from the SDK and may be absent on an older skapi-js, in which case the
    * poll simply cannot be stopped and is left running — see pausePolling.
+   *
+   * (This block documents _trackPoll, further down. The two methods below sit between it
+   * and its subject.)
    */
+  /**
+   * Foreground poll with an early-probe race.
+   *
+   * skapi's poll() is a bare setInterval(fn, latency) with NO check at t=0, so the earliest a
+   * reply can be observed is one full POLL_INTERVAL (3s) after dispatch. For a long generation
+   * that granularity is free. For a SHORT one it is nearly pure dead time: a greeting that the
+   * provider finishes in 1s still waits until the 3s tick, which measured as a large share of a
+   * 5s "yo" round trip.
+   *
+   * So keep the 3s interval as the steady state, and additionally point-look-up the item a few
+   * times early, on a widening schedule. Whichever answers first wins and the other is stopped.
+   * The probe uses the csrHistoryItemLookup hook both clients already implement; without it this
+   * degrades to exactly the old behaviour.
+   *
+   * FOREGROUND ONLY. Background indexing polls keep the flat cadence: nobody is watching them,
+   * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
+   * the request budget the cap exists to protect.
+   */
+  attachForegroundPoll(source, itemId, opts) {
+    return this._fgPollWithEarlyProbe(source, itemId, opts);
+  }
+  _fgPollWithEarlyProbe(source, itemId, opts) {
+    var base = source.poll(Object.assign({ latency: POLL_INTERVAL }, opts || {}));
+    var lookup = chatEngineConfig().csrHistoryItemLookup;
+    var ident = this.host.getIdentity();
+    var platform = ident && ident.platform;
+    if (!lookup || !itemId || !ident || !ident.projectId || platform !== "claude" && platform !== "openai") {
+      return base;
+    }
+    var settled = false;
+    var timers = [];
+    var clearProbes = function() {
+      for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+      timers = [];
+    };
+    var stopBase = base && typeof base.stop === "function" ? base.stop.bind(base) : null;
+    var raced = new Promise(function(resolve, reject) {
+      base.then(function(res) {
+        if (settled) return;
+        settled = true;
+        clearProbes();
+        resolve(res);
+      }, function(err) {
+        if (settled) return;
+        settled = true;
+        clearProbes();
+        reject(err);
+      });
+      var fullId = buildHistoryItemFullId(platform, ident.projectId, itemId);
+      EARLY_PROBE_SCHEDULE_MS.forEach(function(delay) {
+        timers.push(setTimeout(function() {
+          if (settled) return;
+          Promise.resolve(lookup(fullId, ident.projectId, ident.owner)).then(function(body) {
+            if (settled || !body || typeof body !== "object") return;
+            if (body.status === "pending" || body.status === "running") return;
+            if (isPollStopped(body)) return;
+            settled = true;
+            clearProbes();
+            if (stopBase) {
+              try {
+                stopBase();
+              } catch (e) {
+              }
+            }
+            if (opts && typeof opts.onResponse === "function") {
+              try {
+                opts.onResponse(body);
+              } catch (e) {
+              }
+            }
+            resolve(body);
+          }, function() {
+          });
+        }, delay));
+      });
+    });
+    raced.stop = function() {
+      settled = true;
+      clearProbes();
+      if (stopBase) stopBase();
+    };
+    return raced;
+  }
   _trackPoll(id, kind, p) {
     var stop = p && typeof p.stop === "function" ? p.stop.bind(p) : void 0;
     if (!stop) {
@@ -3212,6 +3492,68 @@ var ChatSession = class {
     };
   }
   /**
+   * Give the immediate-send pair the server's id for their turn, the moment the
+   * dispatch learns it.
+   *
+   * WHY THIS EXISTS. An immediate send pushes its user bubble and its
+   * "Thinking..." placeholder locally, and until now neither ever carried a
+   * _serverItemId — only the QUEUED path stamped one, off its ack. So for the
+   * whole life of the turn there was no way to tell the local copy and the
+   * server's copy of the SAME turn apart, and the history merge fell back to a
+   * heuristic: rescue the local pair unless the freshly-fetched page happens to
+   * contain a pending assistant.
+   *
+   * That heuristic has a hole exactly one poll interval wide. The server settles
+   * the request; for up to POLL_INTERVAL the client has not noticed, so
+   * `state.sending` is still true and the local pair is still on screen — while a
+   * history fetch issued in that window returns the turn ALREADY SETTLED, with no
+   * pending assistant in it. The rescue then re-appends the local pair below the
+   * server's copy (the question, twice), and when the poll finally resolves,
+   * typewriteLatestReply writes the answer into the rescued placeholder because it
+   * is the only pending assistant left (the answer, twice). updateHistoryCache
+   * persists the result, so it survives every later visit.
+   *
+   * Navigating away while waiting and coming back is what lands a fetch in that
+   * window: a remount runs refreshGate -> a fresh first page, at an arbitrary
+   * moment relative to the 3s poll.
+   *
+   * With the id on the bubbles, both clients' rescue loops skip them through the
+   * dedup they already have (`_serverItemId is in this page`), the reply the
+   * dispatch caches inherits the id too, and nothing needs a new special case.
+   *
+   * Matched by _localId, never by index: a file's indexing rows are spliced in
+   * above these bubbles while the request is in flight.
+   */
+  _stampTurnWithItemId(key, userLid, placeholderLid, itemId) {
+    if (!itemId) return;
+    var changed = false;
+    var stamp = function(list) {
+      var hit = false;
+      for (var i = 0; i < list.length; i++) {
+        var m = list[i];
+        if (!m || !m._localId) continue;
+        if (m._localId !== userLid && m._localId !== placeholderLid) continue;
+        if (m._serverItemId === itemId) continue;
+        list[i] = Object.assign({}, m, { _serverItemId: itemId });
+        hit = true;
+      }
+      return hit;
+    };
+    changed = stamp(this.state.messages);
+    var cached = key ? this.aiChatHistoryCache[key] : void 0;
+    if (cached) {
+      var msgs = cached.messages.slice();
+      if (stamp(msgs)) {
+        this.aiChatHistoryCache[key] = {
+          messages: msgs,
+          endOfList: cached.endOfList,
+          startKeyHistory: cached.startKeyHistory
+        };
+      }
+    }
+    if (changed) this.host.notify();
+  }
+  /**
    * Land a resolved reply in the history cache of a chat that is NOT currently
    * visible, without touching state.messages. Mirrors the cache-only path in
    * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
@@ -3292,8 +3634,9 @@ var ChatSession = class {
           if (initial.id) {
             if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
             dispatchItemId = initial.id;
+            if (typeof params.onItemId === "function") params.onItemId(initial.id);
           }
-          var dp = initial.poll({ latency: POLL_INTERVAL });
+          var dp = self._fgPollWithEarlyProbe(initial, initial.id);
           if (initial.id) self._trackPoll(initial.id, "fg", dp);
           return dp;
         }
@@ -3318,28 +3661,9 @@ var ChatSession = class {
     }).then(function(result) {
       delete self.pendingAgentRequests[params.key];
       if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
-      var existing = self.aiChatHistoryCache[params.key] || { messages: [], endOfList: false, startKeyHistory: [] };
       var reply = { role: "assistant", content: result.content, isError: result.isError };
-      var msgs = existing.messages.slice();
-      var idx = -1;
-      for (var i = msgs.length - 1; i >= 0; i--) {
-        var m = msgs[i];
-        if (m && m.isPending && m.role === "assistant" && !m.isBackgroundTask) {
-          idx = i;
-          break;
-        }
-      }
-      if (idx !== -1) {
-        reply._serverItemId = msgs[idx]._serverItemId;
-        msgs[idx] = reply;
-      } else {
-        msgs.push(reply);
-      }
-      self.aiChatHistoryCache[params.key] = {
-        messages: msgs,
-        endOfList: existing.endOfList,
-        startKeyHistory: existing.startKeyHistory
-      };
+      if (dispatchItemId) reply._serverItemId = dispatchItemId;
+      self._applyReplyToCache(params.key, reply, dispatchItemId);
       return result;
     });
     this.pendingAgentRequests[params.key] = run;
@@ -3728,8 +4052,9 @@ var ChatSession = class {
       }
       this.host.notify();
       this.updateHistoryCache();
-      this.host.scrollToBottom(true);
+      this.scrollForDispatch(stageId);
       var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
+      var capturedQueuedLid = queuedBubble._localId;
       Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner)).then(function(result) {
         var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
           return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
@@ -3741,8 +4066,9 @@ var ChatSession = class {
           self.state.messages[sendingIdx] = upd;
           self.host.notify();
         }
+        if (serverId) self._stampTurnWithItemId(capturedKey, capturedQueuedLid, void 0, serverId);
         if (result && result.poll && (result.status === "pending" || result.status === "running")) {
-          var qp = result.poll({ latency: POLL_INTERVAL });
+          var qp = self._fgPollWithEarlyProbe(result, serverId);
           if (serverId) self._trackPoll(serverId, "fg", qp);
           return qp.then(function(res) {
             if (isPollStopped(res)) return;
@@ -3758,7 +4084,7 @@ var ChatSession = class {
       return;
     }
     var immediateUser = { role: "user", content: composed, _localId: this._newLocalId(), _ts: wallClockNow(), ...key ? { _ownerKey: key } : {} };
-    var immediatePlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, ...key ? { _ownerKey: key } : {} };
+    var immediatePlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _localId: this._newLocalId(), ...key ? { _ownerKey: key } : {} };
     var iStage = this._stageIndex(this.state.messages, stageId);
     if (iStage !== -1) {
       var iEx = this.state.messages[iStage];
@@ -3772,7 +4098,7 @@ var ChatSession = class {
     this.host.notify();
     this.updateHistoryCache();
     this.state.sending = true;
-    this.host.scrollToBottom(true);
+    this.scrollForDispatch(stageId);
     var historyForLlm = this.state.messages.filter(function(m) {
       if (m === immediateUser) return false;
       return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
@@ -3785,6 +4111,7 @@ var ChatSession = class {
       projectId: id.projectId,
       history: historyForLlm
     });
+    var immediateUserLid = immediateUser._localId, immediatePlaceholderLid = immediatePlaceholder._localId;
     var run = this.dispatchAgentRequest({
       key,
       projectId: id.projectId,
@@ -3796,7 +4123,15 @@ var ChatSession = class {
       boundedMessages: bounded.messages,
       userId: chatQueue,
       extractContent,
-      fileUrls
+      fileUrls,
+      // THE fix for a turn rendering twice after navigate-away-and-back. Until
+      // this existed the immediate-send pair carried no server id for its whole
+      // life (only the QUEUED path stamped one, off its ack), so nothing could
+      // tell the local copy and the server's copy of the same turn apart. See
+      // _stampTurnWithItemId.
+      onItemId: function(itemId) {
+        self._stampTurnWithItemId(key, immediateUserLid, immediatePlaceholderLid, itemId);
+      }
     });
     Promise.resolve(run).catch(function() {
     }).then(function() {
@@ -3806,6 +4141,28 @@ var ChatSession = class {
         self.host.scrollToBottomIfSticky(true);
       });
     });
+  }
+  /**
+   * Scroll for a dispatch that is going out NOW, but never for one arriving late.
+   *
+   * A turn with attachments does not dispatch when the user hits Send: it waits out
+   * its uploads and then its whole indexing chain, which is minutes
+   * (awaitIndexingDrained). By then the reader has very often scrolled up into
+   * history to pass the time, and the forcing scrollToBottom yanked them out of it
+   * — and worse, force-pinned stickToBottom, which no-ops every method on the
+   * scroll anchor and re-arms the queue-detect poll whose only bail is
+   * !stickToBottom.
+   *
+   * `stageId` is the exact marker for that case: only the attachment path ever
+   * produces one. The gesture itself was already paid for at stage time, where
+   * stageOutgoingMessage forces the scroll while the user is still looking at the
+   * composer. Deliberately NOT gated on "did we find the staged bubble" — a remount
+   * rebuilds from the cache and the turn is appended rather than replaced, which is
+   * just as late and just as unrequested.
+   */
+  scrollForDispatch(stageId) {
+    if (stageId) this.host.scrollToBottomIfSticky(true);
+    else this.host.scrollToBottom(true);
   }
   promoteNextBgQueuedToRunning() {
     if (this.state.messages.some(function(m) {
@@ -3932,12 +4289,41 @@ var ChatSession = class {
     else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
     else this.state.messages.push(msg);
   }
+  /**
+   * The server's OWN copy of this turn is already on screen.
+   *
+   * A first-page fetch can land between the server settling the item and this
+   * poll's tick, and now that the local bubbles carry the item id
+   * (_stampTurnWithItemId) the rescue correctly drops them and renders the
+   * server's settled pair instead. There is then nothing left to resolve: the
+   * -1 fallback would push the answer in a SECOND time at the bottom of the list,
+   * and the positional fallbacks would hijack some other turn's bubble.
+   *
+   * The USER bubble counts, not just a settled assistant: an item whose answer is
+   * empty produces no assistant bubble at all in the mapper, and that variant
+   * would otherwise still bottom-push "No text response received...". While a turn
+   * is genuinely live its user bubble is always pending (the queued branch sets
+   * isPendingQueued, promoteNextQueuedToRunning sets isPendingInProcess), so this
+   * cannot fire early.
+   */
+  _turnAlreadyRendered(serverId) {
+    if (!serverId) return false;
+    return this.state.messages.some(function(m) {
+      return m._serverItemId === serverId && !m.isPending && !m.isPendingQueued && !m.isPendingInProcess;
+    });
+  }
   onQueuedSendResponse(_composed, response, platform, serverId, ownerKey) {
     if (serverId) this.historyItemPolls.delete(serverId);
     if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
       var offReply = isErrorResponseBody(response) ? { role: "assistant", content: getErrorMessage(response), isError: true } : { role: "assistant", content: ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim() || "No text response received from AI provider." };
       this._applyReplyToCache(ownerKey, offReply, serverId);
       if (serverId) this.cancelledServerIds.delete(serverId);
+      return;
+    }
+    if (this._turnAlreadyRendered(serverId)) {
+      if (serverId) this.cancelledServerIds.delete(serverId);
+      this.host.notify();
+      this.updateHistoryCache();
       return;
     }
     var targetIdx = this.resolveQueuedUserBubble(serverId);
@@ -3979,6 +4365,12 @@ var ChatSession = class {
       var isGone = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
       this._applyReplyToCache(ownerKey, isGone ? { role: "assistant", content: "Request was cancelled.", isError: true } : { role: "assistant", content: getErrorMessage(err), isError: true }, serverId);
       if (serverId) this.cancelledServerIds.delete(serverId);
+      return;
+    }
+    if (this._turnAlreadyRendered(serverId)) {
+      if (serverId) this.cancelledServerIds.delete(serverId);
+      this.host.notify();
+      this.updateHistoryCache();
       return;
     }
     var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
@@ -5242,21 +5634,15 @@ var ChatSession = class {
         var rescued = [];
         for (var ri = 0; ri < self.state.messages.length; ri++) {
           var mm = self.state.messages[ri];
-          if (mm.isBackgroundTask) continue;
-          if (mm._ownerKey !== void 0 && mm._ownerKey !== loadKey) continue;
-          if (mm._serverItemId && serverIds[mm._serverItemId]) continue;
-          if (!mm._serverItemId) {
-            if (mm._stageId) {
-              rescued.push(mm);
-              continue;
-            }
-            if (mappedHasPendingAssistant) continue;
-            if (mm.isSendingToServer || mm.isPendingQueued || mm.isPendingInProcess || mm.isPending) rescued.push(mm);
-            else if (self.state.sending && mm.role === "user") {
-              var next = self.state.messages[ri + 1];
-              if (next && !next.isBackgroundTask && next.isPending && !next._serverItemId) rescued.push(mm);
-            }
-          }
+          if (shouldRescueInFlightMessage(mm, {
+            hasServerId: function(sid) {
+              return !!serverIds[sid];
+            },
+            pageHasPendingAssistant: mappedHasPendingAssistant,
+            sending: !!self.state.sending,
+            next: self.state.messages[ri + 1],
+            loadKey
+          })) rescued.push(mm);
         }
         var oldestInPage1 = void 0;
         mapped.forEach(function(m) {
@@ -5307,6 +5693,9 @@ var ChatSession = class {
         keptOlderPages = prependOlder.length > 0 || interleave.length > 0;
         self.state.messages = prependOlder.length ? prependOlder.concat(page1) : page1;
         rescued.forEach(function(m) {
+          if (m._serverItemId && self.state.messages.some(function(x) {
+            return x._serverItemId === m._serverItemId && x.role === m.role;
+          })) return;
           self.state.messages.push(m);
         });
         if (Object.keys(locallyCancelled).length) {
@@ -5458,8 +5847,8 @@ var ChatSession = class {
           if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
           if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
           var capturedId = item.id;
-          var pp = item.poll({
-            latency: POLL_INTERVAL,
+          var isBg = !!(item._isBgTask || item._isOnBgQueue);
+          var pollOpts = {
             onResponse: function(response) {
               if (isPollStopped(response)) return;
               self.handleHistoryItemResolution(capturedId, response, platform);
@@ -5474,9 +5863,9 @@ var ChatSession = class {
                 var uIdx = self.state.messages.findIndex(function(m) {
                   return m.role === "user" && m._serverItemId === capturedId && !m.isCancelled;
                 });
-                var isBg = aIdx !== -1 && !!self.state.messages[aIdx].isBackgroundTask || uIdx !== -1 && !!self.state.messages[uIdx].isBackgroundTask;
+                var isBg2 = aIdx !== -1 && !!self.state.messages[aIdx].isBackgroundTask || uIdx !== -1 && !!self.state.messages[uIdx].isBackgroundTask;
                 if (aIdx !== -1) self.state.messages.splice(aIdx, 1);
-                if (!isBg) {
+                if (!isBg2) {
                   if (uIdx !== -1) {
                     var ex = self.state.messages[uIdx];
                     self.state.messages[uIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId };
@@ -5503,7 +5892,8 @@ var ChatSession = class {
                 self.updateHistoryCache();
               }
             }
-          });
+          };
+          var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts);
           self._trackPoll(capturedId, item._isBgTask || item._isOnBgQueue ? "bg" : "fg", pp);
           if (pp && pp.catch) pp.catch(function() {
           });
@@ -6134,6 +6524,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_URL_EXPIRES_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, shouldRescueInFlightMessage, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map
