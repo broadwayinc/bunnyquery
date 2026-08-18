@@ -2580,6 +2580,8 @@ function shouldRescueInFlightMessage(m, ctx) {
 // src/engine/scroll_anchor.ts
 var ROW_KEY_ATTR = "data-row-key";
 var ROW_POS_ATTR = "data-row-pos";
+var MAX_ALTS = 2;
+var ALT_SCAN_LIMIT = 64;
 var UNKNOWN_ROW_POS = "\0?";
 function createScrollAnchor(options) {
   var held = null;
@@ -2590,6 +2592,7 @@ function createScrollAnchor(options) {
     var boxTop = box.getBoundingClientRect().top;
     var kids = box.children;
     var fallback = null;
+    var fallbackAt = -1;
     for (var i = 0; i < kids.length; i++) {
       var el = kids[i];
       if (!el || typeof el.getAttribute !== "function") continue;
@@ -2608,10 +2611,20 @@ function createScrollAnchor(options) {
         scrollHeight: box.scrollHeight,
         el
       };
-      if (rawPos === null) return cand;
-      if (!fallback) fallback = cand;
+      if (rawPos === null) {
+        cand.alts = collectAlts(box, boxTop, i + 1);
+        return cand;
+      }
+      if (!fallback) {
+        fallback = cand;
+        fallbackAt = i;
+      }
     }
-    return fallback || {
+    if (fallback) {
+      fallback.alts = collectAlts(box, boxTop, fallbackAt + 1, true);
+      return fallback;
+    }
+    return {
       key: null,
       top: 0,
       pos: null,
@@ -2619,6 +2632,26 @@ function createScrollAnchor(options) {
       scrollHeight: box.scrollHeight,
       el: null
     };
+  }
+  function collectAlts(box, boxTop, from, ordinaryOnly) {
+    var out = [];
+    var kids = box.children;
+    var stop = Math.min(kids.length, from + ALT_SCAN_LIMIT);
+    for (var i = from; i < stop && out.length < MAX_ALTS; i++) {
+      var el = kids[i];
+      if (!el || typeof el.getAttribute !== "function") continue;
+      var key = el.getAttribute(ROW_KEY_ATTR);
+      if (!key) continue;
+      var rawPos = el.getAttribute(ROW_POS_ATTR);
+      if (ordinaryOnly && rawPos !== null) continue;
+      out.push({
+        key,
+        top: el.getBoundingClientRect().top - boxTop,
+        pos: rawPos === null ? null : rawPos || UNKNOWN_ROW_POS,
+        el
+      });
+    }
+    return out.length ? out : void 0;
   }
   function findRow(box, anchor) {
     var el = anchor.el;
@@ -2632,31 +2665,79 @@ function createScrollAnchor(options) {
     }
     return null;
   }
-  function restore(anchor) {
+  var sawFrozen = false;
+  var parked = null;
+  var parkedStuck = false;
+  var returning = false;
+  var wroteTop = -1;
+  var restoreExact = true;
+  var restorePinned = false;
+  function frozen() {
+    var f = !!options.isFrozen && options.isFrozen();
+    if (f) sawFrozen = true;
+    return f;
+  }
+  function restore(anchor, unbounded) {
+    if (frozen()) return;
     var box = options.getBox();
     if (!box || !anchor || options.isStuck()) return;
     var el = findRow(box, anchor);
     if (el) {
       var livePos = el.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
-      if (anchor.pos !== null && anchor.pos !== UNKNOWN_ROW_POS && livePos !== UNKNOWN_ROW_POS && livePos !== anchor.pos) {
-        lost(box, anchor);
-        return;
-      }
+      if (anchor.pos !== null && anchor.pos !== UNKNOWN_ROW_POS && livePos !== UNKNOWN_ROW_POS && livePos !== anchor.pos) el = null;
+    }
+    if (el) {
       var boxTop = box.getBoundingClientRect().top;
       var delta = el.getBoundingClientRect().top - boxTop - anchor.top;
       var slack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-      if (delta > slack || delta < -slack) {
+      if (!unbounded && (delta > slack || delta < -slack)) {
         lost(box, anchor);
         return;
       }
+      var want = box.scrollTop + delta;
       if (delta >= 1 || delta <= -1) box.scrollTop += delta;
+      wroteTop = box.scrollTop;
+      restorePinned = true;
+      restoreExact = box.scrollTop >= want - 1 && box.scrollTop <= want + 1;
       held = {
         key: anchor.key,
         top: anchor.top,
         pos: anchor.pos,
         scrollTop: box.scrollTop,
         scrollHeight: box.scrollHeight,
-        el
+        el,
+        // Carried, not dropped: one successful restore used to disarm the
+        // standbys for every later hold.
+        alts: anchor.alts
+      };
+      return;
+    }
+    var alts = anchor.alts;
+    for (var ai = 0; alts && ai < alts.length; ai++) {
+      var alt = alts[ai];
+      var ael = findRow(box, { key: alt.key, top: alt.top, pos: alt.pos, scrollTop: anchor.scrollTop, scrollHeight: anchor.scrollHeight, el: alt.el });
+      if (!ael) continue;
+      if (alt.pos !== null && alt.pos !== UNKNOWN_ROW_POS) {
+        var altLive = ael.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
+        if (altLive !== UNKNOWN_ROW_POS && altLive !== alt.pos) continue;
+      }
+      var aboxTop = box.getBoundingClientRect().top;
+      var adelta = ael.getBoundingClientRect().top - aboxTop - alt.top;
+      var aslack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
+      if (!unbounded && (adelta > aslack || adelta < -aslack)) continue;
+      var awant = box.scrollTop + adelta;
+      if (adelta >= 1 || adelta <= -1) box.scrollTop += adelta;
+      wroteTop = box.scrollTop;
+      restorePinned = true;
+      restoreExact = box.scrollTop >= awant - 1 && box.scrollTop <= awant + 1;
+      held = {
+        key: alt.key,
+        top: alt.top,
+        pos: alt.pos,
+        scrollTop: box.scrollTop,
+        scrollHeight: box.scrollHeight,
+        el: ael,
+        alts: alts.slice(ai + 1)
       };
       return;
     }
@@ -2667,9 +2748,13 @@ function createScrollAnchor(options) {
     var grew = box.scrollHeight - anchor.scrollHeight;
     if (grew > 0) {
       box.scrollTop = anchor.scrollTop + grew;
+      wroteTop = box.scrollTop;
       return;
     }
-    if (options.rawFallback) box.scrollTop = anchor.scrollTop;
+    if (options.rawFallback) {
+      box.scrollTop = anchor.scrollTop;
+      wroteTop = box.scrollTop;
+    }
   }
   function preserve(mutate) {
     var anchor = capture();
@@ -2678,9 +2763,21 @@ function createScrollAnchor(options) {
     return result;
   }
   function remember() {
+    var b0 = options.getBox();
+    if (returning && b0 && b0.scrollTop !== wroteTop) {
+      parked = null;
+      parkedStuck = false;
+      returning = false;
+    }
+    if (frozen()) return;
     held = capture();
   }
   function hold() {
+    if (frozen()) return;
+    if (sawFrozen || returning) {
+      settleReturn();
+      return;
+    }
     var box = options.getBox();
     if (!box || options.isStuck()) {
       held = null;
@@ -2707,12 +2804,67 @@ function createScrollAnchor(options) {
     if (prev === void 0) prev = 0;
     var delta = h - prev;
     if (delta === 0) return;
+    if (frozen()) {
+      foldFrozenGrowth(box, el, delta);
+      return;
+    }
     if (el.getBoundingClientRect().top >= box.getBoundingClientRect().top) return;
     box.scrollTop += delta;
+    wroteTop = box.scrollTop;
     if (held) held = capture();
+  }
+  function park() {
+    parked = capture();
+    parkedStuck = !!options.isStuck();
+    returning = true;
+  }
+  function pinBottom() {
+    var box = options.getBox();
+    if (!box) return;
+    box.scrollTop = box.scrollHeight;
+    wroteTop = box.scrollTop;
+  }
+  function settleReturn() {
+    if (frozen()) return false;
+    sawFrozen = false;
+    if (parkedStuck) {
+      pinBottom();
+      return true;
+    }
+    var target = parked || held;
+    restoreExact = true;
+    restorePinned = false;
+    restore(target, true);
+    parked = !restorePinned || !restoreExact ? target : null;
+    returning = !!parked;
+    return false;
+  }
+  function isReturning() {
+    return returning;
+  }
+  function thaw() {
+    settleReturn();
+  }
+  function foldFrozenGrowth(box, el, delta) {
+    var elTop = el.getBoundingClientRect().top;
+    foldInto(box, held, elTop, delta);
+    foldInto(box, parked, elTop, delta);
+  }
+  function foldInto(box, a, elTop, delta) {
+    if (!a || a.top >= 0) return;
+    var rowEl = findRow(box, a);
+    if (!rowEl) return;
+    var within = elTop - rowEl.getBoundingClientRect().top;
+    if (within < 0 || within >= rowEl.offsetHeight) return;
+    if (within >= -a.top) return;
+    a.top -= delta;
+    a.scrollHeight += delta;
   }
   function forget() {
     held = null;
+    parked = null;
+    parkedStuck = false;
+    returning = false;
   }
   return {
     capture,
@@ -2720,6 +2872,12 @@ function createScrollAnchor(options) {
     preserve,
     remember,
     hold,
+    park,
+    settleReturn,
+    isReturning,
+    pinBottom,
+    isFrozen: frozen,
+    thaw,
     absorb,
     forget
   };
@@ -5822,6 +5980,7 @@ var ChatSession = class {
           releaseBgFlag();
           self.updateHistoryCache();
           self.host.notify();
+          if (self.host.settleScroll) self.host.settleScroll();
         }, function() {
           releaseBgFlag();
           self.host.notify();
@@ -5903,7 +6062,7 @@ var ChatSession = class {
         self.drainBgTaskQueue();
       }
       if (!fetchMore) self.refreshLiveIndexState();
-      if (!fetchMore) return self.host.scrollToBottomIfSticky();
+      if (!fetchMore) return self.host.settleScroll ? self.host.settleScroll() : self.host.scrollToBottomIfSticky();
     }).catch(function(err) {
       console.warn("[chat-engine] getChatHistory failed", err);
     }).then(function() {

@@ -55,8 +55,19 @@ function makeBox(rows, clientHeight) {
         _top: BOX_TOP,
         children: [],
         clientHeight: clientHeight,
-        scrollTop: 0,
+        _top_: 0,
         get scrollHeight() { return this.children.reduce((n, r) => n + r._h, 0); },
+        get maxScrollTop() { return Math.max(0, this.scrollHeight - this.clientHeight); },
+        // CLAMPED, like a real scroller. This is the single most important physical
+        // fact in this bug and the harness used to hide it: a write past the end is
+        // silently truncated, and a shrink BELOW the reader eats a correction that
+        // the code has no way to notice unless it re-reads the value it just wrote.
+        _writes: 0,
+        get scrollTop() { return this._top_; },
+        set scrollTop(v) {
+            this._writes++;
+            this._top_ = Math.min(Math.max(0, v), this.maxScrollTop);
+        },
         getBoundingClientRect() { return { top: this._top }; },
         set(rows) {
             // Detached rows must stop claiming this box as their parent, exactly
@@ -66,6 +77,10 @@ function makeBox(rows, clientHeight) {
             for (const r of this.children) if (rows.indexOf(r) === -1) r._box = null;
             this.children = rows;
             for (const r of rows) r._box = this;
+            // A shrink re-clamps whatever the box was already at. Not a write by
+            // anyone: assign the backing field so _writes stays a count of
+            // deliberate scrollTop sets.
+            this._top_ = Math.min(Math.max(0, this._top_), this.maxScrollTop);
         },
     };
     box.set(rows);
@@ -86,6 +101,21 @@ function topRowKeyAndOffset(box) {
         if (top + r._h > 0) return { key: r._key, top: top };
     }
     return null;
+}
+
+// A screenful of collapsed indexing rows over some scrollback: the only shape in
+// which capture() legitimately falls back to a group row. A single trailing group
+// row cannot be the topmost visible one (there is nothing below it to scroll
+// against), which is why the fixtures below pad above and fill the viewport.
+function groupScreen(count, pos) {
+    const rows = [row('pad', 600)];
+    const groups = [];
+    for (let i = 0; i < count; i++) {
+        const g = row('g' + i, 30, pos === undefined ? 'turn-' + i : pos);
+        groups.push(g);
+        rows.push(g);
+    }
+    return { rows, groups };
 }
 
 /* ---- the cases -----------------------------------------------------------*/
@@ -231,26 +261,25 @@ test('the "Fetching history..." bar taking height at the top is absorbed', () =>
 });
 
 test('a collapsed indexing row that RELOCATED is not pinned', () => {
-    // data-row-pos names the turn the row currently renders at. When an older
-    // page moves the run's start, the row itself moves; pinning it would drag the
-    // reader to wherever the run now begins. The group row is last here, which is
-    // what "nothing better on screen" means: an ordinary row after it would win.
-    const grp = row('g', 30, 'turn-9');
-    const box = makeBox([row('a', 200), grp], 300);
+    // data-row-pos names the turn the row currently renders at. When an older page
+    // moves the run's start, the row itself moves; pinning it would drag the reader
+    // to wherever the run now begins.
+    const { rows, groups } = groupScreen(10);
+    const box = makeBox(rows, 300);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 210;
+    box.scrollTop = 600;                       // the whole viewport is group rows
     const a = anchor.capture();
-    assert.strictEqual(a.key, 'g');
-    assert.strictEqual(a.pos, 'turn-9');
+    assert.strictEqual(a.key, 'g0');
+    assert.strictEqual(a.pos, 'turn-0');
 
-    grp._pos = 'turn-2';                       // re-anchored to the run's first pass
-    box.set([row('old', 500), box.children[0], grp]);
+    groups[0]._pos = 'turn-99';                // re-anchored to the run's first pass
+    box.set([row('older', 500), ...rows]);
     anchor.restore(a);
 
     // Not dragged along to wherever the run now starts. The row cannot be held,
     // but the page that moved it is 500px of new content ABOVE the reader, and
     // paying that keeps them on the same content they were looking at.
-    assert.strictEqual(box.scrollTop, 710);
+    assert.strictEqual(box.scrollTop, 1100);
 });
 
 test('the anchor is the topmost VISIBLE row, not the first ordinary row anywhere', () => {
@@ -272,28 +301,27 @@ test('an EMPTY data-row-pos is "cannot tell", not a relocation', () => {
     // data-row-pos="". Reading that as a position made every stub -> real-group
     // handoff look like the row had moved, and aborted the anchor — on a fresh open
     // that is a background resolution the reader hits every time.
-    const stub = row('g', 30, '');
-    const box = makeBox([row('a', 200), stub], 300);
+    const { rows, groups } = groupScreen(10, '');
+    const box = makeBox(rows, 300);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 210;
+    box.scrollTop = 600;
     const a = anchor.capture();
-    assert.strictEqual(a.key, 'g');
+    assert.strictEqual(a.key, 'g0');
 
-    stub._pos = 'turn-2';          // the real group arrives and names its turn
-    stub._h = 60;                  // and the row grows a line
+    groups[0]._pos = 'turn-2';     // the real group arrives and names its turn
     anchor.restore(a);
-    assert.strictEqual(box.scrollTop, 210);  // held, not abandoned
+    assert.strictEqual(box.scrollTop, 600);  // held, not abandoned
 });
 
 test('a row that had a position and now reports none is not treated as moved either', () => {
-    const grp = row('g', 30, 'turn-9');
-    const box = makeBox([row('a', 200), grp], 300);
+    const { rows, groups } = groupScreen(10);
+    const box = makeBox(rows, 300);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 210;
+    box.scrollTop = 600;
     const a = anchor.capture();
-    grp._pos = '';
+    groups[0]._pos = '';
     anchor.restore(a);
-    assert.strictEqual(box.scrollTop, 210);
+    assert.strictEqual(box.scrollTop, 600);
 });
 
 test('an ordinary row inside the viewport still wins over a group row above it', () => {
@@ -324,7 +352,9 @@ test('a row that RELOCATED across the conversation is not followed', () => {
 });
 
 test('rows entirely above the fold are skipped', () => {
-    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    // Four rows, not three: with three the box maxes out at 300 and scrollTop 400
+    // is not a position this scroller can be in.
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200), row('d', 200)], 300);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
     box.scrollTop = 400;
     const a = anchor.capture();
@@ -382,7 +412,8 @@ test('forget() drops the reader place so the next chat starts clean', () => {
 
 test('a growing bubble ABOVE the reader is absorbed; one below is not touched', () => {
     const above = row('a', 100), below = row('c', 100);
-    const box = makeBox([above, row('b', 200), below], 300);
+    // A trailing row so scrollTop 150 (and 310 after the growth) are reachable.
+    const box = makeBox([above, row('b', 200), below, row('tail', 600)], 300);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
     box.scrollTop = 150;
     anchor.remember();
@@ -584,6 +615,400 @@ test('a no-op update does not write scrollTop (sub-pixel noise is not a jump)', 
     anchor.hold();
     assert.strictEqual(writes, 0);
     assert.strictEqual(box.scrollTop, 250);
+});
+
+/* ---- standby anchors: the reader's own row did not survive ---------------*/
+
+test('a standby row holds the reader when the anchored row is dropped', () => {
+    // A refresh can drop the exact row the reader was on. lost() would guess from
+    // the list's TOTAL growth, which includes everything added BELOW them.
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200), row('d', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    const a = anchor.capture();
+    assert.strictEqual(a.key, 'b');
+    assert.ok(a.alts && a.alts.length, 'standbys are collected in the same walk');
+
+    // 'b' is gone, 400px arrives ABOVE the reader and 600px BELOW them. lost() would
+    // pay the list's whole growth (800); the standby 'c' pays only what actually
+    // moved it: +400 above, -200 for the dropped row = 200.
+    box.set([row('older', 400), row('a', 200), row('c', 200), row('d', 200), row('extra', 600)]);
+    anchor.restore(a);
+    assert.strictEqual(box.scrollTop, 450);
+});
+
+test('a standby that also vanished is skipped for the next one', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200), row('d', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    const a = anchor.capture();
+    box.set([row('older', 400), row('a', 200), row('d', 200)]);   // b AND c gone
+    anchor.restore(a);
+    // 'd' is the surviving standby, and the content above it is unchanged (a+b+c =
+    // 600, now older+a = 600), so the reader does not move at all.
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('standbys do not fire while the anchored row is still there', () => {
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 250;
+    const a = anchor.capture();
+    anchor.preserve(() => box.set([row('older', 300), ...box.children]));
+    assert.strictEqual(box.scrollTop, 550);
+});
+
+/* ---- frozen: a hidden tab must not move the reader -----------------------*/
+
+test('while FROZEN nothing writes, and the reader place survives the whole stretch', () => {
+    // The tab-return bug: a hidden tab keeps refreshing the list, every refresh
+    // wrote scrollTop against a layout nobody was looking at and re-stamped the
+    // anchor on the way through, so the reader came back to wherever the LAST of
+    // those writes landed and only the next correction put them right.
+    let hidden = false;
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 250;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    hidden = true;
+    const writes0 = box._writes;
+    // Two refreshes land while hidden: a surface page that drops rows, then the
+    // deferred batch that brings them back, each of which would have moved us. The
+    // assertion is that the ANCHOR does not write — the box itself legitimately
+    // re-clamps when the shrink puts the current offset past the new end.
+    anchor.preserve(() => box.set([row('b', 200), row('c', 200)]));
+    anchor.hold();
+    anchor.preserve(() => box.set([row('a', 200), row('b', 200), row('c', 200)]));
+    assert.strictEqual(box._writes, writes0, 'frozen: the anchor must not write');
+
+    // The tab comes forward. One hold() puts them back on the line they left.
+    hidden = false;
+    anchor.hold();
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+});
+
+test('a scroll event while frozen does not overwrite the remembered place', () => {
+    let hidden = true;
+    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 250;
+    hidden = false; anchor.remember(); hidden = true;   // the reader's real place
+
+    box.scrollTop = 0;            // something clamps the box while nobody is looking
+    anchor.remember();            // must be ignored
+    hidden = false;
+    // The FIRST hold() after a frozen stretch behaves like thaw(): scrollTop moved,
+    // but nothing that happened while hidden was the reader. It must not re-measure
+    // either — that would destroy the only record of where they were, which is what
+    // left them in the "middle".
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 250);
+});
+
+test('a hold() racing the visibility handler cannot destroy the remembered place', () => {
+    // onUpdated -> hold() fires on every render, so one can land between the tab
+    // becoming visible and the visibility handler's own thaw().
+    let hidden = false;
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 500;
+    anchor.remember();
+    hidden = true;
+    anchor.hold();                         // a render while hidden: marks the stretch
+    box.scrollTop = box.scrollHeight;      // an invisible scroll-to-bottom
+    hidden = false;
+
+    anchor.hold();                         // the racing render wins the first call
+    assert.strictEqual(box.scrollTop, 500);
+    anchor.thaw();                         // and the handler's thaw is then a no-op
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('thaw() puts the reader back after invisible writes moved the box', () => {
+    // The reported symptom, in one test: the reader is mid-history, the tab is
+    // hidden, a refresh lands and something scrolls the box to the bottom while
+    // nobody is looking. On return they must be back on their line, immediately.
+    let hidden = false;
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 500;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    hidden = true;
+    box.scrollTop = box.scrollHeight;      // an invisible scroll-to-bottom
+    anchor.preserve(() => box.set([row('a', 400), row('b', 400), row('c', 400), row('d', 400)]));
+    hidden = false;
+
+    anchor.thaw();
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('thaw() is a no-op while still frozen, and harmless with nothing remembered', () => {
+    let hidden = true;
+    const box = makeBox([row('a', 200), row('b', 200)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 100;
+    anchor.thaw();
+    assert.strictEqual(box.scrollTop, 100);
+    hidden = false;
+    anchor.forget();
+    anchor.thaw();
+    assert.strictEqual(box.scrollTop, 100);
+});
+
+test('absorb still records a height while frozen, so it does not double-pay later', () => {
+    let hidden = true;
+    const tall = row('tall', 900);
+    const box = makeBox([tall, row('after', 200)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    const img = imgIn(box, tall, 100);
+    img.grow(320);
+    anchor.absorb(img);                    // decoded while hidden: recorded, not paid
+    assert.strictEqual(box.scrollTop, 0);
+
+    hidden = false;
+    box.scrollTop = 600;
+    anchor.remember();
+    img.grow(320);                         // no change now
+    anchor.absorb(img);
+    assert.strictEqual(box.scrollTop, 600, 'the hidden growth must not be paid twice');
+});
+
+/* ---- parked: away in another APP, where nothing goes hidden --------------*/
+
+test('park/thaw survives an unfocused stretch in which compensation kept running', () => {
+    // Switching to another application usually leaves this tab the ACTIVE tab:
+    // visibilitychange never fires, the page keeps rendering, and the anchor keeps
+    // compensating — which re-stamps the live anchor over and over. Only a place
+    // parked at blur can still name where the reader actually was.
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 500;
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+
+    anchor.park();                                  // window blur
+
+    // Away. Background work keeps compensating (nothing is frozen) and keeps
+    // re-stamping the live anchor, then something scrolls the box outright.
+    anchor.preserve(() => box.set([row('older', 600), ...box.children]));
+    anchor.hold();
+    box.scrollTop = box.scrollHeight;               // an unwatched scroll-to-bottom
+
+    anchor.thaw();                                  // window focus
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, before.key);
+    assert.strictEqual(after.top, before.top);
+});
+
+test('thaw() with nothing parked still falls back to the live anchor', () => {
+    let hidden = false;
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({
+        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
+    });
+    box.scrollTop = 500;
+    anchor.remember();
+    hidden = true;
+    box.scrollTop = 0;
+    hidden = false;
+    anchor.thaw();
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('a second thaw() does not move the reader again', () => {
+    // Both handlers can fire on one return (a tab switch is also a focus change).
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 500;
+    anchor.remember();
+    anchor.park();
+    box.scrollTop = 1200;
+    anchor.thaw();
+    assert.strictEqual(box.scrollTop, 500);
+    anchor.thaw();
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('a reader who left PINNED is put back on the bottom, and the host is told', () => {
+    // capture() records nothing for a pinned reader (the bottom is the place, not a
+    // row), so parkedStuck is the only note of it. Without it, a stickiness lost
+    // during the absence had no fallback at all and the reader stayed wherever the
+    // list happened to leave them.
+    const box = makeBox([row('a', 400), row('b', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => true });
+    box.scrollTop = 500;
+    anchor.park();
+    box.scrollTop = 0;                              // something moved it while away
+    assert.strictEqual(anchor.settleReturn(), true, 'the host must re-pin');
+    assert.strictEqual(box.scrollTop, 500);
+});
+
+test('a pinned return STAYS armed, so it lands on the post-merge bottom', () => {
+    // Phase 1 pins to the surface page's bottom; the deferred indexing batch then
+    // adds rows. Re-pinning only once left the reader stranded above the newest
+    // turn by exactly the batch's height.
+    let stuck = true;
+    const box = makeBox([row('a', 400), row('b', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => stuck });
+    box.scrollTop = 500;
+    anchor.park();
+
+    anchor.settleReturn();                          // phase 1
+    assert.strictEqual(box.scrollTop, 500);
+    assert.strictEqual(anchor.isReturning(), true, 'still armed for phase 2');
+
+    box.set([row('a', 400), row('b', 400), row('batch', 600)]);   // phase 2 merges
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 1100, 'the bottom that exists AFTER the merge');
+});
+
+/* ---- a correction the box could not take, retried when it can ------------*/
+
+// 60 rows of 100px in a 600px box: the measured shape from the audit.
+function longChat(n) {
+    const rows = [];
+    for (let i = 0; i < n; i++) rows.push(row('m' + i, 100));
+    return rows;
+}
+
+test('THE BUG: a tail shrink clamps the return away, and phase 2 must retry it', () => {
+    // Reader near the end of the loaded history. While they are away the TAIL loses
+    // rows (a finished run collapsing its passes, the pending indicator going away),
+    // so the box's maximum scrollTop drops below where they were and the browser
+    // truncates the correction. Believing that write succeeded is what left them a
+    // few hundred pixels off their line, permanently — the ~1s phase-2 correction
+    // then slid the list under them and kept the error.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;                 // m53 sits at the top of the viewport
+    anchor.remember();
+    const before = topRowKeyAndOffset(box);
+    assert.strictEqual(before.key, 'm53');
+    assert.strictEqual(before.top, 0);
+
+    anchor.park();
+    box.set(rows.slice(0, 55));           // phase 1: five tail rows go away
+    assert.strictEqual(box.scrollTop, 4900, 'the browser clamped us');
+
+    anchor.settleReturn();                // the return lands short and knows it
+    assert.strictEqual(box.scrollTop, 4900);
+    assert.strictEqual(anchor.isReturning(), true, 'still armed: the write was clamped');
+
+    box.set(rows);                        // phase 2: the batch brings them back
+    anchor.settleReturn();
+    const after = topRowKeyAndOffset(box);
+    assert.strictEqual(after.key, 'm53');
+    assert.strictEqual(after.top, 0);
+    assert.strictEqual(box.scrollTop, 5300);
+    assert.strictEqual(anchor.isReturning(), false, 'landed: the return retires');
+});
+
+test('a return that lands first time retires immediately', () => {
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 3000;
+    anchor.remember();
+    anchor.park();
+    box.set([row('older', 400), ...rows]);
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 3400);
+    assert.strictEqual(anchor.isReturning(), false);
+});
+
+test('THE READER WINS: scrolling themselves after the return retires it at once', () => {
+    // The regression the naive "keep retrying" fix caused, measured at -700px and
+    // -4900px by the audit: a still-armed return that outlives the reader yanks
+    // them back the next time anything merges. A scroll position this module did
+    // not write is the reader, and that retires the return.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.park();
+    box.set(rows.slice(0, 55));
+    anchor.settleReturn();
+    assert.strictEqual(anchor.isReturning(), true);
+
+    box.scrollTop = 300;          // the reader scrolls up to read something older
+    anchor.remember();            // their own scroll event
+    assert.strictEqual(anchor.isReturning(), false, 'the reader retired the return');
+
+    box.set(rows);                // phase 2 lands anyway
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 300, 'they are left exactly where they went');
+});
+
+test('THE READER WINS even scrolling to the very top, where the pager lives', () => {
+    // The worst measured regression (-4900px): scroll-to-top is the ONLY pager
+    // trigger, so dragging a reader off it also breaks paging.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.park();
+    box.set(rows.slice(0, 55));
+    anchor.settleReturn();
+
+    box.scrollTop = 0;
+    anchor.remember();
+    box.set([row('older', 900), ...rows]);   // the page the pager fetched
+    anchor.settleReturn();
+    assert.ok(box.scrollTop <= 900, 'not dragged back down the conversation');
+});
+
+test('the anchor own writes do NOT retire the return', () => {
+    // Every write in this module records itself, so its own compensation cannot be
+    // mistaken for the reader. Miss one and the return retires a settle too early.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.park();
+    box.set(rows.slice(0, 55));
+    anchor.settleReturn();
+    assert.strictEqual(anchor.isReturning(), true);
+
+    // A page prepends and the bracketing restore compensates: its write is ours.
+    anchor.preserve(() => box.set([row('older', 400), ...rows.slice(0, 55)]));
+    anchor.remember();
+    assert.strictEqual(anchor.isReturning(), true, 'our own write is not the reader');
+});
+
+test('pinBottom records its write, so a host pin does not retire the return either', () => {
+    const box = makeBox(longChat(60), 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 3000;
+    anchor.remember();
+    anchor.park();
+    anchor.pinBottom();
+    anchor.remember();
+    assert.strictEqual(anchor.isReturning(), true);
 });
 
 /* ---- report --------------------------------------------------------------*/

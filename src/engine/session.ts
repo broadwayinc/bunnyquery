@@ -3803,6 +3803,12 @@ export class ChatSession {
 					releaseBgFlag();
 					self.updateHistoryCache();
 					self.host.notify();
+					// The other half of the refresh. Everything this batch brought in
+					// sits ABOVE or AMONG the newest turn, so a reader pinned to the
+					// bottom was left stranded above it by exactly the batch's height,
+					// with nothing to put them back (every scroll-anchor method no-ops
+					// while pinned, and this handler ended here).
+					if (self.host.settleScroll) self.host.settleScroll();
 				}, function () {
 					// Stubs missing until the next refresh re-asks; never fatal.
 					releaseBgFlag();
@@ -3932,7 +3938,11 @@ export class ChatSession {
 			// the one resumePolling fires on visibilitychange. Forcing yanked a
 			// reader who had scrolled up back to the bottom. On a genuine mount the
 			// user is still pinned, so this behaves identically there.
-			if (!fetchMore) return self.host.scrollToBottomIfSticky();
+			//
+			// settleScroll when the host has one: it makes the same decision, and it
+			// is also called again once the deferred bg batch merges, so a pinned
+			// reader lands on the REAL bottom instead of the surface page's.
+			if (!fetchMore) return self.host.settleScroll ? self.host.settleScroll() : self.host.scrollToBottomIfSticky();
 		}).catch(function (err: any) {
 			console.warn('[chat-engine] getChatHistory failed', err);
 		}).then(function () {

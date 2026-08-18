@@ -194,6 +194,20 @@ export interface ChatHost {
 	 *  that cannot scroll has no way to reach page 2 (see viewport_fill). Only
 	 *  the view can measure that, which is why the engine merely announces it. */
 	onHistoryLoaded?(fetchMore: boolean, token: number): void;
+	/**
+	 * A list refresh just changed heights: put the reader back where they were.
+	 *
+	 * Called at BOTH moments a first-page refresh moves things — the surface page
+	 * landing, and the deferred background-indexing batch merging on top of it a
+	 * round trip later — because leaving a wrong position on screen between the two
+	 * is what reads as "the scroll jumped, then travelled somewhere else".
+	 *
+	 * The view owns the decision (it is the only side that can measure): pinned to
+	 * the bottom means the bottom AFTER the batch merged, anywhere else means the
+	 * exact line the reader was on. Falls back to scrollToBottomIfSticky when a host
+	 * does not implement it, which is the old behaviour.
+	 */
+	settleScroll?(): void;
 
 	// --- skapi surface beyond configureChatEngine() ---
 	cancelRequest(opts: {

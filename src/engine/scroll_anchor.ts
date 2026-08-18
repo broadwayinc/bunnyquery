@@ -83,6 +83,18 @@ export interface RowAnchor {
 	 * key. Never trusted without re-checking that it is still in the box.
 	 */
 	el: AnchorRowEl | null;
+	/**
+	 * The next few anchorable rows below the primary, each with its own offset.
+	 *
+	 * The primary row does not always survive: a refresh can drop it, a collapsed
+	 * indexing row can be re-identified, an expanded group can fold. Without a
+	 * fallback the only thing left is lost(), which guesses from the list's total
+	 * growth — and total growth includes everything added BELOW the reader, so a
+	 * merge that lands rows on both sides of them over-pays. A second row that is
+	 * still there beats any guess, and collecting them costs nothing: capture is
+	 * already walking these rows.
+	 */
+	alts?: Array<{ key: string; top: number; pos: string | null; el: AnchorRowEl }>;
 }
 
 export interface ScrollAnchorOptions {
@@ -93,6 +105,21 @@ export interface ScrollAnchorOptions {
 	 * scrollToBottom* paths own the position, so every method here no-ops.
 	 */
 	isStuck: () => boolean;
+	/**
+	 * The reader cannot see this box right now (the tab is hidden), so FREEZE:
+	 * remember where they were and refuse to move them.
+	 *
+	 * A hidden tab still runs everything that mutates the list — a resumed poll, a
+	 * head refresh and its deferred background batch, a settling request — and each
+	 * of those would otherwise write scrollTop against a layout nobody is looking at
+	 * and re-stamp the remembered position on the way through. The reader then comes
+	 * back to wherever the last of those writes happened to land, which is the
+	 * "somehow placed in the middle" they see, and only the NEXT correction puts
+	 * them right. So while frozen, reads still happen but nothing writes and nothing
+	 * re-stamps: the anchor holds the last position the reader actually had, and one
+	 * hold() on return puts them back on it.
+	 */
+	isFrozen?: () => boolean;
 	/**
 	 * Fall back to the raw scrollTop when the anchored row cannot be found again.
 	 *
@@ -116,6 +143,22 @@ export interface ScrollAnchor {
 	remember: () => void;
 	/** Put the remembered place back, if it is still the reader's own. */
 	hold: () => void;
+	/** The reader is going away: park the exact place they are leaving. */
+	park: () => void;
+	/**
+	 * They are back. Puts them on the parked place, and STAYS ARMED until it has
+	 * actually landed. Returns true when the host must pin to the bottom instead
+	 * (the reader left pinned), which only the host can do meaningfully.
+	 */
+	settleReturn: () => boolean;
+	/** A return is armed: its position, not the host's, decides scrollTop. */
+	isReturning: () => boolean;
+	/** Pin to the bottom, instantly, recording the write. The ONLY way to pin. */
+	pinBottom: () => void;
+	/** The box is not being painted (hidden tab). Shared so hosts agree. */
+	isFrozen: () => boolean;
+	/** Deprecated alias of settleReturn, kept so a stale dist does not break. */
+	thaw: () => void;
 	/** Absorb one element's own resize. See below. */
 	absorb: (el: AnchorGrowableEl | null | undefined) => void;
 	/** Drop the remembered place (chat switch, unmount). */
@@ -139,6 +182,11 @@ var ROW_KEY_ATTR = 'data-row-key';
  * it did not move.
  */
 var ROW_POS_ATTR = 'data-row-pos';
+/** How many standby rows capture() records. Two is enough to survive a refresh
+ *  that drops the reader's own row without paying for a full-list guess. */
+var MAX_ALTS = 2;
+/** How far past the anchor collectAlts will look for them. */
+var ALT_SCAN_LIMIT = 64;
 /** data-row-pos is present but empty: the row cannot say where it is anchored. */
 var UNKNOWN_ROW_POS = '\u0000?';
 
@@ -156,6 +204,7 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		var boxTop = box.getBoundingClientRect().top;
 		var kids = box.children;
 		var fallback: RowAnchor | null = null;
+		var fallbackAt = -1;
 		for (var i = 0; i < kids.length; i++) {
 			var el = kids[i];
 			if (!el || typeof el.getAttribute !== 'function') continue;
@@ -184,13 +233,51 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 				key: key, top: top, pos: pos,
 				scrollTop: box.scrollTop, scrollHeight: box.scrollHeight, el: el,
 			};
-			if (rawPos === null) return cand;   // an ordinary row: use it
-			if (!fallback) fallback = cand;  // a group row: only if nothing better
+			if (rawPos === null) {
+				// An ordinary row: use it, and take a couple of standbys from the rows
+				// after it in the same walk.
+				cand.alts = collectAlts(box, boxTop, i + 1);
+				return cand;
+			}
+			if (!fallback) { fallback = cand; fallbackAt = i; }  // group row: last resort
 		}
-		return fallback || {
+		// The weak anchor needs standbys MORE than the strong one does, not less: a
+		// screenful of collapsed indexing rows is exactly what a background sweep
+		// re-keys and re-anchors, and without them state (c) fell straight into
+		// lost()'s whole-list guess. Ordinary rows only — more group rows from the
+		// same block are the very rows the same batch rewrites.
+		if (fallback) {
+			fallback.alts = collectAlts(box, boxTop, fallbackAt + 1, true);
+			return fallback;
+		}
+		return {
 			key: null, top: 0, pos: null,
 			scrollTop: box.scrollTop, scrollHeight: box.scrollHeight, el: null,
 		};
+	}
+
+	/** Up to MAX_ALTS anchorable rows starting at `from`, for restore's fallback. */
+	function collectAlts(box: AnchorBoxEl, boxTop: number, from: number, ordinaryOnly?: boolean) {
+		var out: Array<{ key: string; top: number; pos: string | null; el: AnchorRowEl }> = [];
+		var kids = box.children;
+		// Bounded: a chat can carry hundreds of collapsed rows below the fold, and
+		// this must not become a full-list walk for two standbys.
+		var stop = Math.min(kids.length, from + ALT_SCAN_LIMIT);
+		for (var i = from; i < stop && out.length < MAX_ALTS; i++) {
+			var el = kids[i];
+			if (!el || typeof el.getAttribute !== 'function') continue;
+			var key = el.getAttribute(ROW_KEY_ATTR);
+			if (!key) continue;
+			var rawPos = el.getAttribute(ROW_POS_ATTR);
+			if (ordinaryOnly && rawPos !== null) continue;
+			out.push({
+				key: key,
+				top: el.getBoundingClientRect().top - boxTop,
+				pos: rawPos === null ? null : (rawPos || UNKNOWN_ROW_POS),
+				el: el,
+			});
+		}
+		return out.length ? out : undefined;
 	}
 
 	function findRow(box: AnchorBoxEl, anchor: RowAnchor): AnchorRowEl | null {
@@ -209,7 +296,43 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		return null;
 	}
 
-	function restore(anchor: RowAnchor | null): void {
+	// A frozen stretch happened and has not been settled yet. hold() has to know,
+	// because its own safety rule cannot survive one: on the first call after the
+	// tab comes forward it must put the reader back rather than conclude they moved
+	// (and, worse, re-measure — which is what DESTROYS the only record of where they
+	// were, and why this cannot be left to whoever calls thaw() first).
+	var sawFrozen = false;
+	// Where the reader was when they went away. Held apart from `held` because the
+	// ordinary compensation keeps re-stamping that one while they are gone.
+	var parked: RowAnchor | null = null;
+	// They left pinned to the bottom. capture() records nothing for such a reader
+	// (there is no row to hold, the bottom IS the place), so this is the only note
+	// of it — and without it a stickiness lost during the absence had no fallback.
+	var parkedStuck = false;
+	// A return is armed: it has not landed yet. It survives across BOTH halves of a
+	// head refresh, which is what puts a pinned reader on the bottom that exists
+	// after the deferred batch merges rather than the surface page's bottom.
+	var returning = false;
+	// The last scrollTop THIS module wrote. A scroll event reporting anything else
+	// is the reader, and the reader always wins — that is the whole retirement rule
+	// for an armed return, and it is why every write below records it.
+	var wroteTop = -1;
+	// Did the last restore's write actually land, and was it a real row pin rather
+	// than lost()'s guess. A shrink below the reader silently truncates a
+	// correction, and a return that believes a clamped write succeeded is a reader
+	// left a few hundred pixels off their line, permanently.
+	var restoreExact = true;
+	var restorePinned = false;
+	function frozen(): boolean {
+		var f = !!options.isFrozen && options.isFrozen();
+		if (f) sawFrozen = true;
+		return f;
+	}
+
+	function restore(anchor: RowAnchor | null, unbounded?: boolean): void {
+		// Frozen: leave `held` exactly as it is. It is the reader's last real
+		// position, and it is what hold() puts back when the tab comes forward.
+		if (frozen()) return;
 		var box = options.getBox();
 		if (!box || !anchor || options.isStuck()) return;
 		var el = findRow(box, anchor);
@@ -221,11 +344,13 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 			// learned its anchorId (or lost it) has not moved; it has just started (or
 			// stopped) being able to answer.
 			var livePos = el.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
+			// A relocation disqualifies the ROW, not the whole capture: fall through
+			// to the standbys, which is a real measurement, rather than to lost()'s
+			// whole-list guess.
 			if (anchor.pos !== null && anchor.pos !== UNKNOWN_ROW_POS &&
-				livePos !== UNKNOWN_ROW_POS && livePos !== anchor.pos) {
-				lost(box, anchor);
-				return;
-			}
+				livePos !== UNKNOWN_ROW_POS && livePos !== anchor.pos) el = null;
+		}
+		if (el) {
 			var boxTop = box.getBoundingClientRect().top;
 			var delta = (el.getBoundingClientRect().top - boxTop) - anchor.top;
 			// A row can also be MOVED rather than resized: a background refetch
@@ -234,11 +359,19 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 			// reader across the conversation. A real prepend or in-place growth
 			// can only ever need a correction on the order of what the list gained,
 			// so a delta a whole screen beyond that is a relocation, not a resize.
+			// `unbounded` is the thaw: across a hidden stretch the box may have been
+			// scrolled anywhere at all (a settling request, a clamp), so a correction
+			// the size of the whole list is not evidence that the ROW moved — it is
+			// just how far the reader has to be carried back.
 			var slack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-			if (delta > slack || delta < -slack) { lost(box, anchor); return; }
+			if (!unbounded && (delta > slack || delta < -slack)) { lost(box, anchor); return; }
 			// Sub-pixel noise is not a jump, and writing scrollTop for it costs a
 			// scroll event (and a re-layout) on every settle.
+			var want = box.scrollTop + delta;
 			if (delta >= 1 || delta <= -1) box.scrollTop += delta;
+			wroteTop = box.scrollTop;
+			restorePinned = true;
+			restoreExact = box.scrollTop >= want - 1 && box.scrollTop <= want + 1;
 			// This position is now the reader's place, and hold() has to know it:
 			// a bracketed restore MOVES scrollTop, which is exactly what hold()
 			// reads as "someone scrolled, my anchor is stale". Without this, every
@@ -248,10 +381,39 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 			held = {
 				key: anchor.key, top: anchor.top, pos: anchor.pos,
 				scrollTop: box.scrollTop, scrollHeight: box.scrollHeight, el: el,
+				// Carried, not dropped: one successful restore used to disarm the
+				// standbys for every later hold.
+				alts: anchor.alts,
 			};
 			return;
 		}
 		// The anchor row is gone: its group collapsed, or the history was replaced.
+		// A standby row that IS still there beats lost()'s guess outright.
+		var alts = anchor.alts;
+		for (var ai = 0; alts && ai < alts.length; ai++) {
+			var alt = alts[ai];
+			var ael = findRow(box, { key: alt.key, top: alt.top, pos: alt.pos, scrollTop: anchor.scrollTop, scrollHeight: anchor.scrollHeight, el: alt.el });
+			if (!ael) continue;
+			if (alt.pos !== null && alt.pos !== UNKNOWN_ROW_POS) {
+				var altLive = ael.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
+				if (altLive !== UNKNOWN_ROW_POS && altLive !== alt.pos) continue;
+			}
+			var aboxTop = box.getBoundingClientRect().top;
+			var adelta = (ael.getBoundingClientRect().top - aboxTop) - alt.top;
+			var aslack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
+			if (!unbounded && (adelta > aslack || adelta < -aslack)) continue;
+			var awant = box.scrollTop + adelta;
+			if (adelta >= 1 || adelta <= -1) box.scrollTop += adelta;
+			wroteTop = box.scrollTop;
+			restorePinned = true;
+			restoreExact = box.scrollTop >= awant - 1 && box.scrollTop <= awant + 1;
+			held = {
+				key: alt.key, top: alt.top, pos: alt.pos,
+				scrollTop: box.scrollTop, scrollHeight: box.scrollHeight, el: ael,
+				alts: alts.slice(ai + 1),
+			};
+			return;
+		}
 		lost(box, anchor);
 	}
 
@@ -272,8 +434,8 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 	function lost(box: AnchorBoxEl, anchor: RowAnchor): void {
 		held = null;
 		var grew = box.scrollHeight - anchor.scrollHeight;
-		if (grew > 0) { box.scrollTop = anchor.scrollTop + grew; return; }
-		if (options.rawFallback) box.scrollTop = anchor.scrollTop;
+		if (grew > 0) { box.scrollTop = anchor.scrollTop + grew; wroteTop = box.scrollTop; return; }
+		if (options.rawFallback) { box.scrollTop = anchor.scrollTop; wroteTop = box.scrollTop; }
 	}
 
 	function preserve<T>(mutate: () => T): T {
@@ -284,10 +446,26 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 	}
 
 	function remember(): void {
+		// THE retirement rule for an armed return, and the only one. This runs from
+		// the host's scroll handler, which sees every scroll event; a position this
+		// module did not write is the reader, and the reader always wins. Checked
+		// before the frozen bail because it is the one thing allowed to end a return.
+		var b0 = options.getBox();
+		if (returning && b0 && b0.scrollTop !== wroteTop) {
+			parked = null; parkedStuck = false; returning = false;
+		}
+		// A scroll event while the tab is hidden is not the reader moving.
+		if (frozen()) return;
 		held = capture();
 	}
 
 	function hold(): void {
+		if (frozen()) return;
+		// Coming out of an absence: nothing that moved this box while nobody was
+		// looking was the reader, so the parked place simply wins. `returning` keeps
+		// this true across BOTH halves of a head refresh, so a correction the first
+		// half's shrink clamped away is retried once the second half re-grows the list.
+		if (sawFrozen || returning) { settleReturn(); return; }
 		var box = options.getBox();
 		if (!box || options.isStuck()) { held = null; return; }
 		if (!held) { held = capture(); return; }
@@ -329,11 +507,16 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		if (!box) return;
 		var h = el.offsetHeight;
 		var prev = seen ? seen.get(el) : undefined;
+		// The baseline is recorded even while frozen (and even while pinned to the
+		// bottom): what must not happen is the WRITE. An image that decodes in a
+		// hidden tab has still resized, and forgetting that would make the next
+		// visible change pay for its whole height.
 		if (seen) seen.set(el, h);
 		if (options.isStuck()) return;
 		if (prev === undefined) prev = 0;
 		var delta = h - prev;
 		if (delta === 0) return;
+		if (frozen()) { foldFrozenGrowth(box, el, delta); return; }
 		// The element's own TOP, which a resize never moves: everything BELOW it
 		// slides by delta, everything above stays. So the reader's first visible
 		// line moved exactly when that top is above the fold — whether the element
@@ -342,6 +525,7 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		// line the reader is looking at, and moving them would be the jump.
 		if (el.getBoundingClientRect().top >= box.getBoundingClientRect().top) return;
 		box.scrollTop += delta;
+		wroteTop = box.scrollTop;
 		// Re-measure the remembered anchor, do not patch it. Its scrollTop is
 		// stale after that write (hold() would read the difference as "the reader
 		// scrolled" and throw the anchor away), and so is its offset whenever the
@@ -351,8 +535,135 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		if (held) held = capture();
 	}
 
+	/**
+	 * The tab has come forward. Put the reader back on the line they left, whatever
+	 * scrollTop says now.
+	 *
+	 * hold() cannot do this job. Its safety rule is "the anchor is valid only while
+	 * box.scrollTop still equals the value it was captured at", which is what stops
+	 * it dragging a reader back after they scroll themselves — and across a hidden
+	 * stretch that rule points the wrong way. Plenty of things write scrollTop while
+	 * the tab is hidden without going through this module at all (a settling request
+	 * scrolling to the bottom, the browser clamping after a refresh shortened the
+	 * list), so on return the value has moved and hold() concludes the reader moved
+	 * it and gives up — leaving them wherever the last invisible write landed. That
+	 * IS the "somehow placed in the middle".
+	 *
+	 * Nothing that happened while nobody was looking was the reader, so here the
+	 * remembered place simply wins.
+	 */
+	/**
+	 * The reader is going away. Park the place they are leaving, in a slot that the
+	 * ordinary compensation cannot overwrite.
+	 *
+	 * Not the same thing as freezing. A tab that goes HIDDEN stops being painted, so
+	 * there is nothing to compensate and writing scrollTop is pointless. But a window
+	 * that merely loses focus — the user switched to another application — is usually
+	 * still `document.visibilityState === 'visible'`: nothing fires visibilitychange,
+	 * the page keeps rendering, and the chat keeps mutating underneath a reader who
+	 * is not there. Compensation must keep running for that case (they may still be
+	 * able to SEE the window, on a second monitor or beside the other app), which is
+	 * exactly why `held` cannot be trusted on return: every background correction
+	 * re-stamps it. So the leaving place is parked separately.
+	 */
+	function park(): void {
+		parked = capture();
+		parkedStuck = !!options.isStuck();
+		returning = true;
+	}
+
+	/**
+	 * Pin to the bottom, instantly, recording the write.
+	 *
+	 * The ONE way anything is allowed to pin. Instant because a smooth glide fires a
+	 * scroll event per frame at positions that are not the bottom, and the hosts
+	 * clear stickToBottom on each of them — so any merge landing inside the ~130ms
+	 * animation strands the reader off the bottom permanently, aiming at a target
+	 * that was already stale when the glide started. Recorded because an unrecorded
+	 * write looks like the reader and would retire an armed return early.
+	 */
+	function pinBottom(): void {
+		var box = options.getBox();
+		if (!box) return;
+		box.scrollTop = box.scrollHeight;
+		wroteTop = box.scrollTop;
+	}
+
+	/**
+	 * The reader is back. Put them on the parked place, whatever scrollTop says now.
+	 *
+	 * hold() cannot do this job. Its safety rule is "the anchor is valid only while
+	 * box.scrollTop still equals the value it was captured at", which is what stops
+	 * it dragging a reader back after they scroll themselves — and across an absence
+	 * that rule points the wrong way. Plenty of things write scrollTop while nobody
+	 * is looking (a settling request scrolling to the bottom, the browser clamping
+	 * after a refresh shortened the list), so on return the value has moved and
+	 * hold() concludes the reader moved it and gives up — leaving them wherever the
+	 * last unwatched write landed. That IS the "somehow placed in the middle".
+	 *
+	 * Nothing that happened while they were away was them, so the parked place wins.
+	 */
+	function settleReturn(): boolean {
+		if (frozen()) return false;
+		sawFrozen = false;
+		// A reader who left pinned has no row to hold; the bottom is the place. Stay
+		// armed so the NEXT settle re-pins after the deferred batch merges, which is
+		// the bottom they actually mean.
+		if (parkedStuck) { pinBottom(); return true; }
+		var target = parked || held;
+		restoreExact = true; restorePinned = false;
+		restore(target, true);
+		// Keep the parked place when the correction could not land. A phase-1 shrink
+		// leaves the list at its shortest, so the browser truncates the write and the
+		// reader ends up short — and phase 2 re-grows the list, making that same
+		// place reachable again. Believing the clamped write was a success is what
+		// made the error permanent.
+		parked = (!restorePinned || !restoreExact) ? target : null;
+		returning = !!parked;
+		return false;
+	}
+
+	function isReturning(): boolean { return returning; }
+
+	/** Deprecated alias. */
+	function thaw(): void { settleReturn(); }
+
+	/**
+	 * An element resized while nobody was looking. Fold it into the remembered
+	 * places instead of dropping it.
+	 *
+	 * The live box cannot be measured against here: while frozen every compensator
+	 * no-ops, so a prepend or a clamp may have moved the box out from under the
+	 * offsets these anchors were taken at. Judge it in the ANCHOR's own frame
+	 * instead — is this element inside the anchored row, and above the reader's
+	 * line — and adjust the anchor rather than the scroll.
+	 *
+	 * `held` and `parked` can be different rows, so each is folded separately. The
+	 * standbys are deliberately not touched: a row below the growth is re-measured
+	 * by restore() anyway.
+	 */
+	function foldFrozenGrowth(box: AnchorBoxEl, el: AnchorGrowableEl, delta: number): void {
+		var elTop = el.getBoundingClientRect().top;
+		foldInto(box, held, elTop, delta);
+		foldInto(box, parked, elTop, delta);
+	}
+
+	function foldInto(box: AnchorBoxEl, a: RowAnchor | null, elTop: number, delta: number): void {
+		if (!a || a.top >= 0) return;            // the row starts at or below the fold
+		var rowEl = findRow(box, a);
+		if (!rowEl) return;
+		var within = elTop - rowEl.getBoundingClientRect().top;
+		if (within < 0 || within >= rowEl.offsetHeight) return;   // outside, or stale
+		if (within >= -a.top) return;            // at or below the reader's own line
+		a.top -= delta;
+		a.scrollHeight += delta;
+	}
+
 	function forget(): void {
 		held = null;
+		parked = null;
+		parkedStuck = false;
+		returning = false;
 	}
 
 	return {
@@ -361,6 +672,12 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		preserve: preserve,
 		remember: remember,
 		hold: hold,
+		park: park,
+		settleReturn: settleReturn,
+		isReturning: isReturning,
+		pinBottom: pinBottom,
+		isFrozen: frozen,
+		thaw: thaw,
 		absorb: absorb,
 		forget: forget,
 	};

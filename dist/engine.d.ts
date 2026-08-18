@@ -1618,6 +1618,20 @@ interface ChatHost {
      *  that cannot scroll has no way to reach page 2 (see viewport_fill). Only
      *  the view can measure that, which is why the engine merely announces it. */
     onHistoryLoaded?(fetchMore: boolean, token: number): void;
+    /**
+     * A list refresh just changed heights: put the reader back where they were.
+     *
+     * Called at BOTH moments a first-page refresh moves things — the surface page
+     * landing, and the deferred background-indexing batch merging on top of it a
+     * round trip later — because leaving a wrong position on screen between the two
+     * is what reads as "the scroll jumped, then travelled somewhere else".
+     *
+     * The view owns the decision (it is the only side that can measure): pinned to
+     * the bottom means the bottom AFTER the batch merged, anywhere else means the
+     * exact line the reader was on. Falls back to scrollToBottomIfSticky when a host
+     * does not implement it, which is the old behaviour.
+     */
+    settleScroll?(): void;
     cancelRequest(opts: {
         url: string;
         method: string;
@@ -1874,6 +1888,23 @@ interface RowAnchor {
      * key. Never trusted without re-checking that it is still in the box.
      */
     el: AnchorRowEl | null;
+    /**
+     * The next few anchorable rows below the primary, each with its own offset.
+     *
+     * The primary row does not always survive: a refresh can drop it, a collapsed
+     * indexing row can be re-identified, an expanded group can fold. Without a
+     * fallback the only thing left is lost(), which guesses from the list's total
+     * growth — and total growth includes everything added BELOW the reader, so a
+     * merge that lands rows on both sides of them over-pays. A second row that is
+     * still there beats any guess, and collecting them costs nothing: capture is
+     * already walking these rows.
+     */
+    alts?: Array<{
+        key: string;
+        top: number;
+        pos: string | null;
+        el: AnchorRowEl;
+    }>;
 }
 interface ScrollAnchorOptions {
     /** The scrolling message box, or null when it is not mounted. */
@@ -1883,6 +1914,21 @@ interface ScrollAnchorOptions {
      * scrollToBottom* paths own the position, so every method here no-ops.
      */
     isStuck: () => boolean;
+    /**
+     * The reader cannot see this box right now (the tab is hidden), so FREEZE:
+     * remember where they were and refuse to move them.
+     *
+     * A hidden tab still runs everything that mutates the list — a resumed poll, a
+     * head refresh and its deferred background batch, a settling request — and each
+     * of those would otherwise write scrollTop against a layout nobody is looking at
+     * and re-stamp the remembered position on the way through. The reader then comes
+     * back to wherever the last of those writes happened to land, which is the
+     * "somehow placed in the middle" they see, and only the NEXT correction puts
+     * them right. So while frozen, reads still happen but nothing writes and nothing
+     * re-stamps: the anchor holds the last position the reader actually had, and one
+     * hold() on return puts them back on it.
+     */
+    isFrozen?: () => boolean;
     /**
      * Fall back to the raw scrollTop when the anchored row cannot be found again.
      *
@@ -1905,6 +1951,22 @@ interface ScrollAnchor {
     remember: () => void;
     /** Put the remembered place back, if it is still the reader's own. */
     hold: () => void;
+    /** The reader is going away: park the exact place they are leaving. */
+    park: () => void;
+    /**
+     * They are back. Puts them on the parked place, and STAYS ARMED until it has
+     * actually landed. Returns true when the host must pin to the bottom instead
+     * (the reader left pinned), which only the host can do meaningfully.
+     */
+    settleReturn: () => boolean;
+    /** A return is armed: its position, not the host's, decides scrollTop. */
+    isReturning: () => boolean;
+    /** Pin to the bottom, instantly, recording the write. The ONLY way to pin. */
+    pinBottom: () => void;
+    /** The box is not being painted (hidden tab). Shared so hosts agree. */
+    isFrozen: () => boolean;
+    /** Deprecated alias of settleReturn, kept so a stale dist does not break. */
+    thaw: () => void;
     /** Absorb one element's own resize. See below. */
     absorb: (el: AnchorGrowableEl | null | undefined) => void;
     /** Drop the remembered place (chat switch, unmount). */
