@@ -2089,13 +2089,28 @@ import {
     // letting the user scroll up to read earlier messages while a response is
     // still generating. (Re-sticking on scroll-to-bottom is done by onHistoryScroll.)
     var _touchStartY = 0;
+    // Every one of these is a RAW user gesture on the message box: they fire
+    // synchronously on the action itself and never for a programmatic scroll. That
+    // makes them the authoritative "the reader is driving now", which is why they
+    // release any armed return here rather than waiting for the scroll event - a
+    // background refresh can settle between the gesture and the event, and a settle
+    // with a return still armed throws the reader back to where they were before
+    // they left. That is the "I touched the scroll and it jumped somewhere else"
+    // report. (agent.vue does the same.)
     function onMessagesWheel(e) {
+        chatScrollAnchor.release();
         if (e.deltaY < 0) CS.stickToBottom = false;
     }
     function onMessagesTouchStart(e) {
+        chatScrollAnchor.release();
         _touchStartY = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
     }
+    // Keyboard scrolling reaches the box only as a scroll event, and a scrollbar
+    // drag or middle-click autoscroll produces neither wheel nor touch.
+    function onMessagesKeyDown() { chatScrollAnchor.release(); }
+    function onMessagesPointerDown() { chatScrollAnchor.release(); }
     function onMessagesTouchMove(e) {
+        chatScrollAnchor.release();
         // Finger dragging DOWN the screen scrolls content UP (toward earlier
         // messages), so release stickiness.
         var y = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
@@ -4479,6 +4494,8 @@ import {
             box.addEventListener("wheel", onMessagesWheel, { passive: true });
             box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
             box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
+            box.addEventListener("keydown", onMessagesKeyDown, { passive: true });
+            box.addEventListener("pointerdown", onMessagesPointerDown, { passive: true });
             // Any image inside the list finishing (or failing) is a height change
             // nobody asked for, and for a reader scrolled up into history it is a
             // jump mid-sentence. Delegated and in the CAPTURE phase because `load`

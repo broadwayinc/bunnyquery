@@ -1961,6 +1961,17 @@ interface ScrollAnchor {
     settleReturn: () => boolean;
     /** A return is armed: its position, not the host's, decides scrollTop. */
     isReturning: () => boolean;
+    /**
+     * The reader is driving. Retire any armed return, at once.
+     *
+     * Call from the raw gesture handlers (wheel, touchstart, touchmove, keydown),
+     * which fire synchronously on a real user action and never for a programmatic
+     * scroll. Waiting for the scroll EVENT is not good enough: a background refresh
+     * can settle in between, and a settle with a return still armed puts the reader
+     * back where they were before they left, which lands as "I touched the scroll
+     * and it threw me somewhere else".
+     */
+    release: () => void;
     /** Pin to the bottom, instantly, recording the write. The ONLY way to pin. */
     pinBottom: () => void;
     /** The box is not being painted (hidden tab). Shared so hosts agree. */

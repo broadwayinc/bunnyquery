@@ -2440,6 +2440,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var ROW_POS_ATTR = "data-row-pos";
   var MAX_ALTS = 2;
   var ALT_SCAN_LIMIT = 64;
+  var MAX_RETURN_SETTLES = 3;
   var UNKNOWN_ROW_POS = "\0?";
   function createScrollAnchor(options) {
     var held = null;
@@ -2527,6 +2528,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var parked = null;
     var parkedStuck = false;
     var returning = false;
+    var returnBudget = 0;
     var wroteTop = -1;
     var restoreExact = true;
     var restorePinned = false;
@@ -2622,17 +2624,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function remember() {
       var b0 = options.getBox();
-      if (returning && b0 && b0.scrollTop !== wroteTop) {
-        parked = null;
-        parkedStuck = false;
-        returning = false;
-      }
+      if (returning && b0 && b0.scrollTop !== wroteTop) release();
       if (frozen()) return;
       held = capture();
     }
     function hold() {
       if (frozen()) return;
-      if (sawFrozen || returning) {
+      if (sawFrozen) {
         settleReturn();
         return;
       }
@@ -2675,6 +2673,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       parked = capture();
       parkedStuck = !!options.isStuck();
       returning = true;
+      returnBudget = MAX_RETURN_SETTLES;
+    }
+    function release() {
+      parked = null;
+      parkedStuck = false;
+      returning = false;
+      returnBudget = 0;
     }
     function pinBottom() {
       var box = options.getBox();
@@ -2684,7 +2689,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function settleReturn() {
       if (frozen()) return false;
+      var wasFrozen = sawFrozen;
       sawFrozen = false;
+      if (!returning && !wasFrozen) return false;
+      if (returning) {
+        if (returnBudget <= 0) {
+          release();
+          return false;
+        }
+        returnBudget--;
+      }
       if (parkedStuck) {
         pinBottom();
         return true;
@@ -2694,7 +2708,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       restorePinned = false;
       restore(target, true);
       parked = !restorePinned || !restoreExact ? target : null;
-      returning = !!parked;
+      returning = !!parked && returnBudget > 0;
+      if (!returning) {
+        parked = null;
+        parkedStuck = false;
+        returnBudget = 0;
+      }
       return false;
     }
     function isReturning() {
@@ -2720,9 +2739,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function forget() {
       held = null;
-      parked = null;
-      parkedStuck = false;
-      returning = false;
+      release();
     }
     return {
       capture,
@@ -2733,6 +2750,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       park,
       settleReturn,
       isReturning,
+      release,
       pinBottom,
       isFrozen: frozen,
       thaw,
@@ -6547,7 +6565,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.8.15" ;
+    var BQ_VERSION = "1.8.16" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -8542,12 +8560,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     var _touchStartY = 0;
     function onMessagesWheel(e) {
+      chatScrollAnchor.release();
       if (e.deltaY < 0) CS.stickToBottom = false;
     }
     function onMessagesTouchStart(e) {
+      chatScrollAnchor.release();
       _touchStartY = e.touches && e.touches[0] ? e.touches[0].clientY : 0;
     }
+    function onMessagesKeyDown() {
+      chatScrollAnchor.release();
+    }
+    function onMessagesPointerDown() {
+      chatScrollAnchor.release();
+    }
     function onMessagesTouchMove(e) {
+      chatScrollAnchor.release();
       var y = e.touches && e.touches[0] ? e.touches[0].clientY : 0;
       if (y > _touchStartY + 4) CS.stickToBottom = false;
     }
@@ -10445,6 +10472,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         box.addEventListener("wheel", onMessagesWheel, { passive: true });
         box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
         box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
+        box.addEventListener("keydown", onMessagesKeyDown, { passive: true });
+        box.addEventListener("pointerdown", onMessagesPointerDown, { passive: true });
         box.addEventListener("load", onMessagesImageSettled, true);
         box.addEventListener("error", onMessagesImageSettled, true);
         if (document.fonts && document.fonts.addEventListener) {

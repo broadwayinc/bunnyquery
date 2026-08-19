@@ -153,6 +153,17 @@ export interface ScrollAnchor {
 	settleReturn: () => boolean;
 	/** A return is armed: its position, not the host's, decides scrollTop. */
 	isReturning: () => boolean;
+	/**
+	 * The reader is driving. Retire any armed return, at once.
+	 *
+	 * Call from the raw gesture handlers (wheel, touchstart, touchmove, keydown),
+	 * which fire synchronously on a real user action and never for a programmatic
+	 * scroll. Waiting for the scroll EVENT is not good enough: a background refresh
+	 * can settle in between, and a settle with a return still armed puts the reader
+	 * back where they were before they left, which lands as "I touched the scroll
+	 * and it threw me somewhere else".
+	 */
+	release: () => void;
 	/** Pin to the bottom, instantly, recording the write. The ONLY way to pin. */
 	pinBottom: () => void;
 	/** The box is not being painted (hidden tab). Shared so hosts agree. */
@@ -187,6 +198,9 @@ var ROW_POS_ATTR = 'data-row-pos';
 var MAX_ALTS = 2;
 /** How far past the anchor collectAlts will look for them. */
 var ALT_SCAN_LIMIT = 64;
+/** Settles an armed return may act on: the two halves of one head refresh, plus
+ *  one spare for a refresh that was already in flight when the reader left. */
+var MAX_RETURN_SETTLES = 3;
 /** data-row-pos is present but empty: the row cannot say where it is anchored. */
 var UNKNOWN_ROW_POS = '\u0000?';
 
@@ -313,6 +327,12 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 	// head refresh, which is what puts a pinned reader on the bottom that exists
 	// after the deferred batch merges rather than the surface page's bottom.
 	var returning = false;
+	// How many more settles an armed return may act on. A return exists to survive
+	// the two halves of one head refresh; beyond that it is a stale instruction
+	// lying in wait, and the reader has moved on. Bounded so a blur that never got
+	// a matching focus (clicking into devtools, another window, an iframe — all of
+	// which fire window blur) cannot arm something that fires minutes later.
+	var returnBudget = 0;
 	// The last scrollTop THIS module wrote. A scroll event reporting anything else
 	// is the reader, and the reader always wins — that is the whole retirement rule
 	// for an armed return, and it is why every write below records it.
@@ -451,9 +471,7 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		// module did not write is the reader, and the reader always wins. Checked
 		// before the frozen bail because it is the one thing allowed to end a return.
 		var b0 = options.getBox();
-		if (returning && b0 && b0.scrollTop !== wroteTop) {
-			parked = null; parkedStuck = false; returning = false;
-		}
+		if (returning && b0 && b0.scrollTop !== wroteTop) release();
 		// A scroll event while the tab is hidden is not the reader moving.
 		if (frozen()) return;
 		held = capture();
@@ -461,11 +479,12 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 
 	function hold(): void {
 		if (frozen()) return;
-		// Coming out of an absence: nothing that moved this box while nobody was
-		// looking was the reader, so the parked place simply wins. `returning` keeps
-		// this true across BOTH halves of a head refresh, so a correction the first
-		// half's shrink clamped away is retried once the second half re-grows the list.
-		if (sawFrozen || returning) { settleReturn(); return; }
+		// Coming out of a FROZEN stretch, and only that. An armed return is settled
+		// by the host, from its focus/visible handler and the refresh settles that
+		// follow — never from here. hold() runs on every render, including the many
+		// that happen WHILE the reader is still away, and letting those settle the
+		// return spent it before they were back to see it.
+		if (sawFrozen) { settleReturn(); return; }
 		var box = options.getBox();
 		if (!box || options.isStuck()) { held = null; return; }
 		if (!held) { held = capture(); return; }
@@ -570,6 +589,15 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		parked = capture();
 		parkedStuck = !!options.isStuck();
 		returning = true;
+		returnBudget = MAX_RETURN_SETTLES;
+	}
+
+	/** The reader is driving: an armed return is no longer anyone's business. */
+	function release(): void {
+		parked = null;
+		parkedStuck = false;
+		returning = false;
+		returnBudget = 0;
 	}
 
 	/**
@@ -605,7 +633,17 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 	 */
 	function settleReturn(): boolean {
 		if (frozen()) return false;
+		var wasFrozen = sawFrozen;
 		sawFrozen = false;
+		// Nothing is armed, so there is nothing to settle. Without this the call was
+		// a licence to re-impose `held` UNBOUNDED at any time — which is exactly how
+		// a reader who had already taken control got thrown back: they released the
+		// return, and the next background settle simply used the live anchor instead.
+		if (!returning && !wasFrozen) return false;
+		if (returning) {
+			if (returnBudget <= 0) { release(); return false; }
+			returnBudget--;
+		}
 		// A reader who left pinned has no row to hold; the bottom is the place. Stay
 		// armed so the NEXT settle re-pins after the deferred batch merges, which is
 		// the bottom they actually mean.
@@ -619,7 +657,8 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		// place reachable again. Believing the clamped write was a success is what
 		// made the error permanent.
 		parked = (!restorePinned || !restoreExact) ? target : null;
-		returning = !!parked;
+		returning = !!parked && returnBudget > 0;
+		if (!returning) { parked = null; parkedStuck = false; returnBudget = 0; }
 		return false;
 	}
 
@@ -661,9 +700,7 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 
 	function forget(): void {
 		held = null;
-		parked = null;
-		parkedStuck = false;
-		returning = false;
+		release();
 	}
 
 	return {
@@ -675,6 +712,7 @@ export function createScrollAnchor(options: ScrollAnchorOptions): ScrollAnchor {
 		park: park,
 		settleReturn: settleReturn,
 		isReturning: isReturning,
+		release: release,
 		pinBottom: pinBottom,
 		isFrozen: frozen,
 		thaw: thaw,

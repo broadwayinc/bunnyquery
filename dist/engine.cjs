@@ -2582,6 +2582,7 @@ var ROW_KEY_ATTR = "data-row-key";
 var ROW_POS_ATTR = "data-row-pos";
 var MAX_ALTS = 2;
 var ALT_SCAN_LIMIT = 64;
+var MAX_RETURN_SETTLES = 3;
 var UNKNOWN_ROW_POS = "\0?";
 function createScrollAnchor(options) {
   var held = null;
@@ -2669,6 +2670,7 @@ function createScrollAnchor(options) {
   var parked = null;
   var parkedStuck = false;
   var returning = false;
+  var returnBudget = 0;
   var wroteTop = -1;
   var restoreExact = true;
   var restorePinned = false;
@@ -2764,17 +2766,13 @@ function createScrollAnchor(options) {
   }
   function remember() {
     var b0 = options.getBox();
-    if (returning && b0 && b0.scrollTop !== wroteTop) {
-      parked = null;
-      parkedStuck = false;
-      returning = false;
-    }
+    if (returning && b0 && b0.scrollTop !== wroteTop) release();
     if (frozen()) return;
     held = capture();
   }
   function hold() {
     if (frozen()) return;
-    if (sawFrozen || returning) {
+    if (sawFrozen) {
       settleReturn();
       return;
     }
@@ -2817,6 +2815,13 @@ function createScrollAnchor(options) {
     parked = capture();
     parkedStuck = !!options.isStuck();
     returning = true;
+    returnBudget = MAX_RETURN_SETTLES;
+  }
+  function release() {
+    parked = null;
+    parkedStuck = false;
+    returning = false;
+    returnBudget = 0;
   }
   function pinBottom() {
     var box = options.getBox();
@@ -2826,7 +2831,16 @@ function createScrollAnchor(options) {
   }
   function settleReturn() {
     if (frozen()) return false;
+    var wasFrozen = sawFrozen;
     sawFrozen = false;
+    if (!returning && !wasFrozen) return false;
+    if (returning) {
+      if (returnBudget <= 0) {
+        release();
+        return false;
+      }
+      returnBudget--;
+    }
     if (parkedStuck) {
       pinBottom();
       return true;
@@ -2836,7 +2850,12 @@ function createScrollAnchor(options) {
     restorePinned = false;
     restore(target, true);
     parked = !restorePinned || !restoreExact ? target : null;
-    returning = !!parked;
+    returning = !!parked && returnBudget > 0;
+    if (!returning) {
+      parked = null;
+      parkedStuck = false;
+      returnBudget = 0;
+    }
     return false;
   }
   function isReturning() {
@@ -2862,9 +2881,7 @@ function createScrollAnchor(options) {
   }
   function forget() {
     held = null;
-    parked = null;
-    parkedStuck = false;
-    returning = false;
+    release();
   }
   return {
     capture,
@@ -2875,6 +2892,7 @@ function createScrollAnchor(options) {
     park,
     settleReturn,
     isReturning,
+    release,
     pinBottom,
     isFrozen: frozen,
     thaw,

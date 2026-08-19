@@ -821,7 +821,7 @@ test('park/thaw survives an unfocused stretch in which compensation kept running
     assert.strictEqual(after.top, before.top);
 });
 
-test('thaw() with nothing parked still falls back to the live anchor', () => {
+test('a hidden tab parks on the way out, exactly as the clients do', () => {
     let hidden = false;
     const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
     const anchor = createScrollAnchor({
@@ -829,11 +829,22 @@ test('thaw() with nothing parked still falls back to the live anchor', () => {
     });
     box.scrollTop = 500;
     anchor.remember();
+    anchor.park();                 // both clients park on hide AND on blur
     hidden = true;
     box.scrollTop = 0;
     hidden = false;
-    anchor.thaw();
+    anchor.settleReturn();
     assert.strictEqual(box.scrollTop, 500);
+});
+
+test('settleReturn with nothing armed is a no-op, never a licence to re-impose', () => {
+    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 500;
+    anchor.remember();
+    box.scrollTop = 900;           // the reader scrolls
+    assert.strictEqual(anchor.settleReturn(), false);
+    assert.strictEqual(box.scrollTop, 900);
 });
 
 test('a second thaw() does not move the reader again', () => {
@@ -1009,6 +1020,77 @@ test('pinBottom records its write, so a host pin does not retire the return eith
     anchor.pinBottom();
     anchor.remember();
     assert.strictEqual(anchor.isReturning(), true);
+});
+
+/* ---- an armed return must never lie in wait ------------------------------*/
+
+test('THE WIDGET BUG: a settle after the reader touches the scroll must not move them', () => {
+    // Reported: come back to the browser, everything looks right, then START TO
+    // INTERACT with the scroll and it throws you to some middle position. That
+    // position is where you were BEFORE you left: a return was still armed, and the
+    // next background settle acted on it. The scroll EVENT would eventually have
+    // retired it, but a refresh can settle first — so the raw gesture has to.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.park();                       // window blur
+    box.set(rows.slice(0, 55));          // a refresh lands while away; write clamps
+    anchor.settleReturn();               // window focus: lands short, stays armed
+    assert.strictEqual(anchor.isReturning(), true);
+
+    box.scrollTop = 1000;                // the reader starts scrolling
+    anchor.release();                    // wheel / touch / key / scrollbar drag
+    assert.strictEqual(anchor.isReturning(), false);
+
+    box.set(rows);                       // the deferred batch merges a beat later
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 1000, 'the reader stays exactly where they are');
+});
+
+test('an armed return expires rather than lying in wait', () => {
+    // window blur fires for far more than "left the browser" — devtools, another
+    // window, an iframe — and a blur with no matching focus must not arm something
+    // that fires minutes later.
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.park();
+    box.set(rows.slice(0, 55));          // keeps the return armed every time
+    for (let i = 0; i < 3; i++) anchor.settleReturn();
+    assert.strictEqual(anchor.isReturning(), false, 'the budget ran out');
+
+    box.scrollTop = 1200;
+    box.set(rows);
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 1200);
+});
+
+test('release() during the absence does not break a later legitimate return', () => {
+    const rows = longChat(60);
+    const box = makeBox(rows, 600);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
+    box.scrollTop = 5300;
+    anchor.remember();
+    anchor.release();                    // a stray gesture with nothing armed
+    anchor.park();                       // then a real absence
+    box.set([row('older', 400), ...rows]);
+    anchor.settleReturn();
+    assert.strictEqual(box.scrollTop, 5700);
+});
+
+test('release() with a pinned reader drops the pin instruction too', () => {
+    const box = makeBox([row('a', 400), row('b', 400)], 300);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => true });
+    box.scrollTop = 500;
+    anchor.park();
+    box.scrollTop = 0;
+    anchor.release();
+    assert.strictEqual(anchor.settleReturn(), false, 'no re-pin after the reader acts');
+    assert.strictEqual(box.scrollTop, 0);
 });
 
 /* ---- report --------------------------------------------------------------*/
