@@ -1985,10 +1985,9 @@ import {
         // animation strands the reader off the bottom permanently, aiming at a target
         // that was already stale when the glide began.
         //
-        // Frozen: rAF is not running, so raf2 would land one to two frames AFTER the
-        // tab comes back, i.e. after the return has already put the reader right, and
-        // force-pin over the top of it. Write now instead.
-        if (chatScrollAnchor.isFrozen()) {
+        // A hidden tab does not run rAF, so raf2 would land one to two frames after
+        // it comes back. Write now instead.
+        if (typeof document !== "undefined" && document.hidden) {
             CS.stickToBottom = true;
             chatScrollAnchor.pinBottom();
             return Promise.resolve();
@@ -2007,8 +2006,8 @@ import {
     // mid-tick, so a streamed response can't repeatedly drag them back down.
     function scrollToBottomIfSticky() {
         if (!CS.stickToBottom) return Promise.resolve();
-        // See scrollToBottom: never smooth, and never rAF-deferred while frozen.
-        if (chatScrollAnchor.isFrozen()) { chatScrollAnchor.pinBottom(); return Promise.resolve(); }
+        // See scrollToBottom: never smooth, and never rAF-deferred while hidden.
+        if (typeof document !== "undefined" && document.hidden) { chatScrollAnchor.pinBottom(); return Promise.resolve(); }
         return raf2().then(function () {
             if (!CS.stickToBottom || !CS.messagesBox) return;
             chatScrollAnchor.pinBottom();
@@ -2016,16 +2015,15 @@ import {
     }
     // The ONE place that decides where the reader sits after a list refresh. Mirror
     // of agent.vue's settleScrollAfterRefresh - see the settleScroll host hook.
-    function settleScrollAfterRefresh(afterAbsence) {
-        // While a return is armed it owns the position, for BOTH halves of the head
-        // refresh: the surface page landing and the deferred indexing batch merging a
-        // round trip later. That is what re-pins a reader who left pinned onto the
-        // bottom that exists AFTER the merge, and what retries a correction the first
-        // half's shrink clamped away.
-        if (afterAbsence || chatScrollAnchor.isReturning()) {
-            if (chatScrollAnchor.settleReturn()) CS.stickToBottom = true;
-            return;
-        }
+    // Called at BOTH moments a first-page refresh changes heights: the surface page
+    // landing, and the deferred indexing batch merging a round trip later. It decides
+    // from the box AS IT IS at that moment and nothing else - a reader following the
+    // bottom gets the bottom that exists now (which after the batch is the real one),
+    // and any other reader gets the line they are on. There is deliberately no
+    // "returning" state: an instruction recorded earlier and carried out at one of
+    // these settles is exactly how the chat threw people around.
+    function settleScrollAfterRefresh() {
+        anchorWroteSinceScroll = true;
         if (CS.stickToBottom) scrollToBottomIfSticky();
         else chatScrollAnchor.hold();
     }
@@ -2033,14 +2031,16 @@ import {
     // DOWN from the browser clamping scrollTop after content above the reader
     // shrank.
     var lastHistoryScrollTop = 0;
+    // The next scroll event was caused by our own compensation, not by the reader.
+    var anchorWroteSinceScroll = false;
     function onHistoryScroll() {
         if (!CS.messagesBox || CS.chatSettingsOpen) return;
         var el = CS.messagesBox;
-        // A scroll event dispatched while the box is not being painted is not the
-        // reader: it is a hidden-tab shrink-then-grow patch firing one event against
-        // the grown scrollHeight, which read as "not at the bottom" and silently
-        // un-stuck someone who left pinned. (agent.vue does the same.)
-        if (chatScrollAnchor.isFrozen()) { lastHistoryScrollTop = el.scrollTop; return; }
+        // A scroll event dispatched while the tab is hidden is not the reader: it is
+        // a shrink-then-grow patch firing one event against the grown scrollHeight,
+        // which reads as "not at the bottom" and silently un-sticks someone who left
+        // pinned. (agent.vue does the same.)
+        if (typeof document !== "undefined" && document.hidden) { lastHistoryScrollTop = el.scrollTop; return; }
         // Re-sticking requires having moved DOWN. Content shrinking above the
         // reader - a group collapsing, a re-render, an image failing back to
         // nothing - makes the browser CLAMP scrollTop to the new maximum, which is
@@ -2050,8 +2050,18 @@ import {
         // after. A clamp can only ever LOWER scrollTop, so this separates the two
         // exactly. (agent.vue does the same.)
         var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
+        var ours = anchorWroteSinceScroll;
+        anchorWroteSinceScroll = false;
         if (!atBottom) CS.stickToBottom = false;
-        else if (el.scrollTop >= lastHistoryScrollTop) CS.stickToBottom = true;
+        // `ours`: the box's own compensation write can land exactly AT the bottom (content
+        // above grew while content below shrank in the same update), and the scroll event
+        // that follows is indistinguishable from the reader flicking down there. Read as
+        // the reader, it silently converts them into a bottom-pinned one, and from then on
+        // every keyboard open and every merge drags them to the newest message.
+        // Flagged rather than value-matched: a clamp reports the POST-clamp position, never
+        // the value that was written, and scroll events coalesce, so the number cannot say
+        // who caused it. The host knows, because the host made the call.
+        else if (!ours && el.scrollTop >= lastHistoryScrollTop) CS.stickToBottom = true;
         lastHistoryScrollTop = el.scrollTop;
         // This is where the reader's place comes from. Every scroll - theirs, and
         // every programmatic one - lands here, so the anchor is always the
@@ -2081,6 +2091,7 @@ import {
         // previewLayoutBox, so this and the engine's own onLayoutChange hook key
         // absorb's per-element memo on the SAME node: the box that resizes is the
         // anchor (picture + dot-trail loader + caption chip), not the <img> alone.
+        anchorWroteSinceScroll = true;
         chatScrollAnchor.absorb(previewLayoutBox(t));
     }
     // Explicit user scroll-UP intent. wheel/touch fire synchronously on the
@@ -2089,28 +2100,13 @@ import {
     // letting the user scroll up to read earlier messages while a response is
     // still generating. (Re-sticking on scroll-to-bottom is done by onHistoryScroll.)
     var _touchStartY = 0;
-    // Every one of these is a RAW user gesture on the message box: they fire
-    // synchronously on the action itself and never for a programmatic scroll. That
-    // makes them the authoritative "the reader is driving now", which is why they
-    // release any armed return here rather than waiting for the scroll event - a
-    // background refresh can settle between the gesture and the event, and a settle
-    // with a return still armed throws the reader back to where they were before
-    // they left. That is the "I touched the scroll and it jumped somewhere else"
-    // report. (agent.vue does the same.)
     function onMessagesWheel(e) {
-        chatScrollAnchor.release();
         if (e.deltaY < 0) CS.stickToBottom = false;
     }
     function onMessagesTouchStart(e) {
-        chatScrollAnchor.release();
         _touchStartY = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
     }
-    // Keyboard scrolling reaches the box only as a scroll event, and a scrollbar
-    // drag or middle-click autoscroll produces neither wheel nor touch.
-    function onMessagesKeyDown() { chatScrollAnchor.release(); }
-    function onMessagesPointerDown() { chatScrollAnchor.release(); }
     function onMessagesTouchMove(e) {
-        chatScrollAnchor.release();
         // Finger dragging DOWN the screen scrolls content UP (toward earlier
         // messages), so release stickiness.
         var y = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
@@ -3449,6 +3445,21 @@ import {
 
     function autoGrowInput(el) {
         if (!el) return;
+        // The composer growing SHRINKS the message box (.bq-messages is flex:1 with
+        // min-height:0 under a flex-shrink:0 input row), which pushes a bottom-pinned
+        // reader off the bottom with NO scroll event at all - so CS.stickToBottom
+        // stays true while the view no longer matches it, and the next background
+        // settle jumps them to catch up. That is the typing half of "I tapped the
+        // input and the scroll went somewhere else".
+        //
+        // A viewport change is not a content change, so the only legal answer is a
+        // pin decided from the box as it is right now. Nothing is stored.
+        //
+        // Deliberately NOT gated on the height having changed: the height:"auto"
+        // probe below forces a layout at the COLLAPSED height, which makes the
+        // message box taller, drops its maxScrollTop and clamps a pinned reader down
+        // - on every keystroke, including the ones whose net height is unchanged.
+        var prevH = el.offsetHeight;
         el.style.height = "auto";
         // scrollHeight covers content+padding but NOT the border under
         // box-sizing:border-box, so add the border or the last line overflows
@@ -3464,6 +3475,12 @@ import {
             el.style.height = h + "px";
             el.style.overflowY = "hidden";
         }
+        var nextH = el.offsetHeight;   // forces the final layout before we measure
+        if (CS.stickToBottom) chatScrollAnchor.pinBottom();
+        // A TALLER box can stop overflowing, which takes the scroll-to-top pager
+        // trigger away with it. Not an `else`: a pinned reader is exactly who ends up
+        // there, having just cleared a long draft.
+        if (nextH < prevH) ensureHistoryFillsViewport();
     }
 
     function buildMessageEl(msg, idx) {
@@ -4190,11 +4207,6 @@ import {
     var chatScrollAnchor = createScrollAnchor({
         getBox: function () { return CS.messagesBox; },
         isStuck: function () { return !!CS.stickToBottom; },
-        // A hidden tab keeps mutating this list - a resumed poll, the head refresh
-        // and its deferred background batch, a settling request - and every one of
-        // those would otherwise move a scroll position nobody is looking at. Freeze
-        // instead, and put the reader back once they can see it (settleScroll).
-        isFrozen: function () { return typeof document !== "undefined" && !!document.hidden; },
         rawFallback: true,
     });
     function captureScrollAnchor() { return chatScrollAnchor.capture(); }
@@ -4208,6 +4220,7 @@ import {
         // no-ops while pinned (there the bottom IS the anchor), so re-pinning has
         // to happen at this call site.
         if (CS.stickToBottom) { chatScrollAnchor.pinBottom(); return; }
+        anchorWroteSinceScroll = true;
         chatScrollAnchor.restore(anchor);
     }
 
@@ -4428,6 +4441,7 @@ import {
         // re-parsed unavailable, a settled turn growing its timestamp) everything
         // below it slides. renderMessages anchors because it tears the list down;
         // this anchors because the replacement changes a height in place.
+        anchorWroteSinceScroll = true;
         chatScrollAnchor.preserve(function () {
             var newEl = buildMessageEl(CS.messages[idx], idx);
             if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
@@ -4494,8 +4508,6 @@ import {
             box.addEventListener("wheel", onMessagesWheel, { passive: true });
             box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
             box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
-            box.addEventListener("keydown", onMessagesKeyDown, { passive: true });
-            box.addEventListener("pointerdown", onMessagesPointerDown, { passive: true });
             // Any image inside the list finishing (or failing) is a height change
             // nobody asked for, and for a reader scrolled up into history it is a
             // jump mid-sentence. Delegated and in the CAPTURE phase because `load`
@@ -4929,24 +4941,8 @@ import {
         // refresh it (no redirect) when the tab becomes visible again.
         if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
             S._visBound = true;
-            // Leaving for another APPLICATION is not the same event, and it is the
-            // one users actually hit: switching apps usually leaves this tab the
-            // ACTIVE tab, so document.visibilityState stays "visible",
-            // visibilitychange never fires, and the handler below is never called.
-            // The page carries on rendering and the chat carries on mutating - a
-            // poll settling, a preview decoding, a deferred indexing batch merging -
-            // under a reader who is not there. Only window blur/focus see it.
-            //
-            // Deliberately just park/restore, with no freeze: an unfocused window can
-            // still be perfectly visible (a second monitor, side by side), so the
-            // ordinary compensation must keep running. Parking is what makes the
-            // return exact anyway, since every background correction re-stamps the
-            // live anchor. (agent.vue does the same.)
-            window.addEventListener("blur", function () { chatScrollAnchor.park(); });
-            window.addEventListener("focus", function () { settleScrollAfterRefresh(true); });
             document.addEventListener("visibilitychange", function () {
                 if (document.visibilityState === "hidden") {
-                    chatScrollAnchor.park();
                     // Nobody is looking: stop background indexing polls. The server keeps
                     // working (the worker drives the document loop itself), so this only
                     // drops traffic, never progress.
@@ -4954,12 +4950,9 @@ import {
                     return;
                 }
                 if (document.visibilityState === "visible") {
-                    // Put the reader back FIRST, in this same task. The anchor was
-                    // frozen for the whole hidden stretch, so it still holds the
-                    // position they left; restoring it before the resumed refresh can
-                    // land means the wrong position is never on screen, rather than
-                    // being corrected a round trip later.
-                    settleScrollAfterRefresh(true);
+                    // Nothing here touches the scroll, and that is the point: the
+                    // reader was never moved while they were away, because
+                    // compensation runs whether or not the tab is visible.
                     // Refresh the MCP grant BEFORE resuming, or the first poll after a long
                     // hidden stretch 401s on an aged-out grant.
                     var refreshed = S.user ? ensureMcpGrantFresh() : null;

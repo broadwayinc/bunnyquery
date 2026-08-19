@@ -658,244 +658,6 @@ test('standbys do not fire while the anchored row is still there', () => {
     assert.strictEqual(box.scrollTop, 550);
 });
 
-/* ---- frozen: a hidden tab must not move the reader -----------------------*/
-
-test('while FROZEN nothing writes, and the reader place survives the whole stretch', () => {
-    // The tab-return bug: a hidden tab keeps refreshing the list, every refresh
-    // wrote scrollTop against a layout nobody was looking at and re-stamped the
-    // anchor on the way through, so the reader came back to wherever the LAST of
-    // those writes landed and only the next correction put them right.
-    let hidden = false;
-    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 250;
-    anchor.remember();
-    const before = topRowKeyAndOffset(box);
-
-    hidden = true;
-    const writes0 = box._writes;
-    // Two refreshes land while hidden: a surface page that drops rows, then the
-    // deferred batch that brings them back, each of which would have moved us. The
-    // assertion is that the ANCHOR does not write — the box itself legitimately
-    // re-clamps when the shrink puts the current offset past the new end.
-    anchor.preserve(() => box.set([row('b', 200), row('c', 200)]));
-    anchor.hold();
-    anchor.preserve(() => box.set([row('a', 200), row('b', 200), row('c', 200)]));
-    assert.strictEqual(box._writes, writes0, 'frozen: the anchor must not write');
-
-    // The tab comes forward. One hold() puts them back on the line they left.
-    hidden = false;
-    anchor.hold();
-    const after = topRowKeyAndOffset(box);
-    assert.strictEqual(after.key, before.key);
-    assert.strictEqual(after.top, before.top);
-});
-
-test('a scroll event while frozen does not overwrite the remembered place', () => {
-    let hidden = true;
-    const box = makeBox([row('a', 200), row('b', 200), row('c', 200)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 250;
-    hidden = false; anchor.remember(); hidden = true;   // the reader's real place
-
-    box.scrollTop = 0;            // something clamps the box while nobody is looking
-    anchor.remember();            // must be ignored
-    hidden = false;
-    // The FIRST hold() after a frozen stretch behaves like thaw(): scrollTop moved,
-    // but nothing that happened while hidden was the reader. It must not re-measure
-    // either — that would destroy the only record of where they were, which is what
-    // left them in the "middle".
-    anchor.hold();
-    assert.strictEqual(box.scrollTop, 250);
-});
-
-test('a hold() racing the visibility handler cannot destroy the remembered place', () => {
-    // onUpdated -> hold() fires on every render, so one can land between the tab
-    // becoming visible and the visibility handler's own thaw().
-    let hidden = false;
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 500;
-    anchor.remember();
-    hidden = true;
-    anchor.hold();                         // a render while hidden: marks the stretch
-    box.scrollTop = box.scrollHeight;      // an invisible scroll-to-bottom
-    hidden = false;
-
-    anchor.hold();                         // the racing render wins the first call
-    assert.strictEqual(box.scrollTop, 500);
-    anchor.thaw();                         // and the handler's thaw is then a no-op
-    assert.strictEqual(box.scrollTop, 500);
-});
-
-test('thaw() puts the reader back after invisible writes moved the box', () => {
-    // The reported symptom, in one test: the reader is mid-history, the tab is
-    // hidden, a refresh lands and something scrolls the box to the bottom while
-    // nobody is looking. On return they must be back on their line, immediately.
-    let hidden = false;
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 500;
-    anchor.remember();
-    const before = topRowKeyAndOffset(box);
-
-    hidden = true;
-    box.scrollTop = box.scrollHeight;      // an invisible scroll-to-bottom
-    anchor.preserve(() => box.set([row('a', 400), row('b', 400), row('c', 400), row('d', 400)]));
-    hidden = false;
-
-    anchor.thaw();
-    const after = topRowKeyAndOffset(box);
-    assert.strictEqual(after.key, before.key);
-    assert.strictEqual(after.top, before.top);
-    assert.strictEqual(box.scrollTop, 500);
-});
-
-test('thaw() is a no-op while still frozen, and harmless with nothing remembered', () => {
-    let hidden = true;
-    const box = makeBox([row('a', 200), row('b', 200)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 100;
-    anchor.thaw();
-    assert.strictEqual(box.scrollTop, 100);
-    hidden = false;
-    anchor.forget();
-    anchor.thaw();
-    assert.strictEqual(box.scrollTop, 100);
-});
-
-test('absorb still records a height while frozen, so it does not double-pay later', () => {
-    let hidden = true;
-    const tall = row('tall', 900);
-    const box = makeBox([tall, row('after', 200)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    const img = imgIn(box, tall, 100);
-    img.grow(320);
-    anchor.absorb(img);                    // decoded while hidden: recorded, not paid
-    assert.strictEqual(box.scrollTop, 0);
-
-    hidden = false;
-    box.scrollTop = 600;
-    anchor.remember();
-    img.grow(320);                         // no change now
-    anchor.absorb(img);
-    assert.strictEqual(box.scrollTop, 600, 'the hidden growth must not be paid twice');
-});
-
-/* ---- parked: away in another APP, where nothing goes hidden --------------*/
-
-test('park/thaw survives an unfocused stretch in which compensation kept running', () => {
-    // Switching to another application usually leaves this tab the ACTIVE tab:
-    // visibilitychange never fires, the page keeps rendering, and the anchor keeps
-    // compensating — which re-stamps the live anchor over and over. Only a place
-    // parked at blur can still name where the reader actually was.
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 500;
-    anchor.remember();
-    const before = topRowKeyAndOffset(box);
-
-    anchor.park();                                  // window blur
-
-    // Away. Background work keeps compensating (nothing is frozen) and keeps
-    // re-stamping the live anchor, then something scrolls the box outright.
-    anchor.preserve(() => box.set([row('older', 600), ...box.children]));
-    anchor.hold();
-    box.scrollTop = box.scrollHeight;               // an unwatched scroll-to-bottom
-
-    anchor.thaw();                                  // window focus
-    const after = topRowKeyAndOffset(box);
-    assert.strictEqual(after.key, before.key);
-    assert.strictEqual(after.top, before.top);
-});
-
-test('a hidden tab parks on the way out, exactly as the clients do', () => {
-    let hidden = false;
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({
-        getBox: () => box, isStuck: () => false, isFrozen: () => hidden,
-    });
-    box.scrollTop = 500;
-    anchor.remember();
-    anchor.park();                 // both clients park on hide AND on blur
-    hidden = true;
-    box.scrollTop = 0;
-    hidden = false;
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 500);
-});
-
-test('settleReturn with nothing armed is a no-op, never a licence to re-impose', () => {
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 500;
-    anchor.remember();
-    box.scrollTop = 900;           // the reader scrolls
-    assert.strictEqual(anchor.settleReturn(), false);
-    assert.strictEqual(box.scrollTop, 900);
-});
-
-test('a second thaw() does not move the reader again', () => {
-    // Both handlers can fire on one return (a tab switch is also a focus change).
-    const box = makeBox([row('a', 400), row('b', 400), row('c', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 500;
-    anchor.remember();
-    anchor.park();
-    box.scrollTop = 1200;
-    anchor.thaw();
-    assert.strictEqual(box.scrollTop, 500);
-    anchor.thaw();
-    assert.strictEqual(box.scrollTop, 500);
-});
-
-test('a reader who left PINNED is put back on the bottom, and the host is told', () => {
-    // capture() records nothing for a pinned reader (the bottom is the place, not a
-    // row), so parkedStuck is the only note of it. Without it, a stickiness lost
-    // during the absence had no fallback at all and the reader stayed wherever the
-    // list happened to leave them.
-    const box = makeBox([row('a', 400), row('b', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => true });
-    box.scrollTop = 500;
-    anchor.park();
-    box.scrollTop = 0;                              // something moved it while away
-    assert.strictEqual(anchor.settleReturn(), true, 'the host must re-pin');
-    assert.strictEqual(box.scrollTop, 500);
-});
-
-test('a pinned return STAYS armed, so it lands on the post-merge bottom', () => {
-    // Phase 1 pins to the surface page's bottom; the deferred indexing batch then
-    // adds rows. Re-pinning only once left the reader stranded above the newest
-    // turn by exactly the batch's height.
-    let stuck = true;
-    const box = makeBox([row('a', 400), row('b', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => stuck });
-    box.scrollTop = 500;
-    anchor.park();
-
-    anchor.settleReturn();                          // phase 1
-    assert.strictEqual(box.scrollTop, 500);
-    assert.strictEqual(anchor.isReturning(), true, 'still armed for phase 2');
-
-    box.set([row('a', 400), row('b', 400), row('batch', 600)]);   // phase 2 merges
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 1100, 'the bottom that exists AFTER the merge');
-});
-
-/* ---- a correction the box could not take, retried when it can ------------*/
-
 // 60 rows of 100px in a 600px box: the measured shape from the audit.
 function longChat(n) {
     const rows = [];
@@ -903,194 +665,85 @@ function longChat(n) {
     return rows;
 }
 
-test('THE BUG: a tail shrink clamps the return away, and phase 2 must retry it', () => {
-    // Reader near the end of the loaded history. While they are away the TAIL loses
-    // rows (a finished run collapsing its passes, the pending indicator going away),
-    // so the box's maximum scrollTop drops below where they were and the browser
-    // truncates the correction. Believing that write succeeded is what left them a
-    // few hundred pixels off their line, permanently — the ~1s phase-2 correction
-    // then slid the list under them and kept the error.
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;                 // m53 sits at the top of the viewport
-    anchor.remember();
-    const before = topRowKeyAndOffset(box);
-    assert.strictEqual(before.key, 'm53');
-    assert.strictEqual(before.top, 0);
 
-    anchor.park();
-    box.set(rows.slice(0, 55));           // phase 1: five tail rows go away
-    assert.strictEqual(box.scrollTop, 4900, 'the browser clamped us');
 
-    anchor.settleReturn();                // the return lands short and knows it
-    assert.strictEqual(box.scrollTop, 4900);
-    assert.strictEqual(anchor.isReturning(), true, 'still armed: the write was clamped');
 
-    box.set(rows);                        // phase 2: the batch brings them back
-    anchor.settleReturn();
-    const after = topRowKeyAndOffset(box);
-    assert.strictEqual(after.key, 'm53');
-    assert.strictEqual(after.top, 0);
-    assert.strictEqual(box.scrollTop, 5300);
-    assert.strictEqual(anchor.isReturning(), false, 'landed: the return retires');
-});
 
-test('a return that lands first time retires immediately', () => {
+
+
+/* ---- the reported sequence, end to end ----------------------------------*/
+
+test('THE REPORT: away in another app, come back, tap the input, touch the scroll', () => {
+    // Long history, reader parked mid-conversation. They switch apps; the chat keeps
+    // mutating (a poll settles, a page merges, a preview decodes) and each change is
+    // compensated AS IT HAPPENS. They come back, tap the composer — the on-screen
+    // keyboard shrinks the box — and then touch the scroll. Nothing may move them at
+    // any point, and crucially there is no stored instruction left over to fire.
     const rows = longChat(60);
     const box = makeBox(rows, 600);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
     box.scrollTop = 3000;
     anchor.remember();
-    anchor.park();
-    box.set([row('older', 400), ...rows]);
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 3400);
-    assert.strictEqual(anchor.isReturning(), false);
+    const before = topRowKeyAndOffset(box);
+
+    // ---- away. Every mutation is bracketed, so the line never moves.
+    anchor.preserve(() => box.set([row('older', 700), ...rows]));
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+    const img = imgIn(box, box.children[3], 10);   // a preview decodes above them
+    img.grow(320);
+    anchor.absorb(img);
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+
+    // ---- back. Nothing to restore, because nothing moved them.
+    const atReturn = box.scrollTop;
+
+    // ---- they tap the composer: the keyboard shrinks the box.
+    box.clientHeight = 300;
+    assert.strictEqual(box.scrollTop, atReturn, 'a viewport change is not a content change');
+
+    // ---- a fetch that the keyboard resize kicked off now settles.
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, atReturn, 'the settle has no old instruction to carry out');
+
+    // ---- and they touch the scroll.
+    box.scrollTop = 1200;
+    anchor.remember();
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 1200, 'the reader is left exactly where they went');
+    anchor.preserve(() => box.set([row('newer', 400), ...box.children]));
+    anchor.hold();
+    assert.strictEqual(box.scrollTop, 1600, 'and is held there, not sent anywhere');
 });
 
-test('THE READER WINS: scrolling themselves after the return retires it at once', () => {
-    // The regression the naive "keep retrying" fix caused, measured at -700px and
-    // -4900px by the audit: a still-armed return that outlives the reader yanks
-    // them back the next time anything merges. A scroll position this module did
-    // not write is the reader, and that retires the return.
+test('a hidden stretch needs no return handling, because compensation ran throughout', () => {
+    // The whole reason the deleted machinery existed. With compensation running
+    // whether or not anyone is watching, the reader's line is already correct when
+    // they come back, so there is nothing to put back and nothing to get wrong.
     const rows = longChat(60);
     const box = makeBox(rows, 600);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
+    box.scrollTop = 3000;
     anchor.remember();
-    anchor.park();
-    box.set(rows.slice(0, 55));
-    anchor.settleReturn();
-    assert.strictEqual(anchor.isReturning(), true);
+    const before = topRowKeyAndOffset(box);
 
-    box.scrollTop = 300;          // the reader scrolls up to read something older
-    anchor.remember();            // their own scroll event
-    assert.strictEqual(anchor.isReturning(), false, 'the reader retired the return');
-
-    box.set(rows);                // phase 2 lands anyway
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 300, 'they are left exactly where they went');
+    anchor.preserve(() => box.set([row('p1', 500), ...rows]));            // surface page
+    anchor.preserve(() => box.set([row('p1', 500), row('bg', 300), ...rows]));  // bg batch
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+    assert.strictEqual(box.scrollTop, 3800);
 });
 
-test('THE READER WINS even scrolling to the very top, where the pager lives', () => {
-    // The worst measured regression (-4900px): scroll-to-top is the ONLY pager
-    // trigger, so dragging a reader off it also breaks paging.
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
-    anchor.remember();
-    anchor.park();
-    box.set(rows.slice(0, 55));
-    anchor.settleReturn();
-
-    box.scrollTop = 0;
-    anchor.remember();
-    box.set([row('older', 900), ...rows]);   // the page the pager fetched
-    anchor.settleReturn();
-    assert.ok(box.scrollTop <= 900, 'not dragged back down the conversation');
-});
-
-test('the anchor own writes do NOT retire the return', () => {
-    // Every write in this module records itself, so its own compensation cannot be
-    // mistaken for the reader. Miss one and the return retires a settle too early.
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
-    anchor.remember();
-    anchor.park();
-    box.set(rows.slice(0, 55));
-    anchor.settleReturn();
-    assert.strictEqual(anchor.isReturning(), true);
-
-    // A page prepends and the bracketing restore compensates: its write is ours.
-    anchor.preserve(() => box.set([row('older', 400), ...rows.slice(0, 55)]));
-    anchor.remember();
-    assert.strictEqual(anchor.isReturning(), true, 'our own write is not the reader');
-});
-
-test('pinBottom records its write, so a host pin does not retire the return either', () => {
+test('no method can move the box without a change to compensate for', () => {
+    // The property the deleted machinery broke: calling any of these repeatedly,
+    // at any time, with nothing having changed, is a no-op. That is what makes a
+    // background settle safe to fire whenever it likes.
     const box = makeBox(longChat(60), 600);
     const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
     box.scrollTop = 3000;
     anchor.remember();
-    anchor.park();
-    anchor.pinBottom();
-    anchor.remember();
-    assert.strictEqual(anchor.isReturning(), true);
-});
-
-/* ---- an armed return must never lie in wait ------------------------------*/
-
-test('THE WIDGET BUG: a settle after the reader touches the scroll must not move them', () => {
-    // Reported: come back to the browser, everything looks right, then START TO
-    // INTERACT with the scroll and it throws you to some middle position. That
-    // position is where you were BEFORE you left: a return was still armed, and the
-    // next background settle acted on it. The scroll EVENT would eventually have
-    // retired it, but a refresh can settle first — so the raw gesture has to.
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
-    anchor.remember();
-    anchor.park();                       // window blur
-    box.set(rows.slice(0, 55));          // a refresh lands while away; write clamps
-    anchor.settleReturn();               // window focus: lands short, stays armed
-    assert.strictEqual(anchor.isReturning(), true);
-
-    box.scrollTop = 1000;                // the reader starts scrolling
-    anchor.release();                    // wheel / touch / key / scrollbar drag
-    assert.strictEqual(anchor.isReturning(), false);
-
-    box.set(rows);                       // the deferred batch merges a beat later
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 1000, 'the reader stays exactly where they are');
-});
-
-test('an armed return expires rather than lying in wait', () => {
-    // window blur fires for far more than "left the browser" — devtools, another
-    // window, an iframe — and a blur with no matching focus must not arm something
-    // that fires minutes later.
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
-    anchor.remember();
-    anchor.park();
-    box.set(rows.slice(0, 55));          // keeps the return armed every time
-    for (let i = 0; i < 3; i++) anchor.settleReturn();
-    assert.strictEqual(anchor.isReturning(), false, 'the budget ran out');
-
-    box.scrollTop = 1200;
-    box.set(rows);
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 1200);
-});
-
-test('release() during the absence does not break a later legitimate return', () => {
-    const rows = longChat(60);
-    const box = makeBox(rows, 600);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false });
-    box.scrollTop = 5300;
-    anchor.remember();
-    anchor.release();                    // a stray gesture with nothing armed
-    anchor.park();                       // then a real absence
-    box.set([row('older', 400), ...rows]);
-    anchor.settleReturn();
-    assert.strictEqual(box.scrollTop, 5700);
-});
-
-test('release() with a pinned reader drops the pin instruction too', () => {
-    const box = makeBox([row('a', 400), row('b', 400)], 300);
-    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => true });
-    box.scrollTop = 500;
-    anchor.park();
-    box.scrollTop = 0;
-    anchor.release();
-    assert.strictEqual(anchor.settleReturn(), false, 'no re-pin after the reader acts');
-    assert.strictEqual(box.scrollTop, 0);
+    const writes0 = box._writes;
+    for (let i = 0; i < 5; i++) { anchor.hold(); anchor.remember(); anchor.preserve(() => {}); }
+    assert.strictEqual(box.scrollTop, 3000);
+    assert.strictEqual(box._writes, writes0, 'not one write');
 });
 
 /* ---- report --------------------------------------------------------------*/

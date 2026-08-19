@@ -2440,7 +2440,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var ROW_POS_ATTR = "data-row-pos";
   var MAX_ALTS = 2;
   var ALT_SCAN_LIMIT = 64;
-  var MAX_RETURN_SETTLES = 3;
   var UNKNOWN_ROW_POS = "\0?";
   function createScrollAnchor(options) {
     var held = null;
@@ -2452,13 +2451,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var kids = box.children;
       var fallback = null;
       var fallbackAt = -1;
+      var behind = [];
       for (var i = 0; i < kids.length; i++) {
         var el = kids[i];
         if (!el || typeof el.getAttribute !== "function") continue;
         var key = el.getAttribute(ROW_KEY_ATTR);
         if (!key) continue;
         var top = el.getBoundingClientRect().top - boxTop;
-        if (top + el.offsetHeight <= 0) continue;
+        if (top + el.offsetHeight <= 0) {
+          var bpos = el.getAttribute(ROW_POS_ATTR);
+          behind.push({
+            key,
+            top,
+            pos: bpos === null ? null : bpos || UNKNOWN_ROW_POS,
+            el
+          });
+          if (behind.length > MAX_ALTS) behind.shift();
+          continue;
+        }
         if (top >= box.clientHeight) break;
         var rawPos = el.getAttribute(ROW_POS_ATTR);
         var pos = rawPos === null ? null : rawPos || UNKNOWN_ROW_POS;
@@ -2471,7 +2481,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           el
         };
         if (rawPos === null) {
-          cand.alts = collectAlts(box, boxTop, i + 1);
+          cand.alts = withBehind(collectAlts(box, boxTop, i + 1), behind);
           return cand;
         }
         if (!fallback) {
@@ -2480,7 +2490,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       if (fallback) {
-        fallback.alts = collectAlts(box, boxTop, fallbackAt + 1, true);
+        fallback.alts = withBehind(
+          collectAlts(box, boxTop, fallbackAt + 1, true) || collectAlts(box, boxTop, fallbackAt + 1),
+          behind
+        );
         return fallback;
       }
       return {
@@ -2512,6 +2525,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return out.length ? out : void 0;
     }
+    function withBehind(forward, behind) {
+      var out = (forward || []).concat(behind.slice().reverse());
+      return out.length ? out : void 0;
+    }
     function findRow(box, anchor) {
       var el = anchor.el;
       if (el && el.parentNode === box) return el;
@@ -2524,21 +2541,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return null;
     }
-    var sawFrozen = false;
-    var parked = null;
-    var parkedStuck = false;
-    var returning = false;
-    var returnBudget = 0;
-    var wroteTop = -1;
-    var restoreExact = true;
-    var restorePinned = false;
-    function frozen() {
-      var f = !!options.isFrozen && options.isFrozen();
-      if (f) sawFrozen = true;
-      return f;
-    }
-    function restore(anchor, unbounded) {
-      if (frozen()) return;
+    function restore(anchor) {
       var box = options.getBox();
       if (!box || !anchor || options.isStuck()) return;
       var el = findRow(box, anchor);
@@ -2550,32 +2553,36 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var boxTop = box.getBoundingClientRect().top;
         var delta = el.getBoundingClientRect().top - boxTop - anchor.top;
         var slack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-        if (!unbounded && (delta > slack || delta < -slack)) {
-          lost(box, anchor);
+        var moved = delta - (anchor.scrollTop - box.scrollTop);
+        if (moved > slack || moved < -slack) {
+          el = null;
+        } else {
+          if (delta >= 1 || delta <= -1) box.scrollTop += delta;
+          held = {
+            key: anchor.key,
+            top: anchor.top,
+            pos: anchor.pos,
+            scrollTop: box.scrollTop,
+            scrollHeight: box.scrollHeight,
+            el,
+            // Carried, not dropped: one successful restore used to disarm the
+            // standbys for every later hold.
+            alts: anchor.alts
+          };
           return;
         }
-        var want = box.scrollTop + delta;
-        if (delta >= 1 || delta <= -1) box.scrollTop += delta;
-        wroteTop = box.scrollTop;
-        restorePinned = true;
-        restoreExact = box.scrollTop >= want - 1 && box.scrollTop <= want + 1;
-        held = {
-          key: anchor.key,
-          top: anchor.top,
-          pos: anchor.pos,
-          scrollTop: box.scrollTop,
-          scrollHeight: box.scrollHeight,
-          el,
-          // Carried, not dropped: one successful restore used to disarm the
-          // standbys for every later hold.
-          alts: anchor.alts
-        };
-        return;
       }
       var alts = anchor.alts;
       for (var ai = 0; alts && ai < alts.length; ai++) {
         var alt = alts[ai];
-        var ael = findRow(box, { key: alt.key, top: alt.top, pos: alt.pos, scrollTop: anchor.scrollTop, scrollHeight: anchor.scrollHeight, el: alt.el });
+        var ael = findRow(box, {
+          key: alt.key,
+          top: alt.top,
+          pos: alt.pos,
+          scrollTop: anchor.scrollTop,
+          scrollHeight: anchor.scrollHeight,
+          el: alt.el
+        });
         if (!ael) continue;
         if (alt.pos !== null && alt.pos !== UNKNOWN_ROW_POS) {
           var altLive = ael.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
@@ -2584,12 +2591,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var aboxTop = box.getBoundingClientRect().top;
         var adelta = ael.getBoundingClientRect().top - aboxTop - alt.top;
         var aslack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-        if (!unbounded && (adelta > aslack || adelta < -aslack)) continue;
-        var awant = box.scrollTop + adelta;
+        var amoved = adelta - (anchor.scrollTop - box.scrollTop);
+        if (amoved > aslack || amoved < -aslack) continue;
         if (adelta >= 1 || adelta <= -1) box.scrollTop += adelta;
-        wroteTop = box.scrollTop;
-        restorePinned = true;
-        restoreExact = box.scrollTop >= awant - 1 && box.scrollTop <= awant + 1;
         held = {
           key: alt.key,
           top: alt.top,
@@ -2608,13 +2612,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var grew = box.scrollHeight - anchor.scrollHeight;
       if (grew > 0) {
         box.scrollTop = anchor.scrollTop + grew;
-        wroteTop = box.scrollTop;
         return;
       }
-      if (options.rawFallback) {
-        box.scrollTop = anchor.scrollTop;
-        wroteTop = box.scrollTop;
-      }
+      if (options.rawFallback) box.scrollTop = anchor.scrollTop;
     }
     function preserve(mutate) {
       var anchor = capture();
@@ -2623,17 +2623,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return result;
     }
     function remember() {
-      var b0 = options.getBox();
-      if (returning && b0 && b0.scrollTop !== wroteTop) release();
-      if (frozen()) return;
       held = capture();
     }
     function hold() {
-      if (frozen()) return;
-      if (sawFrozen) {
-        settleReturn();
-        return;
-      }
       var box = options.getBox();
       if (!box || options.isStuck()) {
         held = null;
@@ -2660,86 +2652,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (prev === void 0) prev = 0;
       var delta = h - prev;
       if (delta === 0) return;
-      if (frozen()) {
-        foldFrozenGrowth(box, el, delta);
-        return;
-      }
       if (el.getBoundingClientRect().top >= box.getBoundingClientRect().top) return;
       box.scrollTop += delta;
-      wroteTop = box.scrollTop;
       if (held) held = capture();
-    }
-    function park() {
-      parked = capture();
-      parkedStuck = !!options.isStuck();
-      returning = true;
-      returnBudget = MAX_RETURN_SETTLES;
-    }
-    function release() {
-      parked = null;
-      parkedStuck = false;
-      returning = false;
-      returnBudget = 0;
     }
     function pinBottom() {
       var box = options.getBox();
       if (!box) return;
       box.scrollTop = box.scrollHeight;
-      wroteTop = box.scrollTop;
-    }
-    function settleReturn() {
-      if (frozen()) return false;
-      var wasFrozen = sawFrozen;
-      sawFrozen = false;
-      if (!returning && !wasFrozen) return false;
-      if (returning) {
-        if (returnBudget <= 0) {
-          release();
-          return false;
-        }
-        returnBudget--;
-      }
-      if (parkedStuck) {
-        pinBottom();
-        return true;
-      }
-      var target = parked || held;
-      restoreExact = true;
-      restorePinned = false;
-      restore(target, true);
-      parked = !restorePinned || !restoreExact ? target : null;
-      returning = !!parked && returnBudget > 0;
-      if (!returning) {
-        parked = null;
-        parkedStuck = false;
-        returnBudget = 0;
-      }
-      return false;
-    }
-    function isReturning() {
-      return returning;
-    }
-    function thaw() {
-      settleReturn();
-    }
-    function foldFrozenGrowth(box, el, delta) {
-      var elTop = el.getBoundingClientRect().top;
-      foldInto(box, held, elTop, delta);
-      foldInto(box, parked, elTop, delta);
-    }
-    function foldInto(box, a, elTop, delta) {
-      if (!a || a.top >= 0) return;
-      var rowEl = findRow(box, a);
-      if (!rowEl) return;
-      var within = elTop - rowEl.getBoundingClientRect().top;
-      if (within < 0 || within >= rowEl.offsetHeight) return;
-      if (within >= -a.top) return;
-      a.top -= delta;
-      a.scrollHeight += delta;
     }
     function forget() {
       held = null;
-      release();
     }
     return {
       capture,
@@ -2747,13 +2670,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       preserve,
       remember,
       hold,
-      park,
-      settleReturn,
-      isReturning,
-      release,
       pinBottom,
-      isFrozen: frozen,
-      thaw,
       absorb,
       forget
     };
@@ -8505,7 +8422,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       enqueueAttachmentSend({ text, batchId, stageId, pinned });
     }
     function scrollToBottom() {
-      if (chatScrollAnchor.isFrozen()) {
+      if (typeof document !== "undefined" && document.hidden) {
         CS.stickToBottom = true;
         chatScrollAnchor.pinBottom();
         return Promise.resolve();
@@ -8518,7 +8435,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function scrollToBottomIfSticky() {
       if (!CS.stickToBottom) return Promise.resolve();
-      if (chatScrollAnchor.isFrozen()) {
+      if (typeof document !== "undefined" && document.hidden) {
         chatScrollAnchor.pinBottom();
         return Promise.resolve();
       }
@@ -8527,25 +8444,25 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         chatScrollAnchor.pinBottom();
       });
     }
-    function settleScrollAfterRefresh(afterAbsence) {
-      if (afterAbsence || chatScrollAnchor.isReturning()) {
-        if (chatScrollAnchor.settleReturn()) CS.stickToBottom = true;
-        return;
-      }
+    function settleScrollAfterRefresh() {
+      anchorWroteSinceScroll = true;
       if (CS.stickToBottom) scrollToBottomIfSticky();
       else chatScrollAnchor.hold();
     }
     var lastHistoryScrollTop = 0;
+    var anchorWroteSinceScroll = false;
     function onHistoryScroll() {
       if (!CS.messagesBox || CS.chatSettingsOpen) return;
       var el = CS.messagesBox;
-      if (chatScrollAnchor.isFrozen()) {
+      if (typeof document !== "undefined" && document.hidden) {
         lastHistoryScrollTop = el.scrollTop;
         return;
       }
       var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 16;
+      var ours = anchorWroteSinceScroll;
+      anchorWroteSinceScroll = false;
       if (!atBottom) CS.stickToBottom = false;
-      else if (el.scrollTop >= lastHistoryScrollTop) CS.stickToBottom = true;
+      else if (!ours && el.scrollTop >= lastHistoryScrollTop) CS.stickToBottom = true;
       lastHistoryScrollTop = el.scrollTop;
       chatScrollAnchor.remember();
       if (el.scrollTop <= 60) pageOlderHistoryUntilTaller();
@@ -8556,25 +8473,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function onMessagesImageSettled(e) {
       var t = e && e.target;
       if (!t || t.tagName !== "IMG") return;
+      anchorWroteSinceScroll = true;
       chatScrollAnchor.absorb(previewLayoutBox(t));
     }
     var _touchStartY = 0;
     function onMessagesWheel(e) {
-      chatScrollAnchor.release();
       if (e.deltaY < 0) CS.stickToBottom = false;
     }
     function onMessagesTouchStart(e) {
-      chatScrollAnchor.release();
       _touchStartY = e.touches && e.touches[0] ? e.touches[0].clientY : 0;
     }
-    function onMessagesKeyDown() {
-      chatScrollAnchor.release();
-    }
-    function onMessagesPointerDown() {
-      chatScrollAnchor.release();
-    }
     function onMessagesTouchMove(e) {
-      chatScrollAnchor.release();
       var y = e.touches && e.touches[0] ? e.touches[0].clientY : 0;
       if (y > _touchStartY + 4) CS.stickToBottom = false;
     }
@@ -9704,6 +9613,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function autoGrowInput(el) {
       if (!el) return;
+      var prevH = el.offsetHeight;
       el.style.height = "auto";
       var cs = window.getComputedStyle(el);
       var border = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
@@ -9716,6 +9626,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         el.style.height = h2 + "px";
         el.style.overflowY = "hidden";
       }
+      var nextH = el.offsetHeight;
+      if (CS.stickToBottom) chatScrollAnchor.pinBottom();
+      if (nextH < prevH) ensureHistoryFillsViewport();
     }
     function buildMessageEl(msg, idx) {
       var cls = ["bq-message"];
@@ -10242,13 +10155,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       isStuck: function() {
         return !!CS.stickToBottom;
       },
-      // A hidden tab keeps mutating this list - a resumed poll, the head refresh
-      // and its deferred background batch, a settling request - and every one of
-      // those would otherwise move a scroll position nobody is looking at. Freeze
-      // instead, and put the reader back once they can see it (settleScroll).
-      isFrozen: function() {
-        return typeof document !== "undefined" && !!document.hidden;
-      },
       rawFallback: true
     });
     function captureScrollAnchor() {
@@ -10261,6 +10167,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         chatScrollAnchor.pinBottom();
         return;
       }
+      anchorWroteSinceScroll = true;
       chatScrollAnchor.restore(anchor);
     }
     function syncDraftingIndicator() {
@@ -10387,6 +10294,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (idx < 0 || idx >= CS.messages.length) return;
       var oldEl = CS.messageEls[idx];
       if (!oldEl || !oldEl.parentNode) return;
+      anchorWroteSinceScroll = true;
       chatScrollAnchor.preserve(function() {
         var newEl = buildMessageEl(CS.messages[idx], idx);
         if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
@@ -10472,8 +10380,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         box.addEventListener("wheel", onMessagesWheel, { passive: true });
         box.addEventListener("touchstart", onMessagesTouchStart, { passive: true });
         box.addEventListener("touchmove", onMessagesTouchMove, { passive: true });
-        box.addEventListener("keydown", onMessagesKeyDown, { passive: true });
-        box.addEventListener("pointerdown", onMessagesPointerDown, { passive: true });
         box.addEventListener("load", onMessagesImageSettled, true);
         box.addEventListener("error", onMessagesImageSettled, true);
         if (document.fonts && document.fonts.addEventListener) {
@@ -10862,20 +10768,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
         S._visBound = true;
-        window.addEventListener("blur", function() {
-          chatScrollAnchor.park();
-        });
-        window.addEventListener("focus", function() {
-          settleScrollAfterRefresh(true);
-        });
         document.addEventListener("visibilitychange", function() {
           if (document.visibilityState === "hidden") {
-            chatScrollAnchor.park();
             if (session && session.pausePolling) session.pausePolling("hidden");
             return;
           }
           if (document.visibilityState === "visible") {
-            settleScrollAfterRefresh(true);
             var refreshed = S.user ? ensureMcpGrantFresh() : null;
             Promise.resolve(refreshed).catch(function() {
             }).then(function() {

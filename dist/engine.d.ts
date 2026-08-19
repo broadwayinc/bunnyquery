@@ -1815,32 +1815,54 @@ declare function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecision
  * prepends, a poll resolves, an indexing row splices in or changes label, a link
  * chip goes grey, an image preview finishes decoding, the "Fetching history..."
  * bar appears and disappears. Every one of those changes the height of something
- * that may sit ABOVE the viewport, and the browser answers by keeping scrollTop —
- * which slides the sentence the user was reading out from under them.
+ * that may sit ABOVE the viewport, and the browser answers by keeping scrollTop,
+ * which slides the sentence the reader was on out from under them.
  *
- * Both clients had their own copy of a row anchor for the ONE case each could
- * bracket (agent.vue watched its row-key list, the widget bracketed its full
- * re-render). Everything else — anything that changed a height without changing
- * the row SET, and everything asynchronous — was uncovered in both. This is the
- * single implementation, and it covers both shapes:
+ * THE ONE RULE: nothing here stores a position to be applied later. Every method
+ * acts at the moment it is called, against the box as it is at that moment, and
+ * is finished when it returns.
+ *
+ * That rule is the whole design, and it was learned the hard way. An earlier
+ * version of this module also had a "park the place they left, put them back when
+ * they return" half — parked/parkedStuck/returning/returnBudget/sawFrozen, a
+ * frozen mode, a retry budget. Every one of those was a stored instruction that
+ * some later event would carry out, and the reader's experience of a stored
+ * instruction is that the chat throws them somewhere for no reason they can see:
+ * they came back from another app, tapped the composer, the on-screen keyboard
+ * fired a resize, the resize triggered a fetch, the fetch settled, and the settle
+ * dutifully executed an instruction recorded before they ever left. Compensating
+ * at the moment of the change needs no such instruction, and a return then needs
+ * no handling at all, because nothing moved the reader in the first place.
+ *
+ * Two shapes, both immediate:
  *
  *   preserve(fn) / capture() + restore(a)
  *       A mutation you can bracket. Measures immediately before and immediately
  *       after, so it is exact even when the mutation tears the list down.
  *
  *   remember() + hold()
- *       A layout change you CANNOT bracket — an image decoding, a font arriving,
- *       a re-parse triggered from a promise. `remember()` runs from the view's
- *       scroll handler, so the anchor is always the reader's own last position;
- *       `hold()` puts that position back whenever something settles.
+ *       A layout change you CANNOT bracket: an image decoding, a font arriving, a
+ *       re-parse from a promise. remember() runs from the view's scroll handler,
+ *       so the anchor is always the reader's own last position.
  *
- * The staleness rule is what makes the unbracketed half safe. A layout change
- * above the viewport does NOT change scrollTop — the browser preserves it, which
- * is precisely why the content appears to jump. So a remembered anchor is still
- * valid exactly while `box.scrollTop` equals the value it was captured at. If it
- * differs, something moved the box on purpose (the user scrolled, a clamp fired,
- * or the browser's own scroll anchoring already compensated), and `hold()`
- * re-captures rather than dragging the reader back to a position they left.
+ * hold() is not an exception to the rule, and the staleness check is why. A height
+ * change above the viewport does NOT change scrollTop; the browser preserves it,
+ * which is precisely why the content appears to jump. So the remembered anchor is
+ * valid exactly while `box.scrollTop` still equals the value it was captured at,
+ * i.e. while nothing at all has moved the box. The instant that stops being true
+ * it is re-measured, never replayed. hold() can therefore only ever undo a height
+ * change that just happened, and can never carry out an old intention.
+ *
+ * Two more consequences worth stating, because both were once done the other way:
+ *
+ *   NO FREEZE. Compensation runs whether or not the tab is visible. Layout and
+ *   getBoundingClientRect are live in a hidden tab; only painting and rAF stop.
+ *   Suspending compensation while hidden is what created the need to restore
+ *   something afterwards.
+ *
+ *   A CLAMP IS ACCEPTED. If the content below the reader shrank, their line is
+ *   genuinely unreachable and the browser truncates the correction. Retrying that
+ *   later is how a correction turns into an ambush.
  *
  * DOM-free like the rest of the engine: the element shapes below are structural,
  * so real DOM nodes satisfy them while this file imports nothing from lib.dom.
@@ -1915,21 +1937,6 @@ interface ScrollAnchorOptions {
      */
     isStuck: () => boolean;
     /**
-     * The reader cannot see this box right now (the tab is hidden), so FREEZE:
-     * remember where they were and refuse to move them.
-     *
-     * A hidden tab still runs everything that mutates the list — a resumed poll, a
-     * head refresh and its deferred background batch, a settling request — and each
-     * of those would otherwise write scrollTop against a layout nobody is looking at
-     * and re-stamp the remembered position on the way through. The reader then comes
-     * back to wherever the last of those writes happened to land, which is the
-     * "somehow placed in the middle" they see, and only the NEXT correction puts
-     * them right. So while frozen, reads still happen but nothing writes and nothing
-     * re-stamps: the anchor holds the last position the reader actually had, and one
-     * hold() on return puts them back on it.
-     */
-    isFrozen?: () => boolean;
-    /**
      * Fall back to the raw scrollTop when the anchored row cannot be found again.
      *
      * For a view that REBUILDS the list (the widget's renderMessages), detaching
@@ -1951,33 +1958,8 @@ interface ScrollAnchor {
     remember: () => void;
     /** Put the remembered place back, if it is still the reader's own. */
     hold: () => void;
-    /** The reader is going away: park the exact place they are leaving. */
-    park: () => void;
-    /**
-     * They are back. Puts them on the parked place, and STAYS ARMED until it has
-     * actually landed. Returns true when the host must pin to the bottom instead
-     * (the reader left pinned), which only the host can do meaningfully.
-     */
-    settleReturn: () => boolean;
-    /** A return is armed: its position, not the host's, decides scrollTop. */
-    isReturning: () => boolean;
-    /**
-     * The reader is driving. Retire any armed return, at once.
-     *
-     * Call from the raw gesture handlers (wheel, touchstart, touchmove, keydown),
-     * which fire synchronously on a real user action and never for a programmatic
-     * scroll. Waiting for the scroll EVENT is not good enough: a background refresh
-     * can settle in between, and a settle with a return still armed puts the reader
-     * back where they were before they left, which lands as "I touched the scroll
-     * and it threw me somewhere else".
-     */
-    release: () => void;
     /** Pin to the bottom, instantly, recording the write. The ONLY way to pin. */
     pinBottom: () => void;
-    /** The box is not being painted (hidden tab). Shared so hosts agree. */
-    isFrozen: () => boolean;
-    /** Deprecated alias of settleReturn, kept so a stale dist does not break. */
-    thaw: () => void;
     /** Absorb one element's own resize. See below. */
     absorb: (el: AnchorGrowableEl | null | undefined) => void;
     /** Drop the remembered place (chat switch, unmount). */

@@ -2580,7 +2580,6 @@ var ROW_KEY_ATTR = "data-row-key";
 var ROW_POS_ATTR = "data-row-pos";
 var MAX_ALTS = 2;
 var ALT_SCAN_LIMIT = 64;
-var MAX_RETURN_SETTLES = 3;
 var UNKNOWN_ROW_POS = "\0?";
 function createScrollAnchor(options) {
   var held = null;
@@ -2592,13 +2591,24 @@ function createScrollAnchor(options) {
     var kids = box.children;
     var fallback = null;
     var fallbackAt = -1;
+    var behind = [];
     for (var i = 0; i < kids.length; i++) {
       var el = kids[i];
       if (!el || typeof el.getAttribute !== "function") continue;
       var key = el.getAttribute(ROW_KEY_ATTR);
       if (!key) continue;
       var top = el.getBoundingClientRect().top - boxTop;
-      if (top + el.offsetHeight <= 0) continue;
+      if (top + el.offsetHeight <= 0) {
+        var bpos = el.getAttribute(ROW_POS_ATTR);
+        behind.push({
+          key,
+          top,
+          pos: bpos === null ? null : bpos || UNKNOWN_ROW_POS,
+          el
+        });
+        if (behind.length > MAX_ALTS) behind.shift();
+        continue;
+      }
       if (top >= box.clientHeight) break;
       var rawPos = el.getAttribute(ROW_POS_ATTR);
       var pos = rawPos === null ? null : rawPos || UNKNOWN_ROW_POS;
@@ -2611,7 +2621,7 @@ function createScrollAnchor(options) {
         el
       };
       if (rawPos === null) {
-        cand.alts = collectAlts(box, boxTop, i + 1);
+        cand.alts = withBehind(collectAlts(box, boxTop, i + 1), behind);
         return cand;
       }
       if (!fallback) {
@@ -2620,7 +2630,10 @@ function createScrollAnchor(options) {
       }
     }
     if (fallback) {
-      fallback.alts = collectAlts(box, boxTop, fallbackAt + 1, true);
+      fallback.alts = withBehind(
+        collectAlts(box, boxTop, fallbackAt + 1, true) || collectAlts(box, boxTop, fallbackAt + 1),
+        behind
+      );
       return fallback;
     }
     return {
@@ -2652,6 +2665,10 @@ function createScrollAnchor(options) {
     }
     return out.length ? out : void 0;
   }
+  function withBehind(forward, behind) {
+    var out = (forward || []).concat(behind.slice().reverse());
+    return out.length ? out : void 0;
+  }
   function findRow(box, anchor) {
     var el = anchor.el;
     if (el && el.parentNode === box) return el;
@@ -2664,21 +2681,7 @@ function createScrollAnchor(options) {
     }
     return null;
   }
-  var sawFrozen = false;
-  var parked = null;
-  var parkedStuck = false;
-  var returning = false;
-  var returnBudget = 0;
-  var wroteTop = -1;
-  var restoreExact = true;
-  var restorePinned = false;
-  function frozen() {
-    var f = !!options.isFrozen && options.isFrozen();
-    if (f) sawFrozen = true;
-    return f;
-  }
-  function restore(anchor, unbounded) {
-    if (frozen()) return;
+  function restore(anchor) {
     var box = options.getBox();
     if (!box || !anchor || options.isStuck()) return;
     var el = findRow(box, anchor);
@@ -2690,32 +2693,36 @@ function createScrollAnchor(options) {
       var boxTop = box.getBoundingClientRect().top;
       var delta = el.getBoundingClientRect().top - boxTop - anchor.top;
       var slack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-      if (!unbounded && (delta > slack || delta < -slack)) {
-        lost(box, anchor);
+      var moved = delta - (anchor.scrollTop - box.scrollTop);
+      if (moved > slack || moved < -slack) {
+        el = null;
+      } else {
+        if (delta >= 1 || delta <= -1) box.scrollTop += delta;
+        held = {
+          key: anchor.key,
+          top: anchor.top,
+          pos: anchor.pos,
+          scrollTop: box.scrollTop,
+          scrollHeight: box.scrollHeight,
+          el,
+          // Carried, not dropped: one successful restore used to disarm the
+          // standbys for every later hold.
+          alts: anchor.alts
+        };
         return;
       }
-      var want = box.scrollTop + delta;
-      if (delta >= 1 || delta <= -1) box.scrollTop += delta;
-      wroteTop = box.scrollTop;
-      restorePinned = true;
-      restoreExact = box.scrollTop >= want - 1 && box.scrollTop <= want + 1;
-      held = {
-        key: anchor.key,
-        top: anchor.top,
-        pos: anchor.pos,
-        scrollTop: box.scrollTop,
-        scrollHeight: box.scrollHeight,
-        el,
-        // Carried, not dropped: one successful restore used to disarm the
-        // standbys for every later hold.
-        alts: anchor.alts
-      };
-      return;
     }
     var alts = anchor.alts;
     for (var ai = 0; alts && ai < alts.length; ai++) {
       var alt = alts[ai];
-      var ael = findRow(box, { key: alt.key, top: alt.top, pos: alt.pos, scrollTop: anchor.scrollTop, scrollHeight: anchor.scrollHeight, el: alt.el });
+      var ael = findRow(box, {
+        key: alt.key,
+        top: alt.top,
+        pos: alt.pos,
+        scrollTop: anchor.scrollTop,
+        scrollHeight: anchor.scrollHeight,
+        el: alt.el
+      });
       if (!ael) continue;
       if (alt.pos !== null && alt.pos !== UNKNOWN_ROW_POS) {
         var altLive = ael.getAttribute(ROW_POS_ATTR) || UNKNOWN_ROW_POS;
@@ -2724,12 +2731,9 @@ function createScrollAnchor(options) {
       var aboxTop = box.getBoundingClientRect().top;
       var adelta = ael.getBoundingClientRect().top - aboxTop - alt.top;
       var aslack = Math.abs(box.scrollHeight - anchor.scrollHeight) + box.clientHeight;
-      if (!unbounded && (adelta > aslack || adelta < -aslack)) continue;
-      var awant = box.scrollTop + adelta;
+      var amoved = adelta - (anchor.scrollTop - box.scrollTop);
+      if (amoved > aslack || amoved < -aslack) continue;
       if (adelta >= 1 || adelta <= -1) box.scrollTop += adelta;
-      wroteTop = box.scrollTop;
-      restorePinned = true;
-      restoreExact = box.scrollTop >= awant - 1 && box.scrollTop <= awant + 1;
       held = {
         key: alt.key,
         top: alt.top,
@@ -2748,13 +2752,9 @@ function createScrollAnchor(options) {
     var grew = box.scrollHeight - anchor.scrollHeight;
     if (grew > 0) {
       box.scrollTop = anchor.scrollTop + grew;
-      wroteTop = box.scrollTop;
       return;
     }
-    if (options.rawFallback) {
-      box.scrollTop = anchor.scrollTop;
-      wroteTop = box.scrollTop;
-    }
+    if (options.rawFallback) box.scrollTop = anchor.scrollTop;
   }
   function preserve(mutate) {
     var anchor = capture();
@@ -2763,17 +2763,9 @@ function createScrollAnchor(options) {
     return result;
   }
   function remember() {
-    var b0 = options.getBox();
-    if (returning && b0 && b0.scrollTop !== wroteTop) release();
-    if (frozen()) return;
     held = capture();
   }
   function hold() {
-    if (frozen()) return;
-    if (sawFrozen) {
-      settleReturn();
-      return;
-    }
     var box = options.getBox();
     if (!box || options.isStuck()) {
       held = null;
@@ -2800,86 +2792,17 @@ function createScrollAnchor(options) {
     if (prev === void 0) prev = 0;
     var delta = h - prev;
     if (delta === 0) return;
-    if (frozen()) {
-      foldFrozenGrowth(box, el, delta);
-      return;
-    }
     if (el.getBoundingClientRect().top >= box.getBoundingClientRect().top) return;
     box.scrollTop += delta;
-    wroteTop = box.scrollTop;
     if (held) held = capture();
-  }
-  function park() {
-    parked = capture();
-    parkedStuck = !!options.isStuck();
-    returning = true;
-    returnBudget = MAX_RETURN_SETTLES;
-  }
-  function release() {
-    parked = null;
-    parkedStuck = false;
-    returning = false;
-    returnBudget = 0;
   }
   function pinBottom() {
     var box = options.getBox();
     if (!box) return;
     box.scrollTop = box.scrollHeight;
-    wroteTop = box.scrollTop;
-  }
-  function settleReturn() {
-    if (frozen()) return false;
-    var wasFrozen = sawFrozen;
-    sawFrozen = false;
-    if (!returning && !wasFrozen) return false;
-    if (returning) {
-      if (returnBudget <= 0) {
-        release();
-        return false;
-      }
-      returnBudget--;
-    }
-    if (parkedStuck) {
-      pinBottom();
-      return true;
-    }
-    var target = parked || held;
-    restoreExact = true;
-    restorePinned = false;
-    restore(target, true);
-    parked = !restorePinned || !restoreExact ? target : null;
-    returning = !!parked && returnBudget > 0;
-    if (!returning) {
-      parked = null;
-      parkedStuck = false;
-      returnBudget = 0;
-    }
-    return false;
-  }
-  function isReturning() {
-    return returning;
-  }
-  function thaw() {
-    settleReturn();
-  }
-  function foldFrozenGrowth(box, el, delta) {
-    var elTop = el.getBoundingClientRect().top;
-    foldInto(box, held, elTop, delta);
-    foldInto(box, parked, elTop, delta);
-  }
-  function foldInto(box, a, elTop, delta) {
-    if (!a || a.top >= 0) return;
-    var rowEl = findRow(box, a);
-    if (!rowEl) return;
-    var within = elTop - rowEl.getBoundingClientRect().top;
-    if (within < 0 || within >= rowEl.offsetHeight) return;
-    if (within >= -a.top) return;
-    a.top -= delta;
-    a.scrollHeight += delta;
   }
   function forget() {
     held = null;
-    release();
   }
   return {
     capture,
@@ -2887,13 +2810,7 @@ function createScrollAnchor(options) {
     preserve,
     remember,
     hold,
-    park,
-    settleReturn,
-    isReturning,
-    release,
     pinBottom,
-    isFrozen: frozen,
-    thaw,
     absorb,
     forget
   };
