@@ -6482,7 +6482,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.8.17" ;
+    var BQ_VERSION = "1.8.18" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -10287,8 +10287,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.messagesBox.appendChild(el);
       });
       syncDraftingIndicator();
-      restoreScrollAnchor(anchor);
       hydrateMessageImagePreviews();
+      restoreScrollAnchor(anchor);
     }
     function refreshMessageBubble(idx) {
       if (idx < 0 || idx >= CS.messages.length) return;
@@ -10300,8 +10300,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
         oldEl.parentNode.replaceChild(newEl, oldEl);
         CS.messageEls[idx] = newEl;
+        hydrateMessageImagePreviews();
       });
-      hydrateMessageImagePreviews();
     }
     function renderChat() {
       clearImagePreviewCache(S.projectId || "default");

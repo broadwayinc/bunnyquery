@@ -746,6 +746,86 @@ test('no method can move the box without a change to compensate for', () => {
     assert.strictEqual(box._writes, writes0, 'not one write');
 });
 
+/* ---- measuring a list before its pictures are back -----------------------*/
+
+// A row whose height depends on whether its preview has been given a src back.
+// This is the one physical fact the harness was missing, and the reason the whole
+// suite passed while the widget threw readers across the conversation: a preview
+// that has been torn out and rebuilt has NO src, the sheet hides a src-less
+// preview, and it measures 0 until hydration hands it one.
+function imgRow(key, textH, imgH) {
+    const r = row(key, textH);
+    r._imgH = imgH;
+    r._hydrated = false;
+    Object.defineProperty(r, '_h', {
+        get() { return textH + (this._hydrated ? this._imgH : 0); },
+        set() { /* height is derived */ },
+    });
+    return r;
+}
+
+test('THE WIDGET BUG: restoring before hydration measures every preview at 0px', () => {
+    // renderMessages tears the list down and rebuilds it, then restores, THEN
+    // hydrates. Reproduced in a real browser at 1.8.17: reader on row m12 at
+    // offset -347 ended up on m8 at +7, four rows backwards.
+    const rows = [];
+    for (let i = 0; i < 30; i++) rows.push(i % 6 === 0 ? imgRow('m' + i, 60, 320) : row('m' + i, 60));
+    for (const r of rows) if (r._imgH) r._hydrated = true;
+    const box = makeBox(rows, 700);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false, rawFallback: true });
+    box.scrollTop = Math.round(box.scrollHeight * 0.5);
+    const before = topRowKeyAndOffset(box);
+
+    // --- the shipped order: rebuild (previews collapsed), restore, then hydrate
+    const rebuilt = rows.map(r => r._imgH ? imgRow(r._key, 60, r._imgH) : row(r._key, 60));
+    const a = anchor.capture();
+    box.set(rebuilt);                       // every preview is 0px right now
+    anchor.restore(a);                      // ...and this is what it measures
+    for (const r of rebuilt) if (r._imgH) r._hydrated = true;   // pictures come back
+    const after = topRowKeyAndOffset(box);
+    assert.notDeepStrictEqual(after, before, 'the shipped order must be shown to drift');
+});
+
+test('THE FIX: hydrating first measures the heights the reader actually had', () => {
+    const rows = [];
+    for (let i = 0; i < 30; i++) rows.push(i % 6 === 0 ? imgRow('m' + i, 60, 320) : row('m' + i, 60));
+    for (const r of rows) if (r._imgH) r._hydrated = true;
+    const box = makeBox(rows, 700);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false, rawFallback: true });
+    box.scrollTop = Math.round(box.scrollHeight * 0.5);
+    const before = topRowKeyAndOffset(box);
+
+    const rebuilt = rows.map(r => r._imgH ? imgRow(r._key, 60, r._imgH) : row(r._key, 60));
+    const a = anchor.capture();
+    box.set(rebuilt);
+    // A warm preview is complete in the memory cache, so assigning its src gives
+    // the element its real height in this same synchronous block (measured: 0px
+    // before, 320px immediately after, img.complete true).
+    for (const r of rebuilt) if (r._imgH) r._hydrated = true;
+    anchor.restore(a);
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+});
+
+test('a preview that is NOT warm still cannot strand the reader below the clamp', () => {
+    // Not every preview is in the memory cache. Those stay 0px through the restore
+    // and grow later, which absorb() pays for — but the restore must still land
+    // rather than being truncated by the shortened content.
+    const rows = [];
+    for (let i = 0; i < 30; i++) rows.push(i % 6 === 0 ? imgRow('m' + i, 60, 320) : row('m' + i, 60));
+    for (const r of rows) if (r._imgH) r._hydrated = true;
+    const box = makeBox(rows, 700);
+    const anchor = createScrollAnchor({ getBox: () => box, isStuck: () => false, rawFallback: true });
+    box.scrollTop = box.maxScrollTop;        // the worst case for a clamp
+    const before = topRowKeyAndOffset(box);
+
+    const rebuilt = rows.map(r => r._imgH ? imgRow(r._key, 60, r._imgH) : row(r._key, 60));
+    const a = anchor.capture();
+    box.set(rebuilt);
+    for (const r of rebuilt) if (r._imgH) r._hydrated = true;   // warm ones back first
+    anchor.restore(a);
+    assert.deepStrictEqual(topRowKeyAndOffset(box), before);
+});
+
 /* ---- report --------------------------------------------------------------*/
 
 let failed = 0;

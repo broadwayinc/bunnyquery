@@ -4424,10 +4424,30 @@ import {
         // carries no data-row-key, so the anchor math never picks it, and as
         // the last child it cannot shift the anchored rows above it.
         syncDraftingIndicator();
-        restoreScrollAnchor(anchor);
-        // Synchronous, so a preview whose url is already cached gets its src in
-        // this same block and a full re-render never blanks a loaded image.
+        // BEFORE the restore, not after. This is the whole reason a reader who
+        // leaves the page and comes back lands somewhere unrelated to where they
+        // were, and it is entirely mechanical:
+        //
+        //   clear()      every <img> is destroyed and scrollTop clamps toward 0
+        //   rebuild      the new <img> elements have NO src yet, and the sheet
+        //                hides a src-less preview, so each one measures 0px
+        //   restore      the anchor math therefore runs against a list that is
+        //                short by the full height of every picture in it
+        //   hydrate      the pictures come back and the list grows underneath
+        //
+        // Two things go wrong there, and the second is the nasty one. The offsets
+        // are measured against the wrong layout; AND the shortened content lowers
+        // the box's maximum scrollTop, so the corrective write is CLAMPED and
+        // cannot reach the right position even in principle. The error scales with
+        // how many previews the conversation has.
+        //
+        // Hydrating first costs nothing and fixes both: a warm preview is already
+        // complete in the memory cache, so assigning its src gives the element its
+        // real height in this same synchronous block (measured: 0px before the
+        // src, 320px immediately after, img.complete true). The anchor then
+        // measures the heights the reader actually had.
         hydrateMessageImagePreviews();
+        restoreScrollAnchor(anchor);
     }
 
     function refreshMessageBubble(idx) {
@@ -4447,8 +4467,11 @@ import {
             if (oldEl.classList.contains("bq-index-pass")) newEl.classList.add("bq-index-pass");
             oldEl.parentNode.replaceChild(newEl, oldEl);
             CS.messageEls[idx] = newEl;
+            // INSIDE the bracket, for the same reason as renderMessages: preserve()
+            // measures the moment this callback returns, and a freshly built bubble's
+            // previews are src-less (0px) until hydration gives them one back.
+            hydrateMessageImagePreviews();
         });
-        hydrateMessageImagePreviews();
     }
 
     function renderChat() {
