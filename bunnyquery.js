@@ -165,7 +165,22 @@
     // documents
     "pdf",
     "docx",
+    "docm",
     "pptx",
+    "pptm",
+    "doc",
+    "ppt",
+    // Korean word processor (OLE/CFB and OOXML-style variants)
+    "hwp",
+    "hwpx",
+    // opendocument text/presentation (ods is a grid, listed above)
+    "odt",
+    "odp",
+    // other long-form documents
+    "epub",
+    "rtf",
+    "html",
+    "htm",
     // plain text / data / markup
     "txt",
     "md",
@@ -6107,6 +6122,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   };
 
   // src/engine/indexing_groups.ts
+  function canonIndexKey(s) {
+    return typeof s === "string" && s ? s.trim() : "";
+  }
   var RUN_RECORD_WORKING_STALE_MS = 6 * 60 * 60 * 1e3;
   var INDEXING_LABEL_RE = /^(Re)?[Ii]ndexing(\s*\(continuing\))?\s*:?\s+(.+)$/;
   var LEADING_MD_LINK_RE = /^\[([^\]]+)\]\(([^)]+)\)/;
@@ -6176,15 +6194,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var openRunOfKey = {};
     var runsOfKey = {};
     var keyOfRun = {};
+    var newestTsOfRun = {};
     var runSeq = 0;
     for (var i = 0; i < list.length; i++) {
       var msg = list[i];
       if (!msg || !msg.isBackgroundTask) continue;
       var runId;
       var ref = msg.role === "user" ? readFileRef(msg) : null;
-      if (ref) {
+      if (msg._serverItemId && runByItemId[msg._serverItemId]) {
+        runId = runByItemId[msg._serverItemId];
+      } else if (ref) {
         var key = ref.path || keyByName[ref.name] || ref.name;
-        if (!ref.continued && openRunOfKey[key]) delete openRunOfKey[key];
+        var alreadySeen = !!(msg._serverItemId && runByItemId[msg._serverItemId]);
+        var openId = openRunOfKey[key];
+        var notLater = false;
+        if (openId && typeof msg._ts === "number" && typeof newestTsOfRun[openId] === "number") {
+          notLater = msg._ts <= newestTsOfRun[openId];
+        }
+        if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
         runId = openRunOfKey[key];
         if (!runId) {
           runId = "run" + runSeq++;
@@ -6192,12 +6219,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           keyOfRun[runId] = key;
           (runsOfKey[key] || (runsOfKey[key] = [])).push(runId);
         }
-      } else if (msg._serverItemId && runByItemId[msg._serverItemId]) {
-        runId = runByItemId[msg._serverItemId];
       } else if (msg.role !== "user") {
         runId = runOfIndex[i - 1];
       }
       if (!runId) continue;
+      if (typeof msg._ts === "number") {
+        var prevTs = newestTsOfRun[runId];
+        if (typeof prevTs !== "number" || msg._ts > prevTs) newestTsOfRun[runId] = msg._ts;
+      }
       var g = groups[runId];
       if (!g) {
         var fileKey = keyOfRun[runId];
@@ -6362,20 +6391,33 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       for (var ci = 0; ci < order.length; ci++) {
         var cg = groups[order[ci]];
         if (cg.path) {
-          coveredPaths[cg.path] = true;
-          if (cg.key) coveredPaths[cg.key] = true;
-        } else if (cg.name) coveredPathlessNames[cg.name] = true;
-        else if (cg.key) coveredPaths[cg.key] = true;
+          coveredPaths[canonIndexKey(cg.path)] = true;
+          if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
+        } else if (cg.name) coveredPathlessNames[canonIndexKey(cg.name)] = true;
+        else if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
       }
       var now = opts && typeof opts.now === "number" ? opts.now : Date.now();
       var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
       for (var sp in runStubs) {
         var rec = runStubs[sp];
-        if (!sp || !rec || !rec.status || coveredPaths[sp]) continue;
+        if (!sp || !rec || !rec.status || coveredPaths[canonIndexKey(sp)]) continue;
         var fname = rec.filename || sp.split("/").pop() || sp;
-        if (coveredPathlessNames[fname]) continue;
+        if (coveredPathlessNames[canonIndexKey(fname)]) continue;
         if (stubPlatform && rec.platform && rec.platform !== stubPlatform) continue;
-        var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
+        var live = !!liveIndexKeys[sp] || !!liveIndexKeys[canonIndexKey(sp)];
+        if (!live && (liveIndexKeys[fname] || liveIndexKeys[canonIndexKey(fname)])) {
+          var claimedByOther = false;
+          for (var lk in liveIndexKeys) {
+            if (!liveIndexKeys[lk]) continue;
+            var lkc = canonIndexKey(lk);
+            if (lkc === canonIndexKey(sp)) continue;
+            if (lkc.length > fname.length && lkc.slice(-(fname.length + 1)) === "/" + fname) {
+              claimedByOther = true;
+              break;
+            }
+          }
+          live = !claimedByOther;
+        }
         var recWhen = typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : void 0;
         if (stubClearedAt && !live && recWhen !== void 0 && recWhen <= stubClearedAt) continue;
         var st = "active";
@@ -6383,7 +6425,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var res = false;
         var reason;
         if (!live) {
-          if (rec.status === "done" || doneKeys[sp] || doneKeys[fname]) {
+          if (rec.status === "done" || doneKeys[sp] || doneKeys[canonIndexKey(sp)] || doneKeys[fname] || doneKeys[canonIndexKey(fname)]) {
             st = "done";
             fin = true;
           } else if (rec.status === "error") {
@@ -6437,11 +6479,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     }
     var suppressAnchor = {};
+    var stubByCanon = {};
+    if (runStubs) for (var ck in runStubs) stubByCanon[canonIndexKey(ck)] = runStubs[ck];
     if (runStubs) {
       for (var ti2 = 0; ti2 < order.length; ti2++) {
         var tg = groups[order[ti2]];
         if (!newestRunOfKey[order[ti2]]) continue;
-        var trec = tg.path && runStubs[tg.path] || runStubs[tg.key];
+        var trec = tg.path && (runStubs[tg.path] || stubByCanon[canonIndexKey(tg.path)]) || runStubs[tg.key] || stubByCanon[canonIndexKey(tg.key)];
         if (!trec || typeof trec.started !== "number") continue;
         if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
         suppressAnchor[order[ti2]] = true;
@@ -6482,7 +6526,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.8.18" ;
+    var BQ_VERSION = "1.9.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

@@ -289,6 +289,23 @@ export type RunStubInfo = {
 	platform?: 'claude' | 'openai';
 };
 
+/** Canonical form of an indexing key for COMPARISON only (never for storage).
+ *
+ *  The two sides of every stub-vs-group comparison come from one string but by two
+ *  routes: the run:: record id keeps `attachment.storagePath` verbatim
+ *  (requests.ts runIndexUniqueId), while the group's key is recovered from the pass
+ *  prompt and trimmed on the way (history.ts parseIndexingRequestText). A path whose
+ *  first or last character is whitespace therefore produced two keys for one file, the
+ *  stub was never suppressed, and the file drew two rows.
+ *
+ *  Trim only. NOT NFC: both keys derive from the same string with no normalization on
+ *  either side, so no NFC/NFD divergence is reachable here, and normalizing a key that
+ *  is also an S3 object key elsewhere is how storage paths get silently renamed.
+ */
+export function canonIndexKey(s?: string): string {
+	return typeof s === 'string' && s ? s.trim() : '';
+}
+
 /** A 'working' run record older than this with no live-queue confirmation is
  *  treated as unknown rather than live: a chain that died without reaching any
  *  error path leaves 'working' dangling, and a row must not spin forever on a
@@ -413,6 +430,10 @@ export function buildChatDisplayList(
 	var openRunOfKey: { [key: string]: string } = {};
 	var runsOfKey: { [key: string]: string[] } = {};
 	var keyOfRun: { [runId: string]: string } = {};
+	// Newest pass timestamp seen for each open run, so a FIRST pass can be told from a
+	// re-index (it arrives AFTER the run it follows) apart from a misordered older pass
+	// (it arrives before). Only the second must not re-open.
+	var newestTsOfRun: { [runId: string]: number } = {};
 	var runSeq = 0;
 
 	for (var i = 0; i < list.length; i++) {
@@ -421,7 +442,18 @@ export function buildChatDisplayList(
 
 		var runId: string | undefined;
 		var ref = msg.role === 'user' ? readFileRef(msg) : null;
-		if (ref) {
+		// A pass already attributed to a run stays with it, whatever its label says.
+		// Reading the label FIRST made attribution depend on walk order: a first pass
+		// ("A new file has just been uploaded") re-opened its file's run at the line
+		// below, so if history delivered a run's continuations before its first pass -
+		// which paging and the bg merge can do - the continuations opened a run, the
+		// late first pass deleted it and opened a second, and the abandoned one was
+		// force-finished. One run then rendered as TWO rows for the same file: a green
+		// "complete" and a yellow "in progress". The same applies to a duplicate copy
+		// of a pass. The id is the stable identity here; the label is a description.
+		if (msg._serverItemId && runByItemId[msg._serverItemId]) {
+			runId = runByItemId[msg._serverItemId];
+		} else if (ref) {
 			// Path first — a file can be re-uploaded under a name that already
 			// exists elsewhere. But a pass that supplied no path (a compact
 			// continuation label recovered from an old history cache) is still the
@@ -431,7 +463,24 @@ export function buildChatDisplayList(
 			// A FIRST pass ("A new file has just been uploaded") when this file
 			// already has a run open starts a new one: it is a re-index, or a
 			// re-upload over the same storage path. Continuations join the run.
-			if (!ref.continued && openRunOfKey[key]) delete openRunOfKey[key];
+			//
+			// ...but only when this pass is genuinely NEW. A first pass whose id is
+			// already attributed is the same pass reached twice (a duplicate bubble, or
+			// a walk that reaches it after the continuations it opened), and re-opening
+			// on it splits one run in half.
+			var alreadySeen = !!(msg._serverItemId && runByItemId[msg._serverItemId]);
+			// ...and only when it is actually LATER than the run it would replace. A
+			// re-index's first pass follows the previous run; a misordered one precedes
+			// the continuations already walked, and re-opening on it abandons a live run
+			// (rendered green "complete") beside the fragment (yellow "in progress").
+			// Timestamps decide it when both are known; without them the old
+			// label-only behaviour stands, so the re-index case is unchanged.
+			var openId = openRunOfKey[key];
+			var notLater = false;
+			if (openId && typeof msg._ts === 'number' && typeof newestTsOfRun[openId] === 'number') {
+				notLater = (msg._ts as number) <= newestTsOfRun[openId];
+			}
+			if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
 			runId = openRunOfKey[key];
 			if (!runId) {
 				runId = 'run' + (runSeq++);
@@ -439,8 +488,6 @@ export function buildChatDisplayList(
 				keyOfRun[runId] = key;
 				(runsOfKey[key] || (runsOfKey[key] = [])).push(runId);
 			}
-		} else if (msg._serverItemId && runByItemId[msg._serverItemId]) {
-			runId = runByItemId[msg._serverItemId];
 		} else if (msg.role !== 'user') {
 			// ADJACENT only. Both paths that create a pass emit its request and
 			// response bubbles together, so an id-less response belongs to the
@@ -455,6 +502,10 @@ export function buildChatDisplayList(
 		// or a response whose request is not loaded) stays an ordinary message
 		// rather than being folded into whichever group happens to be nearest.
 		if (!runId) continue;
+		if (typeof msg._ts === 'number') {
+			var prevTs = newestTsOfRun[runId];
+			if (typeof prevTs !== 'number' || (msg._ts as number) > prevTs) newestTsOfRun[runId] = msg._ts as number;
+		}
 
 		var g = groups[runId];
 		if (!g) {
@@ -780,16 +831,18 @@ export function buildChatDisplayList(
 		var coveredPathlessNames: { [k: string]: boolean } = {};
 		for (var ci = 0; ci < order.length; ci++) {
 			var cg = groups[order[ci]];
-			if (cg.path) { coveredPaths[cg.path] = true; if (cg.key) coveredPaths[cg.key] = true; }
-			else if (cg.name) coveredPathlessNames[cg.name] = true;
-			else if (cg.key) coveredPaths[cg.key] = true;
+			if (cg.path) {
+				coveredPaths[canonIndexKey(cg.path)] = true;
+				if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
+			} else if (cg.name) coveredPathlessNames[canonIndexKey(cg.name)] = true;
+			else if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
 		}
 		var now = opts && typeof opts.now === 'number' ? opts.now : Date.now();
 		var stubClearedAt = (opts && typeof opts.stubClearedAt === 'number' && opts.stubClearedAt > 0)
 			? opts.stubClearedAt : 0;
 		for (var sp in runStubs) {
 			var rec = runStubs[sp];
-			if (!sp || !rec || !rec.status || coveredPaths[sp]) continue;
+			if (!sp || !rec || !rec.status || coveredPaths[canonIndexKey(sp)]) continue;
 			var fname = rec.filename || sp.split('/').pop() || sp;
 			// A PATHLESS group (legacy compact label) can only be matched by
 			// name, and that is still the right match: the file already has a
@@ -797,7 +850,7 @@ export function buildChatDisplayList(
 			// void. What is gone is the reverse — a group WITH a path no longer
 			// writes into the name namespace, so it can no longer delete a
 			// same-basename stub from another folder.
-			if (coveredPathlessNames[fname]) continue;
+			if (coveredPathlessNames[canonIndexKey(fname)]) continue;
 			// A run recorded under the OTHER platform's chat belongs to that
 			// conversation: its passes live in that history (so no real group
 			// can ever cover this stub) and the queue probe is platform-scoped
@@ -808,7 +861,26 @@ export function buildChatDisplayList(
 			// whatever the record says (a lagged update must not paint a verdict over
 			// visible work), then the record's own terminal statuses, then the
 			// queue's authoritative ABSENCE, and only then the stated wait.
-			var live = !!liveIndexKeys[sp] || !!liveIndexKeys[fname];
+			// The bare-NAME disjunct is load-bearing: a legacy pass prompt may carry no
+			// storage path at all, so the name is the only key its run can appear under.
+			// But it also matched ANY live file sharing this basename, painting a
+			// finished run's stub yellow because a same-named file in another folder was
+			// indexing. Take the name hit only when it cannot belong to a different
+			// file - i.e. no OTHER live key is a path ending in this basename.
+			var live = !!liveIndexKeys[sp] || !!liveIndexKeys[canonIndexKey(sp)];
+			if (!live && (liveIndexKeys[fname] || liveIndexKeys[canonIndexKey(fname)])) {
+				var claimedByOther = false;
+				for (var lk in liveIndexKeys) {
+					if (!liveIndexKeys[lk]) continue;
+					var lkc = canonIndexKey(lk);
+					if (lkc === canonIndexKey(sp)) continue;
+					if (lkc.length > fname.length && lkc.slice(-(fname.length + 1)) === '/' + fname) {
+						claimedByOther = true;
+						break;
+					}
+				}
+				live = !claimedByOther;
+			}
 			// Cleared-history horizon: a run that ended at or before the clear is
 			// part of what the user asked to forget. A live queue hit survives it
 			// (see BuildDisplayListOptions.stubClearedAt). A record carrying NO
@@ -825,7 +897,8 @@ export function buildChatDisplayList(
 				// A done:: marker from the same sweep is as terminal as the record's
 				// own 'done' — it settles a dangling 'working' the chain never
 				// flipped (mirrors the real-group doneKeys disjunct).
-				if (rec.status === 'done' || doneKeys[sp] || doneKeys[fname]) { st = 'done'; fin = true; }
+				if (rec.status === 'done' || doneKeys[sp] || doneKeys[canonIndexKey(sp)]
+					|| doneKeys[fname] || doneKeys[canonIndexKey(fname)]) { st = 'done'; fin = true; }
 				else if (rec.status === 'error') { st = 'error'; fin = true; }
 				else if (rec.status === 'cancelled') { st = 'cancelled'; fin = true; }
 				else if (liveIndexChecked) {
@@ -903,11 +976,14 @@ export function buildChatDisplayList(
 	// the first pass paged in, and again when paging ended. A record with a
 	// `started` places the run at ONE spot for as long as the record exists.
 	var suppressAnchor: { [runId: string]: boolean } = {};
+	var stubByCanon: { [k: string]: RunStubInfo } = {};
+	if (runStubs) for (var ck in runStubs) stubByCanon[canonIndexKey(ck)] = runStubs[ck];
 	if (runStubs) {
 		for (var ti2 = 0; ti2 < order.length; ti2++) {
 			var tg = groups[order[ti2]];
 			if (!newestRunOfKey[order[ti2]]) continue;
-			var trec = (tg.path && runStubs[tg.path]) || runStubs[tg.key];
+			var trec = (tg.path && (runStubs[tg.path] || stubByCanon[canonIndexKey(tg.path)]))
+				|| runStubs[tg.key] || stubByCanon[canonIndexKey(tg.key)];
 			if (!trec || typeof trec.started !== 'number') continue;
 			if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
 			suppressAnchor[order[ti2]] = true;
