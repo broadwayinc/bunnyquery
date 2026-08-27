@@ -117,13 +117,31 @@ export const isOfficeFile = isServerExtractable;
 // CSV/TSV specifically must be here rather than in the inline path: the layer now gives
 // them ROW-bounded windows with absolute row numbers, where the character windower used
 // to split rows across boundaries and emit no row numbers at all.
+// Only extensions the LAYER can actually extract belong here (_OFFICE_EXTRACTORS in
+// office_extraction.py). Listing one it cannot read would page a file the reader answers
+// with UNSUPPORTED_FORMAT on every window.
+//
+// The document formats below were extractable all along and simply were not listed, so
+// every one of them took the 200k one-shot path and was silently truncated - .hwp most
+// painfully, since the layer carries a full OLE/CFB + AES-128 parser for it.
+//
+// Deliberately NOT here: the ~40 source/config extensions the layer also decodes (.py,
+// .sql, .css, .toml ...). They are windowable, but adding them moves every small code
+// upload from one pass to multi-pass worker indexing, which is a cost change that wants
+// measuring on its own rather than riding along with this one.
 const PAGED_READ_EXTENSIONS = new Set([
 	// grids
 	'xls', 'xlsx', 'xlsm', 'ods',
 	// delimited text (row-windowed by the layer)
 	'csv', 'tsv', 'tab',
 	// documents
-	'pdf', 'docx', 'pptx',
+	'pdf', 'docx', 'docm', 'pptx', 'pptm', 'doc', 'ppt',
+	// Korean word processor (OLE/CFB and OOXML-style variants)
+	'hwp', 'hwpx',
+	// opendocument text/presentation (ods is a grid, listed above)
+	'odt', 'odp',
+	// other long-form documents
+	'epub', 'rtf', 'html', 'htm',
 	// plain text / data / markup
 	'txt', 'md', 'markdown', 'log', 'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml',
 ]);
