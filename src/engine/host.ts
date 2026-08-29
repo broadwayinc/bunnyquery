@@ -20,6 +20,19 @@ export interface ChatIdentity {
 	owner: string;
 	/** Per-user queue name (falls back to projectId). */
 	userId: string;
+	/**
+	 * This chat is being used by a visitor with NO account, on a project whose
+	 * owner allows that.
+	 *
+	 * It changes where the MCP tools point. A signed-in turn goes to the MCP
+	 * server's root endpoint and authenticates with the caller's own token; an
+	 * anonymous turn has no token to send, and an EMPTY one is worse than none
+	 * (the server cannot identify a project from it, and an empty credential may
+	 * be rejected by the provider before the request is even made). So an
+	 * anonymous turn goes to the project-scoped endpoint instead, which is
+	 * read-only, restricted to public records, and needs no credential at all.
+	 */
+	anonymous?: boolean;
 	platform: 'claude' | 'openai' | 'none';
 	model?: string;
 	serviceName?: string;
@@ -250,6 +263,22 @@ export interface ChatHost {
 	 * whichever pass got there first created the record and the others hoped it had.
 	 */
 	ensureFileIndexRecord?(storagePath: string, meta?: { name?: string; mime?: string; size?: number }): Promise<any>;
+	/**
+	 * The access group this file's records must be written at: the uploader's
+	 * choice, which is the project default or a per-upload answer.
+	 *
+	 * Asked PER FILE, and asked AFTER ensureFileIndexRecord has run, because the
+	 * host is what actually creates the "src::" record and it must report the
+	 * group it really used. The engine threads the answer into the indexing
+	 * prompts so the agent's own records land in the same group; a record saved
+	 * under a different group is in a different table and never comes back with
+	 * the rest of the file.
+	 *
+	 * Optional and may return a promise. A host without it (or one that returns
+	 * nothing) gets "authorized", which is what every record used before the
+	 * setting existed.
+	 */
+	uploadAccessGroup?(storagePath: string): 'public' | 'authorized' | 'private' | undefined | Promise<'public' | 'authorized' | 'private' | undefined>;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;

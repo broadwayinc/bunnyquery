@@ -157,6 +157,7 @@ import {
         googleInProgress: "bq_embed:google_in_progress", // sessionStorage
         googleRedirect: "bq_embed:google_redirect", // sessionStorage
         clearHorizon: "bq_embed:clearedAt",
+        anonId: "bq_embed:anon_id",     // per-project anonymous device id
     };
 
     /* ========================================================================
@@ -309,6 +310,74 @@ import {
     // Per-service storage key helper
     function skey(base) {
         return base + ":" + (S.projectId || "default");
+    }
+
+    /* ---- anonymous visitors --------------------------------------------- *
+     * A project whose owner turned "Allow anonymous users" on serves the chat
+     * with no login wall. Two things follow from that.
+     *
+     * 1. WHO IS ALLOWED. The switch is the service's own `prevent_anonymous`
+     *    flag, read off the unauthenticated getConnectionInfo() response, so the
+     *    widget needs no extra call and no credentials to know. `opts.allowAnonymous`
+     *    overrides it either way, for a page that wants to pin the behaviour.
+     *
+     * 2. WHOSE CHAT IS IT. The backend identifies an unauthenticated requester as
+     *    `ip + "(" + user_agent + ")"`, which is not a device: two phones on one
+     *    office wifi produce the same string and would read each other's
+     *    transcript. So the widget mints its own id, keeps it in localStorage,
+     *    and uses it as the chat identity — which becomes the request QUEUE name,
+     *    and a queue is listed by its own name, not by the caller's ip. The id is
+     *    per project so two BunnyQuery widgets on one site do not share a chat.
+     *
+     *    This id is a NAME, not a secret: the queue listing is not user-scoped
+     *    server-side, so anyone who learns another device's id could read that
+     *    conversation. Anonymous chats are non-confidential by construction, and
+     *    anonymous visitors cannot upload or write records at all.
+     */
+    function anonymousAllowed() {
+        if (S.opts && typeof S.opts.allowAnonymous === "boolean") return S.opts.allowAnonymous;
+        var conf = (S.service && S.service.conf) || null;
+        // Unknown until service info lands. Default to NOT allowed so a failed
+        // or slow load shows the login page rather than a chat that cannot send.
+        if (!conf || typeof conf.prevent_anonymous === "undefined") return false;
+        return !conf.prevent_anonymous;
+    }
+
+    // True when this page is being used by a visitor with no account.
+    function isAnonymousSession() {
+        return !S.user && anonymousAllowed();
+    }
+
+    function randomId() {
+        try {
+            var buf = new Uint8Array(16);
+            (window.crypto || window.msCrypto).getRandomValues(buf);
+            var out = "";
+            for (var i = 0; i < buf.length; i++) out += ("0" + buf[i].toString(16)).slice(-2);
+            return out;
+        } catch (e) {
+            // Storage-less/crypto-less fallback. Weaker, but this value only has
+            // to be unlikely to collide, never unguessable.
+            return "x" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        }
+    }
+
+    // The stable per-device, per-project anonymous id. Minted on first use.
+    // Falls back to an in-memory value when localStorage is unavailable (private
+    // mode, blocked site data), which keeps ONE tab's conversation coherent even
+    // though it cannot survive a reload.
+    var _anonIdMemo = null;
+    function anonDeviceId() {
+        if (_anonIdMemo) return _anonIdMemo;
+        var key = skey(SK.anonId);
+        var stored = lsGet(key);
+        if (stored) { _anonIdMemo = stored; return stored; }
+        var minted = "anon_" + randomId();
+        lsSet(key, minted);
+        // Read back: when storage is blocked lsSet silently no-ops, and holding
+        // the value in memory is the only way the same tab keeps one queue.
+        _anonIdMemo = lsGet(key) || minted;
+        return _anonIdMemo;
     }
 
     /* ========================================================================
@@ -954,6 +1023,13 @@ import {
                     onclick: function () { renderSignup(); }, text: "Sign up →" }));
             }
 
+            // On a project that allows anonymous users the login page is a
+            // detour, not a wall: the visitor arrived here from the chat's own
+            // Login link and has to be able to go back without an account.
+            // Only when there is no session, since a logged-in user reaching the
+            // login page is a different situation entirely.
+            var canReturnToChat = !S.user && anonymousAllowed();
+
             var form = h("form", { class: "bq-form", onsubmit: submit },
                 h("label", { class: "bq-label" }, h("span", { text: "Email" }), emailInput),
                 h("label", { class: "bq-label" }, h("span", { text: "Password" }), pwInput),
@@ -962,7 +1038,14 @@ import {
                 h("div", { class: "bq-form-bottom" }, submitBtn)
             );
 
-            var children = authHeader("Login").concat([form]);
+            var children = [];
+            if (canReturnToChat) {
+                children.push(h("div", { class: "bq-settings-top" },
+                    h("button", { class: "bq-link", type: "button",
+                        onclick: function () { enterAfterLogin(); },
+                        text: "← Back to chat" })));
+            }
+            children = children.concat(authHeader("Login")).concat([form]);
 
             if (googleEnabled()) {
                 children.push(
@@ -1686,7 +1769,15 @@ import {
                 return undefined;
             })(),
             owner: S.owner,
-            userId: (S.user && S.user.user_id) || S.projectId,
+            // The chat identity, which the engine turns into the request queue
+            // name. An anonymous visitor gets their DEVICE id rather than the
+            // project id: the old fallback gave every anonymous visitor of a
+            // project the same queue, so they would have shared one transcript
+            // and head-of-line-blocked each other's turns on a single FIFO.
+            userId: (S.user && S.user.user_id) || (isAnonymousSession() ? anonDeviceId() : S.projectId),
+            // Sends the turn's MCP tools to the project-scoped, credential-free
+            // endpoint instead of the root one with an empty bearer.
+            anonymous: isAnonymousSession(),
             platform: S.aiPlatform, model: S.aiModel || undefined,
             serviceName: S.serviceName, serviceDescription: S.serviceDescription,
         };
@@ -1717,11 +1808,20 @@ import {
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
         deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
-        ensureFileIndexRecord: function (path, meta) { return ensureFileIndexRecordDb(path, meta); },
+        ensureFileIndexRecord: function (path, meta) {
+            // Resolve the group FIRST and remember it: the engine asks for it
+            // straight after, and both the record and the answer have to be the
+            // same decision or the file's own record and its extracted rows end
+            // up in different tables.
+            return resolveUploadAccessGroup(path).then(function (g) {
+                return ensureFileIndexRecordDb(path, meta, g);
+            });
+        },
+        uploadAccessGroup: function (path) { return resolveUploadAccessGroup(path); },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
-        resetOverwriteBatch: function () { return resetOverwriteBatch(); },
+        resetOverwriteBatch: function () { resetOverwriteBatch(); resetAccessGroupBatch(); },
         renderAttachmentChips: function () { renderAttachmentChips(); },
         updateComposerControls: function () { updateComposerControls(); },
     });
@@ -2476,12 +2576,12 @@ import {
     // "__MEDIA__" media-index writes, which land while window 1 is still being BUILT, before
     // the model's first turn could create anything. Best-effort: losing the guarantee must
     // not lose the upload.
-    function ensureFileIndexRecordDb(storagePath, meta) {
+    function ensureFileIndexRecordDb(storagePath, meta, accessGroup) {
         if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
         return Promise.resolve(S.skapi.postRecord(null, {
             service: S.projectId,
             unique_id: "src::" + storagePath,
-            table: { name: "file_summaries", access_group: "authorized" },
+            table: { name: "file_summaries", access_group: normalizeUploadAccessGroup(accessGroup) },
             // Deleting the file record must cascade to every record referencing it.
             source: { can_remove_referencing_records: true },
             data: {
@@ -3264,7 +3364,13 @@ import {
     /* ---- history + clear-horizon (agent.vue) ----------------------------- */
     function getClearHistoryStorageKey() {
         if (!S.projectId || S.aiPlatform === "none") return "";
-        return SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+        var key = SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+        // An anonymous visitor and a signed-in one share a browser but not a
+        // transcript, so they must not share a horizon either: clearing as a
+        // visitor would otherwise hide the account's history too. The signed-in
+        // key is left exactly as it was, so no existing horizon is orphaned.
+        if (isAnonymousSession()) key += "#" + anonDeviceId();
+        return key;
     }
     function getClearedAt() {
         var key = getClearHistoryStorageKey();
@@ -3759,8 +3865,12 @@ import {
         // Stub rows are per-CHAT and this chat belongs to the signed-in end
         // user: another user's runs must not splice rows into it. Ownerless
         // records (pre-owner sweeps) are kept.
+        // An anonymous visitor owns no runs — they cannot upload or index at
+        // all — so they get no stub rows. Stated rather than left to fall out
+        // of an empty owner id, which SKIPS the filter and would splice in every
+        // user's rows the moment an anonymous read of these records succeeds.
         var stubs = undefined;
-        if (fresh) {
+        if (fresh && !isAnonymousSession()) {
             stubs = {};
             var myId = (S.user && S.user.user_id) || "";
             for (var rp in markerSweep.runs) {
@@ -4511,11 +4621,22 @@ import {
             CS.settingsBtnEl = settingsBtn;
 
             // Landing-style brand header (brandTitleEl, shared with the
-            // logged-out pages) with the gear (settings) on the right.
+            // logged-out pages). The right slot holds the gear for a signed-in
+            // user; an anonymous visitor gets a Login link instead, because
+            // every row behind the gear (email, name, password, newsletter,
+            // logout) belongs to an account they do not have.
+            var headerRight = isAnonymousSession()
+                ? h("button", {
+                    class: "bq-link", type: "button", title: "Login",
+                    onclick: function () { renderLogin(); }, text: "Login",
+                })
+                : settingsBtn;
+            if (isAnonymousSession()) CS.settingsBtnEl = null;
+
             var header = h("div", { class: "bq-section-title" },
                 h("div", { class: "bq-title-row" },
                     brandTitleEl(),
-                    h("div", { class: "bq-title-right" }, settingsBtn)));
+                    h("div", { class: "bq-title-right" }, headerRight)));
 
             var chatArea;
             if (S.aiPlatform === "none") {
@@ -4657,6 +4778,147 @@ import {
         var r = overwriteState.resolver; overwriteState.resolver = null;
         if (r) r(choice);
     }
+    /* ---- upload access group --------------------------------------------- *
+     * Who can read what is extracted from a file the visitor uploads.
+     *
+     * The project owner sets one value in the dashboard,
+     * conf.default_access_group: a group to use silently, or "ask" to be prompted
+     * per file. It arrives on the unauthenticated getConnectionInfo() response,
+     * so the widget needs no extra call. The value chosen here is applied to the file's "src::" record
+     * AND handed to the engine, which puts it in the indexing prompt so the rows
+     * the agent extracts land in the same group. A record written under a
+     * different group is in a different table and never comes back with the rest
+     * of the file.
+     *
+     * "authorized" whenever the project said nothing, which is what every record
+     * written before this setting existed used.
+     */
+    var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
+    var UPLOAD_ACCESS_LABELS = {
+        public: "Public",
+        authorized: "Signed in users",
+        private: "Only me",
+    };
+    var UPLOAD_ACCESS_HINTS = {
+        public: "Anyone can ask about this file, including visitors who are not logged in.",
+        authorized: "Only users signed in to this project can ask about this file.",
+        private: "Only you can ask about this file.",
+    };
+    function normalizeUploadAccessGroup(v) {
+        return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? "authorized" : v;
+    }
+    // The project's single `default_access_group` setting, as stored. May also
+    // hold a raw group number or "admin" (it is the SDK-wide default, which takes
+    // everything table.access_group takes); the widget offers neither, and
+    // normalizeUploadAccessGroup folds anything unrecognised back to the safe
+    // default rather than showing a chooser that cannot represent it.
+    function projectAccessSetting() {
+        var conf = (S.service && S.service.conf) || {};
+        var v = conf.default_access_group;
+        if (v === "ask") return "ask";
+        return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? null : v;
+    }
+    // "authorized" when the project has never set one: that is the group every
+    // BunnyQuery record was hardcoded to before the setting existed, so a project
+    // that never opened the control keeps the visibility its files already had.
+    function projectUploadAccessGroup() {
+        var v = projectAccessSetting();
+        return v && v !== "ask" ? v : "authorized";
+    }
+    function projectAsksUploadAccess() {
+        return projectAccessSetting() === "ask";
+    }
+
+    var accessGroupState = { resolver: null, sticky: null, handle: null, applyToAll: false, choice: "authorized", perPath: {} };
+    function resetAccessGroupBatch() {
+        accessGroupState.sticky = null;
+        accessGroupState.applyToAll = false;
+        accessGroupState.perPath = {};
+    }
+    function chooseAccessGroup(choice) {
+        var picked = normalizeUploadAccessGroup(choice);
+        // "Apply to all remaining files" carries this answer through the REST OF
+        // THIS BATCH and no further: resetAccessGroupBatch() clears it when the
+        // next send starts.
+        if (accessGroupState.applyToAll) accessGroupState.sticky = picked;
+        if (accessGroupState.handle) { accessGroupState.handle.close(); accessGroupState.handle = null; }
+        var r = accessGroupState.resolver; accessGroupState.resolver = null;
+        if (r) r(picked);
+    }
+
+    // Serialized like the overwrite prompt, and for the same reason: uploads run
+    // concurrently and two files must never fight over the single modal.
+    var accessGroupChain = Promise.resolve();
+    function resolveUploadAccessGroup(storagePath) {
+        if (!projectAsksUploadAccess()) return Promise.resolve(projectUploadAccessGroup());
+        // Under "ask" the project names no group, so the modal opens on the same
+        // value an unset project would have used.
+        var fallback = projectUploadAccessGroup();
+        if (accessGroupState.sticky) return Promise.resolve(accessGroupState.sticky);
+
+        // ONE answer per file, remembered for the batch. This is asked TWICE per
+        // upload - once when the "src::" record is created, once when the engine
+        // builds the indexing request - and the two must be the same decision, or
+        // the file's own record and the rows extracted from it land in different
+        // access groups and never come back together. Without the memo the
+        // visitor is also asked the same question about the same file twice.
+        var pathKey = String(storagePath || "");
+        if (pathKey && accessGroupState.perPath[pathKey]) {
+            return Promise.resolve(accessGroupState.perPath[pathKey]);
+        }
+
+        var run = accessGroupChain.then(function () {
+            // A file ahead of this one may have answered "apply to all" while this
+            // one waited. Honour it without asking again.
+            if (accessGroupState.sticky) return accessGroupState.sticky;
+            // And this file may have been answered while it waited its turn.
+            if (pathKey && accessGroupState.perPath[pathKey]) {
+                return accessGroupState.perPath[pathKey];
+            }
+            accessGroupState.applyToAll = false;
+            accessGroupState.choice = fallback;
+            var filename = String(storagePath || "").split("/").pop() || "this file";
+            return new Promise(function (resolve) {
+                accessGroupState.resolver = resolve;
+                accessGroupState.handle = openModal(function () {
+                    var radios = [];
+                    var list = h("div", { class: "bq-access-options" });
+                    UPLOAD_ACCESS_GROUPS.forEach(function (g) {
+                        var input = h("input", { type: "radio", name: "bq-access-group", value: g });
+                        input.checked = g === accessGroupState.choice;
+                        input.addEventListener("change", function () {
+                            if (input.checked) accessGroupState.choice = g;
+                        });
+                        radios.push(input);
+                        list.appendChild(h("label", { class: "bq-access-option" }, input,
+                            h("span", { class: "bq-access-option-label", text: UPLOAD_ACCESS_LABELS[g] }),
+                            h("span", { class: "bq-access-option-hint", text: UPLOAD_ACCESS_HINTS[g] })));
+                    });
+                    var applyCb = h("input", { type: "checkbox" });
+                    applyCb.addEventListener("change", function () { accessGroupState.applyToAll = !!applyCb.checked; });
+                    var applyLabel = h("label", { class: "bq-overwrite-applyall" }, applyCb,
+                        h("span", { text: "Apply to all remaining files" }));
+                    return h("div", { class: "bq-modal" },
+                        h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Who can read this file?" })),
+                        h("p", { class: "bq-modal-desc" },
+                            "Choose who can ask questions about \u201C" + filename + "\u201D once it is indexed."),
+                        list,
+                        applyLabel,
+                        h("div", { class: "bq-modal-btns" },
+                            h("button", { class: "btn", type: "button", onclick: function () { chooseAccessGroup(accessGroupState.choice); } }, "Upload"))
+                    );
+                }, { dismissible: false });
+            });
+        });
+        // Keep the chain alive even if a prompt rejects, or every later file hangs.
+        accessGroupChain = run.catch(function () { return undefined; });
+        return run.then(function (picked) {
+            var g = normalizeUploadAccessGroup(picked);
+            if (pathKey) accessGroupState.perPath[pathKey] = g;
+            return g;
+        }).catch(function () { return fallback; });
+    }
+
     function promptOverwrite(filename) {
         // A prior file in this batch chose "apply to all" — honor it silently.
         if (overwriteState.sticky) return Promise.resolve(overwriteState.sticky);
@@ -4757,6 +5019,11 @@ import {
             .catch(function () {})
             .then(function () {
                 S.user = null;
+                // On a project that allows anonymous users there is no login
+                // wall to fall back to; dropping the visitor on one would strand
+                // them on a page the project said it did not want. Re-enter the
+                // chat instead, now as an anonymous device.
+                if (anonymousAllowed()) return enterAfterLogin();
                 renderLogin();
             });
     }
@@ -4772,7 +5039,12 @@ import {
         return Promise.resolve()
             .then(function () { return S.user ? S.user : getProfile().then(function (u) { S.user = u; return u; }); })
             .then(function () { return loadServiceInfo(); })
-            .then(function (conn) { S.service = conn; applyAgentConfig(); })
+            // Keep the copy boot already loaded when this re-load comes back
+            // empty (loadServiceInfo swallows its own errors and resolves null).
+            // Overwriting it with null loses conf.prevent_anonymous, and an
+            // anonymous visitor would then be drawn as a signed-in one: the chat
+            // header would offer the account gear to someone with no account.
+            .then(function (conn) { if (conn) S.service = conn; applyAgentConfig(); })
             .then(function () { renderChat(); })
             .catch(function (err) {
                 console.error("[bunnyquery] enterAfterLogin failed", err);
@@ -4847,6 +5119,12 @@ import {
         return getProfile().then(function (user) {
             S.user = user;
             if (!user) {
+                // A project that allows anonymous users opens straight into the
+                // chat. enterAfterLogin tolerates a null user and, crucially,
+                // reaches no MCP-grant code: the ladder below would redirect the
+                // whole page away to an authorize endpoint a visitor with no
+                // account can never complete.
+                if (anonymousAllowed()) return enterAfterLogin();
                 renderLogin();
                 return;
             }
@@ -4892,6 +5170,13 @@ import {
             signupConfirmationUrl: null, // defaults to current host page
             hostDomain: null,            // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
             attachmentParsers: null,     // client-side attachment parsers, e.g. [createHwpParser()]
+            // Open the chat with no login for visitors without an account.
+            // null → follow the project's own "Allow anonymous users" setting
+            // (getConnectionInfo().conf.prevent_anonymous); true/false pins it.
+            allowAnonymous: null,
+            // Server-driven windowed indexing; read at configureChatEngine time.
+            // Listed here so the defaults object is the full opt surface.
+            windowedIndexing: true,
         }, opts || {});
         S.mountEl = mountEl;
 

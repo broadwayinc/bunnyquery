@@ -798,10 +798,23 @@ export class ChatSession {
 		return 'lid_' + this._lidSeq;
 	}
 
+	/**
+	 * The key every per-chat cache hangs off: the restored message cache, the
+	 * hydrated-body memo, the live-index key and the per-file storage-path key.
+	 *
+	 * It carries the IDENTITY as well as the project and platform. A single
+	 * browser can hold more than one conversation on one project without a
+	 * reload — an anonymous visitor who signs in, or a dashboard user who logs
+	 * out and back in as someone else — and with an identity-free key the
+	 * previous conversation stayed in the cache and was re-rendered, and written
+	 * back, as the new one's. `userId` is the same value the request queue is
+	 * named after, so two identities that share a queue share a cache, which is
+	 * exactly right.
+	 */
 	getHistoryCacheKey(): string {
 		var id = this.host.getIdentity();
 		if (!id.projectId || id.platform === 'none') return '';
-		return id.projectId + '#' + id.platform;
+		return id.projectId + '#' + id.platform + '#' + (id.userId || '');
 	}
 
 	// ─── compact-stub hydration ─────────────────────────────────────────────
@@ -1059,9 +1072,17 @@ export class ChatSession {
 			if (projectId === undefined) projectId = id.projectId;
 			if (owner === undefined) owner = id.owner;
 		}
+		// Read LIVE, unlike projectId/owner above, and deliberately: this decides
+		// which MCP endpoint the turn's tools point at, and a retry after the
+		// visitor signed in should use the authenticated one rather than the
+		// project-scoped anonymous route it was composed under. Getting it wrong
+		// costs a failed turn, never a wider read: the anonymous route is
+		// read-only and public-records-only whoever calls it.
+		var liveId = this.host.getIdentity();
+		var mcpScope = { anonymous: liveId.anonymous, publicProjectId: liveId.publicProjectId };
 		return platform === 'openai'
-			? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls)
-			: callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls);
+			? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, undefined, undefined, mcpScope)
+			: callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, undefined, undefined, mcpScope);
 	}
 
 	dispatchAgentRequest(params: any) {
@@ -4071,6 +4092,17 @@ export class ChatSession {
 							size: member.file.size,
 						})).catch(function () { });
 					});
+					// The access group the host actually recorded this file at. Read
+					// AFTER ensureFileIndexRecord so the value here is the one the
+					// "src::" record really carries, never a second guess at it.
+					var accessGroup: 'public' | 'authorized' | 'private' | undefined;
+					preIndex = preIndex.then(function () {
+						if (alreadyIndexing) return;
+						if (typeof self.host.uploadAccessGroup !== 'function') return;
+						return Promise.resolve(self.host.uploadAccessGroup(member.storagePath))
+							.then(function (g) { accessGroup = g || undefined; })
+							.catch(function () { });
+					});
 					// Run a client-side attachment parser (e.g. .hwp) if one matches; its
 					// output is inlined into the indexing request (falls back to office
 					// extraction / web_fetch when no parser matches or it yields nothing).
@@ -4092,6 +4124,7 @@ export class ChatSession {
 						attachment: {
 							name: member.file.name, storagePath: member.storagePath,
 							mime: mime || undefined, size: member.file.size, url: url,
+							accessGroup: accessGroup,
 						},
 						parsedContent: parsedContent || undefined,
 					}).then(function (ack: any) {

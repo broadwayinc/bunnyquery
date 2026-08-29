@@ -38,6 +38,38 @@ export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
 
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
+
+/**
+ * Where a chat turn's MCP tools point, and what they authenticate with.
+ *
+ * A SIGNED-IN turn uses the server's root endpoint with the literal
+ * '$ACCESS_TOKEN', which the backend substitutes from the caller's
+ * `x-access-token` header before the request leaves for the provider.
+ *
+ * An ANONYMOUS turn has no such header, so that substitution yields an EMPTY
+ * credential: `authorization_token: ""` for Claude, `Bearer ` for OpenAI. That is
+ * worse than sending none. The MCP server cannot identify a project from an empty
+ * token, so every tool call 401s — and a pass whose calls all 401 is exactly what
+ * the polling worker classifies as an auth outage, which STOPS the chain. A
+ * provider that validates the field would reject the whole request before that.
+ *
+ * So an anonymous turn points at the project-scoped endpoint `/p/<project id>`
+ * and sends NO credential. That route is anonymous by construction: read-only,
+ * one project, public records only, and a bearer on it is ignored rather than
+ * honoured.
+ *
+ * The project id is the PUBLIC compound token, matching the route's own pattern
+ * and the form the tools accept; the raw regional code would not match.
+ */
+function mcpEndpointFor(
+	anonymous: boolean | undefined,
+	publicProjectId: string | undefined,
+	service: string,
+): { url: string; token?: string } {
+	if (!anonymous) return { url: mcpUrl(), token: '$ACCESS_TOKEN' };
+	const project = publicProjectId || service;
+	return { url: String(mcpUrl()).replace(/\/+$/, '') + '/p/' + project };
+}
 const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretRequest(opts);
 
 // Resolve the per-image `detail` for OpenAI. The version match tolerates a
@@ -548,7 +580,9 @@ export async function callClaudeWithPublicMcp(
 	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
+	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
 ) {
+	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	return callClaudeWithMcp({
 		prompt,
 		messages,
@@ -562,8 +596,10 @@ export async function callClaudeWithPublicMcp(
 		fileUrls,
 		mcpServer: {
 			name: MCP_NAME,
-			url: mcpUrl(),
-			authorizationToken: '$ACCESS_TOKEN',
+			url: endpoint.url,
+			// Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
+			// guard below drops the key rather than sending an empty one.
+			authorizationToken: endpoint.token,
 		},
 		onResponse,
 		onError,
@@ -582,7 +618,9 @@ export async function callOpenAIWithPublicMcp(
 	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
+	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
 ) {
+	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	const resolvedModel = model || DEFAULT_OPENAI_MODEL;
 	const imageDetail = getOpenAIImageDetail(resolvedModel);
 	const messageList =
@@ -636,11 +674,14 @@ export async function callOpenAIWithPublicMcp(
 				{
 					type: 'mcp',
 					server_label: MCP_NAME,
-					server_url: mcpUrl(),
+					server_url: endpoint.url,
 					require_approval: 'never',
-					headers: {
-						Authorization: 'Bearer $ACCESS_TOKEN',
-					},
+					// No `headers` at all for an anonymous turn: `Bearer ` with an
+					// empty token is a credential the MCP server rejects, and the
+					// project-scoped endpoint needs none.
+					...(endpoint.token
+						? { headers: { Authorization: 'Bearer ' + endpoint.token } }
+						: {}),
 				},
 				...(OPENAI_WEB_SEARCH_ENABLED
 					? [
@@ -681,6 +722,13 @@ export type AttachmentSaveInfo = {
 		mime?: string;
 		size?: number;
 		url: string;
+		/**
+		 * Access group this file's records are written at (the uploader's choice,
+		 * already applied to the "src::" record). Threaded into the indexing
+		 * prompts so the agent's own records land in the same group; omitted
+		 * means "authorized", the group everything used before the setting existed.
+		 */
+		accessGroup?: 'public' | 'authorized' | 'private';
 	};
 	/**
 	 * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
@@ -892,6 +940,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		projectId: info.publicProjectId || service,
 		serviceName: info.serviceName,
 		serviceDescription: info.serviceDescription,
+		// Per-FILE, not per-project: one project holds public and private files at
+		// once, so this travels on the attachment rather than the identity.
+		accessGroup: attachment.accessGroup,
 	});
 
 	if (platform === 'openai') {

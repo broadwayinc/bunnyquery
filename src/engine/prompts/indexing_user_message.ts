@@ -20,6 +20,18 @@ export type IndexingAttachmentInfo = {
 	size?: number;
 	/** Temporary signed URL the agent/MCP fetches to read the file contents. */
 	url: string;
+	/**
+	 * Access group every record extracted from this file must be written at.
+	 *
+	 * The uploader chooses it (project default, or a per-upload prompt), and the
+	 * `src::` file record is already created at this group before indexing starts.
+	 * The rows, chapters and summaries the agent writes have to MATCH it: skapi's
+	 * access group is part of a record's table key, so a public file whose rows
+	 * were saved as "authorized" is a file an anonymous visitor can see the name
+	 * of and none of the contents of. Omitted means "authorized", which is what
+	 * every record written before this setting existed used.
+	 */
+	accessGroup?: 'public' | 'authorized' | 'private';
 };
 
 export type BuildIndexingUserMessageOptions = {
@@ -44,6 +56,15 @@ export type BuildIndexingUserMessageOptions = {
 	pagedRead?: boolean;
 };
 
+/**
+ * The access group to write this file's records at. One place, so the user
+ * message, the continue message and the system prompt cannot disagree.
+ */
+export function indexingAccessGroup(attachment: { accessGroup?: string }): 'public' | 'authorized' | 'private' {
+	const g = attachment && attachment.accessGroup;
+	return g === 'public' || g === 'private' ? g : 'authorized';
+}
+
 export function buildIndexingUserMessage(
 	attachment: IndexingAttachmentInfo,
 	options?: BuildIndexingUserMessageOptions,
@@ -54,7 +75,11 @@ export function buildIndexingUserMessage(
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
-		(typeof attachment.size === 'number' ? `- size (bytes): ${attachment.size}\n` : '');
+		(typeof attachment.size === 'number' ? `- size (bytes): ${attachment.size}\n` : '') +
+		// Stated in the metadata block as well as the system prompt because this is
+		// the per-FILE value: one project can hold public and private files at once,
+		// and the system prompt is what is constant across the run.
+		`- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}\n`;
 
 	if (options?.inlineContent) {
 		// Parsed client-side (an attachment-parser plugin). The content is already
@@ -169,7 +194,8 @@ function buildRenderMeta(attachment: IndexingAttachmentInfo): string {
 		`File metadata:\n` +
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
-		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '')
+		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
+		`- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}\n`
 	);
 }
 
@@ -262,6 +288,7 @@ export function buildIndexingContinueMessage(attachment: IndexingAttachmentInfo)
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
+		`- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}\n` +
 		`\nRecords for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). ` +
 		`First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. ` +
 		`Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:\n` +

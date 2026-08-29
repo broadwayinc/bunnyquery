@@ -345,6 +345,7 @@ Project description: """${serviceDescription}"""`;
   // src/engine/prompts/indexing_system_prompt.ts
   function buildIndexingSystemPrompt(params) {
     const { projectId, serviceName, serviceDescription } = params;
+    const accessGroup = params.accessGroup === "public" || params.accessGroup === "private" ? params.accessGroup : "authorized";
     let systemPrompt = `You are a background indexing agent for project ${projectId}.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Most files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) have ALREADY been extracted on the server and included inline in the user message between the "BEGIN FILE CONTENT" / "END FILE CONTENT" markers - read that directly. If the inline content is a "[skapi: ...]" note, the file could not be extracted - index it from its metadata only.
@@ -353,7 +354,8 @@ Project description: """${serviceDescription}"""`;
 - VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
 - TRANSCRIBE, DO NOT DESCRIBE. When an image contains ANY text - a label, tag, stamp, form field, serial/part number, handwriting - your FIRST job is to read the characters out and store them VERBATIM, not to describe the scene. A record saying "a red inspection tag with handwritten markings" is worthless: it is unsearchable and every such photo produces the same sentence. Put the characters you can actually read into these EXACT fields, not variations of them: "printed_text" (the pre-printed wording), "handwritten_text" (what a person wrote by hand), and, when you can resolve one, "part_no", "tag_id" and "date". Same reason as the fixed table names: a field called photo_text in one pass and visible_text_notes in the next cannot be queried together. Read PARTIAL values rather than skipping: "500.7402.52__" beats nothing. Only when a character is genuinely unreadable, leave that field null or mark the unreadable span - do NOT invent it, and do NOT replace the whole transcription with a description of what the object looks like. A scene description is a nice extra AFTER the text, never instead of it.
 - IMAGE FILES uploaded as the file itself: if ANY readable character appears ANYWHERE in the image (a label, a stamp, a sign in the background) it counts as an image WITH text - transcribe it per the rule above, and also capture the layout (what appears where) and every entity named. Only a truly text-free image gets description first: a one-line caption, then the objects present with their attributes (type, color, count, condition, position). Either way, save what you extract onto the file's "src::" record with updateRecords, TAG every entity and identifier visible, and INDEX the one number the image offers (a measured value, an amount, a count).
-- Whatever the file type, this file's identity is "src::" + its storage path (the "storage path" metadata line) - never the inline content or a temporary URL. That record ALREADY EXISTS: the upload pipeline creates it in table "file_summaries" (access group "authorized") before indexing starts, so posting it again is rejected as a duplicate unique_id. Reference it from every record you write, and add what you learn to it with updateRecords. If that update unexpectedly reports the record does not exist, post it yourself ONCE with that exact "src::" unique_id (table "file_summaries", access group "authorized") and carry on; this is the ONE exception to the do-NOT-post-the-file-record rules elsewhere in these instructions, because the source identity must never be dropped just because an update failed.
+- Whatever the file type, this file's identity is "src::" + its storage path (the "storage path" metadata line) - never the inline content or a temporary URL. That record ALREADY EXISTS: the upload pipeline creates it in table "file_summaries" (access group "${accessGroup}") before indexing starts, so posting it again is rejected as a duplicate unique_id. Reference it from every record you write, and add what you learn to it with updateRecords. If that update unexpectedly reports the record does not exist, post it yourself ONCE with that exact "src::" unique_id (table "file_summaries", access group "${accessGroup}") and carry on; this is the ONE exception to the do-NOT-post-the-file-record rules elsewhere in these instructions, because the source identity must never be dropped just because an update failed.
+- ACCESS GROUP (hard rule): every record you write for this file - the file record, per-row records, chapters, summaries, intermediates - MUST be posted with access group "${accessGroup}". Pass it explicitly on every postRecords call; do not leave it out and do not vary it between passes of the same file. An access group is part of a record's table key, so records saved under a different group than the file are in a different table and will not come back with the rest of it: a "public" file whose rows were saved as "authorized" is one an anonymous visitor can see the name of and none of the contents of, and a re-index cannot find the strays to clean them up. The one exception is the EXTRACTED MEDIA records in "__MEDIA__", which the pipeline creates for you - leave their group alone and only enrich them.
 - REACHABILITY (hard rule): every record you write while indexing this file MUST be reachable from the file's "src::<storage path>" record by following reference - either reference that record directly, or reference something that already reaches it. A record with no reference, or one pointing outside this file's chain, is an ORPHAN: deleting or re-indexing the file removes the reachable records and leaves the orphan behind forever, where it keeps turning up in later answers as stale data. If you create an intermediate record that OTHER records reference (a page record that rows hang off, a sheet or section record), set source.can_remove_referencing_records to true on it; the delete cascade passes a delete through a record only when that record carries the flag OR a unique_id starting "src::" (the file record cascades because its unique_id starts with "src::"; the intermediates you create carry no "src::" id, so they need the flag), and it cascades ONE LEVEL AT A TIME, so EVERY intermediate record in a chain needs its own marker - an unmarked link stops the cascade there and everything below it survives as orphans. When in doubt, reference the file record directly and keep the chain flat.
 - TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, window by window, until it ends. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed. INDEX each row record on the row's most useful NUMERIC column (named by its header) so rows sort and range-query; when the row has no numeric column, index the grid row number instead. TAG each row record with the sheet name, the file name, and the row's categorical values (a status, a category, a type) - tags are how rows are filtered without scanning the table.
 - ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
@@ -374,6 +376,10 @@ Project description: """${serviceDescription}"""`;
   }
 
   // src/engine/prompts/indexing_user_message.ts
+  function indexingAccessGroup(attachment) {
+    const g = attachment && attachment.accessGroup;
+    return g === "public" || g === "private" ? g : "authorized";
+  }
   function buildIndexingUserMessage(attachment, options) {
     const head = `A new file has just been uploaded. Index it now.
 
@@ -382,7 +388,11 @@ File metadata:
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + (typeof attachment.size === "number" ? `- size (bytes): ${attachment.size}
-` : "");
+` : "") + // Stated in the metadata block as well as the system prompt because this is
+    // the per-FILE value: one project can hold public and private files at once,
+    // and the system prompt is what is constant across the run.
+    `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
+`;
     if (options?.inlineContent) {
       return head + `
 The file's content was parsed by the client and is provided inline below. Read it directly - do NOT fetch any URL for this file. Set every record's reference to exactly "src::" + the storage path above (not this content). That file record already exists, so enrich it with updateRecords rather than posting it.
@@ -430,7 +440,8 @@ Records for the earlier pages are ALREADY saved (they reference "${src}"). The N
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
-` : "");
+` : "") + `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
+`;
   }
   function buildRenderDatafy(placeholder) {
     return `
@@ -473,7 +484,8 @@ File metadata:
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
 ` + (attachment.mime ? `- mime type: ${attachment.mime}
-` : "") + `
+` : "") + `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
+
 Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
  - Text: the cursor is the character offset already read.
@@ -1459,6 +1471,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
   var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
   var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
+  function mcpEndpointFor(anonymous, publicProjectId, service) {
+    if (!anonymous) return { url: mcpUrl(), token: "$ACCESS_TOKEN" };
+    const project = publicProjectId || service;
+    return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
+  }
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
   var VARIANT_IMAGE_DETAIL = "original";
   var VARIANT_TEXT_VERBOSITY = "high";
@@ -1684,7 +1701,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     });
   }
-  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
+  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
     return callClaudeWithMcp({
       prompt,
       messages,
@@ -1698,11 +1716,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       fileUrls,
       mcpServer: {
         name: MCP_NAME,
-        url: mcpUrl(),
-        authorizationToken: "$ACCESS_TOKEN"
+        url: endpoint.url,
+        // Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
+        // guard below drops the key rather than sending an empty one.
+        authorizationToken: endpoint.token
       }});
   }
-  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError) {
+  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
     const resolvedModel = model || DEFAULT_OPENAI_MODEL;
     const imageDetail = getOpenAIImageDetail(resolvedModel);
     const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
@@ -1745,11 +1766,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           {
             type: "mcp",
             server_label: MCP_NAME,
-            server_url: mcpUrl(),
+            server_url: endpoint.url,
             require_approval: "never",
-            headers: {
-              Authorization: "Bearer $ACCESS_TOKEN"
-            }
+            // No `headers` at all for an anonymous turn: `Bearer ` with an
+            // empty token is a credential the MCP server rejects, and the
+            // project-scoped endpoint needs none.
+            ...endpoint.token ? { headers: { Authorization: "Bearer " + endpoint.token } } : {}
           },
           ...[
             {
@@ -1860,7 +1882,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       // by the tools' schema pattern.
       projectId: info.publicProjectId || service,
       serviceName: info.serviceName,
-      serviceDescription: info.serviceDescription
+      serviceDescription: info.serviceDescription,
+      // Per-FILE, not per-project: one project holds public and private files at
+      // once, so this travels on the attachment rather than the identity.
+      accessGroup: attachment.accessGroup
     });
     if (platform === "openai") {
       const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
@@ -3383,10 +3408,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this._lidSeq += 1;
       return "lid_" + this._lidSeq;
     }
+    /**
+     * The key every per-chat cache hangs off: the restored message cache, the
+     * hydrated-body memo, the live-index key and the per-file storage-path key.
+     *
+     * It carries the IDENTITY as well as the project and platform. A single
+     * browser can hold more than one conversation on one project without a
+     * reload — an anonymous visitor who signs in, or a dashboard user who logs
+     * out and back in as someone else — and with an identity-free key the
+     * previous conversation stayed in the cache and was re-rendered, and written
+     * back, as the new one's. `userId` is the same value the request queue is
+     * named after, so two identities that share a queue share a cache, which is
+     * exactly right.
+     */
     getHistoryCacheKey() {
       var id = this.host.getIdentity();
       if (!id.projectId || id.platform === "none") return "";
-      return id.projectId + "#" + id.platform;
+      return id.projectId + "#" + id.platform + "#" + (id.userId || "");
     }
     /** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
      *  clients call this right after their mapper runs (loadHistory does it
@@ -3589,7 +3627,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (projectId === void 0) projectId = id.projectId;
         if (owner === void 0) owner = id.owner;
       }
-      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls);
+      var liveId = this.host.getIdentity();
+      var mcpScope = { anonymous: liveId.anonymous, publicProjectId: liveId.publicProjectId };
+      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope);
     }
     dispatchAgentRequest(params) {
       var self = this;
@@ -5977,6 +6017,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               })).catch(function() {
               });
             });
+            var accessGroup;
+            preIndex = preIndex.then(function() {
+              if (alreadyIndexing) return;
+              if (typeof self.host.uploadAccessGroup !== "function") return;
+              return Promise.resolve(self.host.uploadAccessGroup(member.storagePath)).then(function(g) {
+                accessGroup = g || void 0;
+              }).catch(function() {
+              });
+            });
             return preIndex.then(function() {
               return parseAttachmentContent(member.file, member.file.name, mime || void 0);
             }).then(function(parsedContent) {
@@ -5995,7 +6044,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                   storagePath: member.storagePath,
                   mime: mime || void 0,
                   size: member.file.size,
-                  url
+                  url,
+                  accessGroup
                 },
                 parsedContent: parsedContent || void 0
               }).then(function(ack) {
@@ -6542,7 +6592,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       // sessionStorage
       googleRedirect: "bq_embed:google_redirect",
       // sessionStorage
-      clearHorizon: "bq_embed:clearedAt"
+      clearHorizon: "bq_embed:clearedAt",
+      anonId: "bq_embed:anon_id"
+      // per-project anonymous device id
     };
     function h(tag, attrs) {
       var el = document.createElement(tag);
@@ -6696,6 +6748,40 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     };
     function skey(base) {
       return base + ":" + (S.projectId || "default");
+    }
+    function anonymousAllowed() {
+      if (S.opts && typeof S.opts.allowAnonymous === "boolean") return S.opts.allowAnonymous;
+      var conf = S.service && S.service.conf || null;
+      if (!conf || typeof conf.prevent_anonymous === "undefined") return false;
+      return !conf.prevent_anonymous;
+    }
+    function isAnonymousSession() {
+      return !S.user && anonymousAllowed();
+    }
+    function randomId() {
+      try {
+        var buf = new Uint8Array(16);
+        (window.crypto || window.msCrypto).getRandomValues(buf);
+        var out = "";
+        for (var i = 0; i < buf.length; i++) out += ("0" + buf[i].toString(16)).slice(-2);
+        return out;
+      } catch (e) {
+        return "x" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      }
+    }
+    var _anonIdMemo = null;
+    function anonDeviceId() {
+      if (_anonIdMemo) return _anonIdMemo;
+      var key = skey(SK.anonId);
+      var stored = lsGet(key);
+      if (stored) {
+        _anonIdMemo = stored;
+        return stored;
+      }
+      var minted = "anon_" + randomId();
+      lsSet(key, minted);
+      _anonIdMemo = lsGet(key) || minted;
+      return _anonIdMemo;
     }
     function loadTheme() {
       var stored = lsGet(SK.theme);
@@ -7225,6 +7311,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             text: "Sign up \u2192"
           }));
         }
+        var canReturnToChat = !S.user && anonymousAllowed();
         var form = h(
           "form",
           { class: "bq-form", onsubmit: submit },
@@ -7234,7 +7321,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           errorBox,
           h("div", { class: "bq-form-bottom" }, submitBtn)
         );
-        var children = authHeader("Login").concat([form]);
+        var children = [];
+        if (canReturnToChat) {
+          children.push(h(
+            "div",
+            { class: "bq-settings-top" },
+            h("button", {
+              class: "bq-link",
+              type: "button",
+              onclick: function() {
+                enterAfterLogin();
+              },
+              text: "\u2190 Back to chat"
+            })
+          ));
+        }
+        children = children.concat(authHeader("Login")).concat([form]);
         if (googleEnabled()) {
           children.push(
             h(
@@ -8185,7 +8287,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           return void 0;
         })(),
         owner: S.owner,
-        userId: S.user && S.user.user_id || S.projectId,
+        // The chat identity, which the engine turns into the request queue
+        // name. An anonymous visitor gets their DEVICE id rather than the
+        // project id: the old fallback gave every anonymous visitor of a
+        // project the same queue, so they would have shared one transcript
+        // and head-of-line-blocked each other's turns on a single FIFO.
+        userId: S.user && S.user.user_id || (isAnonymousSession() ? anonDeviceId() : S.projectId),
+        // Sends the turn's MCP tools to the project-scoped, credential-free
+        // endpoint instead of the root one with an empty bearer.
+        anonymous: isAnonymousSession(),
         platform: S.aiPlatform,
         model: S.aiModel || void 0,
         serviceName: S.serviceName,
@@ -8247,7 +8357,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return deleteFileIndexRecordDb(path);
       },
       ensureFileIndexRecord: function(path, meta) {
-        return ensureFileIndexRecordDb(path, meta);
+        return resolveUploadAccessGroup(path).then(function(g) {
+          return ensureFileIndexRecordDb(path, meta, g);
+        });
+      },
+      uploadAccessGroup: function(path) {
+        return resolveUploadAccessGroup(path);
       },
       storagePathFor: function(relPath) {
         return attachmentStoragePath(relPath);
@@ -8259,7 +8374,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return promptOverwrite(filename);
       },
       resetOverwriteBatch: function() {
-        return resetOverwriteBatch();
+        resetOverwriteBatch();
+        resetAccessGroupBatch();
       },
       renderAttachmentChips: function() {
         renderAttachmentChips();
@@ -8813,12 +8929,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       return createChain();
     }
-    function ensureFileIndexRecordDb(storagePath, meta) {
+    function ensureFileIndexRecordDb(storagePath, meta, accessGroup) {
       if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
       return Promise.resolve(S.skapi.postRecord(null, {
         service: S.projectId,
         unique_id: "src::" + storagePath,
-        table: { name: "file_summaries", access_group: "authorized" },
+        table: { name: "file_summaries", access_group: normalizeUploadAccessGroup(accessGroup) },
         // Deleting the file record must cascade to every record referencing it.
         source: { can_remove_referencing_records: true },
         data: {
@@ -9517,7 +9633,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function getClearHistoryStorageKey() {
       if (!S.projectId || S.aiPlatform === "none") return "";
-      return SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+      var key = SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+      if (isAnonymousSession()) key += "#" + anonDeviceId();
+      return key;
     }
     function getClearedAt() {
       var key = getClearHistoryStorageKey();
@@ -9881,7 +9999,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var liveIndex = session.getLiveIndexState();
       var fresh = markerSweep.svc === S.projectId;
       var stubs = void 0;
-      if (fresh) {
+      if (fresh && !isAnonymousSession()) {
         stubs = {};
         var myId = S.user && S.user.user_id || "";
         for (var rp in markerSweep.runs) {
@@ -10392,6 +10510,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           }
         });
         CS.settingsBtnEl = settingsBtn;
+        var headerRight = isAnonymousSession() ? h("button", {
+          class: "bq-link",
+          type: "button",
+          title: "Login",
+          onclick: function() {
+            renderLogin();
+          },
+          text: "Login"
+        }) : settingsBtn;
+        if (isAnonymousSession()) CS.settingsBtnEl = null;
         var header = h(
           "div",
           { class: "bq-section-title" },
@@ -10399,7 +10527,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             "div",
             { class: "bq-title-row" },
             brandTitleEl(),
-            h("div", { class: "bq-title-right" }, settingsBtn)
+            h("div", { class: "bq-title-right" }, headerRight)
           )
         );
         var chatArea;
@@ -10536,6 +10664,128 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       overwriteState.resolver = null;
       if (r) r(choice);
     }
+    var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
+    var UPLOAD_ACCESS_LABELS = {
+      public: "Public",
+      authorized: "Signed in users",
+      private: "Only me"
+    };
+    var UPLOAD_ACCESS_HINTS = {
+      public: "Anyone can ask about this file, including visitors who are not logged in.",
+      authorized: "Only users signed in to this project can ask about this file.",
+      private: "Only you can ask about this file."
+    };
+    function normalizeUploadAccessGroup(v) {
+      return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? "authorized" : v;
+    }
+    function projectAccessSetting() {
+      var conf = S.service && S.service.conf || {};
+      var v = conf.default_access_group;
+      if (v === "ask") return "ask";
+      return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? null : v;
+    }
+    function projectUploadAccessGroup() {
+      var v = projectAccessSetting();
+      return v && v !== "ask" ? v : "authorized";
+    }
+    function projectAsksUploadAccess() {
+      return projectAccessSetting() === "ask";
+    }
+    var accessGroupState = { resolver: null, sticky: null, handle: null, applyToAll: false, choice: "authorized", perPath: {} };
+    function resetAccessGroupBatch() {
+      accessGroupState.sticky = null;
+      accessGroupState.applyToAll = false;
+      accessGroupState.perPath = {};
+    }
+    function chooseAccessGroup(choice) {
+      var picked = normalizeUploadAccessGroup(choice);
+      if (accessGroupState.applyToAll) accessGroupState.sticky = picked;
+      if (accessGroupState.handle) {
+        accessGroupState.handle.close();
+        accessGroupState.handle = null;
+      }
+      var r = accessGroupState.resolver;
+      accessGroupState.resolver = null;
+      if (r) r(picked);
+    }
+    var accessGroupChain = Promise.resolve();
+    function resolveUploadAccessGroup(storagePath) {
+      if (!projectAsksUploadAccess()) return Promise.resolve(projectUploadAccessGroup());
+      var fallback = projectUploadAccessGroup();
+      if (accessGroupState.sticky) return Promise.resolve(accessGroupState.sticky);
+      var pathKey = String(storagePath || "");
+      if (pathKey && accessGroupState.perPath[pathKey]) {
+        return Promise.resolve(accessGroupState.perPath[pathKey]);
+      }
+      var run = accessGroupChain.then(function() {
+        if (accessGroupState.sticky) return accessGroupState.sticky;
+        if (pathKey && accessGroupState.perPath[pathKey]) {
+          return accessGroupState.perPath[pathKey];
+        }
+        accessGroupState.applyToAll = false;
+        accessGroupState.choice = fallback;
+        var filename = String(storagePath || "").split("/").pop() || "this file";
+        return new Promise(function(resolve) {
+          accessGroupState.resolver = resolve;
+          accessGroupState.handle = openModal(function() {
+            var list = h("div", { class: "bq-access-options" });
+            UPLOAD_ACCESS_GROUPS.forEach(function(g) {
+              var input = h("input", { type: "radio", name: "bq-access-group", value: g });
+              input.checked = g === accessGroupState.choice;
+              input.addEventListener("change", function() {
+                if (input.checked) accessGroupState.choice = g;
+              });
+              list.appendChild(h(
+                "label",
+                { class: "bq-access-option" },
+                input,
+                h("span", { class: "bq-access-option-label", text: UPLOAD_ACCESS_LABELS[g] }),
+                h("span", { class: "bq-access-option-hint", text: UPLOAD_ACCESS_HINTS[g] })
+              ));
+            });
+            var applyCb = h("input", { type: "checkbox" });
+            applyCb.addEventListener("change", function() {
+              accessGroupState.applyToAll = !!applyCb.checked;
+            });
+            var applyLabel = h(
+              "label",
+              { class: "bq-overwrite-applyall" },
+              applyCb,
+              h("span", { text: "Apply to all remaining files" })
+            );
+            return h(
+              "div",
+              { class: "bq-modal" },
+              h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Who can read this file?" })),
+              h(
+                "p",
+                { class: "bq-modal-desc" },
+                "Choose who can ask questions about \u201C" + filename + "\u201D once it is indexed."
+              ),
+              list,
+              applyLabel,
+              h(
+                "div",
+                { class: "bq-modal-btns" },
+                h("button", { class: "btn", type: "button", onclick: function() {
+                  chooseAccessGroup(accessGroupState.choice);
+                } }, "Upload")
+              )
+            );
+          }, { dismissible: false });
+        });
+      });
+      accessGroupChain = run.catch(function() {
+        return void 0;
+      });
+      return run.then(function(picked) {
+        var g = normalizeUploadAccessGroup(picked);
+        if (pathKey) accessGroupState.perPath[pathKey] = g;
+        return g;
+      }).catch(function() {
+        return fallback;
+      });
+    }
     function promptOverwrite(filename) {
       if (overwriteState.sticky) return Promise.resolve(overwriteState.sticky);
       overwriteState.applyToAll = false;
@@ -10647,6 +10897,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }).catch(function() {
       }).then(function() {
         S.user = null;
+        if (anonymousAllowed()) return enterAfterLogin();
         renderLogin();
       });
     }
@@ -10660,7 +10911,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }).then(function() {
         return loadServiceInfo();
       }).then(function(conn) {
-        S.service = conn;
+        if (conn) S.service = conn;
         applyAgentConfig();
       }).then(function() {
         renderChat();
@@ -10720,6 +10971,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return getProfile().then(function(user) {
         S.user = user;
         if (!user) {
+          if (anonymousAllowed()) return enterAfterLogin();
           renderLogin();
           return;
         }
@@ -10758,8 +11010,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // defaults to current host page
         hostDomain: null,
         // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
-        attachmentParsers: null
+        attachmentParsers: null,
         // client-side attachment parsers, e.g. [createHwpParser()]
+        // Open the chat with no login for visitors without an account.
+        // null → follow the project's own "Allow anonymous users" setting
+        // (getConnectionInfo().conf.prevent_anonymous); true/false pins it.
+        allowAnonymous: null,
+        // Server-driven windowed indexing; read at configureChatEngine time.
+        // Listed here so the defaults object is the full opt surface.
+        windowedIndexing: true
       }, opts || {});
       S.mountEl = mountEl;
       clear(mountEl);

@@ -9,6 +9,7 @@ export { buildChatSystemPrompt, type ChatSystemPromptParams } from './chat_syste
 export { buildIndexingSystemPrompt, type IndexingSystemPromptParams } from './indexing_system_prompt';
 export {
 	buildIndexingUserMessage,
+	indexingAccessGroup,
 	buildIndexingContinueMessage,
 	buildIndexingRenderMessage,
 	buildIndexingRenderContinueTemplate,

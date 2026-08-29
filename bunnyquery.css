@@ -1018,6 +1018,39 @@
 }
 .bq-overwrite-applyall input { cursor: pointer; margin: 0; }
 
+/* Access-group chooser (who may read a file once it is indexed). A radio list
+   rather than a row of buttons: the three answers are not equally weighted and
+   the hint under each is what actually distinguishes them. */
+.bq-access-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin: 0 0 1rem;
+}
+.bq-access-option {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: baseline;
+    column-gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid transparent;
+    cursor: pointer;
+    user-select: none;
+}
+.bq-access-option:hover { background: var(--bq-hover-bg); }
+.bq-access-option input { cursor: pointer; margin: 0; }
+.bq-access-option-label {
+    font-size: 0.88rem;
+    color: var(--bq-ink);
+}
+.bq-access-option-hint {
+    grid-column: 2;
+    font-size: 0.76rem;
+    line-height: 1.35;
+    color: var(--bq-muted);
+    margin-top: 0.15rem;
+}
+
 /* ============================================================================
  * RESPONSIVE
  * ==========================================================================*/
