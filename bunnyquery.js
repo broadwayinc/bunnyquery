@@ -6603,7 +6603,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.9.6" ;
+    var BQ_VERSION = "1.9.7" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -6779,8 +6779,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function anonymousAllowed() {
       if (S.opts && typeof S.opts.allowAnonymous === "boolean") return S.opts.allowAnonymous;
       var conf = S.service && S.service.conf || null;
-      if (!conf || typeof conf.prevent_anonymous === "undefined") return false;
-      return !conf.prevent_anonymous;
+      if (!conf) return false;
+      return conf.require_login === false;
     }
     function isAnonymousSession() {
       return !S.user && anonymousAllowed();
@@ -11045,7 +11045,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // client-side attachment parsers, e.g. [createHwpParser()]
         // Open the chat with no login for visitors without an account.
         // null → follow the project's own "Allow anonymous users" setting
-        // (getConnectionInfo().conf.prevent_anonymous); true/false pins it.
+        // (getConnectionInfo().conf.require_login); true/false pins it.
         allowAnonymous: null,
         // Server-driven windowed indexing; read at configureChatEngine time.
         // Listed here so the defaults object is the full opt surface.

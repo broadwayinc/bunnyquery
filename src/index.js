@@ -316,10 +316,15 @@ import {
      * A project whose owner turned "Allow anonymous users" on serves the chat
      * with no login wall. Two things follow from that.
      *
-     * 1. WHO IS ALLOWED. The switch is the service's own `prevent_anonymous`
-     *    flag, read off the unauthenticated getConnectionInfo() response, so the
-     *    widget needs no extra call and no credentials to know. `opts.allowAnonymous`
+     * 1. WHO IS ALLOWED. The switch is the project's `require_login` flag, read
+     *    off the unauthenticated getConnectionInfo() response, so the widget
+     *    needs no extra call and no credentials to know. `opts.allowAnonymous`
      *    overrides it either way, for a page that wants to pin the behaviour.
+     *
+     *    NOT `prevent_anonymous`. That one governs anonymous record WRITES at
+     *    the skapi layer; it never gated reading public records, and the
+     *    BunnyQuery MCP refuses anonymous writes whatever it says. The two
+     *    settings are unrelated and must not be conflated again.
      *
      * 2. WHOSE CHAT IS IT. The backend identifies an unauthenticated requester as
      *    `ip + "(" + user_agent + ")"`, which is not a device: two phones on one
@@ -339,8 +344,11 @@ import {
         var conf = (S.service && S.service.conf) || null;
         // Unknown until service info lands. Default to NOT allowed so a failed
         // or slow load shows the login page rather than a chat that cannot send.
-        if (!conf || typeof conf.prevent_anonymous === "undefined") return false;
-        return !conf.prevent_anonymous;
+        // Only an explicit `false` opens it, which is the same way
+        // aiClientSecretGrp decides the client secret's access group - so the
+        // flag and the key can never disagree about which way they fail.
+        if (!conf) return false;
+        return conf.require_login === false;
     }
 
     // True when this page is being used by a visitor with no account.
@@ -5045,7 +5053,7 @@ import {
             .then(function () { return loadServiceInfo(); })
             // Keep the copy boot already loaded when this re-load comes back
             // empty (loadServiceInfo swallows its own errors and resolves null).
-            // Overwriting it with null loses conf.prevent_anonymous, and an
+            // Overwriting it with null loses conf.require_login, and an
             // anonymous visitor would then be drawn as a signed-in one: the chat
             // header would offer the account gear to someone with no account.
             .then(function (conn) { if (conn) S.service = conn; applyAgentConfig(); })
@@ -5176,7 +5184,7 @@ import {
             attachmentParsers: null,     // client-side attachment parsers, e.g. [createHwpParser()]
             // Open the chat with no login for visitors without an account.
             // null → follow the project's own "Allow anonymous users" setting
-            // (getConnectionInfo().conf.prevent_anonymous); true/false pins it.
+            // (getConnectionInfo().conf.require_login); true/false pins it.
             allowAnonymous: null,
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
