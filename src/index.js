@@ -1905,6 +1905,10 @@ import {
             // buildGreetingEl, so the two can never disagree.
             greeting: greetingParts().text,
             canUpload: !uploadsFrozenForUser(),
+            // Where THIS project's indexer writes. The MCP's auto-fill assumes
+            // "authorized"; on a project set to public or private that would
+            // search the wrong group and answer "nothing found".
+            indexAccessGroup: projectUploadAccessGroup(),
             client: "widget",
         });
     }

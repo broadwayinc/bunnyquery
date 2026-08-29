@@ -279,6 +279,18 @@ type ChatSystemPromptParams = {
      * given when the caller says which one this is.
      */
     client?: 'console' | 'widget';
+    /**
+     * The access group THIS project's indexer writes its records at, from the
+     * project's `default_access_group` setting.
+     *
+     * The MCP auto-fills an index/tag query that names a table but no group with
+     * "authorized", which used to be right because every BunnyQuery record was
+     * hardcoded to it. Now a project can index at "public" (so an anonymous
+     * visitor can read it) or "private", and on those projects the auto-fill
+     * silently searches a group the data is not in and answers "nothing found".
+     * Defaults to 'authorized', which is what an unset project still uses.
+     */
+    indexAccessGroup?: string;
 };
 declare function buildChatSystemPrompt(params: ChatSystemPromptParams): string;
 
