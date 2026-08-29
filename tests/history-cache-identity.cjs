@@ -25,7 +25,7 @@
  */
 
 const assert = require('assert');
-const { ChatSession } = require('../dist/engine.cjs');
+const { ChatSession, chatCacheKey, indexScopeKey } = require('../dist/engine.cjs');
 
 const results = [];
 function test(name, fn) {
@@ -116,6 +116,55 @@ test('a missing userId does not throw or produce "undefined" in the key', () => 
     const key = sessionFor({ projectId: 'svc-1', owner: 'o', platform: 'claude' }).getHistoryCacheKey();
     assert.ok(typeof key === 'string' && key.length > 0);
     assert.ok(key.indexOf('undefined') === -1, 'stringified undefined leaked into the key: ' + key);
+});
+
+/* ---- THE INVARIANT: one shape, no hand-built twins ----------------------- *
+ * The original version of this file tested only the PROPERTY (two identities ->
+ * two keys) and passed while the feature was broken. Adding a third segment to
+ * getHistoryCacheKey left three hand-built two-segment twins behind, so
+ * `key !== getHistoryCacheKey()` was permanently true: every send looked like it
+ * belonged to another project, the optimistic bubble and the "Thinking..."
+ * placeholder were never pushed, and nothing rendered until the server history
+ * caught up. These tests pin the shape itself. */
+
+test("THE REGRESSION: the send path's key equals getHistoryCacheKey()", () => {
+    // This exact equality is what decides `offChat` in dispatch. When it broke,
+    // the chat stopped showing sent messages at all.
+    const s = sessionFor(SIGNED_IN);
+    assert.strictEqual(
+        chatCacheKey(SIGNED_IN.projectId, SIGNED_IN.platform, SIGNED_IN.userId),
+        s.getHistoryCacheKey(),
+    );
+});
+
+test('the mapper stamps _ownerKey with the same shape the cache filters by', () => {
+    // updateHistoryCache keeps a bubble only when `_ownerKey === getHistoryCacheKey()`.
+    // A two-segment stamp against a three-segment key drops every local bubble.
+    const stamped = chatCacheKey(ANON.projectId, ANON.platform, ANON.userId);
+    assert.strictEqual(stamped, sessionFor(ANON).getHistoryCacheKey());
+});
+
+test('the INDEX scope is deliberately identity-free, and NOT the chat key', () => {
+    // Claim/stop/cancel are per project+platform. Folding the identity in would
+    // have to be threaded through BgTaskEntry for no benefit: an anonymous
+    // visitor cannot index at all.
+    const idx = indexScopeKey(SIGNED_IN.projectId, SIGNED_IN.platform);
+    assert.strictEqual(idx, 'svc-1#claude');
+    assert.notStrictEqual(idx, sessionFor(SIGNED_IN).getHistoryCacheKey());
+});
+
+test('the index scope is the SAME for two identities on one project', () => {
+    assert.strictEqual(
+        indexScopeKey(ANON.projectId, ANON.platform),
+        indexScopeKey(SIGNED_IN.projectId, SIGNED_IN.platform),
+    );
+});
+
+test('both helpers return the empty key for an unusable identity', () => {
+    for (const fn of [chatCacheKey, indexScopeKey]) {
+        assert.strictEqual(fn('', 'claude', 'u'), '');
+        assert.strictEqual(fn('svc-1', 'none', 'u'), '');
+    }
 });
 
 /* ---- report ------------------------------------------------------------- */

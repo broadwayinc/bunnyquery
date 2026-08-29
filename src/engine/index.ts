@@ -81,6 +81,11 @@ export {
 	__resetSplitHistoryState,
 	type IndexingRequestRef,
 	type MapHistoryOptions,
+	// THE two key builders. Exported so a consumer (and a test) can assert the
+	// shape rather than rebuild it: a hand-built twin drifting out of step with
+	// getHistoryCacheKey is what stopped the chat rendering sent messages.
+	chatCacheKey,
+	indexScopeKey,
 } from './history';
 
 // Older history is reachable only by scrolling to the top of the message box, so

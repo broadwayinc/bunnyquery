@@ -2344,6 +2344,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
   const fetch = _fetchImpl || getChatHistory;
   const bgQueue = bgIndexingQueueName(params.userId, params.service);
   const base = { service: params.service, owner: params.owner, platform: params.platform };
+  const surfaceScope = params.scopeSurfaceToQueue && params.userId ? { queue: params.userId, queue_exact: true } : { queue_exclude: bgQueue };
   const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
   const limit = fetchOptions && fetchOptions.limit;
   const firstLoad = !splitHistoryStates[key];
@@ -2371,13 +2372,13 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     } else {
       const sOpts = { fetchMore };
       if (limit) sOpts.limit = limit;
-      let s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+      let s = await fetch({ ...base, ...surfaceScope }, sOpts);
       let hops = 0;
       while (s && !s.endOfList && !(s.list || []).length && hops < SURFACE_EMPTY_MAX_PAGES) {
         hops++;
         const nOpts = { fetchMore: true };
         if (limit) nOpts.limit = limit;
-        s = await fetch({ ...base, queue_exclude: bgQueue }, nOpts);
+        s = await fetch({ ...base, ...surfaceScope }, nOpts);
       }
       state.pendingSurface = {
         list: s && Array.isArray(s.list) ? s.list : [],
@@ -2510,6 +2511,14 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     firstLoad
   };
 }
+function chatCacheKey(projectId, platform, userId) {
+  if (!projectId || platform === "none") return "";
+  return projectId + "#" + platform + "#" + (userId || "");
+}
+function indexScopeKey(projectId, platform) {
+  if (!projectId || platform === "none") return "";
+  return projectId + "#" + platform;
+}
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
   var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
@@ -2596,7 +2605,7 @@ function mapHistoryListToMessages(list, platform, opts) {
     }
   });
   if (opts.projectId) {
-    var ownerKey = opts.projectId + "#" + platform;
+    var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
     for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
   }
   return { messages: mapped, runningItemIds };
@@ -3123,7 +3132,8 @@ var ChatSession = class {
   /** Storage paths are project-relative, and one ChatSession serves every
    *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
   _indexClaimKey(storagePath) {
-    return this.getHistoryCacheKey() + "|" + storagePath;
+    var id = this.host.getIdentity();
+    return indexScopeKey(id.projectId, id.platform) + "|" + storagePath;
   }
   /**
    * Take this file's indexing slot, or report that someone already has it.
@@ -3565,8 +3575,7 @@ var ChatSession = class {
    */
   getHistoryCacheKey() {
     var id = this.host.getIdentity();
-    if (!id.projectId || id.platform === "none") return "";
-    return id.projectId + "#" + id.platform + "#" + (id.userId || "");
+    return chatCacheKey(id.projectId, id.platform, id.userId);
   }
   /** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
    *  clients call this right after their mapper runs (loadHistory does it
@@ -4116,7 +4125,7 @@ var ChatSession = class {
     }
     if (stageId) delete this._liveStages[stageId];
     var llmComposed = composedForLlm || composed;
-    var key = !id.projectId ? "" : id.projectId + "#" + id.platform;
+    var key = chatCacheKey(id.projectId, id.platform, id.userId);
     var offChat = !!key && key !== this.getHistoryCacheKey();
     var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function(m) {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
@@ -4682,7 +4691,8 @@ var ChatSession = class {
   cancelIndexingGroup(group) {
     var self = this;
     if (!group || !group.key) return;
-    var scoped = this.getHistoryCacheKey() + "|" + group.key;
+    var idn = this.host.getIdentity();
+    var scoped = indexScopeKey(idn.projectId, idn.platform) + "|" + group.key;
     this.cancelledIndexKeys.add(scoped);
     if (!group.finished) {
       var stoppedIds = {};
@@ -5150,7 +5160,7 @@ var ChatSession = class {
     if (!entry) return "";
     var file = entry.storagePath || entry.filename;
     if (!file) return "";
-    return entry.projectId + "#" + entry.platform + "|" + file;
+    return indexScopeKey(entry.projectId, entry.platform) + "|" + file;
   }
   /**
    * Reconcile the bg queue with the files the user has stopped.
@@ -5677,7 +5687,7 @@ var ChatSession = class {
   loadHistory(fetchMore, token) {
     var self = this;
     var id = this.host.getIdentity();
-    var loadKey = !id.projectId || id.platform === "none" ? "" : id.projectId + "#" + id.platform;
+    var loadKey = chatCacheKey(id.projectId, id.platform, id.userId);
     if (token === void 0) token = this.state.gateRefreshToken;
     if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.projectId) {
       return Promise.resolve();
@@ -5696,7 +5706,17 @@ var ChatSession = class {
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
     if (!fetchMore) options.deferBg = true;
     var fetchHistory = function() {
-      return getSplitChatHistory({ service: projectId, owner, platform, userId: id.userId }, options);
+      return getSplitChatHistory({
+        service: projectId,
+        owner,
+        platform,
+        userId: id.userId,
+        // An anonymous visitor's history is scoped server side by
+        // ip + "(" + user_agent + ")", which two devices behind one NAT
+        // share. Read this device's own queue instead. See
+        // scopeSurfaceToQueue.
+        scopeSurfaceToQueue: !!id.anonymous
+      }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
       if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -5718,6 +5738,10 @@ var ChatSession = class {
       var mapped = mapHistoryListToMessages(list, platform, {
         clearedAt: self.host.getClearedAt(),
         projectId: id.projectId,
+        // So the `_ownerKey` stamped on server history matches loadKey and
+        // the cache key. Without it every mapped bubble carries a
+        // two-segment stamp that no comparison can ever match.
+        userId: id.userId,
         formatIndexingLabel: self.host.formatIndexingLabel
       }).messages;
       self.applyHydratedBodies(mapped);
@@ -5926,6 +5950,7 @@ var ChatSession = class {
           var m2 = mapHistoryListToMessages(sorted, platform, {
             clearedAt: self.host.getClearedAt(),
             projectId: id.projectId,
+            userId: id.userId,
             formatIndexingLabel: self.host.formatIndexingLabel
           }).messages;
           self.applyHydratedBodies(m2);
@@ -6714,6 +6739,6 @@ function buildChatDisplayList(messages, opts) {
   return out;
 }
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, shouldRescueInFlightMessage, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, OUTPUT_TOKEN_RESERVE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, TOOL_AND_RESPONSE_BUFFER, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, shouldRescueInFlightMessage, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

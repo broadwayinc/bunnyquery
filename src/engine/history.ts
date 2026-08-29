@@ -323,7 +323,34 @@ export type SplitHistoryResult = {
 };
 
 export async function getSplitChatHistory(
-	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
+	params: {
+		service: string;
+		owner: string;
+		platform: 'claude' | 'openai';
+		userId?: string;
+		/**
+		 * Scope the SURFACE fetch to this chat's own queue instead of "everything
+		 * that is not the bg queue".
+		 *
+		 * Set for an ANONYMOUS visitor, and only for one. The backend identifies an
+		 * unauthenticated caller as `ip + "(" + user_agent + ")"`, and the default
+		 * surface fetch (queue_exclude, no queue) is scoped by exactly that string
+		 * server side - so two anonymous visitors behind one NAT on the same browser
+		 * build read each other's transcript, which is the thing per-device history
+		 * exists to prevent. Reading the device's own queue instead scopes it by a
+		 * value the client controls and the other device does not share.
+		 *
+		 * NOT used for a signed-in caller. Their turns are already scoped by their
+		 * `sub`, and queue_exact would additionally hide any history sent under a
+		 * different queue name than the current userId (an older fallback, a
+		 * pre-rename row), which queue_exclude still returns.
+		 *
+		 * The queue name is unguessable but NOT secret: it travels on every request
+		 * and queue listings are not user-scoped server side. Anonymous transcripts
+		 * are non-confidential by construction.
+		 */
+		scopeSurfaceToQueue?: boolean;
+	},
 	fetchOptions: Record<string, any>,
 	/** Test seam: replaces getChatHistory. Not for production callers. */
 	_fetchImpl?: typeof getChatHistory,
@@ -345,7 +372,34 @@ export async function getSplitChatHistory(
 
 async function _getSplitChatHistoryLocked(
 	key: string,
-	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
+	params: {
+		service: string;
+		owner: string;
+		platform: 'claude' | 'openai';
+		userId?: string;
+		/**
+		 * Scope the SURFACE fetch to this chat's own queue instead of "everything
+		 * that is not the bg queue".
+		 *
+		 * Set for an ANONYMOUS visitor, and only for one. The backend identifies an
+		 * unauthenticated caller as `ip + "(" + user_agent + ")"`, and the default
+		 * surface fetch (queue_exclude, no queue) is scoped by exactly that string
+		 * server side - so two anonymous visitors behind one NAT on the same browser
+		 * build read each other's transcript, which is the thing per-device history
+		 * exists to prevent. Reading the device's own queue instead scopes it by a
+		 * value the client controls and the other device does not share.
+		 *
+		 * NOT used for a signed-in caller. Their turns are already scoped by their
+		 * `sub`, and queue_exact would additionally hide any history sent under a
+		 * different queue name than the current userId (an older fallback, a
+		 * pre-rename row), which queue_exclude still returns.
+		 *
+		 * The queue name is unguessable but NOT secret: it travels on every request
+		 * and queue listings are not user-scoped server side. Anonymous transcripts
+		 * are non-confidential by construction.
+		 */
+		scopeSurfaceToQueue?: boolean;
+	},
 	fetchOptions: Record<string, any>,
 	releaseLock: () => void,
 	_fetchImpl?: typeof getChatHistory,
@@ -353,6 +407,14 @@ async function _getSplitChatHistoryLocked(
 	const fetch = _fetchImpl || getChatHistory;
 	const bgQueue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform };
+	// What the SURFACE (non-background) fetch filters on. `queue_exclude` is the
+	// default and returns every row that is not on the bg chain; the anonymous
+	// path narrows to this chat's OWN queue instead. Same queue name the chat
+	// turns are dispatched under (requests.ts `queue: userId || service`), so the
+	// two cannot drift.
+	const surfaceScope: Record<string, any> = params.scopeSurfaceToQueue && params.userId
+		? { queue: params.userId, queue_exact: true }
+		: { queue_exclude: bgQueue };
 	const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
 	const limit = fetchOptions && fetchOptions.limit;
 
@@ -404,14 +466,14 @@ async function _getSplitChatHistoryLocked(
 		} else {
 			const sOpts: any = { fetchMore };
 			if (limit) sOpts.limit = limit;
-			let s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+			let s = await fetch({ ...base, ...surfaceScope }, sOpts);
 			// Loop past empty-but-not-end pages (see SURFACE_EMPTY_MAX_PAGES).
 			let hops = 0;
 			while (s && !s.endOfList && !((s.list || []).length) && hops < SURFACE_EMPTY_MAX_PAGES) {
 				hops++;
 				const nOpts: any = { fetchMore: true };
 				if (limit) nOpts.limit = limit;
-				s = await fetch({ ...base, queue_exclude: bgQueue }, nOpts);
+				s = await fetch({ ...base, ...surfaceScope }, nOpts);
 			}
 			state.pendingSurface = {
 				list: (s && Array.isArray(s.list)) ? s.list : [],
@@ -588,9 +650,53 @@ async function _getSplitChatHistoryLocked(
 }
 
 
+/**
+ * THE chat key. Every cache, every ownership stamp and every "is this turn for
+ * the chat on screen?" comparison is built here and nowhere else.
+ *
+ * It used to be written out by hand in four places. When a third segment was
+ * added for the chat identity - a browser can hold an anonymous conversation and
+ * a signed-in one on the SAME project, and the two must not share a cache - only
+ * one of those four was updated. The rest kept producing the two-segment form,
+ * so `key !== getHistoryCacheKey()` became permanently true: every send was
+ * treated as belonging to another project, the optimistic bubble and the
+ * "Thinking..." placeholder were never pushed, and nothing appeared until the
+ * server history caught up. One function, so a twin cannot drift again.
+ */
+export function chatCacheKey(
+	projectId: string | undefined,
+	platform: string | undefined,
+	userId?: string,
+): string {
+	if (!projectId || platform === 'none') return '';
+	return projectId + '#' + platform + '#' + (userId || '');
+}
+
+/**
+ * The INDEXING scope key: project + platform, deliberately WITHOUT the identity.
+ *
+ * Claiming, stopping and cancelling a file's indexing are scoped per project and
+ * platform because a storage path is project-relative and one ChatSession serves
+ * every project. They are NOT per user: an anonymous visitor cannot upload or
+ * index at all, so there is no second identity to separate, and folding the
+ * identity in here would only have to be threaded through BgTaskEntry to no end.
+ *
+ * Kept separate from chatCacheKey ON PURPOSE. These two were the same string
+ * once, which is exactly how adding a segment to one silently broke the other.
+ */
+export function indexScopeKey(
+	projectId: string | undefined,
+	platform: string | undefined,
+): string {
+	if (!projectId || platform === 'none') return '';
+	return projectId + '#' + platform;
+}
+
 export type MapHistoryOptions = {
 	clearedAt: number;
 	projectId: string;
+	/** Chat identity, so the `_ownerKey` stamp matches chatCacheKey(). */
+	userId?: string;
 	/** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
 	formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
@@ -728,7 +834,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 	// unchallenged. That is what let one project's transcript survive on screen
 	// into another project and be persisted under its key.
 	if (opts.projectId) {
-		var ownerKey = opts.projectId + '#' + platform;
+		var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
 		for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
 	}
 	return { messages: mapped, runningItemIds: runningItemIds };

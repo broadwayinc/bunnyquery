@@ -46,7 +46,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
-import { mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage } from './history';
+import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
@@ -325,7 +325,8 @@ export class ChatSession {
 	/** Storage paths are project-relative, and one ChatSession serves every
 	 *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
 	private _indexClaimKey(storagePath: string): string {
-		return this.getHistoryCacheKey() + '|' + storagePath;
+		var id = this.host.getIdentity();
+		return indexScopeKey(id.projectId, id.platform) + '|' + storagePath;
 	}
 
 	/**
@@ -813,8 +814,7 @@ export class ChatSession {
 	 */
 	getHistoryCacheKey(): string {
 		var id = this.host.getIdentity();
-		if (!id.projectId || id.platform === 'none') return '';
-		return id.projectId + '#' + id.platform + '#' + (id.userId || '');
+		return chatCacheKey(id.projectId, id.platform, id.userId);
 	}
 
 	// ─── compact-stub hydration ─────────────────────────────────────────────
@@ -1482,7 +1482,7 @@ export class ChatSession {
 		// getIdentity()/getHistoryCacheKey() to the new project) can't
 		// misattribute this turn's bubbles to that project.
 		// (platform === 'none' already returned above, so projectId is the only gate)
-		var key = !id.projectId ? '' : id.projectId + '#' + id.platform;
+		var key = chatCacheKey(id.projectId, id.platform, id.userId);
 		// True when the pinned chat is NOT the one currently on screen. Then
 		// state.messages belongs to a different project and MUST NOT be touched:
 		// the turn is staged in the pinned chat's cache instead and shows up when
@@ -2159,7 +2159,8 @@ export class ChatSession {
 		if (!group || !group.key) return;
 		// The group belongs to the chat on screen, so scope its key the same way
 		// _indexKeyOf scopes a queued task's.
-		var scoped = this.getHistoryCacheKey() + '|' + group.key;
+		var idn = this.host.getIdentity();
+		var scoped = indexScopeKey(idn.projectId, idn.platform) + '|' + group.key;
 		this.cancelledIndexKeys.add(scoped);
 		// Remember WHICH RUN was stopped, by the ids of the passes it is made of.
 		// Everything else here stops the work without leaving any mark on the
@@ -2709,7 +2710,7 @@ export class ChatSession {
 		if (!entry) return '';
 		var file = entry.storagePath || entry.filename;
 		if (!file) return '';
-		return entry.projectId + '#' + entry.platform + '|' + file;
+		return indexScopeKey(entry.projectId, entry.platform) + '|' + file;
 	}
 
 	/**
@@ -3435,7 +3436,7 @@ export class ChatSession {
 		// request is built from. The rescue below compares against this rather
 		// than a live getHistoryCacheKey(), so a project switch mid-fetch can't
 		// make another chat's in-flight bubbles look local.
-		var loadKey = (!id.projectId || id.platform === 'none') ? '' : id.projectId + '#' + id.platform;
+		var loadKey = chatCacheKey(id.projectId, id.platform, id.userId);
 		if (token === undefined) token = this.state.gateRefreshToken;
 		if ((this.state.loadingHistory && this.state.historyRequestToken === token) || id.platform === 'none' || !id.projectId) {
 			return Promise.resolve();
@@ -3464,7 +3465,16 @@ export class ChatSession {
 		// stubs, tiled to the surface page's time window with module-level
 		// state (buffering + retry safety) — see getSplitChatHistory. Returns
 		// the exact single-fetch shape; startKeyHistory is bookkeeping only.
-		var fetchHistory = function () { return getSplitChatHistory({ service: projectId, owner: owner, platform: platform, userId: id.userId }, options); };
+		var fetchHistory = function () {
+			return getSplitChatHistory({
+				service: projectId, owner: owner, platform: platform, userId: id.userId,
+				// An anonymous visitor's history is scoped server side by
+				// ip + "(" + user_agent + ")", which two devices behind one NAT
+				// share. Read this device's own queue instead. See
+				// scopeSurfaceToQueue.
+				scopeSurfaceToQueue: !!id.anonymous,
+			}, options);
+		};
 
 		return Promise.resolve().then(fetchHistory).catch(function (err: any) {
 			if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -3489,6 +3499,10 @@ export class ChatSession {
 			var mapped = mapHistoryListToMessages(list, platform, {
 				clearedAt: self.host.getClearedAt(),
 				projectId: id.projectId,
+				// So the `_ownerKey` stamped on server history matches loadKey and
+				// the cache key. Without it every mapped bubble carries a
+				// two-segment stamp that no comparison can ever match.
+				userId: id.userId,
 				formatIndexingLabel: self.host.formatIndexingLabel,
 			}).messages;
 			// Re-apply any previously-hydrated compact bodies: a refresh maps
@@ -3782,6 +3796,7 @@ export class ChatSession {
 					var m2 = mapHistoryListToMessages(sorted, platform, {
 						clearedAt: self.host.getClearedAt(),
 						projectId: id.projectId,
+						userId: id.userId,
 						formatIndexingLabel: self.host.formatIndexingLabel,
 					}).messages;
 					self.applyHydratedBodies(m2);

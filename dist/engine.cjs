@@ -2346,6 +2346,7 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
   const fetch = _fetchImpl || getChatHistory;
   const bgQueue = bgIndexingQueueName(params.userId, params.service);
   const base = { service: params.service, owner: params.owner, platform: params.platform };
+  const surfaceScope = params.scopeSurfaceToQueue && params.userId ? { queue: params.userId, queue_exact: true } : { queue_exclude: bgQueue };
   const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
   const limit = fetchOptions && fetchOptions.limit;
   const firstLoad = !splitHistoryStates[key];
@@ -2373,13 +2374,13 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     } else {
       const sOpts = { fetchMore };
       if (limit) sOpts.limit = limit;
-      let s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+      let s = await fetch({ ...base, ...surfaceScope }, sOpts);
       let hops = 0;
       while (s && !s.endOfList && !(s.list || []).length && hops < SURFACE_EMPTY_MAX_PAGES) {
         hops++;
         const nOpts = { fetchMore: true };
         if (limit) nOpts.limit = limit;
-        s = await fetch({ ...base, queue_exclude: bgQueue }, nOpts);
+        s = await fetch({ ...base, ...surfaceScope }, nOpts);
       }
       state.pendingSurface = {
         list: s && Array.isArray(s.list) ? s.list : [],
@@ -2512,6 +2513,14 @@ async function _getSplitChatHistoryLocked(key, params, fetchOptions, releaseLock
     firstLoad
   };
 }
+function chatCacheKey(projectId, platform, userId) {
+  if (!projectId || platform === "none") return "";
+  return projectId + "#" + platform + "#" + (userId || "");
+}
+function indexScopeKey(projectId, platform) {
+  if (!projectId || platform === "none") return "";
+  return projectId + "#" + platform;
+}
 function mapHistoryListToMessages(list, platform, opts) {
   var mapped = [], runningItemIds = [];
   var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
@@ -2598,7 +2607,7 @@ function mapHistoryListToMessages(list, platform, opts) {
     }
   });
   if (opts.projectId) {
-    var ownerKey = opts.projectId + "#" + platform;
+    var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
     for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
   }
   return { messages: mapped, runningItemIds };
@@ -3125,7 +3134,8 @@ var ChatSession = class {
   /** Storage paths are project-relative, and one ChatSession serves every
    *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
   _indexClaimKey(storagePath) {
-    return this.getHistoryCacheKey() + "|" + storagePath;
+    var id = this.host.getIdentity();
+    return indexScopeKey(id.projectId, id.platform) + "|" + storagePath;
   }
   /**
    * Take this file's indexing slot, or report that someone already has it.
@@ -3567,8 +3577,7 @@ var ChatSession = class {
    */
   getHistoryCacheKey() {
     var id = this.host.getIdentity();
-    if (!id.projectId || id.platform === "none") return "";
-    return id.projectId + "#" + id.platform + "#" + (id.userId || "");
+    return chatCacheKey(id.projectId, id.platform, id.userId);
   }
   /** Re-apply memoized hydrated texts onto freshly-mapped messages. Both
    *  clients call this right after their mapper runs (loadHistory does it
@@ -4118,7 +4127,7 @@ var ChatSession = class {
     }
     if (stageId) delete this._liveStages[stageId];
     var llmComposed = composedForLlm || composed;
-    var key = !id.projectId ? "" : id.projectId + "#" + id.platform;
+    var key = chatCacheKey(id.projectId, id.platform, id.userId);
     var offChat = !!key && key !== this.getHistoryCacheKey();
     var isQueuedSend = !offChat && (useBgQueue || this.state.sending || this.state.messages.some(function(m) {
       return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
@@ -4684,7 +4693,8 @@ var ChatSession = class {
   cancelIndexingGroup(group) {
     var self = this;
     if (!group || !group.key) return;
-    var scoped = this.getHistoryCacheKey() + "|" + group.key;
+    var idn = this.host.getIdentity();
+    var scoped = indexScopeKey(idn.projectId, idn.platform) + "|" + group.key;
     this.cancelledIndexKeys.add(scoped);
     if (!group.finished) {
       var stoppedIds = {};
@@ -5152,7 +5162,7 @@ var ChatSession = class {
     if (!entry) return "";
     var file = entry.storagePath || entry.filename;
     if (!file) return "";
-    return entry.projectId + "#" + entry.platform + "|" + file;
+    return indexScopeKey(entry.projectId, entry.platform) + "|" + file;
   }
   /**
    * Reconcile the bg queue with the files the user has stopped.
@@ -5679,7 +5689,7 @@ var ChatSession = class {
   loadHistory(fetchMore, token) {
     var self = this;
     var id = this.host.getIdentity();
-    var loadKey = !id.projectId || id.platform === "none" ? "" : id.projectId + "#" + id.platform;
+    var loadKey = chatCacheKey(id.projectId, id.platform, id.userId);
     if (token === void 0) token = this.state.gateRefreshToken;
     if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.projectId) {
       return Promise.resolve();
@@ -5698,7 +5708,17 @@ var ChatSession = class {
     if (fetchMore && this.state.historyStartKeyHistory.length) options.startKeyHistory = this.state.historyStartKeyHistory.slice();
     if (!fetchMore) options.deferBg = true;
     var fetchHistory = function() {
-      return getSplitChatHistory({ service: projectId, owner, platform, userId: id.userId }, options);
+      return getSplitChatHistory({
+        service: projectId,
+        owner,
+        platform,
+        userId: id.userId,
+        // An anonymous visitor's history is scoped server side by
+        // ip + "(" + user_agent + ")", which two devices behind one NAT
+        // share. Read this device's own queue instead. See
+        // scopeSurfaceToQueue.
+        scopeSurfaceToQueue: !!id.anonymous
+      }, options);
     };
     return Promise.resolve().then(fetchHistory).catch(function(err) {
       if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
@@ -5720,6 +5740,10 @@ var ChatSession = class {
       var mapped = mapHistoryListToMessages(list, platform, {
         clearedAt: self.host.getClearedAt(),
         projectId: id.projectId,
+        // So the `_ownerKey` stamped on server history matches loadKey and
+        // the cache key. Without it every mapped bubble carries a
+        // two-segment stamp that no comparison can ever match.
+        userId: id.userId,
         formatIndexingLabel: self.host.formatIndexingLabel
       }).messages;
       self.applyHydratedBodies(mapped);
@@ -5928,6 +5952,7 @@ var ChatSession = class {
           var m2 = mapHistoryListToMessages(sorted, platform, {
             clearedAt: self.host.getClearedAt(),
             projectId: id.projectId,
+            userId: id.userId,
             formatIndexingLabel: self.host.formatIndexingLabel
           }).messages;
           self.applyHydratedBodies(m2);
@@ -6787,6 +6812,7 @@ exports.callClaudeWithMcp = callClaudeWithMcp;
 exports.callClaudeWithPublicMcp = callClaudeWithPublicMcp;
 exports.callOpenAIWithPublicMcp = callOpenAIWithPublicMcp;
 exports.canonicalizePathForm = canonicalizePathForm;
+exports.chatCacheKey = chatCacheKey;
 exports.chatEngineConfig = chatEngineConfig;
 exports.classifyInlineLink = classifyInlineLink;
 exports.clearAttachmentParsers = clearAttachmentParsers;
@@ -6830,6 +6856,7 @@ exports.groupAttachmentFailures = groupAttachmentFailures;
 exports.hasBom = hasBom;
 exports.hydrateImagePreviews = hydrateImagePreviews;
 exports.indexDoneUniqueId = indexDoneUniqueId;
+exports.indexScopeKey = indexScopeKey;
 exports.indexingAccessGroup = indexingAccessGroup;
 exports.isAuthExpiredError = isAuthExpiredError;
 exports.isBgIndexingQueue = isBgIndexingQueue;
