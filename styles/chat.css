@@ -154,6 +154,38 @@
 .bq-cancel-queue-btn:hover:not(.is-disabled) { background: var(--bq-warning-bg); color: var(--bq-warning); }
 .bq-cancel-queue-btn.is-disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
 
+/* ---- unfinalized streamed answer (ask for it) ----------------------------
+   A turn whose answer was streamed and never finalized keeps its bytes in the
+   chunk store, and this bubble is what the reader gets when nothing is currently
+   fetching them: the per-load recovery cap left this one behind, or a read failed.
+   It is deliberately NOT the danger red of an error bubble - nothing is broken and
+   nothing is lost, the answer is simply not here yet - and deliberately not a
+   spinner, which would promise an arrival nobody has scheduled. Shared by both
+   chatboxes (this file is bunnyquery/styles/chat.css, which agent.vue imports). */
+.bq-stream-recover-note {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--bq-muted);
+    font-style: italic;
+}
+.bq-bubble.is-stream-failed .bq-stream-recover-note { color: var(--bq-warning); }
+.bq-stream-recover-btn {
+    display: inline-block;
+    margin-top: 0.4rem;
+    padding: 0.18rem 0.55rem;
+    min-height: 0;
+    border: 1px solid var(--bq-line);
+    background: transparent;
+    color: inherit;
+    font-size: 0.72rem;
+    line-height: 1.3;
+    cursor: pointer;
+    box-shadow: none;
+    border-radius: 0;
+}
+.bq-stream-recover-btn:hover { background: rgba(127, 127, 127, 0.12); }
+.bq-bubble.is-stream-failed .bq-stream-recover-btn { border-color: var(--bq-warning-border); color: var(--bq-warning); }
+
 /* ---- collapsed background-indexing group ---------------------------------*/
 /* One file's many indexing passes (first pass + every CONTINUE pass, each with
    a request AND a response bubble) render as a single status row instead of

@@ -59,6 +59,19 @@
   function windowedIndexingEnabled() {
     return _config?.windowedIndexing === true;
   }
+  function liveStreamingRealtimeEnabled() {
+    return liveStreamingEnabled() && _config?.liveStreamingRealtime === true;
+  }
+  function liveStreamingEnabled() {
+    return _config?.liveStreaming === true;
+  }
+  function streamRecoveryEnabled() {
+    if (_config?.streamRecovery === false) return false;
+    return typeof _config?.clientSecretRequestStream === "function";
+  }
+  function skapiSupportsStreaming(sk) {
+    return !!sk && typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
+  }
   function pollOpt() {
     const p = _config?.poll;
     return p === void 0 ? {} : { poll: p };
@@ -298,7 +311,7 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
-Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized", but THIS project indexes at access_group ${indexGroupLiteral}, so pass access_group ${indexGroupLiteral} EXPLICITLY on every index or tag query here - the auto-fill would search a group this project's data is not in and come back empty. Files uploaded before the project's setting changed may sit at another group, so when a scoped query comes back empty, retry it across the other groups (0, 1, "private") before concluding there is nothing, while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
+Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized", but THIS project indexes at access_group ${indexGroupLiteral}, so pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name here, index or tag or plain - the auto-fill would search a group this project's data is not in and come back empty, and leaving access_group off a plain table query does NOT mean "all groups": unless you are the project's owner the server reads a table with no group as access_group 0 (public only), so a table indexed at ${indexGroupLiteral} comes back empty with its records sitting right there. Files uploaded before the project's setting changed may sit at another group, so when a scoped query comes back empty, retry it across the other groups (0, 1, "private") before concluding there is nothing, while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups ONLY for the project's owner, and only its access_group 0 records for any other user, so name the group whenever you name a table. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
 Embedded values: a search term is often stored inside a larger string. A merchant "BAKSA" appears as "DNH*BAKSA#4070277042", and a card as "5860****5173". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
@@ -516,7 +529,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function isTransientStatus(status) {
     return status === 408 || status === 425 || status === 429 || status >= 500;
   }
+  function isCsrStatusEnvelope(res) {
+    return !!res && typeof res === "object" && !Array.isArray(res) && typeof res.status === "string" && typeof res.id === "string" && "in_queue" in res;
+  }
+  function csrEnvelopeError(input) {
+    if (!isCsrStatusEnvelope(input)) return void 0;
+    if (input.status !== "failed") return void 0;
+    return input.error != null ? input.error : { message: "The AI provider request failed." };
+  }
   function getErrorMessage(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
     if (!input) return "Something went wrong.";
     if (typeof input === "string") return input;
     if (input.error && input.error.message) return input.error.message;
@@ -531,7 +554,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return "Something went wrong.";
   }
   function isErrorResponseBody(response) {
-    if (!response || typeof response !== "object") return false;
+    var envErr = csrEnvelopeError(response);
+    if (envErr !== void 0) response = envErr;
+    if (!response || typeof response !== "object") return envErr !== void 0;
     if (typeof response.status_code === "number" && response.status_code >= 400) return true;
     if (response.type === "error") return true;
     if (response.error && (response.error.message || response.error.type)) return true;
@@ -548,6 +573,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return false;
   }
   function isNonRetryableRequestError(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
     if (!input || typeof input !== "object") return false;
     var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
     var param = void 0;
@@ -578,6 +605,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return false;
   }
   function isAuthExpiredError(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
     if (!input) return false;
     var blobs = [];
     var push = function(v) {
@@ -1457,6 +1486,541 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return { platform, model, contextWindow, hasPlatform: !!platform };
   }
 
+  // src/engine/sse.ts
+  var CLAUDE_EVENTS = {
+    message_start: true,
+    message_delta: true,
+    message_stop: true,
+    content_block_start: true,
+    content_block_delta: true,
+    content_block_stop: true,
+    ping: true
+  };
+  var CLAUDE_TOOL_BLOCKS = {
+    tool_use: true,
+    server_tool_use: true,
+    mcp_tool_use: true,
+    web_search_tool_use: true
+  };
+  var OPENAI_TOOL_ITEMS = {
+    function_call: true,
+    mcp_call: true,
+    web_search_call: true,
+    file_search_call: true,
+    code_interpreter_call: true,
+    computer_call: true,
+    image_generation_call: true
+  };
+  function detectProvider(type) {
+    if (!type) return null;
+    if (type.indexOf("response.") === 0) return "openai";
+    if (CLAUDE_EVENTS[type]) return "claude";
+    return null;
+  }
+  function lineEnd(s, from) {
+    for (var i = from; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c === 10) return { at: i, len: 1 };
+      if (c === 13) {
+        if (i + 1 >= s.length) return null;
+        return { at: i, len: s.charCodeAt(i + 1) === 10 ? 2 : 1 };
+      }
+    }
+    return null;
+  }
+  function readFrame(lines) {
+    var event = "";
+    var data = [];
+    var framed = false;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (!line.length) continue;
+      if (line.charCodeAt(0) === 58) {
+        framed = true;
+        continue;
+      }
+      var colon = line.indexOf(":");
+      var field = colon === -1 ? line : line.slice(0, colon);
+      var value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.charCodeAt(0) === 32) value = value.slice(1);
+      if (field === "data") {
+        framed = true;
+        data.push(value);
+      } else if (field === "event") {
+        framed = true;
+        event = value;
+      } else if (field === "id" || field === "retry") {
+        framed = true;
+      }
+    }
+    return { event, data: data.join("\n"), framed };
+  }
+  function createSseParser() {
+    var buf = "";
+    var lines = [];
+    var lastSeq = 0;
+    var sawFraming = false;
+    var raw = "";
+    var rawHasContent = false;
+    var ended = false;
+    var rawParsed = false;
+    var rawBody = null;
+    var provider = null;
+    var terminalEvent = null;
+    var errored = false;
+    var error = null;
+    var stopReason = null;
+    var toolCalls = [];
+    var malformedFrames = 0;
+    var malformedToolJson = 0;
+    var message = null;
+    var blocks = /* @__PURE__ */ new Map();
+    var parts = /* @__PURE__ */ new Map();
+    var reasoning = /* @__PURE__ */ new Map();
+    var response = null;
+    var textCache = null;
+    var thinkingCache = null;
+    function feed(text) {
+      if (typeof text !== "string" || !text.length) return;
+      if (!sawFraming) {
+        raw += text;
+        if (!rawHasContent) rawHasContent = /\S/.test(text);
+        rawParsed = false;
+        rawBody = null;
+      }
+      buf += text;
+      var i = 0;
+      for (; ; ) {
+        var end2 = lineEnd(buf, i);
+        if (!end2) break;
+        var line = buf.slice(i, end2.at);
+        i = end2.at + end2.len;
+        if (line.length === 0) dispatch();
+        else lines.push(line);
+      }
+      if (i > 0) buf = buf.slice(i);
+    }
+    function feedChunks(chunks) {
+      if (!chunks || !chunks.length) return;
+      for (var i = 0; i < chunks.length; i++) {
+        var c = chunks[i];
+        if (!c || typeof c !== "object") continue;
+        var seq = typeof c.seq === "number" ? c.seq : 0;
+        if (seq && seq <= lastSeq) continue;
+        if (seq > lastSeq) lastSeq = seq;
+        feed(typeof c.txt === "string" ? c.txt : "");
+      }
+    }
+    function end() {
+      if (buf.length) {
+        var tail = buf.charCodeAt(buf.length - 1) === 13 ? buf.slice(0, -1) : buf;
+        if (tail.length) lines.push(tail);
+        buf = "";
+      }
+      if (lines.length) dispatch();
+      ended = true;
+    }
+    function isUnframed() {
+      return ended && !sawFraming && rawHasContent;
+    }
+    function dispatch() {
+      var pending = lines;
+      lines = [];
+      if (!pending.length) return;
+      try {
+        var frame = readFrame(pending);
+        if (frame.framed && !sawFraming) {
+          sawFraming = true;
+          raw = "";
+          rawHasContent = false;
+        }
+        if (!frame.data.length) return;
+        if (frame.data === "[DONE]") return;
+        var ev = JSON.parse(frame.data);
+        if (!ev || typeof ev !== "object") {
+          malformedFrames++;
+          return;
+        }
+        var type = typeof ev.type === "string" && ev.type ? ev.type : frame.event;
+        if (!type) {
+          malformedFrames++;
+          return;
+        }
+        if (!provider) provider = detectProvider(type);
+        if (provider === "openai") handleOpenAI(type, ev);
+        else if (provider === "claude") handleClaude(type, ev);
+        else handleUnattributed(type, ev);
+      } catch (e) {
+        malformedFrames++;
+      }
+    }
+    function handleUnattributed(type, ev) {
+      if (type === "error") {
+        takeError(ev && ev.error ? ev : { type: "error", error: ev });
+        return;
+      }
+      malformedFrames++;
+    }
+    function takeError(payload) {
+      errored = true;
+      terminalEvent = "error";
+      error = payload;
+    }
+    function handleClaude(type, ev) {
+      if (type === "ping") return;
+      if (type === "error") {
+        takeError({ type: "error", error: ev && ev.error ? ev.error : ev });
+        return;
+      }
+      if (type === "message_start") {
+        message = ev && ev.message ? shallowClone(ev.message) : { type: "message", role: "assistant" };
+        if (typeof message.stop_reason === "string") stopReason = message.stop_reason;
+        return;
+      }
+      if (type === "content_block_start") {
+        var idx = numberOr(ev.index, -1);
+        if (idx < 0) {
+          malformedFrames++;
+          return;
+        }
+        var block = ev.content_block ? shallowClone(ev.content_block) : {};
+        blocks.set(idx, { block, json: "", sawJson: false });
+        invalidate();
+        if (block && typeof block.type === "string" && CLAUDE_TOOL_BLOCKS[block.type]) {
+          var call = {
+            index: idx,
+            name: typeof block.name === "string" && block.name ? block.name : block.type,
+            type: block.type
+          };
+          if (typeof block.server_name === "string") call.serverName = block.server_name;
+          toolCalls.push(call);
+        }
+        return;
+      }
+      if (type === "content_block_delta") {
+        var i = numberOr(ev.index, -1);
+        var d = ev.delta;
+        if (i < 0 || !d || typeof d !== "object") {
+          malformedFrames++;
+          return;
+        }
+        var st = blocks.get(i);
+        if (!st) {
+          st = { block: { type: deltaBlockType(d.type) }, json: "", sawJson: false };
+          blocks.set(i, st);
+        }
+        applyClaudeDelta(st, d);
+        invalidate();
+        return;
+      }
+      if (type === "content_block_stop") {
+        var j = numberOr(ev.index, -1);
+        var s = j >= 0 ? blocks.get(j) : void 0;
+        if (s && s.sawJson) finishToolJson(s);
+        return;
+      }
+      if (type === "message_delta") {
+        if (!message) message = { type: "message", role: "assistant" };
+        var delta = ev.delta;
+        if (delta && typeof delta === "object") {
+          for (var k in delta) {
+            if (Object.prototype.hasOwnProperty.call(delta, k)) message[k] = delta[k];
+          }
+          if (typeof delta.stop_reason === "string") stopReason = delta.stop_reason;
+        }
+        if (ev.usage && typeof ev.usage === "object") {
+          message.usage = mergeInto(shallowClone(message.usage) || {}, ev.usage);
+        }
+        return;
+      }
+      if (type === "message_stop") {
+        terminalEvent = "message_stop";
+        return;
+      }
+      malformedFrames++;
+    }
+    function applyClaudeDelta(st, d) {
+      var t = d.type;
+      if (t === "text_delta") {
+        st.block.text = (st.block.text || "") + str(d.text);
+        return;
+      }
+      if (t === "thinking_delta") {
+        st.block.thinking = (st.block.thinking || "") + str(d.thinking);
+        return;
+      }
+      if (t === "signature_delta") {
+        st.block.signature = (st.block.signature || "") + str(d.signature);
+        return;
+      }
+      if (t === "input_json_delta") {
+        st.json += str(d.partial_json);
+        st.sawJson = true;
+        return;
+      }
+      if (t === "citations_delta") {
+        if (d.citation) {
+          if (!Array.isArray(st.block.citations)) st.block.citations = [];
+          st.block.citations.push(d.citation);
+        }
+        return;
+      }
+      malformedFrames++;
+    }
+    function finishToolJson(st) {
+      if (!st.json.length) {
+        return;
+      }
+      try {
+        st.block.input = JSON.parse(st.json);
+      } catch (e) {
+        malformedToolJson++;
+      }
+    }
+    function deltaBlockType(deltaType) {
+      if (deltaType === "thinking_delta" || deltaType === "signature_delta") return "thinking";
+      if (deltaType === "input_json_delta") return "tool_use";
+      return "text";
+    }
+    function handleOpenAI(type, ev) {
+      if (type === "response.output_text.delta") {
+        putPart(ev, str(ev.delta), false);
+        invalidate();
+        return;
+      }
+      if (type === "response.output_text.done") {
+        if (typeof ev.text === "string") {
+          putPart(ev, ev.text, true);
+          invalidate();
+        }
+        return;
+      }
+      if (type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta") {
+        putReasoning(type, ev, str(ev.delta), false);
+        invalidate();
+        return;
+      }
+      if (type === "response.reasoning_summary_text.done" || type === "response.reasoning_text.done") {
+        if (typeof ev.text === "string") {
+          putReasoning(type, ev, ev.text, true);
+          invalidate();
+        }
+        return;
+      }
+      if (type === "response.output_item.added") {
+        var item = ev.item;
+        if (item && typeof item.type === "string" && OPENAI_TOOL_ITEMS[item.type]) {
+          toolCalls.push({
+            index: numberOr(ev.output_index, toolCalls.length),
+            // A built-in tool (web_search_call) has no name of its own, so the item
+            // type is the only label there is and a row can still be drawn.
+            name: typeof item.name === "string" && item.name ? item.name : item.type,
+            type: item.type
+          });
+        }
+        return;
+      }
+      if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
+        terminalEvent = type;
+        if (ev.response && typeof ev.response === "object") {
+          response = ev.response;
+          var st = response.status;
+          if (st === "incomplete") {
+            var reason = response.incomplete_details && response.incomplete_details.reason;
+            stopReason = typeof reason === "string" && reason ? reason : "incomplete";
+          } else if (typeof st === "string" && st) {
+            stopReason = st;
+          }
+          if (response.error && (response.error.message || response.error.code)) {
+            errored = true;
+            error = response;
+          }
+        }
+        if (type === "response.failed") errored = true;
+        return;
+      }
+      if (type === "response.error" || type === "error") {
+        takeError(ev && ev.error ? ev : { type: "error", error: ev });
+        return;
+      }
+    }
+    function putReasoning(type, ev, text, replace) {
+      var summary = type.indexOf("response.reasoning_summary_text.") === 0;
+      var oi = numberOr(ev.output_index, 0);
+      var idx = numberOr(summary ? ev.summary_index : ev.content_index, 0);
+      var key = oi + ":" + (summary ? "s" : "r") + ":" + idx;
+      var r = reasoning.get(key);
+      if (!r) {
+        r = { oi, idx, kind: summary ? 0 : 1, text: "" };
+        reasoning.set(key, r);
+      }
+      r.text = replace ? text : r.text + text;
+    }
+    function putPart(ev, text, replace) {
+      var oi = numberOr(ev.output_index, 0);
+      var ci = numberOr(ev.content_index, 0);
+      var key = oi + ":" + ci;
+      var p = parts.get(key);
+      if (!p) {
+        p = { oi, ci, text: "" };
+        parts.set(key, p);
+      }
+      p.text = replace ? text : p.text + text;
+    }
+    function invalidate() {
+      textCache = null;
+      thinkingCache = null;
+    }
+    function claudeTextBlocks() {
+      return orderedBlocks().filter(function(b) {
+        return b && b.type === "text";
+      });
+    }
+    function orderedBlocks() {
+      var idx = [];
+      blocks.forEach(function(_v, k) {
+        idx.push(k);
+      });
+      idx.sort(function(a, b) {
+        return a - b;
+      });
+      var out = [];
+      for (var i = 0; i < idx.length; i++) out.push(blocks.get(idx[i]).block);
+      return out;
+    }
+    function orderedParts() {
+      var out = [];
+      parts.forEach(function(p) {
+        out.push(p);
+      });
+      out.sort(function(a, b) {
+        return a.oi !== b.oi ? a.oi - b.oi : a.ci - b.ci;
+      });
+      return out;
+    }
+    function currentText() {
+      if (textCache !== null) return textCache;
+      var out;
+      if (provider === "openai") {
+        out = orderedParts().map(function(p) {
+          return p.text;
+        }).join("\n");
+      } else {
+        out = claudeTextBlocks().map(function(b) {
+          return b.text || "";
+        }).join("\n");
+      }
+      textCache = out;
+      return out;
+    }
+    function currentThinking() {
+      if (thinkingCache !== null) return thinkingCache;
+      var out;
+      if (provider === "openai") {
+        var rs = [];
+        reasoning.forEach(function(r) {
+          rs.push(r);
+        });
+        rs.sort(function(a, b) {
+          if (a.oi !== b.oi) return a.oi - b.oi;
+          if (a.idx !== b.idx) return a.idx - b.idx;
+          return a.kind - b.kind;
+        });
+        out = rs.map(function(r) {
+          return r.text;
+        }).join("\n");
+      } else {
+        out = orderedBlocks().filter(function(b) {
+          return b && b.type === "thinking";
+        }).map(function(b) {
+          return b.thinking || "";
+        }).join("\n");
+      }
+      thinkingCache = out;
+      return out;
+    }
+    function buildBody() {
+      if (provider === "openai") {
+        if (response) return response;
+      } else if (blocks.size || message) {
+        var base = message ? shallowClone(message) : { type: "message", role: "assistant" };
+        base.content = orderedBlocks();
+        return base;
+      }
+      if (errored && error) return error;
+      return unframedBody();
+    }
+    function unframedBody() {
+      if (!isUnframed()) return null;
+      if (rawParsed) return rawBody;
+      rawParsed = true;
+      try {
+        var v = JSON.parse(raw);
+        rawBody = v && typeof v === "object" ? v : null;
+      } catch (e) {
+        rawBody = null;
+      }
+      return rawBody;
+    }
+    function snapshot() {
+      return {
+        provider,
+        text: currentText(),
+        thinkingText: currentThinking(),
+        toolCalls: toolCalls.slice(),
+        toolNames: toolCalls.map(function(t) {
+          return t.name;
+        }),
+        stopReason,
+        complete: terminalEvent !== null,
+        // A terminal event that ENDED the answer rather than KILLED it. The
+        // `errored` term covers all three ways a stream dies with a terminal event
+        // on it: an Anthropic or OpenAI `error` frame (takeError sets both), a
+        // response.failed, and a response.completed/incomplete whose Response
+        // object carries an error payload. See the field's own doc for the loss
+        // this separation prevents.
+        answerComplete: terminalEvent !== null && terminalEvent !== "error" && !errored,
+        terminalEvent,
+        errored,
+        error,
+        malformedFrames,
+        malformedToolJson,
+        unframed: isUnframed(),
+        unframedText: isUnframed() ? raw : null,
+        lastSeq
+      };
+    }
+    return {
+      feed,
+      feedChunks,
+      end,
+      snapshot,
+      finalBody: buildBody
+    };
+  }
+  function str(v) {
+    return typeof v === "string" ? v : "";
+  }
+  function numberOr(v, fallback) {
+    return typeof v === "number" && isFinite(v) ? v : fallback;
+  }
+  function shallowClone(o) {
+    if (!o || typeof o !== "object") return o;
+    var out = Array.isArray(o) ? o.slice() : {};
+    if (!Array.isArray(o)) {
+      for (var k in o) {
+        if (Object.prototype.hasOwnProperty.call(o, k)) out[k] = o[k];
+      }
+    }
+    return out;
+  }
+  function mergeInto(target, src) {
+    for (var k in src) {
+      if (Object.prototype.hasOwnProperty.call(src, k)) target[k] = src[k];
+    }
+    return target;
+  }
+
   // src/engine/requests.ts
   var ANTHROPIC_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages";
   var ANTHROPIC_VERSION = "2023-06-01";
@@ -1479,6 +2043,26 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
   }
   var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
+  var CHAT_STREAM_ON = Object.freeze({
+    transport: Object.freeze({ stream: true }),
+    body: Object.freeze({ stream: true })
+  });
+  var CHAT_STREAM_OFF = Object.freeze({
+    transport: Object.freeze({}),
+    body: Object.freeze({})
+  });
+  var CHAT_STREAM_ON_REALTIME = Object.freeze({
+    // `realtime` rides on the TRANSPORT arm only. It is a skapi option, not a field
+    // the destination understands, so it must never reach `data`: the body arm stays
+    // exactly what it is with the socket off.
+    transport: Object.freeze({ stream: true, realtime: true }),
+    body: Object.freeze({ stream: true })
+  });
+  function chatStreamWiring(queue) {
+    if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
+    if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
+    return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+  }
   var VARIANT_IMAGE_DETAIL = "original";
   var VARIANT_TEXT_VERBOSITY = "high";
   var OLDEST_NANO_REASONING_EFFORT = "high";
@@ -1625,6 +2209,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     });
   }
   var POLL_INTERVAL = 3e3;
+  var STREAM_POLL_INTERVAL = 1e3;
   var MAX_CONCURRENT_BG_POLLS = 6;
   async function callClaudeWithMcp({
     prompt,
@@ -1647,12 +2232,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (mcpServer.authorizationToken) {
       mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
     }
+    const stream = chatStreamWiring(userId || service);
     return clientSecretRequest({
       clientSecretName: "claude",
       queue: userId || service,
       service,
       owner,
       ...pollOpt(),
+      ...stream.transport,
       url: ANTHROPIC_MESSAGES_API_URL,
       method: "POST",
       headers: {
@@ -1664,6 +2251,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       data: {
         model,
         max_tokens: maxTokens,
+        // Top level beside model/messages/mcp_servers, which is where the
+        // Messages API takes it.
+        ...stream.body,
         ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
         ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
         ...system ? {
@@ -1746,12 +2336,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         content: m.content
       }))
     ];
+    const stream = chatStreamWiring(userId || service);
     return clientSecretRequest({
       clientSecretName: "openai",
       queue: userId || service,
       service,
       owner,
       ...pollOpt(),
+      ...stream.transport,
       url: OPENAI_RESPONSES_API_URL,
       method: "POST",
       headers: {
@@ -1761,6 +2353,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       data: {
         model: resolvedModel,
         max_output_tokens: getMaxOutputTokens("openai", resolvedModel),
+        // Top level beside model/input/tools, which is where the Responses API
+        // takes it.
+        ...stream.body,
         ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
         ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
         input: responseInput,
@@ -2148,9 +2743,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       { service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
       { limit: params.limit, fetchMore: false }
     )).then(function(result) {
-      const entry = { result, at: Date.now() };
-      bgProbeCache[key] = entry;
-      return entry;
+      const entry2 = { result, at: Date.now() };
+      bgProbeCache[key] = entry2;
+      return entry2;
     });
     bgProbeInflight[key] = p;
     p.then(function() {
@@ -2380,8 +2975,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return projectId + "#" + platform;
   }
   function mapHistoryListToMessages(list, platform, opts) {
-    var mapped = [], runningItemIds = [];
+    var mapped = [], runningItemIds = [], streamPendingItemIds = [];
     var extractAssistantText = platform === "openai" ? extractOpenAIText : extractClaudeText;
+    var canRecoverStreams = streamRecoveryEnabled();
     var filtered = filterListByClearHorizon(list, opts.clearedAt);
     filtered.slice().reverse().forEach(function(item) {
       var requestBody = item && item.request_body;
@@ -2395,6 +2991,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var userText = isCompact ? typeof item.request_text === "string" ? item.request_text : "" : extractLastUserTextFromRequest(requestBody);
       var assistantText = isPending ? "" : isCompact ? (typeof item.response_text === "string" ? item.response_text : "").trim() : (extractAssistantText(response) || "").trim() || "";
       var isErrorResponse = !isPending && (isFailed || !isCompact && isErrorResponseBody(response));
+      var isStreamPending = canRecoverStreams && !isCompact && !isPending && !isCancelledItem && !isErrorResponse && !item._isBgTask && !item._isOnBgQueue && item.status === "resolved" && item.response_body == null && item.error == null && !assistantText;
       var reportedComplete = !!(item && item._isBgTask) && !isErrorResponse && (isCompact ? item.response_complete_marker === true : !!assistantText && assistantText.indexOf(INDEXING_COMPLETE_MARKER) !== -1);
       if (reportedComplete) assistantText = assistantText.split(INDEXING_COMPLETE_MARKER).join("").trim();
       var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
@@ -2453,6 +3050,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (serverItemId !== void 0) em._serverItemId = serverItemId;
         if (replyTs !== void 0) em._ts = replyTs;
         mapped.push(em);
+      } else if (isStreamPending) {
+        var sp = { role: "assistant", content: "", _streamPending: true };
+        if (serverItemId !== void 0) {
+          sp._serverItemId = serverItemId;
+          streamPendingItemIds.push(serverItemId);
+        }
+        if (replyTs !== void 0) sp._ts = replyTs;
+        mapped.push(sp);
       } else if (assistantText || reportedComplete) {
         var okm = { role: "assistant", content: sanitizeAttachmentLinksForHistory(assistantText, opts.projectId, true) || EMPTY_INDEXING_REPLY };
         if (item._fromBgChain) okm._fromBgChain = true;
@@ -2468,7 +3073,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
       for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
     }
-    return { messages: mapped, runningItemIds };
+    return { messages: mapped, runningItemIds, streamPendingItemIds };
+  }
+  function adoptLocalAnswerIntoPage(incoming, local) {
+    if (!incoming || !local || !incoming._streamPending) return false;
+    if (incoming.role !== "assistant" || local.role !== "assistant") return false;
+    var hasText = typeof local.content === "string" && local.content.length > 0;
+    var isLive = !!(local.isPending || local._streaming);
+    if (!hasText && !isLive) return false;
+    if (hasText) {
+      incoming.content = local.content;
+      incoming._streamPending = false;
+    }
+    if (local._localId !== void 0) incoming._localId = local._localId;
+    if (local.isPending) incoming.isPending = true;
+    if (local.isPendingInProcess) incoming.isPendingInProcess = true;
+    if (local._streaming) incoming._streaming = true;
+    return true;
   }
   function shouldRescueInFlightMessage(m, ctx) {
     if (!m) return false;
@@ -2476,6 +3097,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (m._ownerKey !== void 0 && ctx.loadKey !== void 0 && m._ownerKey !== ctx.loadKey) return false;
     if (m._serverItemId && ctx.hasServerId(m._serverItemId)) return false;
     if (m._stageId) return true;
+    if (m._streaming && !m._serverItemId) return true;
     if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
     if (m.isSendingToServer || m.isPendingQueued || m.isPendingInProcess || m.isPending) return true;
     if (ctx.sending && m.role === "user") {
@@ -2862,8 +3484,143 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function isPollStopped(res) {
     return !!res && typeof res === "object" && res.status === "stopped";
   }
+  var LIVE_PENDING_LINK_WINDOW = 512;
+  var STREAM_RECOVERY_PER_LOAD = 2;
+  function liveSafePrefix(text) {
+    if (!text) return "";
+    var cut = text.length;
+    var fenceAt = -1, fences = 0, from = 0, hit;
+    for (; ; ) {
+      hit = text.indexOf("```", from);
+      if (hit === -1) break;
+      fences++;
+      fenceAt = hit;
+      from = hit + 3;
+    }
+    if (fences % 2 === 1 && fenceAt !== -1) cut = fenceAt;
+    var head = text.slice(0, cut);
+    var lineStart = head.lastIndexOf("\n") + 1;
+    var line = head.slice(lineStart);
+    var open = line.lastIndexOf("[");
+    if (open !== -1 && line.length - open <= LIVE_PENDING_LINK_WINDOW) {
+      var rest = line.slice(open);
+      var close = rest.indexOf("]");
+      if (close === -1) {
+        cut = lineStart + open;
+      } else if (rest.charAt(close + 1) === "(" && rest.indexOf(")", close + 1) === -1) {
+        cut = lineStart + open;
+      }
+    }
+    var tokStart = line.length;
+    while (tokStart > 0 && !/\s/.test(line.charAt(tokStart - 1))) tokStart--;
+    var tok = line.slice(tokStart);
+    if (tok && /^(?:https?:\/\/|src::)/i.test(tok)) {
+      var tokCut = lineStart + tokStart;
+      if (tokCut < cut) cut = tokCut;
+    }
+    if (line.indexOf("```") === -1) {
+      var ticks = 0, lastTick = -1;
+      for (var i = 0; i < line.length; i++) {
+        if (line.charAt(i) === "`") {
+          ticks++;
+          lastTick = i;
+        }
+      }
+      if (ticks % 2 === 1 && lastTick !== -1) {
+        var tickCut = lineStart + lastTick;
+        if (tickCut < cut) cut = tickCut;
+      }
+    }
+    if (cut >= text.length) return text;
+    if (cut < 0) cut = 0;
+    return text.slice(0, cut);
+  }
+  function commonPrefixLength(a, b) {
+    var n = Math.min(a.length, b.length), i = 0;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    if (i > 0) {
+      var prev = a.charCodeAt(i - 1);
+      if (prev >= 55296 && prev <= 56319) i--;
+    }
+    return i;
+  }
+  function typewriterResumeIndex(painted, fullText, regions) {
+    if (!painted || !fullText) return 0;
+    if (/^\s/.test(painted) && !/^\s/.test(fullText)) {
+      painted = painted.replace(/^\s+/, "");
+      if (!painted) return 0;
+    }
+    var i = commonPrefixLength(painted, fullText);
+    if (i <= 0) return 0;
+    if (i >= fullText.length) return fullText.length;
+    for (var changed = true; changed; ) {
+      changed = false;
+      for (var k = 0; k < regions.length; k++) {
+        var r = regions[k];
+        if (i > r.start && i < r.end) {
+          i = r.end;
+          changed = true;
+        }
+      }
+    }
+    return i > fullText.length ? fullText.length : i;
+  }
+  function mayKeepStreamedAnswer(snap, rowStatus) {
+    if (rowStatus !== void 0 && rowStatus !== null && rowStatus !== "" && rowStatus !== "resolved") return false;
+    if (!snap || typeof snap !== "object") return false;
+    if (snap.errored) return false;
+    if (snap.answerComplete) return true;
+    if (snap.unframed) return true;
+    return false;
+  }
+  function streamRecoveryPhase(msg) {
+    if (!msg || !msg._streamPending || msg.content || !msg._serverItemId) return "";
+    if (msg._streamRecovery === "active") return "active";
+    if (msg._streamRecovery === "failed") return "failed";
+    return "idle";
+  }
+  function streamRecoveryLabels(phase) {
+    if (phase === "failed") {
+      return { note: "Could not load this answer.", action: "Try again" };
+    }
+    return { note: "This answer was not saved with the conversation.", action: "Load answer" };
+  }
+  var LIVE_PAINT_MIN_MS = 250;
+  var LIVE_TYPE_MAX_STEP = 1200;
   var ChatSession = class {
     constructor(host) {
+      // --- live streaming ----------------------------------------------------
+      //
+      // A streamed turn's answer NEVER reaches the polling row: the relay appends the
+      // destination's raw bytes to a chunk table and the row settles with a status and
+      // nothing else. So for a streamed turn this parser is not a nicety that makes the
+      // wait prettier, it is the only place the answer exists until csr-finalize stores
+      // one. Three things follow, and all three are load-bearing:
+      //
+      //   1. EVERY foreground poll gets a sink while streaming is on, not just the one
+      //      the dispatch attaches. A tab return, a reload, a resumePolling all
+      //      re-attach a poll to a still-running item, and skapi's reader sends
+      //      `since: 0` on its first tick, so a fresh sink REPLAYS the whole stream from
+      //      the beginning. Attaching without one settles that turn on an envelope and
+      //      the user's answer is gone.
+      //   2. The parser is keyed by SERVER ITEM ID, and so is the bubble it paints into.
+      //      A history refetch replaces the local pending bubble with the server's copy
+      //      of the same turn; that copy carries the same _serverItemId, so the next
+      //      paint finds it and carries on. Nothing has to be rescued and nothing can be
+      //      painted twice.
+      //   3. The stream is never the source of truth. At settle the parser's ASSEMBLED
+      //      body (byte equivalent to what a buffered call returns) goes through the
+      //      same extractClaudeText / extractOpenAIText the buffered path uses, and a
+      //      row that does hold a stored body wins outright.
+      //
+      // Background polls never get a sink, and that is safe because nothing on the bg
+      // queue ever streams: an indexing pass must not (the worker READS its reply), and
+      // a chat turn sent with attachments is deliberately left buffered for exactly the
+      // reason point 1 gives, since the re-attach loop would poll it as a background
+      // item and hand it no reader. See chatStreamWiring. A sink there would also spend
+      // the request budget MAX_CONCURRENT_BG_POLLS exists to protect.
+      /** Live streams by server item id. One per in-flight streamed turn. */
+      this.liveStreams = {};
       // ─── compact-stub hydration ─────────────────────────────────────────────
       // Split-fetch bg pages arrive as label stubs (no bodies). When the user
       // expands a row, the real reply text is fetched per item (csr-poll point
@@ -3068,8 +3825,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return Promise.resolve(probeBgQueue(
           { service: id.projectId, owner: id.owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
           { maxAgeMs: BG_PROBE_TTL_MS }
-        )).then(function(entry) {
-          return entry.result;
+        )).then(function(entry2) {
+          return entry2.result;
         }).catch(function() {
           return null;
         });
@@ -3256,10 +4013,49 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
      * the request budget the cap exists to protect.
      */
-    attachForegroundPoll(source, itemId, opts) {
-      return this._fgPollWithEarlyProbe(source, itemId, opts);
+    attachForegroundPoll(source, itemId, opts, ctx) {
+      return this._fgPollWithEarlyProbe(source, itemId, opts, ctx);
     }
-    _fgPollWithEarlyProbe(source, itemId, opts) {
+    _fgPollWithEarlyProbe(source, itemId, opts, ctx) {
+      var self = this;
+      var live = this._beginLiveStream(itemId, ctx);
+      if (live) {
+        var inner = opts || {};
+        var callerResponse = typeof inner.onResponse === "function" ? inner.onResponse : null;
+        var callerError = typeof inner.onError === "function" ? inner.onError : null;
+        var streamOpts = Object.assign({}, inner, {
+          onStream: function(chunk, _seq, via) {
+            self._feedLiveStream(live, chunk, via);
+          },
+          onResponse: function(res) {
+            var effective = res;
+            if (isPollStopped(res)) self._closeLiveStream(live, false);
+            else effective = self._settleLiveStream(live, res);
+            if (callerResponse) callerResponse(effective);
+          },
+          onError: function(err) {
+            self._closeLiveStream(live, false);
+            if (callerError) callerError(err);
+          }
+        });
+        var lp = source.poll(Object.assign({ latency: STREAM_POLL_INTERVAL }, streamOpts));
+        var stopLp = lp && typeof lp.stop === "function" ? lp.stop.bind(lp) : null;
+        var wrapped = Promise.resolve(lp).then(function(res) {
+          if (isPollStopped(res)) {
+            self._closeLiveStream(live, false);
+            return res;
+          }
+          return self._settleLiveStream(live, res);
+        }, function(err) {
+          self._closeLiveStream(live, false);
+          throw err;
+        });
+        wrapped.stop = function() {
+          self._closeLiveStream(live, false);
+          if (stopLp) stopLp();
+        };
+        return wrapped;
+      }
       var base = source.poll(Object.assign({ latency: POLL_INTERVAL }, opts || {}));
       var lookup = chatEngineConfig().csrHistoryItemLookup;
       var ident = this.host.getIdentity();
@@ -3340,6 +4136,661 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (handle && handle.kind === "bg") n++;
       });
       return n;
+    }
+    /**
+     * Open (or re-open) the live stream for `itemId`, or null when this poll must
+     * not carry one.
+     *
+     * Re-entrant on purpose: an auth-refresh retry re-dispatches the SAME turn under
+     * a NEW id, and a re-attach after a tab return replays an existing id from seq 0.
+     * Either way the bytes about to arrive are a whole stream, so an existing entry
+     * is discarded and a fresh parser takes its place - feeding a replay into the old
+     * parser would concatenate the answer with itself.
+     *
+     * `ctx` IS THE TURN'S OWN IDENTITY, and every caller that has one passes it.
+     * This used to read the LIVE getIdentity(), which is a bug of exactly the kind
+     * _callProviderFor documents and threads its own parameters to avoid: the user
+     * hits Send, then switches project or platform inside the ack round trip, and the
+     * stream that opens for the OLD turn is stamped with the NEW identity. What that
+     * costs is not cosmetic - `platform` picks which url csr-finalize is addressed
+     * with and which extractor reads the assembled body, `projectId`/`owner` scope
+     * the finalize itself, and `ownerKey` decides which chat the answer is painted
+     * into. Get them from the live read at the wrong moment and the turn is finalized
+     * against the wrong service (so its answer is never stored), parsed with the
+     * wrong provider's extractor, or painted into a conversation it does not belong
+     * to. The live read stays only as the fallback for a caller with nothing pinned.
+     */
+    _beginLiveStream(itemId, ctx) {
+      if (!liveStreamingEnabled()) return null;
+      if (!itemId) {
+        console.warn("[chat-engine] live streaming is on but the dispatch reported no item id");
+        return null;
+      }
+      var pinnedPlatform = ctx && (ctx.platform === "claude" || ctx.platform === "openai") ? ctx.platform : void 0;
+      var ident = pinnedPlatform && ctx && ctx.projectId !== void 0 && ctx.owner !== void 0 && ctx.ownerKey !== void 0 ? null : this.host.getIdentity();
+      var platform = pinnedPlatform || (ident ? ident.platform : void 0);
+      if (platform !== "claude" && platform !== "openai") return null;
+      var projectId = ctx && ctx.projectId !== void 0 ? ctx.projectId : ident ? ident.projectId : "";
+      var owner = ctx && ctx.owner !== void 0 ? ctx.owner : ident ? ident.owner : "";
+      var ownerKey = ctx && ctx.ownerKey !== void 0 ? ctx.ownerKey : this.getHistoryCacheKey();
+      var prev = this.liveStreams[itemId];
+      if (prev) this._closeLiveStream(prev, false);
+      var st = {
+        id: itemId,
+        ownerKey,
+        platform,
+        projectId,
+        owner,
+        parser: createSseParser(),
+        painted: "",
+        started: false,
+        fed: false,
+        ended: false,
+        timer: null,
+        lastPaintAt: 0,
+        finalBody: null,
+        transport: { socket: 0, poll: 0 }
+      };
+      this.liveStreams[itemId] = st;
+      return st;
+    }
+    /** The chunk sink handed to skapi's poll. Raw relayed text, in order, never parsed
+     *  here: the parser owns the grammar and this owns the pacing. */
+    _feedLiveStream(st, chunk, via) {
+      if (st.ended || typeof chunk !== "string" || !chunk) return;
+      st.fed = true;
+      if (via === "socket") st.transport.socket++;
+      else if (via === "poll") st.transport.poll++;
+      st.parser.feed(chunk);
+      if (st.timer) return;
+      var self = this;
+      var wait = st.lastPaintAt ? Math.max(0, LIVE_PAINT_MIN_MS - (nowMs() - st.lastPaintAt)) : 0;
+      st.timer = setTimeout(function() {
+        st.timer = null;
+        self._paintLiveStream(st);
+      }, wait);
+    }
+    /**
+     * Write the safe prefix of the answer so far into the turn's bubble.
+     *
+     * notify() is spent EXACTLY ONCE per turn, on the first paint, because that is a
+     * state change the per-bubble refresh cannot express: the bubble stops being a
+     * "Thinking..." spinner and becomes text. Every paint after it goes through
+     * refreshMessageBubble, which is what keeps a growing answer from rebuilding the
+     * whole display list once a second.
+     */
+    _paintLiveStream(st) {
+      if (st.ended) return;
+      st.lastPaintAt = nowMs();
+      if (this.getHistoryCacheKey() !== st.ownerKey) return;
+      var idx = this._liveTargetIndex(st.id);
+      if (idx === -1) return;
+      var msg = this.state.messages[idx];
+      if (!msg) return;
+      var snap = st.parser.snapshot();
+      var next = liveSafePrefix(snap.text);
+      if (next.length <= st.painted.length) return;
+      var prev = st.painted;
+      st.painted = next;
+      var grew = next.length - prev.length;
+      var animate = grew > 0 && grew <= LIVE_TYPE_MAX_STEP;
+      if (animate) {
+        if (!msg._localId) msg._localId = this._newLocalId();
+        if (!msg._streaming) {
+          msg._streaming = true;
+          this.host.notify();
+        }
+        this.enqueueTypewrite(idx, next, msg._localId, prev);
+      } else {
+        msg.content = next;
+        if (!msg._streaming) {
+          msg._streaming = true;
+          this.host.notify();
+        } else this.host.refreshMessageBubble(idx);
+      }
+      this.host.scrollToBottomIfSticky();
+      this._reportLiveStream(st, st.started ? "update" : "start", snap, next);
+      st.started = true;
+    }
+    /** The bubble a live stream paints into: the turn's pending assistant placeholder,
+     *  found by server item id. Not by _localId, deliberately - a history refetch
+     *  replaces the local copy with the server's, and only the id survives that. */
+    _liveTargetIndex(itemId) {
+      return this.state.messages.findIndex(function(m) {
+        return !!m && m.role === "assistant" && !m.isBackgroundTask && m._serverItemId === itemId && (!!m.isPending || !!m._streaming);
+      });
+    }
+    /** Hand the host its optional observation update. Guarded: this runs on the paint
+     *  path, and a throwing hook must not cost the user the rest of their answer. */
+    _reportLiveStream(st, phase, snap, text) {
+      var hook = chatEngineConfig().onLiveStreamUpdate;
+      if (!hook) return;
+      try {
+        hook({
+          serverItemId: st.id,
+          ownerKey: st.ownerKey,
+          phase,
+          text,
+          thinkingText: snap && snap.thinkingText || "",
+          toolNames: snap && snap.toolNames ? snap.toolNames.slice() : [],
+          complete: !!(snap && snap.complete),
+          // Reported alongside `complete`, never instead of it: a host drawing
+          // "still arriving" wants complete, a host drawing "this answer is
+          // partial" wants this one, and an `error` frame is the case where the
+          // two disagree. See sse.ts answerComplete.
+          answerComplete: !!(snap && snap.answerComplete),
+          errored: !!(snap && snap.errored),
+          transport: { socket: st.transport.socket, poll: st.transport.poll }
+        });
+      } catch (e) {
+        console.warn("[chat-engine] onLiveStreamUpdate threw", e);
+      }
+    }
+    /** Stop painting and (when the turn really ended) assemble the body. `finished`
+     *  is false for a stream being discarded rather than settled: a retry replacing
+     *  it, or a stop, neither of which has an answer to assemble. */
+    _closeLiveStream(st, finished) {
+      var first = !st.ended;
+      if (st.timer) {
+        clearTimeout(st.timer);
+        st.timer = null;
+      }
+      if (first) {
+        st.ended = true;
+        if (finished && st.fed) {
+          st.parser.end();
+          st.finalBody = st.parser.finalBody();
+        }
+      }
+      if (this.liveStreams[st.id] === st) delete this.liveStreams[st.id];
+      if (first && st.started) this._reportLiveStream(st, "end", st.parser.snapshot(), "");
+      if (this.getHistoryCacheKey() !== st.ownerKey) return;
+      var idx = this._liveTargetIndex(st.id);
+      if (idx !== -1 && this.state.messages[idx] && this.state.messages[idx]._streaming) {
+        this.state.messages[idx]._streaming = false;
+      }
+    }
+    /**
+     * Settle a streamed turn: end the parse, decide the body the rest of the session
+     * will read, and release the chunks.
+     *
+     * The substitution is one-directional and never a merge. A response that is a
+     * real stored body (a buffered turn, or a streamed one somebody already
+     * finalized) is returned untouched, because that is the destination's own answer
+     * and the stream is not entitled to overwrite it. Only a STATUS ENVELOPE - the
+     * shape a streamed row settles as, having stored nothing - is replaced, and then
+     * by the assembled body, which every caller downstream reads with the same
+     * extractor it uses for a buffered reply. Idempotent, because it is reached both
+     * through the poll's onResponse and through the promise it resolves.
+     */
+    _settleLiveStream(st, response) {
+      this._closeLiveStream(st, true);
+      if (!isCsrStatusEnvelope(response)) return response;
+      if (response.status !== "resolved") return response;
+      if (!this._mayFinalize(st)) this._rec().incomplete[st.id] = true;
+      if (st.finalBody == null) return response;
+      this._finalizeStreamedTurn(st);
+      return st.finalBody;
+    }
+    /**
+     * May this parse be STORED as the turn's permanent answer?
+     *
+     * THE FAILURE THIS PREVENTS. Finalizing does two things at once: it stores what
+     * you give it as the row's result, and it DELETES the chunks it was assembled
+     * from. So finalizing a truncated parse is not a cosmetic loss, it is the
+     * permanent one: the truncation becomes the stored answer and the only copy of
+     * the missing part is deleted in the same call. And a truncated parse is a shape
+     * this repo has already paid for - a degraded chunk read (the poller degrades to
+     * "no chunks this tick, more=true" on any transient chunk-table error, and caps
+     * a long answer at 500k characters per response) can hand the settle a stream
+     * that stopped mid-answer. The row can settle 'resolved' on top of that, because
+     * the ROW's status describes the destination's request, not the client's read of
+     * it.
+     *
+     * THE POLICY ITSELF IS mayKeepStreamedAnswer (top of this file), shared with the
+     * recovery path so the two cannot drift apart again - they did, and the drift was
+     * silent: the live settle refused a failed turn while the recovery finalized one.
+     * What is local to this method is only the two things the free function cannot
+     * know: that there is an assembled body at all, and that this call site is
+     * reached only on a row that settled 'resolved' (the caller returns before it
+     * otherwise), which is the status it therefore states.
+     *
+     * The test the policy applies is deliberately NOT `complete`: a terminal event
+     * arrived and the answer finished are two claims, and an `error` frame satisfies
+     * the first while truncating the second. See sse.ts's answerComplete.
+     */
+    _mayFinalize(st) {
+      if (st.finalBody == null) return false;
+      return mayKeepStreamedAnswer(st.parser.snapshot(), "resolved");
+    }
+    /**
+     * Store the assembled body as the version history keeps, which is also what
+     * releases this request's chunks.
+     *
+     * The ASSEMBLED BODY and not the extracted text, because the row is read back by
+     * mapHistoryListToMessages through extractClaudeText / extractOpenAIText: storing
+     * the provider's own document is what makes a streamed turn indistinguishable
+     * from a buffered one on the next load, with no branch anywhere in the mapper.
+     *
+     * BEST EFFORT, and loudly so: the answer is already on screen and already in the
+     * history cache by the time this fires. A failure costs the chunks (they stay,
+     * and the turn stays re-readable) and a row that reads back empty, never the
+     * user's answer in front of them.
+     *
+     * WHAT IS DELIBERATELY NEVER FINALIZED, because finalize is also the only way to
+     * release chunks and it is tempting to reach for it as a cleanup:
+     *
+     *   - an INCOMPLETE parse (see _mayFinalize). Storing a truncation makes it
+     *     permanent AND deletes the part that was missing from it. A stream killed by
+     *     an `error` frame is one of these however terminal it looks: the frame ends
+     *     the stream, so `complete` is true, while the text is only what arrived
+     *     before the error. That is why the gate reads answerComplete.
+     *   - a FAILED turn. Its chunks hold the part of the answer that did arrive,
+     *     which is the only copy of that text there is, and the two ways to release
+     *     them both cost something real: storing the partial makes a truncated answer
+     *     the turn's permanent history AND masks the failure on read (csr-poll hands
+     *     back a finalized body before it ever looks at the row's error, so the turn
+     *     would read back as a clean short answer), while storing the error throws
+     *     the partial away outright. Keeping them costs storage on rows that produced
+     *     bytes and then failed, which is rare - a failure before the first byte (a
+     *     wrong API key, the common case) has no chunks to keep - and the poller
+     *     hands those chunks back alongside the error on every later read, so nothing
+     *     is stranded, only retained. Retention is the honest trade here; deletion is
+     *     not reversible.
+     *   - a CANCELLED turn, for the same reason plus one: the user's Stop means the
+     *     half answer is to be discarded, so writing it into history as the kept
+     *     version would resurrect exactly what the stop was for.
+     */
+    _finalizeStreamedTurn(st) {
+      if (st.finalized) return;
+      if (!this._mayFinalize(st)) return;
+      var fin = chatEngineConfig().clientSecretRequestFinalize;
+      if (!fin || st.finalBody == null) return;
+      st.finalized = true;
+      var url = st.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+      try {
+        Promise.resolve(fin(st.id, st.finalBody, {
+          url,
+          method: "POST",
+          service: st.projectId,
+          owner: st.owner
+        })).catch(function(err) {
+          console.warn("[chat-engine] clientSecretRequestFinalize failed", err);
+        });
+      } catch (e) {
+        console.warn("[chat-engine] clientSecretRequestFinalize threw", e);
+      }
+    }
+    /** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
+     *  A pending assistant placeholder is created with content '' by every path that
+     *  makes one, so non-empty content on one can only have been painted here. */
+    _paintedTextAt(idx) {
+      var m = idx >= 0 ? this.state.messages[idx] : void 0;
+      if (!m || m.role !== "assistant" || typeof m.content !== "string") return "";
+      return m.content;
+    }
+    /** The recovery bookkeeping, created on first touch.
+     *
+     *  LAZY, not constructor-initialised, and for a concrete reason: ChatSession is
+     *  also built with Object.create(ChatSession.prototype) by the engine's own test
+     *  harnesses, which drive one method against a hand-built state rather than a
+     *  whole session. A field only the constructor creates is undefined there, and
+     *  the method that reaches for it throws, turning a test of the settle into a
+     *  crash about bookkeeping. */
+    _rec() {
+      if (!this._streamRecovery) this._streamRecovery = { incomplete: {}, attempted: {}, inflight: {}, failed: {}, queue: [], running: false };
+      return this._streamRecovery;
+    }
+    /**
+     * Put this session's fetching state onto the turn's bubble, so a view can tell a
+     * loader that means something from one that means nothing.
+     *
+     * ONLY EVER ONTO A STILL-MARKED BUBBLE. Once `_streamPending` is off the turn has
+     * an answer (or was proven to have none) and this says nothing about it; writing
+     * it there would leave a stale 'active' on a settled bubble forever.
+     *
+     * host.notify() is what redraws the widget, whose renderer is imperative. It is a
+     * no-op in agent.vue, whose state is a Vue reactive() - the property write above
+     * is what redraws there. Both are covered by doing both, and neither is a
+     * substitute for the other.
+     */
+    _markRecoveryPhase(itemId, phase) {
+      var changed = false;
+      for (var i = 0; i < this.state.messages.length; i++) {
+        var m = this.state.messages[i];
+        if (!m || m.role !== "assistant" || m._serverItemId !== itemId || !m._streamPending) continue;
+        var next = phase === null ? void 0 : phase;
+        if (m._streamRecovery === next) continue;
+        if (next === void 0) delete m._streamRecovery;
+        else m._streamRecovery = next;
+        changed = true;
+      }
+      if (changed) this.host.notify();
+    }
+    /**
+     * Let LOCAL answers survive a freshly-mapped page whose copies of them are
+     * authoritative-but-empty. Call with the page BEFORE it replaces or merges into
+     * state.messages; mutates the page's bubbles in place.
+     *
+     * The adoption itself is history.ts's adoptLocalAnswerIntoPage (shared, so the
+     * clients' own mappers cannot fork it). What lives here is the one thing the
+     * pure function cannot know: whether the local text is the WHOLE answer. Text
+     * left by a stream that ended without a terminal event is not, so that bubble
+     * keeps its marker and gets read back even though it has content - otherwise a
+     * truncated answer would adopt itself over the row and never be corrected.
+     */
+    _adoptLocalAnswers(mapped, loadKey) {
+      if (!mapped || !mapped.length) return;
+      var pendingIncoming = [];
+      for (var i = 0; i < mapped.length; i++) {
+        if (mapped[i] && mapped[i]._streamPending) pendingIncoming.push(mapped[i]);
+      }
+      if (!pendingIncoming.length) return;
+      var locals = {};
+      for (var j = 0; j < this.state.messages.length; j++) {
+        var lm = this.state.messages[j];
+        if (!lm || lm.role !== "assistant" || !lm._serverItemId) continue;
+        if (lm._ownerKey !== void 0 && loadKey !== void 0 && lm._ownerKey !== loadKey) continue;
+        if (locals[lm._serverItemId] === void 0) locals[lm._serverItemId] = lm;
+      }
+      for (var k = 0; k < pendingIncoming.length; k++) {
+        var inc = pendingIncoming[k];
+        var id = inc._serverItemId;
+        if (!id) continue;
+        var local = locals[id];
+        if (!local) continue;
+        if (!adoptLocalAnswerIntoPage(inc, local)) continue;
+        if (this._rec().incomplete[id]) inc._streamPending = true;
+      }
+      for (var p = 0; p < pendingIncoming.length; p++) {
+        var pi = pendingIncoming[p];
+        if (!pi._streamPending || !pi._serverItemId) continue;
+        var phase = this._recoveryPhaseFor(pi._serverItemId);
+        if (phase === null) delete pi._streamRecovery;
+        else pi._streamRecovery = phase;
+      }
+    }
+    /**
+     * This session's fetching state for one turn, from the bookkeeping rather than
+     * from any bubble. A queued entry counts as 'active': it is committed to be read,
+     * serially, and the reader has no way to tell "being read" from "next in line"
+     * apart from the wait.
+     */
+    _recoveryPhaseFor(itemId) {
+      var rec = this._rec();
+      if (rec.inflight[itemId]) return "active";
+      for (var i = 0; i < rec.queue.length; i++) if (rec.queue[i].id === itemId) return "active";
+      if (rec.failed[itemId]) return "failed";
+      return null;
+    }
+    /**
+     * PUBLIC DELEGATE, for a client that maps and merges its own history page.
+     *
+     * agent.vue keeps a forked mapper and a forked first-page merge (its mount path
+     * runs them, while resumePolling routes through loadHistory below), so both
+     * paths are live for the SAME row inside one component. Adoption is part of the
+     * merge contract, not an optional extra: without it that fork erases a streamed
+     * answer off the screen on every turn, which is the whole of MAJOR 3.
+     *
+     * Exposed rather than reimplemented because the rule needs the session's own
+     * `incomplete` set, which the pure helper (history.ts adoptLocalAnswerIntoPage)
+     * cannot see. A client that reached for the helper alone would adopt a TRUNCATED
+     * answer over the row and clear the marker that would have gone back for the
+     * rest - a fork that reads as correct and loses text.
+     *
+     * Call it exactly where loadHistory does: on the freshly mapped page, after
+     * applyHydratedBodies and BEFORE the page replaces or merges into state.messages.
+     */
+    adoptLocalAnswers(mapped, loadKey) {
+      this._adoptLocalAnswers(mapped, loadKey);
+    }
+    /**
+     * Queue the on-screen turns whose answer is only in the chunk store, newest
+     * first, and start draining. Never blocks and never throws.
+     *
+     * `ownerKey` is the chat the queue entries belong to, snapshotted by the caller:
+     * a recovery that lands after the user has moved on writes into that chat's
+     * cache, never into whatever list is on screen by then.
+     */
+    _scheduleStreamRecovery(ownerKey, platform, projectId, owner) {
+      if (!streamRecoveryEnabled()) return;
+      var rec = this._rec();
+      var wanted = [];
+      for (var i = this.state.messages.length - 1; i >= 0; i--) {
+        var m = this.state.messages[i];
+        if (!m || m.role !== "assistant" || !m._streamPending || !m._serverItemId) continue;
+        var id = m._serverItemId;
+        if (rec.attempted[id]) continue;
+        if (this.liveStreams[id]) continue;
+        if (rec.queue.some(function(e) {
+          return e.id === id;
+        })) continue;
+        wanted.push(id);
+        if (wanted.length >= STREAM_RECOVERY_PER_LOAD) break;
+      }
+      if (!wanted.length) return;
+      for (var w = 0; w < wanted.length; w++) {
+        rec.queue.push({ id: wanted[w], ownerKey, platform, projectId, owner });
+        this._markRecoveryPhase(wanted[w], "active");
+      }
+      this._drainStreamRecovery();
+    }
+    /**
+     * PUBLIC DELEGATE, the other half of what a forked history path needs.
+     *
+     * Same reason as adoptLocalAnswers: agent.vue's mount path never calls
+     * loadHistory, so without this its pages would MARK unfinalized streamed turns
+     * and then never read them back - CRITICAL 1 left unfixed on the client's
+     * primary path, with the marker making it look handled.
+     *
+     * Takes the load's SNAPSHOTTED identity rather than reading it live, and that is
+     * the reason this exists instead of the caller looping over recoverStreamedAnswer:
+     * that one reads getIdentity() at call time (right, for an on-demand affordance
+     * the user just clicked), which after a project switch racing the load would
+     * finalize the turn against the project they switched TO. Call it AFTER the page
+     * is rendered and the loading flags are cleared - it must never hold up the
+     * conversation it belongs to.
+     */
+    scheduleStreamRecovery(ownerKey, platform, projectId, owner) {
+      this._scheduleStreamRecovery(ownerKey, platform, projectId, owner);
+    }
+    /** Serial drain of the recovery queue. Each entry is one full chunk read. */
+    _drainStreamRecovery() {
+      var rec = this._rec();
+      if (rec.running) return;
+      var next = rec.queue.shift();
+      if (!next) return;
+      rec.running = true;
+      var self = this;
+      this._readBackStreamedTurn(next.id, next.ownerKey, next.platform, next.projectId, next.owner).catch(function() {
+      }).then(function() {
+        self._rec().running = false;
+        self._drainStreamRecovery();
+      });
+    }
+    /**
+     * Read one unfinalized streamed turn back out of the chunk store and put its
+     * answer where the turn's answer belongs.
+     *
+     * Public because the cap above is deliberately small: a host that wants to offer
+     * "load the rest" on an older recoverable turn calls this with its
+     * `_serverItemId`, and gets the same path the automatic recovery uses. Safe to
+     * call for an id that turns out not to be recoverable, and safe to call twice -
+     * a second call while the first is still in flight is a no-op.
+     *
+     * THIS IS THE USER ASKING, and that is why it passes `manual`. The automatic
+     * recovery refuses a row it has already tried, so that a re-render, or the
+     * history load that every visibilitychange fires, cannot loop on the same
+     * chunks. A click is neither of those: it is one bounded request that a person
+     * asked for, and applying the loop guard to it made the affordance a button that
+     * silently did nothing for exactly the rows most likely to have it - every row
+     * an earlier read touched and could not settle.
+     */
+    recoverStreamedAnswer(itemId) {
+      if (!itemId) return Promise.resolve();
+      var id = this.host.getIdentity();
+      var platform = id && id.platform === "openai" ? "openai" : "claude";
+      return this._readBackStreamedTurn(itemId, this.getHistoryCacheKey(), platform, id ? id.projectId : "", id ? id.owner : "", true);
+    }
+    _readBackStreamedTurn(itemId, ownerKey, platform, projectId, owner, manual) {
+      var cfg = chatEngineConfig();
+      var read = cfg.clientSecretRequestStream;
+      if (!read || !itemId) return Promise.resolve();
+      if (this._rec().inflight[itemId]) return Promise.resolve();
+      if (!manual && this._rec().attempted[itemId]) {
+        this._markRecoveryPhase(itemId, null);
+        return Promise.resolve();
+      }
+      this._rec().attempted[itemId] = true;
+      this._rec().inflight[itemId] = true;
+      delete this._rec().failed[itemId];
+      this._markRecoveryPhase(itemId, "active");
+      var self = this;
+      var url = platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+      var parser = createSseParser();
+      var fed = false;
+      return Promise.resolve(read(itemId, {
+        url,
+        method: "POST",
+        service: projectId,
+        owner,
+        since: 0,
+        onStream: function(chunk) {
+          if (typeof chunk !== "string" || !chunk) return;
+          fed = true;
+          parser.feed(chunk);
+        }
+      })).then(function(res) {
+        if (isPollStopped(res)) {
+          delete self._rec().attempted[itemId];
+          delete self._rec().inflight[itemId];
+          self._markRecoveryPhase(itemId, null);
+          return;
+        }
+        var envelope = isCsrStatusEnvelope(res);
+        var body = null;
+        if (res && !envelope) {
+          body = res;
+        } else if (fed) {
+          parser.end();
+          body = parser.finalBody();
+        }
+        var snap = parser.snapshot();
+        var fromRow = !!(res && !envelope);
+        var rowStatus = envelope && typeof res.status === "string" ? res.status : void 0;
+        var degraded = !!(envelope && res && res.more === true);
+        var store = !fromRow && !degraded && body != null && mayKeepStreamedAnswer(snap, rowStatus);
+        delete self._rec().inflight[itemId];
+        delete self._rec().failed[itemId];
+        self._markRecoveryPhase(itemId, null);
+        if (degraded) {
+          delete self._rec().attempted[itemId];
+        }
+        self._applyRecoveredAnswer(itemId, ownerKey, platform, projectId, owner, body, store, degraded);
+      }, function(err) {
+        console.warn("[chat-engine] could not read back a streamed turn", itemId, err);
+        delete self._rec().attempted[itemId];
+        delete self._rec().inflight[itemId];
+        self._rec().failed[itemId] = true;
+        self._markRecoveryPhase(itemId, "failed");
+      });
+    }
+    /**
+     * Write a recovered answer into the turn's bubble (or into the owning chat's
+     * cache when the reader has moved on), then store it as the version history
+     * keeps.
+     *
+     * FINALIZING IS WHAT MAKES THIS RUN ONCE. It copies the answer onto the row and
+     * releases the chunks, so the next load reads an ordinary turn and no recovery is
+     * scheduled for it ever again, by anyone, in any tab. `store` is the caller's
+     * decision and carries two gates at once: mayKeepStreamedAnswer, the SAME keep
+     * policy the live settle applies (an incomplete, errored or failed read is shown
+     * but never stored, because storing it would make the truncation permanent and
+     * delete the part that was missing), and whether the body is new at all (one
+     * that came off the row is already stored).
+     */
+    _applyRecoveredAnswer(itemId, ownerKey, platform, projectId, owner, body, store, degraded) {
+      var text = "";
+      var isErr = isErrorResponseBody(body);
+      if (body != null && !isErr) {
+        text = ((platform === "openai" ? extractOpenAIText(body) : extractClaudeText(body)) || "").trim();
+      }
+      if (!text && !isErr) {
+        if (degraded) {
+          return;
+        }
+        this._clearStreamPendingMark(itemId, ownerKey, true);
+        return;
+      }
+      var reply = isErr ? { role: "assistant", content: getErrorMessage(body), isError: true, _serverItemId: itemId } : { role: "assistant", content: text, _serverItemId: itemId };
+      if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+        this._applyReplyToCache(ownerKey, reply, itemId);
+      } else {
+        var idx = -1;
+        for (var i = 0; i < this.state.messages.length; i++) {
+          var m = this.state.messages[i];
+          if (m && m.role === "assistant" && m._serverItemId === itemId) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx === -1) {
+          this._applyReplyToCache(ownerKey, reply, itemId);
+        } else {
+          var prev = this.state.messages[idx];
+          if (prev._ts !== void 0) reply._ts = prev._ts;
+          if (prev._ownerKey !== void 0) reply._ownerKey = prev._ownerKey;
+          this.state.messages[idx] = reply;
+          this.updateHistoryCache();
+          this.host.notify();
+        }
+      }
+      if (!degraded) delete this._rec().incomplete[itemId];
+      if (!store || body == null || isErr) return;
+      var fin = chatEngineConfig().clientSecretRequestFinalize;
+      if (!fin) return;
+      var url = platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+      try {
+        Promise.resolve(fin(itemId, body, { url, method: "POST", service: projectId, owner })).catch(function(err) {
+          console.warn("[chat-engine] finalize of a recovered turn failed", err);
+        });
+      } catch (e) {
+        console.warn("[chat-engine] finalize of a recovered turn threw", e);
+      }
+    }
+    /**
+     * Take the "answer is elsewhere" marker off a turn once it is settled one way or
+     * the other. `drop` removes an assistant bubble that turned out to have no answer
+     * at all, which restores exactly the list the mapper used to produce for such a
+     * row (none), rather than leaving a permanently empty bubble behind.
+     *
+     * ONLY EVER CALLED FOR A TURN THAT WAS ACTUALLY READ. The marker is the one thing
+     * that keeps an unrecovered answer reachable, so it comes off only on the strength
+     * of an answer (the recovery wrote one) or of a read that came back empty. A read
+     * that FAILED, or one that was STOPPED, knows neither, and taking the marker off
+     * on either of those is how a bubble ends up empty forever with its answer still
+     * in the chunk table. `drop` is likewise never passed for a bubble that HAS
+     * content: an empty row is an empty turn, a failed read is not.
+     */
+    _clearStreamPendingMark(itemId, ownerKey, drop) {
+      if (ownerKey && this.getHistoryCacheKey() !== ownerKey) return;
+      var changed = false;
+      for (var i = this.state.messages.length - 1; i >= 0; i--) {
+        var m = this.state.messages[i];
+        if (!m || m.role !== "assistant" || m._serverItemId !== itemId) continue;
+        if (!m._streamPending) continue;
+        if (drop && !m.content) {
+          this.state.messages.splice(i, 1);
+          changed = true;
+          continue;
+        }
+        m._streamPending = false;
+        changed = true;
+      }
+      if (changed) {
+        this.updateHistoryCache();
+        this.host.notify();
+      }
     }
     /**
      * Stop and forget one item's poll. Used after a cancel: the row is either gone
@@ -3655,7 +5106,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               dispatchItemId = initial.id;
               if (typeof params.onItemId === "function") params.onItemId(initial.id);
             }
-            var dp = self._fgPollWithEarlyProbe(initial, initial.id);
+            var dp = self._fgPollWithEarlyProbe(initial, initial.id, void 0, {
+              platform: params.aiPlatform,
+              projectId: params.projectId,
+              owner: params.owner,
+              ownerKey: params.key
+            });
             if (initial.id) self._trackPoll(initial.id, "fg", dp);
             return dp;
           }
@@ -3868,8 +5324,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           Promise.resolve(probeBgQueue(
             { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
             { maxAgeMs: 0 }
-          )).then(function(entry) {
-            settle(entry.result);
+          )).then(function(entry2) {
+            settle(entry2.result);
           }, function() {
             settle(null);
           });
@@ -4087,7 +5543,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           }
           if (serverId) self._stampTurnWithItemId(capturedKey, capturedQueuedLid, void 0, serverId);
           if (result && result.poll && (result.status === "pending" || result.status === "running")) {
-            var qp = self._fgPollWithEarlyProbe(result, serverId);
+            var qp = self._fgPollWithEarlyProbe(result, serverId, void 0, {
+              platform: capturedPlatform,
+              projectId: id.projectId,
+              owner: id.owner,
+              ownerKey: capturedKey
+            });
             if (serverId) self._trackPoll(serverId, "fg", qp);
             return qp.then(function(res) {
               if (isPollStopped(res)) return;
@@ -4358,9 +5819,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         answer = (answer || "").trim() || "No text response received from AI provider.";
         var lid = this._newLocalId();
         if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
-          this.state.messages[targetIdx] = { role: "assistant", content: "", _localId: lid };
+          var qPainted = this._paintedTextAt(targetIdx);
+          var prevQ = this.state.messages[targetIdx] || {};
+          var qSettled = { role: "assistant", content: qPainted, _localId: lid };
+          if (prevQ._serverItemId) qSettled._serverItemId = prevQ._serverItemId;
+          if (prevQ._ownerKey) qSettled._ownerKey = prevQ._ownerKey;
+          this.state.messages[targetIdx] = qSettled;
           this.host.notify();
-          this.enqueueTypewrite(targetIdx, answer, lid);
+          this.enqueueTypewrite(targetIdx, answer, lid, qPainted);
         } else if (targetIdx >= 0) {
           this.state.messages.splice(targetIdx, 0, { role: "assistant", content: "", _localId: lid });
           this.host.notify();
@@ -4622,7 +6088,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     //     renders self-throttles to what the machine can actually paint.
     //   * rAF paces us to the browser's paint cycle and pauses in background
     //     tabs, so we never queue work faster than it can be drawn.
-    typewriteIntoIndex(idx, fullText, localId) {
+    //
+    // `paintedText` is what a LIVE STREAM already put in this bubble. The reveal
+    // starts from the point the two texts stop agreeing rather than from zero: the
+    // authoritative answer still replaces the live one character for character (it is
+    // the only source of truth, and this method writes fullText and nothing else), but
+    // retyping a paragraph the reader has just watched arrive is the one thing that
+    // would make a streamed turn look worse than an unstreamed one.
+    typewriteIntoIndex(idx, fullText, localId, paintedText) {
       var self = this;
       if (!fullText) return Promise.resolve();
       var CHARS_PER_SEC = 300;
@@ -4638,7 +6111,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       this.state.typing = true;
       this.state.typingAbort = false;
-      var i = 0;
+      var i = paintedText ? typewriterResumeIndex(paintedText, fullText, regions) : 0;
       var last = nowMs();
       return new Promise(function(resolve) {
         var done = false;
@@ -4653,16 +6126,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (done) return;
           done = true;
           cleanup();
-          if (!self.state.typingAbort) {
-            var fi = localId ? self.state.messages.findIndex(function(mm) {
-              return mm._localId === localId;
-            }) : idx;
-            if (fi !== -1) {
-              var t = self.state.messages[fi];
-              if (t) {
-                t.content = fullText;
-                self.host.refreshMessageBubble(fi);
-              }
+          var fi = localId ? self.state.messages.findIndex(function(mm) {
+            return mm._localId === localId;
+          }) : idx;
+          if (fi !== -1) {
+            var t = self.state.messages[fi];
+            if (t) {
+              t.content = fullText;
+              self.host.refreshMessageBubble(fi);
             }
           }
           self.state.typing = false;
@@ -4721,12 +6192,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         nextFrame(frame);
       });
     }
-    enqueueTypewrite(idx, fullText, localId) {
+    enqueueTypewrite(idx, fullText, localId, paintedText) {
       var self = this;
       var target = this.state.messages[idx];
       if (target && target._ts === void 0) target._ts = wallClockNow();
+      if (!this.typewriterQueue) this.typewriterQueue = Promise.resolve();
       this.typewriterQueue = this.typewriterQueue.then(function() {
-        return self.typewriteIntoIndex(idx, fullText, localId);
+        return self.typewriteIntoIndex(idx, fullText, localId, paintedText);
       });
       return this.typewriterQueue;
     }
@@ -4759,12 +6231,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         this.promoteNextQueuedToRunning();
         return Promise.resolve();
       }
+      var painted = this._paintedTextAt(pendingIdx);
       var lid = this._newLocalId();
-      this.state.messages[pendingIdx] = { role: "assistant", content: "", isPending: false, _localId: lid };
+      var prevSettled = this.state.messages[pendingIdx] || {};
+      var settled = { role: "assistant", content: painted, isPending: false, _localId: lid };
+      if (prevSettled._serverItemId) settled._serverItemId = prevSettled._serverItemId;
+      if (prevSettled._ownerKey) settled._ownerKey = prevSettled._ownerKey;
+      this.state.messages[pendingIdx] = settled;
       this._removeStrayPendingAssistants();
       this.host.notify();
       this.promoteNextQueuedToRunning();
-      return this.enqueueTypewrite(pendingIdx, latest.content, lid);
+      return this.enqueueTypewrite(pendingIdx, latest.content, lid, painted);
     }
     // Remove leftover non-background pending ("Thinking…") assistant bubbles: the
     // duplicate that appears when a concurrent history refetch re-maps the still-
@@ -4794,6 +6271,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       for (var k = this.state.messages.length - 1; k >= 0; k--) {
         var m = this.state.messages[k];
         if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
+        if (m._streaming) continue;
         if (this._isLiveImmediatePlaceholder(k)) continue;
         this.state.messages.splice(k, 1);
       }
@@ -4971,10 +6449,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           this.updateHistoryCache();
           return;
         }
+        var hPainted = this._paintedTextAt(idx);
         var lid = this._newLocalId();
-        this.state.messages[idx] = { role: "assistant", content: "", _localId: lid, _serverItemId: itemId };
+        this.state.messages[idx] = { role: "assistant", content: hPainted, _localId: lid, _serverItemId: itemId };
         this.host.notify();
-        this.enqueueTypewrite(idx, text, lid);
+        this.enqueueTypewrite(idx, text, lid, hPainted);
         this.updateHistoryCache();
         return;
       }
@@ -5016,11 +6495,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  path is project-relative ("report.xlsx"), and ONE ChatSession serves every
      *  project — unscoped, stopping a file in one project would silently suppress
      *  the same filename's continuations in another. */
-    _indexKeyOf(entry) {
-      if (!entry) return "";
-      var file = entry.storagePath || entry.filename;
+    _indexKeyOf(entry2) {
+      if (!entry2) return "";
+      var file = entry2.storagePath || entry2.filename;
       if (!file) return "";
-      return indexScopeKey(entry.projectId, entry.platform) + "|" + file;
+      return indexScopeKey(entry2.projectId, entry2.platform) + "|" + file;
     }
     /**
      * Reconcile the bg queue with the files the user has stopped.
@@ -5049,17 +6528,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (m.isPending || m.isPendingQueued || m.isPendingInProcess) surfaced[m._serverItemId] = true;
       });
       for (var i = this.bgTaskQueue.length - 1; i >= 0; i--) {
-        var entry = this.bgTaskQueue[i];
-        var key = this._indexKeyOf(entry);
+        var entry2 = this.bgTaskQueue[i];
+        var key = this._indexKeyOf(entry2);
         if (!key || !this.cancelledIndexKeys.has(key)) continue;
-        if (!entry.resumePass && !this.state.stoppedIndexIds[entry.id]) {
+        if (!entry2.resumePass && !this.state.stoppedIndexIds[entry2.id]) {
           this.cancelledIndexKeys.delete(key);
           continue;
         }
-        if (surfaced[entry.id]) continue;
+        if (surfaced[entry2.id]) continue;
         this.bgTaskQueue.splice(i, 1);
-        this._stopPoll(entry.id);
-        this._cancelServerItem(entry.id);
+        this._stopPoll(entry2.id);
+        this._cancelServerItem(entry2.id);
       }
     }
     /**
@@ -5117,8 +6596,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return Promise.resolve(probeBgQueue(
           { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
           { maxAgeMs: 0 }
-        )).then(function(entry) {
-          return entry.result;
+        )).then(function(entry2) {
+          return entry2.result;
         }).catch(function() {
           return null;
         });
@@ -5271,30 +6750,30 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
       var injectedAny = false;
-      this.bgTaskQueue.forEach(function(entry) {
-        if (entry.projectId !== svcId || entry.platform !== plat) return;
-        if (!presentIds[entry.id]) {
-          var isRunning = entry.status === "running";
+      this.bgTaskQueue.forEach(function(entry2) {
+        if (entry2.projectId !== svcId || entry2.platform !== plat) return;
+        if (!presentIds[entry2.id]) {
+          var isRunning = entry2.status === "running";
           var userBubble = {
             role: "user",
-            content: self.host.formatIndexingLabel(entry.filename, entry.mime, entry.size, entry.storagePath, entry.isReindex, !!entry.resumePass),
+            content: self.host.formatIndexingLabel(entry2.filename, entry2.mime, entry2.size, entry2.storagePath, entry2.isReindex, !!entry2.resumePass),
             isBackgroundTask: true,
-            _serverItemId: entry.id,
+            _serverItemId: entry2.id,
             // Structured ref so this live pass groups with the same file's passes
             // rebuilt from history (see indexing_groups.buildChatDisplayList).
             _indexFile: {
-              name: entry.filename,
-              path: entry.storagePath,
-              mime: entry.mime,
-              size: entry.size,
-              isReindex: !!entry.isReindex,
-              continued: !!entry.resumePass
+              name: entry2.filename,
+              path: entry2.storagePath,
+              mime: entry2.mime,
+              size: entry2.size,
+              isReindex: !!entry2.isReindex,
+              continued: !!entry2.resumePass
             }
           };
           if (isRunning) userBubble.isPendingInProcess = true;
           else userBubble.isPendingQueued = true;
-          var stageAt = self._stageIndex(self.state.messages, entry.stageId);
-          var runningBubble = isRunning ? { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry.id } : null;
+          var stageAt = self._stageIndex(self.state.messages, entry2.stageId);
+          var runningBubble = isRunning ? { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: entry2.id } : null;
           if (stageAt === -1) {
             self.state.messages.push(userBubble);
             if (runningBubble) self.state.messages.push(runningBubble);
@@ -5303,16 +6782,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           } else {
             self.state.messages.splice(stageAt, 0, userBubble);
           }
-          presentIds[entry.id] = true;
+          presentIds[entry2.id] = true;
           injectedAny = true;
         }
-        if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === "function") {
+        if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry2.id) && typeof entry2.poll === "function") {
           bgPollBudget--;
-          var capturedId = entry.id, capturedPlat = plat;
-          var capturedEntry = entry;
+          var capturedId = entry2.id, capturedPlat = plat;
+          var capturedEntry = entry2;
           var wasStopped = false;
-          var bp = entry.poll({ latency: POLL_INTERVAL });
-          self._trackPoll(entry.id, "bg", bp);
+          var bp = entry2.poll({ latency: POLL_INTERVAL });
+          self._trackPoll(entry2.id, "bg", bp);
           bp.then(function(response) {
             if (isPollStopped(response)) {
               wasStopped = true;
@@ -5378,13 +6857,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  client knows DETERMINISTICALLY (see the two call sites in
      *  maybeResumeIndexing). Best-effort by contract; identity-checked so a
      *  project switch mid-settle cannot stamp the wrong service. */
-    _mintDoneMarker(entry) {
+    _mintDoneMarker(entry2) {
       try {
         var mint = chatEngineConfig().mintIndexDoneMarker;
-        if (!mint || !entry || !entry.storagePath || !entry.projectId) return;
+        if (!mint || !entry2 || !entry2.storagePath || !entry2.projectId) return;
         var id = this.host.getIdentity();
-        if (!id || id.projectId !== entry.projectId) return;
-        mint({ service: entry.projectId, storagePath: entry.storagePath });
+        if (!id || id.projectId !== entry2.projectId) return;
+        mint({ service: entry2.projectId, storagePath: entry2.storagePath });
       } catch (_e) {
       }
     }
@@ -5405,27 +6884,27 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  maybeResumeIndexing's single-pass branch); paged files stay with their
      *  drivers. Outcome is read from the settled bubbles' own flags, which is
      *  all the history mapping left us. Best-effort and idempotent throughout. */
-    _flipRunFromSettledEntry(entry) {
+    _flipRunFromSettledEntry(entry2) {
       try {
-        if (!entry || !entry.storagePath || !entry.id || !entry.projectId) return;
-        if (isPagedReadFile(entry.filename, entry.mime)) return;
-        if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
-        if (this.state.stoppedIndexIds[entry.id]) return;
+        if (!entry2 || !entry2.storagePath || !entry2.id || !entry2.projectId) return;
+        if (isPagedReadFile(entry2.filename, entry2.mime)) return;
+        if (this.cancelledIndexKeys.has(this._indexKeyOf(entry2))) return;
+        if (this.state.stoppedIndexIds[entry2.id]) return;
         var userMsg = null, replyMsg = null;
         this.state.messages.forEach(function(m) {
-          if (m._serverItemId !== entry.id) return;
+          if (m._serverItemId !== entry2.id) return;
           if (m.role === "user") {
             if (!userMsg) userMsg = m;
           } else if (!replyMsg) replyMsg = m;
         });
         if (userMsg && userMsg.isCancelled || replyMsg && replyMsg.isCancelled) {
-          this._flipRunRecord(entry, "cancelled");
+          this._flipRunRecord(entry2, "cancelled");
         } else if (replyMsg && replyMsg.isError) {
           var errText = typeof replyMsg.content === "string" ? replyMsg.content.replace(/\s+/g, " ").trim().slice(0, 300) : "";
-          this._flipRunRecord(entry, "error", errText || "Indexing failed.");
+          this._flipRunRecord(entry2, "error", errText || "Indexing failed.");
         } else if (replyMsg) {
-          this._mintDoneMarker(entry);
-          this._flipRunRecord(entry, "done");
+          this._mintDoneMarker(entry2);
+          this._flipRunRecord(entry2, "done");
         }
       } catch (_e) {
       }
@@ -5436,55 +6915,55 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  mid-settle — otherwise the record lies 'working' forever. Best-effort
      *  through upsertIndexRunRecordSafe; the consumer's precedence guard keeps
      *  repeats and races harmless. */
-    _flipRunRecord(entry, status, error) {
-      if (!entry || !entry.storagePath || !entry.projectId) return;
+    _flipRunRecord(entry2, status, error) {
+      if (!entry2 || !entry2.storagePath || !entry2.projectId) return;
       var patch = { status, finished: Date.now() };
       if (error) patch.error = error;
-      upsertIndexRunRecordSafe(entry.projectId, entry.storagePath, patch);
+      upsertIndexRunRecordSafe(entry2.projectId, entry2.storagePath, patch);
     }
-    maybeResumeIndexing(entry, response, platform) {
+    maybeResumeIndexing(entry2, response, platform) {
       var self = this;
       var endOfClientChain = function() {
         self._nudgeIndexingDrain();
       };
       try {
-        if (!entry || !entry.storagePath) return;
-        if (this.cancelledIndexKeys.has(this._indexKeyOf(entry))) return;
-        if (!isPagedReadFile(entry.filename, entry.mime)) {
+        if (!entry2 || !entry2.storagePath) return;
+        if (this.cancelledIndexKeys.has(this._indexKeyOf(entry2))) return;
+        if (!isPagedReadFile(entry2.filename, entry2.mime)) {
           if (!isErrorResponseBody(response) && !this._isCancelledPollResult(response)) {
-            this._mintDoneMarker(entry);
-            this._flipRunRecord(entry, "done");
+            this._mintDoneMarker(entry2);
+            this._flipRunRecord(entry2, "done");
           } else if (this._isCancelledPollResult(response)) {
-            this._flipRunRecord(entry, "cancelled");
+            this._flipRunRecord(entry2, "cancelled");
           } else {
-            this._flipRunRecord(entry, "error", this._runErrorText(response));
+            this._flipRunRecord(entry2, "error", this._runErrorText(response));
           }
           endOfClientChain();
           return;
         }
-        if (isImageVisionFile(entry.filename, entry.mime)) return;
-        if (windowedIndexingEnabled() && isWindowedReadFile(entry.filename, entry.mime)) return;
+        if (isImageVisionFile(entry2.filename, entry2.mime)) return;
+        if (windowedIndexingEnabled() && isWindowedReadFile(entry2.filename, entry2.mime)) return;
         if (isErrorResponseBody(response)) {
-          this._flipRunRecord(entry, "error", this._runErrorText(response));
+          this._flipRunRecord(entry2, "error", this._runErrorText(response));
           endOfClientChain();
           return;
         }
         var answer = (platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "";
         if (answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1) {
-          this._mintDoneMarker(entry);
-          this._flipRunRecord(entry, "done");
+          this._mintDoneMarker(entry2);
+          this._flipRunRecord(entry2, "done");
           endOfClientChain();
           return;
         }
-        var pass = (entry.resumePass || 0) + 1;
+        var pass = (entry2.resumePass || 0) + 1;
         if (pass > MAX_INDEXING_RESUME_PASSES) {
-          this._flipRunRecord(entry, "error", "Stopped after " + MAX_INDEXING_RESUME_PASSES + " passes without finishing.");
+          this._flipRunRecord(entry2, "error", "Stopped after " + MAX_INDEXING_RESUME_PASSES + " passes without finishing.");
           endOfClientChain();
           return;
         }
         var id = this.host.getIdentity();
-        if (!id || id.platform === "none" || id.projectId !== entry.projectId) {
-          this._flipRunRecord(entry, "error", "Indexing stopped: the session or project changed before the file finished.");
+        if (!id || id.platform === "none" || id.projectId !== entry2.projectId) {
+          this._flipRunRecord(entry2, "error", "Indexing stopped: the session or project changed before the file finished.");
           endOfClientChain();
           return;
         }
@@ -5502,10 +6981,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           serviceName: id.serviceName,
           serviceDescription: id.serviceDescription,
           attachment: {
-            name: entry.filename,
-            storagePath: entry.storagePath,
-            mime: entry.mime,
-            size: entry.size,
+            name: entry2.filename,
+            storagePath: entry2.storagePath,
+            mime: entry2.mime,
+            size: entry2.size,
             url: ""
           }
         }).then(function(ack) {
@@ -5514,11 +6993,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               projectId: id.projectId,
               platform: id.platform,
               id: ack.id,
-              filename: entry.filename,
-              storagePath: entry.storagePath,
-              isReindex: entry.isReindex,
-              mime: entry.mime,
-              size: entry.size,
+              filename: entry2.filename,
+              storagePath: entry2.storagePath,
+              isReindex: entry2.isReindex,
+              mime: entry2.mime,
+              size: entry2.size,
               status: ack.status === "running" ? "running" : "pending",
               poll: ack.poll,
               resumePass: pass
@@ -5605,6 +7084,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           formatIndexingLabel: self.host.formatIndexingLabel
         }).messages;
         self.applyHydratedBodies(mapped);
+        self._adoptLocalAnswers(mapped, loadKey);
         var keptOlderPages = false;
         var keptScreenAwaitingBg = false;
         if (fetchMore) {
@@ -5780,6 +7260,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
         self.updateHistoryCache();
         self.host.notify();
+        self._scheduleStreamRecovery(loadKey, platform, projectId, owner);
         var bgPending = !fetchMore && history && history.bgPending;
         if (bgPending) {
           var batchId = ++_bgHistoryBatchSeq;
@@ -5929,7 +7410,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                 }
               }
             };
-            var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts);
+            var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts, {
+              platform,
+              projectId,
+              owner,
+              ownerKey: loadKey
+            });
             self._trackPoll(capturedId, item._isBgTask || item._isOnBgQueue ? "bg" : "fg", pp);
             if (pp && pp.catch) pp.catch(function() {
             });
@@ -6599,11 +8085,90 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return out;
   }
 
+  // src/engine/project_settings.ts
+  var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
+  var DEFAULT_UPLOAD_ACCESS_GROUP = "authorized";
+  var PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
+  var UPLOAD_ACCESS_LABELS = {
+    public: "Public",
+    authorized: "Signed in users",
+    private: "Only me"
+  };
+  var UPLOAD_ACCESS_HINTS = {
+    public: "Anyone can ask about this file, including visitors who are not logged in.",
+    authorized: "Only users signed in to this project can ask about this file.",
+    private: "Only you can ask about this file."
+  };
+  function normalizeUploadAccessGroup(value) {
+    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? DEFAULT_UPLOAD_ACCESS_GROUP : value;
+  }
+  function normalizeProjectAccessSetting(value) {
+    if (value === "ask") return "ask";
+    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? null : value;
+  }
+  function accessSettingFrom(data) {
+    return normalizeProjectAccessSetting(data?.upload_access_group);
+  }
+  function uploadAccessGroupFrom(data) {
+    const v = accessSettingFrom(data);
+    return v && v !== "ask" ? v : DEFAULT_UPLOAD_ACCESS_GROUP;
+  }
+  function asksUploadAccessFrom(data) {
+    return accessSettingFrom(data) === "ask";
+  }
+  var reader = null;
+  var cache = /* @__PURE__ */ new Map();
+  function configureProjectSettings(fn) {
+    reader = fn;
+  }
+  function entry(service) {
+    let e = cache.get(service);
+    if (!e) {
+      e = { data: null, settled: false, inflight: null };
+      cache.set(service, e);
+    }
+    return e;
+  }
+  function loadProjectSettings(service) {
+    if (!service) return Promise.resolve(null);
+    const e = entry(service);
+    if (e.settled) return Promise.resolve(e.data);
+    if (e.inflight) return e.inflight;
+    if (!reader) return Promise.resolve(null);
+    const run = reader(service).then((data) => data && typeof data === "object" ? data : null).catch(() => null).then((data) => {
+      const cur = entry(service);
+      if (cur.inflight === run) {
+        cur.data = data;
+        cur.settled = true;
+        cur.inflight = null;
+      }
+      return data;
+    });
+    e.inflight = run;
+    return run;
+  }
+  function primeProjectSettings(service) {
+    void loadProjectSettings(service);
+  }
+  function readyProjectSettings(service) {
+    return loadProjectSettings(service);
+  }
+  function cachedProjectSettings(service) {
+    const e = cache.get(service);
+    return e && e.settled ? e.data : null;
+  }
+  function projectUploadAccessGroup(service) {
+    return uploadAccessGroupFrom(cachedProjectSettings(service));
+  }
+  function projectAsksUploadAccess(service) {
+    return asksUploadAccessFrom(cachedProjectSettings(service));
+  }
+
   // src/index.js
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.9.7" ;
+    var BQ_VERSION = "1.9.10" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -6680,9 +8245,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     }
     function base64UrlEncode(bytes) {
-      var str = "";
-      for (var i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
-      return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      var str2 = "";
+      for (var i = 0; i < bytes.length; i++) str2 += String.fromCharCode(bytes[i]);
+      return btoa(str2).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     }
     function randBytes(n) {
       var b = new Uint8Array(n);
@@ -8514,10 +10079,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // buildGreetingEl, so the two can never disagree.
         greeting: greetingParts().text,
         canUpload: !uploadsFrozenForUser(),
-        // Where THIS project's indexer writes. The MCP's auto-fill assumes
-        // "authorized"; on a project set to public or private that would
-        // search the wrong group and answer "nothing found".
-        indexAccessGroup: projectUploadAccessGroup()});
+        // Where THIS project's indexer writes, from the "bq::settings"
+        // record. The MCP's auto-fill assumes "authorized"; on a project set
+        // to public or private that would search the wrong group and answer
+        // "nothing found". A SYNC CACHE READ, because the engine calls this
+        // hook from paths with nowhere to put an await. Every send that
+        // reaches it has settled the fetch first: sendMessage awaits
+        // readyProjectSettings on the text-only branch, and the attachment
+        // branch resolves the upload group before it dispatches.
+        indexAccessGroup: projectUploadAccessGroup(S.projectId)});
     }
     function refreshSkapiSession() {
       return S.skapi.getProfile({ refreshToken: true }).then(function() {
@@ -8593,7 +10163,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       CS.drafting = false;
       syncDraftingIndicator();
       if (!hasAttachments) {
-        session.dispatchComposedMessage(text, false);
+        readyProjectSettings(S.projectId).then(function() {
+          session.dispatchComposedMessage(text, false);
+        });
         return;
       }
       attachmentBatchSeq += 1;
@@ -9150,32 +10722,32 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       if (objs.length) appendAttachments(objs);
     }
-    function readEntry(entry, prefix) {
+    function readEntry(entry2, prefix) {
       prefix = prefix || "";
       return new Promise(function(resolve) {
-        if (!entry) {
+        if (!entry2) {
           resolve([]);
           return;
         }
-        if (entry.isFile) {
-          entry.file(function(file) {
+        if (entry2.isFile) {
+          entry2.file(function(file) {
             resolve([{ file, path: prefix + file.name }]);
           }, function() {
             resolve([]);
           });
           return;
         }
-        if (entry.isDirectory) {
-          var reader = entry.createReader();
+        if (entry2.isDirectory) {
+          var reader2 = entry2.createReader();
           var all = [];
           var readBatch = function() {
-            reader.readEntries(function(entries) {
+            reader2.readEntries(function(entries) {
               if (!entries.length) {
                 resolve(all);
                 return;
               }
               Promise.all(entries.map(function(e) {
-                return readEntry(e, prefix + entry.name + "/");
+                return readEntry(e, prefix + entry2.name + "/");
               })).then(function(groups) {
                 groups.forEach(function(g) {
                   all.push.apply(all, g);
@@ -9485,20 +11057,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         for (var i = 0; i < items.length; i++) {
           var it = items[i];
           if (it.kind !== "file") continue;
-          var entry = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
-          entries.push(entry || it.getAsFile());
+          var entry2 = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
+          entries.push(entry2 || it.getAsFile());
         }
-        Promise.all(entries.map(function(entry2) {
-          if (!entry2) return Promise.resolve(null);
-          if (entry2 instanceof File) return Promise.resolve(newAttachment({ kind: "file", name: entry2.name, file: entry2 }));
-          if (entry2.isFile) {
-            return readEntry(entry2).then(function(files) {
+        Promise.all(entries.map(function(entry3) {
+          if (!entry3) return Promise.resolve(null);
+          if (entry3 instanceof File) return Promise.resolve(newAttachment({ kind: "file", name: entry3.name, file: entry3 }));
+          if (entry3.isFile) {
+            return readEntry(entry3).then(function(files) {
               return files[0] ? newAttachment({ kind: "file", name: files[0].file.name, file: files[0].file }) : null;
             });
           }
-          if (entry2.isDirectory) {
-            return readEntry(entry2).then(function(files) {
-              return newAttachment({ kind: "folder", name: entry2.name, files });
+          if (entry3.isDirectory) {
+            return readEntry(entry3).then(function(files) {
+              return newAttachment({ kind: "folder", name: entry3.name, files });
             });
           }
           return Promise.resolve(null);
@@ -9831,8 +11403,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
       if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
       var bubble;
-      if (msg.isPending) {
+      if (msg.isPending && !msg._streaming || streamRecoveryPhase(msg) === "active") {
         bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+      } else if (streamRecoveryPhase(msg)) {
+        var labels = streamRecoveryLabels(streamRecoveryPhase(msg));
+        bubble = h("div", { class: "bq-bubble is-stream-recover" + (streamRecoveryPhase(msg) === "failed" ? " is-stream-failed" : "") });
+        bubble.appendChild(h("span", { class: "bq-stream-recover-note", text: labels.note }));
+        var recoverBtn = h("button", { class: "bq-stream-recover-btn", type: "button", text: labels.action });
+        recoverBtn.addEventListener("click", function(e) {
+          e.stopPropagation();
+          session.recoverStreamedAnswer(msg._serverItemId);
+        });
+        bubble.appendChild(recoverBtn);
       } else {
         bubble = h("div", { class: "bq-bubble" });
         if (msg.role === "user" && msg.isPendingQueued) {
@@ -9857,7 +11439,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
         if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
         if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
-        var ts = formatChatTimestamp(msg._ts);
+        var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
         if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
       }
       return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
@@ -10329,8 +11911,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return h(
         "div",
         { class: "bq-history-loading" },
-        h("span", { text: "Fetching history" }),
-        h("span", { class: "bq-loader" })
+        h(
+          "span",
+          { class: "bq-history-loading-inner" },
+          h("span", { text: "Fetching history" }),
+          h("span", { class: "bq-loader" })
+        )
       );
     }
     function rowAnchorKey(msg, index) {
@@ -10395,8 +11981,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.messagesBox.appendChild(h(
           "div",
           { class: "bq-history-loading" },
-          h("span", { text: "Loading indexing history" }),
-          h("span", { class: "bq-loader" })
+          h(
+            "span",
+            { class: "bq-history-loading-inner" },
+            h("span", { text: "Loading indexing history" }),
+            h("span", { class: "bq-loader" })
+          )
         ));
       }
       CS.messagesBox.appendChild(buildGreetingEl());
@@ -10497,6 +12087,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
     }
     function renderChat() {
+      primeProjectSettings(S.projectId);
       clearImagePreviewCache(S.projectId || "default");
       chatScrollAnchor.forget();
       for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
@@ -10695,33 +12286,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       overwriteState.resolver = null;
       if (r) r(choice);
     }
-    var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
-    var UPLOAD_ACCESS_LABELS = {
-      public: "Public",
-      authorized: "Signed in users",
-      private: "Only me"
-    };
-    var UPLOAD_ACCESS_HINTS = {
-      public: "Anyone can ask about this file, including visitors who are not logged in.",
-      authorized: "Only users signed in to this project can ask about this file.",
-      private: "Only you can ask about this file."
-    };
-    function normalizeUploadAccessGroup(v) {
-      return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? "authorized" : v;
-    }
-    function projectAccessSetting() {
-      var conf = S.service && S.service.conf || {};
-      var v = conf.default_access_group;
-      if (v === "ask") return "ask";
-      return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? null : v;
-    }
-    function projectUploadAccessGroup() {
-      var v = projectAccessSetting();
-      return v && v !== "ask" ? v : "authorized";
-    }
-    function projectAsksUploadAccess() {
-      return projectAccessSetting() === "ask";
-    }
     var accessGroupState = { resolver: null, sticky: null, handle: null, applyToAll: false, choice: "authorized", perPath: {} };
     function resetAccessGroupBatch() {
       accessGroupState.sticky = null;
@@ -10741,8 +12305,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     var accessGroupChain = Promise.resolve();
     function resolveUploadAccessGroup(storagePath) {
-      if (!projectAsksUploadAccess()) return Promise.resolve(projectUploadAccessGroup());
-      var fallback = projectUploadAccessGroup();
+      return readyProjectSettings(S.projectId).then(function() {
+        return decideUploadAccessGroup(storagePath);
+      });
+    }
+    function decideUploadAccessGroup(storagePath) {
+      var svc = S.projectId;
+      if (!projectAsksUploadAccess(svc)) return Promise.resolve(projectUploadAccessGroup(svc));
+      var fallback = projectUploadAccessGroup(svc);
       if (accessGroupState.sticky) return Promise.resolve(accessGroupState.sticky);
       var pathKey = String(storagePath || "");
       if (pathKey && accessGroupState.perPath[pathKey]) {
@@ -11049,7 +12619,25 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         allowAnonymous: null,
         // Server-driven windowed indexing; read at configureChatEngine time.
         // Listed here so the defaults object is the full opt surface.
-        windowedIndexing: true
+        windowedIndexing: true,
+        // Live streaming of chat turns; read at configureChatEngine time.
+        // OFF until the region's polling worker relays the response bytes:
+        // see the configureChatEngine call for what goes wrong without it.
+        // A REQUEST, not a switch: it is also refused (with a warning, falling
+        // back to buffered) when the embedder's own skapi-js is too old to
+        // carry skapi's half of the stream flag. See skapiSupportsStreaming.
+        liveStreaming: false,
+        // Socket delivery for the streamed reply. OFF unless the embedder asks,
+        // and separately from liveStreaming, because this widget runs on someone
+        // else's page with someone else's skapi instance: skapi's joinRealtime
+        // REPLACES the connection's group rather than adding to it, so for the
+        // length of a turn this would take the room out from under whatever the
+        // host app uses realtime for, and the host would see its own messages
+        // simply stop. Only an embedder who knows their app does not use realtime
+        // (or does not mind) can answer that, so only they can turn it on. It is
+        // purely an accelerator: with it off the reply still streams, just on the
+        // poll's cadence rather than as the text is relayed.
+        liveStreamingRealtime: false
       }, opts || {});
       S.mountEl = mountEl;
       clear(mountEl);
@@ -11058,6 +12646,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       applyTheme(loadTheme());
       S.booted = true;
       console.log("[bunnyquery] v" + BQ_VERSION);
+      var canStream = skapiSupportsStreaming(S.skapi);
+      var liveStreaming = S.opts.liveStreaming === true;
+      if (liveStreaming && !canStream) {
+        liveStreaming = false;
+        console.warn(
+          "[bunnyquery] liveStreaming was requested but this page's skapi-js has no clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Falling back to buffered replies - update skapi-js to enable streaming."
+        );
+      }
+      configureProjectSettings(function(service) {
+        if (!S.skapi || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+        return Promise.resolve(S.skapi.getRecords({ service, unique_id: PROJECT_SETTINGS_UNIQUE_ID })).then(function(res) {
+          var rec = res && res.list && res.list[0] || null;
+          return rec && rec.data || null;
+        });
+      });
       configureChatEngine({
         clientSecretRequest: function(o) {
           return S.skapi.clientSecretRequest(o);
@@ -11090,7 +12693,49 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // on a big file. Pass windowedIndexing: false in init opts to opt back out.
         windowedIndexing: S.opts.windowedIndexing !== false,
         // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
-        attachmentParsers: S.opts.attachmentParsers || void 0
+        attachmentParsers: S.opts.attachmentParsers || void 0,
+        // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
+        // Off by default, and for the same shipping-order reason
+        // windowedIndexing had one: THE RELAYING POLLING WORKER MUST SHIP
+        // FIRST. With this on against a region whose worker does not relay,
+        // the request either has its `since` cursor rejected or the row keeps
+        // an SSE transcript where the readers expect a parsed document, and
+        // the turn reads back as an empty answer. A streamed row settles with
+        // a STATUS AND NO BODY on purpose, so there is no fallback to read.
+        // Flip it per environment once the worker is deployed there; the
+        // widget takes it as an init opt because an embed picks its own
+        // region, where agent.vue flips one module constant.
+        // It also needs a skapi-js that supports `stream`/`onStream`, and the
+        // page's pin is the EMBEDDER's, so the request is granted above by
+        // skapiSupportsStreaming rather than taken on trust here.
+        liveStreaming,
+        // Requires liveStreaming, and cannot outlive it: the AND is what stops an
+        // embedder turning on socket delivery for a reply that is not streamed.
+        liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true,
+        // What stores the version of a streamed turn that history keeps. The
+        // engine sends the ASSEMBLED provider body, so a streamed turn reads
+        // back through exactly the extractors a buffered one does, with no
+        // branch in the mapper; storing is also what releases the chunks.
+        // Called only for a streamed turn, and best-effort inside the engine.
+        // Handed over only when the SDK actually has it, so the engine's own
+        // "is this host able to?" checks answer honestly instead of a call
+        // reaching an undefined method mid-turn.
+        clientSecretRequestFinalize: canStream ? function(requestId, data, options) {
+          return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+        } : void 0,
+        // THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
+        // with a status and NO body: the answer is chunks until finalize copies
+        // a version onto the row. A row that settles while no poll is attached
+        // (the tab was closed, a mobile browser discarded it, the device slept
+        // and the interval stopped) is therefore never finalized, and without
+        // this hook the engine has no way back to it - the answer reads as gone
+        // from the conversation with every byte of it still stored. Given the
+        // request id this drains that turn's chunks in one pass, and the engine
+        // parses them exactly as it parses a live stream, finalizing what it
+        // read so the row becomes ordinary history and is never re-read.
+        clientSecretRequestStream: canStream ? function(requestId, options) {
+          return S.skapi.clientSecretRequestStream(requestId, options);
+        } : void 0
       });
       if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
         S._resizeBound = true;

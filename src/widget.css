@@ -659,23 +659,42 @@
     background: var(--bq-paper);
 }
 
+/* ZERO HEIGHT IN FLOW, DELIBERATELY. Mirrors agent.vue, where the reasoning is
+   written out in full: this bar mounts when a history fetch starts and unmounts
+   when the page lands, both while the reader sits at the top of the list, and as
+   an in-flow sticky element it moved every row by its own height each time
+   (measured in Chrome with overflow-anchor:none). The outer box now contributes
+   nothing to layout and the inner strip overflows it, so the bar still sits
+   pinned at the top of the viewport while mounting it moves nothing. */
 .bq-history-loading {
     position: sticky;
     top: 0;
     z-index: 1;
+    height: 0;
+    padding: 0;
+    overflow: visible;
+    pointer-events: none;
+}
+.bq-history-loading-inner {
     display: flex;
+    align-items: center;
     justify-content: center;
     gap: 0.1em;
     padding: 0.5rem 0 1rem;
     font-size: 0.8rem;
     color: var(--bq-muted);
-    background: var(--bq-paper);
+    background: linear-gradient(to bottom, var(--bq-paper) 70%, transparent);
 }
-/* initial first-page load: center it in the (empty) messages area */
+/* initial first-page load: center it in the (empty) messages area. A full-box
+   overlay rather than a top strip, so it takes its height back - and it replaces
+   an EMPTY messages area, so it has nothing to move. */
 .bq-history-loading.is-initial {
     position: absolute;
     inset: 0;
+    height: auto;
+    display: flex;
     align-items: center;
+    justify-content: center;
     padding: 0;
 }
 

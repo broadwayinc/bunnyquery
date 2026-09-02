@@ -63,6 +63,54 @@ declare function parseAttachmentContent(file: File, name: string, mime?: string)
  * send cancel). So the request builders include `poll` only when it is set.
  */
 
+/**
+ * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
+ *
+ * Deliberately a flat snapshot rather than the SseParser itself: the hook is a
+ * VIEW seam, and handing a client the parser would invite it to drive the stream
+ * (feed it, end it, read the assembled body) behind the session's back.
+ */
+interface LiveStreamUpdate {
+    /** Server item id of the turn, the same id its bubbles carry as _serverItemId. */
+    serverItemId: string;
+    /** History cache key (`projectId#platform`) the turn belongs to. A host that
+     *  renders several projects must ignore an update for a chat it is not showing. */
+    ownerKey: string;
+    /** 'start' on the first paint, 'update' on every later one, 'end' once the
+     *  stream is over and nothing more will be painted - whether because the turn
+     *  settled (its authoritative answer is about to replace the live text) or
+     *  because it was stopped. 'end' is only sent to a host that was told 'start'. */
+    phase: 'start' | 'update' | 'end';
+    /** Answer text so far, already trimmed to a safe reveal boundary: it never
+     *  ends inside a half-arrived link, fence or url. Empty on 'end'. */
+    text: string;
+    /** Extended-thinking text so far. Separate from `text` and never part of it. */
+    thinkingText: string;
+    /** Tools reached for, in order of appearance, duplicates kept. */
+    toolNames: string[];
+    /** A terminal event arrived. False on 'end' means the stream was cut. */
+    complete: boolean;
+    /** The terminal event that arrived meant the answer FINISHED rather than DIED:
+     *  false while running, false on a cut stream, and false when the stream ended
+     *  on a provider error. `complete` answers "is anything more coming?"; this one
+     *  answers "is this the whole answer?", and they differ on exactly the case
+     *  that costs text - an `error` frame is terminal and truncating at once. A host
+     *  drawing a "partial answer" affordance wants THIS one. Added after `complete`
+     *  and always present: a host that ignores it reads as it did before. */
+    answerComplete: boolean;
+    /** The stream ended in a provider error. */
+    errored: boolean;
+    /** How many chunks of this turn each of skapi's two transports carried FIRST:
+     *  `socket` for the websocket relay, `poll` for the chunk-table read. Both feed
+     *  the same sink by design, so a turn that streamed perfectly over the socket
+     *  and one that was polled the whole way are otherwise indistinguishable. A
+     *  host that does not care can ignore it; a host showing a live/degraded
+     *  indicator, or just logging which path it got, reads this. */
+    transport: {
+        socket: number;
+        poll: number;
+    };
+}
 interface ChatEngineConfig {
     /** skapi.clientSecretRequest, bound to the consumer's skapi instance. */
     clientSecretRequest: (opts: any) => Promise<any>;
@@ -138,6 +186,114 @@ interface ChatEngineConfig {
         };
     }) => void;
     /**
+     * Opt in to LIVE STREAMING of chat turns.
+     *
+     * Off by default, and for the same shipping-order reason `windowedIndexing`
+     * is: THE BACKEND MUST SHIP FIRST. When on, every chat turn carries two
+     * `stream` flags (see requests.ts chatStreamWiring) and the polling row
+     * settles with a STATUS AND NO BODY, because the answer was the stream. On a
+     * region whose polling worker does not relay, that same request either has
+     * its unknown `since` cursor rejected or stores an SSE transcript where the
+     * readers expect a parsed document, and the turn reads back as an empty
+     * answer. So it stays off until the worker is deployed, then flips per
+     * environment.
+     *
+     * It also needs `clientSecretRequestFinalize` below: without it a streamed
+     * turn is never finalized, so its row keeps a status and no body forever and
+     * a later history load shows the question with an empty answer.
+     */
+    liveStreaming?: boolean;
+    /**
+     * Also push each relayed chunk over skapi's websocket, so text lands as it is
+     * relayed instead of on the next poll tick. Requires `liveStreaming`.
+     *
+     * SEPARATE FROM `liveStreaming` ON PURPOSE, and off unless a host asks. It is a
+     * pure accelerator with a safe fallback, so the reason is not risk to the chat, it
+     * is what it does to the HOST'S OWN realtime: skapi's joinRealtime REPLACES the
+     * connection's group rather than adding to it, so for the length of a turn this
+     * takes the room. The dashboard owns its skapi instance and uses realtime for
+     * nothing else, so it opts in. The embeddable widget is handed the EMBEDDER'S
+     * instance and cannot know what their app does with it, so it stays off there
+     * unless the embedder turns it on.
+     */
+    liveStreamingRealtime?: boolean;
+    /**
+     * skapi.clientSecretRequestFinalize, bound to the consumer's skapi instance.
+     * Stores the version of a streamed turn that history should keep (the engine
+     * sends the ASSEMBLED provider body, so history reads it exactly as it reads
+     * a buffered turn) and releases that request's chunks. Optional: a host
+     * without it can still stream, it just leaves the chunks and an empty row.
+     */
+    clientSecretRequestFinalize?: (requestId: string, data: any, options: {
+        url: string;
+        method: string;
+        service?: string;
+        owner?: string;
+    }) => Promise<any>;
+    /**
+     * skapi.clientSecretRequestStream, bound to the consumer's skapi instance.
+     *
+     * THE SECOND HALF OF THE DURABILITY GUARANTEE, and without it a streamed turn
+     * is only as durable as the tab that started it. A streamed row settles with a
+     * status and NO body; the answer is stored as chunks until
+     * clientSecretRequestFinalize says what to keep. A row that settles while no
+     * poll is attached (the user closed the tab, a mobile browser discarded it,
+     * the device slept and the interval stopped) is therefore never finalized, and
+     * a later history load sees a terminal row with no body and used to emit no
+     * assistant bubble at all: the answer simply gone from the conversation, with
+     * every byte of it still sitting in the chunk table.
+     *
+     * This is the documented way back to it. Given the request id it fetches every
+     * chunk of an already-finished turn in one pass (paging internally on `more`)
+     * and delivers them in order through `onStream`, then resolves. The engine
+     * feeds those into a fresh SSE parser and treats the assembled body exactly as
+     * it treats a live one, including finalizing it, which stores the answer as
+     * ordinary history and releases the chunks, so each row is recovered at most
+     * once ever.
+     *
+     * Optional. Without it the engine still marks such turns (`_streamPending` on
+     * the bubble) but has no way to read them back, so a host that ignores this
+     * behaves as it does today.
+     *
+     * NOTE THAT THIS HOOK, NOT `liveStreaming`, IS WHAT ARMS RECOVERY. See
+     * streamRecoveryEnabled() below for why the two decisions are separate.
+     */
+    clientSecretRequestStream?: (requestId: string, options: {
+        url: string;
+        method: string;
+        onStream?: (chunk: string, seq: number) => void;
+        since?: number;
+        poll?: number;
+        service?: string;
+        owner?: string;
+    }) => Promise<any>;
+    /**
+     * Observation hook for a live-streaming turn, called at most once per paint
+     * (about once a second) plus once when the turn settles.
+     *
+     * The engine already paints the answer text into the pending bubble itself,
+     * so a host needs this ONLY for the affordances the engine deliberately does
+     * not decide the presentation of: a "thinking..." line, or a "querying sales
+     * table..." row drawn from the tools the model reached for before any answer
+     * text exists. Optional, and a host without it behaves exactly as today.
+     *
+     * Never throw from it: it is called on the paint path and a throw would cost
+     * the user the rest of their answer. The engine guards it anyway.
+     */
+    onLiveStreamUpdate?: (update: LiveStreamUpdate) => void;
+    /**
+     * Force the read-back of already-streamed turns OFF, even though the chunk
+     * reader is injected.
+     *
+     * There is no need to set it to turn recovery ON: injecting
+     * `clientSecretRequestStream` is what arms it (see streamRecoveryEnabled).
+     * This exists only as the way back out for a host that wants byte-for-byte the
+     * pre-recovery rendering of a terminal-but-empty row - no bubble, no marker, no
+     * chunk read - while keeping the reader available for its own use. Omit it and
+     * nothing changes.
+     */
+    streamRecovery?: boolean;
+    /**
      * Single-item csr-poll point lookup (skapi.util.request('csr-poll', {id,
      * service, owner}, {auth:true})). For a RESOLVED item the backend returns
      * the provider response body itself; for a failed one, the resolved error.
@@ -149,6 +305,75 @@ interface ChatEngineConfig {
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
+/**
+ * True when a streamed turn whose answer never reached its row can be READ BACK.
+ *
+ * IT ASKS FOR THE READER AND NOT FOR `liveStreaming`, AND THAT SPLIT IS THE WHOLE
+ * POINT. "Should NEW turns stream?" and "can an ALREADY streamed row be recovered?"
+ * are two different questions about two different sets of rows, and answering both
+ * with one flag strands the second set the moment the first answer changes.
+ *
+ * The failure, and it is not hypothetical - it is what turning the feature off
+ * does. A row streamed yesterday holds its answer in the chunk table and a status
+ * and no body on the row; only csr-finalize ever copies one onto it. Flip
+ * `liveStreaming` off today (an embedder drops the option, a dev rolls the flag
+ * back after a bad deploy, a client's skapiSupportsStreaming probe degrades the
+ * instance to buffered) and every one of those rows instantly becomes unmarked,
+ * unrecoverable and unreadable: the mapper emits no bubble for it, the recovery
+ * never looks at it, and its answer is unreachable with every byte of it still
+ * stored. Rolling a rendering flag back must not delete anybody's history.
+ *
+ * The reader is the honest test because it is the CAPABILITY the recovery needs.
+ * Without it the engine could mark such a turn and never fill it in, trading a
+ * missing bubble for a permanently empty one, which is strictly worse than the
+ * bug - so the marker is still only ever minted when something can act on it.
+ *
+ * The cost of asking the wider question is one wasted read, once, on a row that
+ * was terminal and empty for some reason other than streaming (a buffered turn
+ * whose body the worker never managed to spill). That read finds no chunks, the
+ * bubble is dropped, and the list looks exactly as it did before. Set
+ * `streamRecovery: false` to opt out of even that.
+ */
+declare function streamRecoveryEnabled(): boolean;
+/**
+ * Does a given skapi INSTANCE support the streaming half of the protocol? Ask this
+ * before honouring a `liveStreaming: true` opt-in, and degrade to buffered when the
+ * answer is no.
+ *
+ * THE FAILURE THIS PREVENTS, and it is the one the SDK's own docs call quiet. A
+ * streamed turn carries TWO `stream` flags: skapi's (relay the destination's bytes
+ * into the chunk table) and the DESTINATION's own field inside `data`, which
+ * BunnyQuery is the party that sets, because skapi relays bytes and knows no
+ * vendor. clientSecretRequest validates its params against a schema and KEEPS ONLY
+ * THE KEYS IN THAT SCHEMA, so an skapi-js predating the feature does not reject
+ * `stream` - it silently DROPS it. What ships is then the exact split
+ * chatStreamWiring exists to make impossible: the destination is asked to answer in
+ * SSE frames, skapi waits and stores the whole transcript on the row, and
+ * extractClaudeText / extractOpenAIText read a wall of `data: {...}` lines where a
+ * document should be and find no answer at all. Nothing throws and nothing logs;
+ * the user gets an empty reply on every single turn.
+ *
+ * It lives in the ENGINE rather than in each client because the two clients are
+ * diffed against each other and this is precisely the kind of predicate that forks:
+ * the widget must ask it (init() takes the EMBEDDER's instance, and an embed page
+ * pins its own skapi-js version, so `liveStreaming: true` is a REQUEST and this is
+ * what grants it) and agent.vue must ask it too (its instance is the repo's own, so
+ * only a stale node_modules or an unbuilt skapi-js can fail it - which is exactly
+ * the state a dev flipping the constant is most likely to be in, and a silently
+ * empty chat is the worst possible way to find out).
+ *
+ * Probed by the two public METHODS rather than by a version string, for two
+ * reasons. They ship in the same change as the `stream` key (one feature: the
+ * relay, the finalize that stores what to keep, and the read-back), so an SDK
+ * missing them is exactly the SDK that would drop the flag. And they are not merely
+ * a proxy for the capability, they ARE half of it - the engine needs finalize to
+ * store a streamed answer onto its row and stream to read an unfinalized one back,
+ * and streaming without either leaves every answer in the chunk table with nothing
+ * able to fetch it. There is no cheap DIRECT probe of the schema: the only way to
+ * learn that `stream` was dropped is to send a real request and read an empty
+ * answer, which is the bug itself.
+ */
+declare function skapiSupportsStreaming(sk: any): boolean;
 
 /**
  * Office-file server-side extraction helpers.
@@ -280,8 +505,10 @@ type ChatSystemPromptParams = {
      */
     client?: 'console' | 'widget';
     /**
-     * The access group THIS project's indexer writes its records at, from the
-     * project's `default_access_group` setting.
+     * The access group THIS project's indexer writes its records at, read from
+     * the project's BunnyQuery settings record (`bq::settings`, key
+     * `upload_access_group`). It used to come from the service record's
+     * `default_access_group`, which no longer exists.
      *
      * The MCP auto-fills an index/tag query that names a table but no group with
      * "authorized", which used to be right because every BunnyQuery record was
@@ -289,6 +516,16 @@ type ChatSystemPromptParams = {
      * visitor can read it) or "private", and on those projects the auto-fill
      * silently searches a group the data is not in and answers "nothing found".
      * Defaults to 'authorized', which is what an unset project still uses.
+     *
+     * A PLAIN table query needs the group just as much, and this is newer: the
+     * SDK no longer fills a group in for a table that arrives without one, so the
+     * SERVER resolves it, and it resolves it differently per caller. A master
+     * (the project's owner) is answered across every access group; a normal
+     * signed-in user is answered from access_group 0 alone. So an end user asking
+     * about a table indexed at "authorized" would silently search public only,
+     * and get "nothing found" over data that is right there. The prompt therefore
+     * asks for the group on EVERY query that names a table, not just index/tag
+     * ones.
      */
     indexAccessGroup?: string;
 };
@@ -468,6 +705,58 @@ declare function buildChatGreeting(params: ChatGreetingParams): ChatGreetingPart
  * Error detection + message extraction (pure). Moved verbatim from the
  * agent.vue / bunnyquery chatbox so both consumers share one implementation.
  */
+/**
+ * True when a csr-poll answer is the STATUS ENVELOPE rather than a stored body.
+ *
+ * Duck-typed, because the engine does not import skapi-js and the SDK does not
+ * export its own copy. The rule is the SDK's (isPollEnvelope): a request that has
+ * a stored result hands that result back verbatim, every other state hands back
+ * `{ id, status, in_queue, ... }`. A finalized body is the caller's own content
+ * and can itself carry a `status` key (OpenAI's Responses object does), so the
+ * id/in_queue pair is demanded too: a provider body would have to reproduce all
+ * three to be mistaken for an envelope.
+ *
+ * It lives HERE, next to the error readers, rather than in session.ts, because
+ * both of the things that have to recognise an envelope (the settle that
+ * substitutes an assembled body for one, and the error readers below) must agree
+ * on what one is. It was written twice once; that is how the error readers came to
+ * look one level too shallow.
+ */
+declare function isCsrStatusEnvelope(res: any): boolean;
+/**
+ * The real error payload inside a FAILED csr-poll status envelope, or undefined
+ * when `input` is not one.
+ *
+ * THE FAILURE THIS PREVENTS, verbatim from the wire. A buffered turn that fails
+ * polls back as the worker's failed payload itself:
+ *
+ *     { status_code: 401, body: { error: { type, message } }, truncated: false }
+ *
+ * ...which every predicate below reads correctly. A STREAMED turn that fails does
+ * not: the poller (client_secret_key_request_polling) cannot return the error
+ * early for a streamed row, because the chunks that arrived before the stream died
+ * have to come back in the same response, so it falls through and ships
+ *
+ *     { id, status: 'failed', queue_name, in_queue, stream, chunks, last_seq,
+ *       more, error: <the payload above> }
+ *
+ * The payload is one level deeper, and every predicate here looked at the top
+ * level: `response.error.message` is undefined on it, `response.status_code` is
+ * absent, and `response.status` is the string 'failed' rather than a number. So a
+ * wrong API key on a streamed turn read as "not an error, and no answer either",
+ * which the caller renders as "No text response received from AI provider": the
+ * one message that tells the user nothing.
+ *
+ * Unwrapping HERE, once, is what makes a streamed error and a buffered error take
+ * the same path through every reader below. Deliberately not recursive: the value
+ * inside an envelope is a provider payload, never another envelope, and a single
+ * unwrap cannot loop on a malformed one.
+ *
+ * A failed envelope with a NULL payload (the worker recorded no detail, or its
+ * spill could not be fetched) still yields an object, because the row's status is
+ * itself the fact: 'failed' with nothing attached must not read as a clean turn.
+ */
+declare function csrEnvelopeError(input: any): any;
 declare function getErrorMessage(input: any): string;
 declare function isErrorResponseBody(response: any): boolean;
 declare function isNonRetryableRequestError(input: any): boolean;
@@ -1216,9 +1505,275 @@ type ParsedAiAgent = {
 declare function parseAiAgentValue(value: string | null | undefined): ParsedAiAgent;
 declare function buildAiAgentValue(platform: string | null | undefined, model?: string | null, contextWindow?: number | null): string;
 
+/**
+ * Streamed-turn parser: raw provider SSE bytes in, live answer text + the body a
+ * buffered call would have returned out.
+ *
+ * WHY THIS FILE EXISTS, AND WHY IT IS HERE AND NOT IN SKAPI.
+ * skapi's clientSecretRequest is a byte relay. On a streamed turn the worker reads
+ * the destination's response incrementally and appends the raw bytes to a chunk
+ * table; it settles the polling row with STATUS ONLY, no body, because the content
+ * lives in the chunks. skapi therefore does not know that Anthropic or OpenAI
+ * exist, has no dialect list, and parses nothing. BunnyQuery is the party that
+ * knows which destination it dialled, so BunnyQuery is the party that parses, and
+ * this module is the whole of that knowledge.
+ *
+ * WHAT ARRIVES. csr-poll hands back `chunks: [{seq, txt}]` (ascending, seq starts
+ * at 1) plus `last_seq` to send back as the next `since`. A chunk is whatever the
+ * worker's flush happened to contain: it flushes on a byte cap or a time interval,
+ * so a chunk boundary lands wherever the socket broke, which is routinely in the
+ * MIDDLE of an SSE frame. Half a frame is not data, so every partial is held in a
+ * buffer until the rest arrives, and nothing is ever emitted from an incomplete
+ * frame. That is what makes this a stateful object fed chunks rather than a
+ * function over a whole transcript.
+ *
+ * REPLAY SAFETY. The parser is a pure function of the chunk SEQUENCE, so a reload
+ * or a second tab that starts at seq 1 of a stream it did not initiate rebuilds
+ * the identical state. Nothing here depends on having dispatched the request.
+ *
+ * THE TWO OUTPUTS, AND WHY BOTH ARE NEEDED.
+ *   text        the assistant's answer ONLY, for rendering as it arrives. Not tool
+ *               arguments, not thinking. Concatenating every delta into one string
+ *               is how a half serialised tool call ends up in the middle of a
+ *               user's sentence.
+ *   finalBody() the assembled provider body, byte equivalent to the buffered
+ *               response, so extractClaudeText / extractOpenAIText (requests.ts)
+ *               produce the identical string whether the turn was read live or
+ *               re-read from history later.
+ *
+ * THE BUG THIS IS SHAPED AROUND. extractClaudeText joins TEXT BLOCKS with '\n':
+ *
+ *     content.filter(b => b.type === 'text').map(b => b.text).join('\n')
+ *
+ * A server-tool turn has text at content index 0, the tool call at 1, its result
+ * at 2, and text again at 3. Accumulate every text_delta into one string and those
+ * two paragraphs fuse with no separator, so the answer the user watched arrive and
+ * the same turn re-read from history are different strings. Blocks are therefore
+ * keyed BY INDEX and never merged, and `text` is the join of the text blocks in
+ * index order, which is exactly the extractor's rule and not an approximation of
+ * it. See tests/sse-stream.cjs, "four separate blocks".
+ *
+ * NEVER THROWS FROM feed(). Chunks arrive on a poll tick, inside a timer the
+ * consumer cannot reasonably wrap; a parse error there would take the whole poll
+ * down over one malformed frame. Frames that cannot be understood are counted
+ * (`malformedFrames`) and skipped.
+ *
+ * HONEST TERMINATION, AND WHY IT TAKES TWO FLAGS. `complete` means a terminal event
+ * actually arrived. A stream that was cut (deadline, cancelled row, a worker crash
+ * after some chunks landed) reports complete:false, and the caller must not present
+ * it as a finished answer. A partial answer the reader can see beats an empty turn,
+ * but only if it is labelled as partial.
+ *
+ * That flag alone used to be read as "the answer is whole", and it is not the same
+ * claim. An `error` frame IS a terminal event: the provider said the stream is over
+ * and nothing more is coming. But the text in hand is only whatever arrived before
+ * the error, so the answer is TRUNCATED and the stream is FINISHED at the same
+ * time. A caller whose finalize gate read `complete` therefore stored the
+ * truncation as the turn's permanent history and, because finalize is also the only
+ * way to release chunks, deleted the only copy of the bytes in the same call - for
+ * a turn the provider had explicitly told it went wrong. So the two claims are two
+ * fields:
+ *
+ *   complete        a terminal event arrived. Nothing more is coming; stop waiting.
+ *   answerComplete  ...and it was a terminal event that means the answer FINISHED
+ *                   (message_stop, response.completed, response.incomplete), not
+ *                   one that means it DIED (an `error` frame, response.failed, a
+ *                   terminal Response carrying an error payload).
+ *
+ * `response.incomplete` is deliberately on the finished side: the model stopped
+ * short at max_output_tokens, but the terminal event carries the complete Response
+ * document, so the chunks hold nothing the body does not. A caller deciding what to
+ * keep reads `answerComplete`; a caller deciding whether to keep waiting reads
+ * `complete`.
+ *
+ * WHEN THE BYTES ARE NOT SSE AT ALL. skapi's `stream: true` tells the RELAY to read
+ * the response incrementally. It does not tell the destination to produce an event
+ * stream: that is the caller's own request body. If the body never asked for one
+ * (or something in front of the destination buffers the stream back into a single
+ * document and drops the framing), the answer arrives as a plain JSON body with not
+ * one `data:` line in it. Every frame test below then matches nothing, and the turn
+ * used to end as an empty answer with malformedFrames 0, complete false and
+ * finalBody() null: the entire reply lost, with nothing in the output saying so, so
+ * a client draws an empty bubble and no error. That state is now reported as
+ * `unframed`, and the bytes are handed back BOTH ways, because the parser cannot
+ * tell an answer from a gateway's error page without knowing the vendor, and it
+ * must not:
+ *   unframedText  the bytes verbatim, for a body that is not JSON at all (an HTML
+ *                 502 page), which finalBody() cannot represent.
+ *   finalBody()   the parsed document when the bytes ARE JSON, because a buffered
+ *                 body is exactly what finalBody() promises, so the caller's
+ *                 existing buffered path (isErrorResponseBody, extractClaudeText,
+ *                 extractOpenAIText) reads it with no new branch at all.
+ * Noticing that a byte stream carries no SSE framing is framing, not parsing, and
+ * JSON.parse is the same transport-level codec this file already runs on every
+ * frame payload. Nothing about the document is interpreted: it is handed over
+ * whole, and `provider` stays null because no event ever identified one.
+ *
+ * DOM-free and framework-free like the rest of the engine.
+ */
+/** One row of csr-poll's `chunks`. */
+interface SseChunk {
+    seq: number;
+    txt: string;
+}
+/**
+ * Which grammar the bytes turned out to be in. Detected, never declared: see
+ * detectProvider() below for why the caller is not asked.
+ */
+type SseProvider = 'claude' | 'openai';
+/**
+ * A tool the model reached for, in the order it appeared, so a "querying sales
+ * table..." row can be drawn before a single character of answer text exists.
+ * Duplicates are kept: two calls to the same tool are two rows, not one.
+ */
+interface SseToolCall {
+    /** Anthropic content index, or OpenAI output index. Identifies the block. */
+    index: number;
+    /** The name as the provider wrote it, falling back to the block/item type for
+     *  a built-in that carries no name of its own (OpenAI's web_search_call). */
+    name: string;
+    /** The provider's own block/item type: tool_use, server_tool_use,
+     *  mcp_tool_use, function_call, mcp_call, web_search_call, ... */
+    type: string;
+    /** Present on Anthropic mcp_tool_use only. */
+    serverName?: string;
+}
+interface SseSnapshot {
+    /** null until the first identifying event has been seen. */
+    provider: SseProvider | null;
+    /** The assistant's answer text so far, joined exactly as the extractor joins
+     *  it. Never contains tool arguments or thinking. */
+    text: string;
+    /** Extended-thinking text so far, for a "thinking..." affordance. Deliberately
+     *  a SEPARATE field: it must never be concatenated into `text`. Populated on
+     *  BOTH providers (Anthropic thinking blocks, OpenAI reasoning summary and
+     *  reasoning text deltas). It used to be Anthropic-only, which meant the field
+     *  read as "the model's thinking" on one provider and as "this model did not
+     *  think" on the other, and every consumer that did not branch on `provider`
+     *  drew the wrong thing. Absorbing exactly that branch is what this module is
+     *  for, so the field is filled rather than renamed. */
+    thinkingText: string;
+    /** Tools reached for, in order of appearance. */
+    toolCalls: SseToolCall[];
+    /** Convenience projection of toolCalls, same order, duplicates kept. */
+    toolNames: string[];
+    /** Anthropic stop_reason ('end_turn' | 'tool_use' | 'max_tokens' | ...), or for
+     *  OpenAI the terminal Response's status, or its incomplete_details.reason when
+     *  it stopped short ('max_output_tokens'). null until the stream says. */
+    stopReason: string | null;
+    /** A terminal event ARRIVED. False means the stream was cut and whatever is
+     *  here is partial: do not present it as a finished answer.
+     *
+     *  THIS IS NOT THE FLAG TO STORE BY. It answers "is anything more coming?", not
+     *  "is this the whole answer?" - see `answerComplete`. */
+    complete: boolean;
+    /** The terminal event that arrived means the answer FINISHED, not that it DIED.
+     *
+     *  True on message_stop, response.completed and response.incomplete; false while
+     *  the stream is still running, false when it was cut, and false when it ended
+     *  on an `error` frame, on response.failed, or on a terminal Response carrying
+     *  an error payload.
+     *
+     *  THE FAILURE THIS FIELD EXISTS FOR. An `error` frame sets `terminalEvent`, so
+     *  `complete` goes true while the text is only what arrived before the error. A
+     *  caller that finalizes on `complete` therefore writes that truncation into the
+     *  turn's permanent history AND releases the chunks it was assembled from, which
+     *  is the one loss in this feature that cannot be undone. Every keep/store gate
+     *  reads THIS field; `complete` is for deciding whether to keep waiting. Bytes
+     *  that were never SSE at all reach neither: see `unframed`, where it is the
+     *  polling row's status and not the parse that says the response finished. */
+    answerComplete: boolean;
+    /** The exact terminal event: 'message_stop', 'response.completed',
+     *  'response.incomplete', 'response.failed', 'error'. null while running. */
+    terminalEvent: string | null;
+    /** The stream ended in a provider error. */
+    errored: boolean;
+    /** The provider's error payload, in the shape isErrorResponseBody() detects. */
+    error: any;
+    /** Frames that could not be parsed, and tool-argument JSON that would not
+     *  parse at content_block_stop. Diagnostics: both are zero on a healthy turn. */
+    malformedFrames: number;
+    malformedToolJson: number;
+    /** Bytes were relayed, end() was called, and NOT ONE of them was SSE framing:
+     *  no `data:`, no `event:`, not even a comment. The destination answered with a
+     *  plain body instead of an event stream. This is NOT malformedFrames: there
+     *  were no frames to mangle. Nothing is lost, `unframedText` is the bytes and
+     *  finalBody() is the parsed document when they are JSON, so the caller can
+     *  either render them through its buffered path or surface a real error.
+     *  `complete` stays false here because no terminal EVENT arrived and none ever
+     *  will: on an unframed body it is the polling row's own status, not the bytes,
+     *  that says whether the response finished. */
+    unframed: boolean;
+    /** The relayed bytes verbatim when `unframed`, else null. */
+    unframedText: string | null;
+    /** Highest chunk seq accepted, for the caller's `since` cursor. 0 = none. */
+    lastSeq: number;
+}
+interface SseParser {
+    /** Feed raw bytes. Any prefix of a frame is held until the rest arrives. */
+    feed(text: string): void;
+    /** Feed csr-poll's `chunks` array. Chunks at or below the highest seq already
+     *  accepted are DROPPED, so a re-poll from a stale `since` cannot double-append
+     *  the same bytes into the answer. */
+    feedChunks(chunks: SseChunk[] | null | undefined): void;
+    /** No more bytes are coming. Flushes a final frame that arrived without its
+     *  terminating blank line. Does NOT mark the stream complete: only a terminal
+     *  event does that. It IS what decides `unframed`, because up to this call
+     *  "no framing seen yet" and "the first frame has not finished arriving" are
+     *  the same state, so a caller that never calls end() never learns the bytes
+     *  were not SSE. */
+    end(): void;
+    snapshot(): SseSnapshot;
+    /** The assembled provider body, byte equivalent to a buffered response, or
+     *  null when nothing has been assembled. See buildBody() for the two rules:
+     *  one about errors, one about bytes that were never SSE. */
+    finalBody(): any;
+}
+declare function createSseParser(): SseParser;
+
 declare const MCP_NAME = "BunnyQuery";
 declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 declare const DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
+/**
+ * THE two `stream` flags of a streamed chat turn, produced together or not at all.
+ *
+ * There are two of them and they are NOT the same flag:
+ *
+ *   * `transport.stream` is SKAPI's. It tells the polling worker to read the
+ *     destination's response incrementally and append the raw bytes to the chunk
+ *     table, and it is never sent on to the destination.
+ *   * `body.stream` is the DESTINATION's own field, and BunnyQuery is the party
+ *     that may set it: skapi relays bytes and knows no vendor, so it cannot know
+ *     that Anthropic Messages and OpenAI Responses both happen to spell it
+ *     `stream` at the top level of the body.
+ *
+ * Setting one without the other fails QUIETLY, which is why they are produced by
+ * one function from one boolean and returned as one object:
+ *
+ *   * body streams, skapi buffers -> the row stores an SSE TRANSCRIPT where
+ *     extractClaudeText / extractOpenAIText expect a parsed document, so the turn
+ *     reads back as an empty answer with nothing in the logs to say why.
+ *   * skapi streams, the body never asked -> the destination sends one plain
+ *     document, the relay chops it into chunks, the frame parser finds no framing
+ *     at all, and the row settles with a status and no body.
+ *
+ * Two frozen constants rather than a fresh object per call: the pair is a
+ * CONSTANT, and an object literal built at each call site is exactly the shape
+ * that drifts when someone edits one arm.
+ */
+type ChatStreamWiring = {
+    /** Spread into the clientSecretRequest OPTIONS (skapi's relay switch). `realtime`
+     *  belongs here and never in `body`: it is skapi's, not the destination's. */
+    transport: {
+        stream?: true;
+        realtime?: true;
+    };
+    /** Spread into `data` (the destination's own switch). */
+    body: {
+        stream?: true;
+    };
+};
+declare function chatStreamWiring(queue?: string): ChatStreamWiring;
 /** How a given model should be shown a rendered document. */
 type VisionProfile = {
     /** Per-image `detail` (OpenAI only). */
@@ -1284,6 +1839,7 @@ type CallClaudeWithMcpParams = {
     onError?: (err: any) => void;
 };
 declare const POLL_INTERVAL = 3000;
+declare const STREAM_POLL_INTERVAL = 1000;
 declare const MAX_CONCURRENT_BG_POLLS = 6;
 declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, }: CallClaudeWithMcpParams): Promise<any>;
 declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
@@ -1611,6 +2167,91 @@ interface ChatMessage {
      *  still dimmed. Cleared (with _dimSending) by markStagedMessageReady the moment
      *  the queue drains, which is when the turn genuinely becomes "(In queue)". */
     isAwaitingIndexing?: boolean;
+    /** PROTOCOL + PRESENTATIONAL: this bubble is being painted from a LIVE stream.
+     *
+     *  It sits alongside `isPending`, never instead of it. The bubble is still the
+     *  turn's "Thinking..." placeholder as far as every queue mechanism is concerned
+     *  (_ownThinkingIndex, resolveQueuedUserBubble, typewriteLatestReply and the
+     *  stray-pending sweep all find their target by isPending), and clearing that flag
+     *  to mean "it has text now" would strand the turn's real answer beside an orphan.
+     *  What this adds is the one thing those mechanisms do not care about and the VIEW
+     *  does: `content` is already worth rendering, so draw the text instead of the
+     *  spinner.
+     *
+     *  Cleared the moment the turn settles, BEFORE the authoritative answer replaces
+     *  the live text: from that instant the bubble is an ordinary reply being typed.
+     *  The partially painted `content` is deliberately left in place across that clear,
+     *  because it is what the typewriter resumes from instead of replaying from zero.
+     *
+     *  Also read by shouldRescueInFlightMessage: a streaming bubble that has no server
+     *  id yet is unrepresentable in a freshly fetched page, so it must survive the
+     *  merge or its stream is orphaned with nothing left to paint into. */
+    _streaming?: boolean;
+    /**
+     * This turn's row is TERMINAL but carries no stored answer, because the answer
+     * was streamed and nobody ever finalized it: the bytes are in the chunk store,
+     * not on the row. The bubble's `content` is therefore UNKNOWN, not empty.
+     *
+     * That distinction is the whole of the fix for two bugs that looked unrelated.
+     * A refetch landing in the window between the row going 'resolved' and finalize
+     * storing the body used to ERASE the answer off the screen (the server copy has
+     * no content, so the merge dropped the local bubble that did); and a turn that
+     * settled while no poll was attached (closed tab, slept device) used to be
+     * unrecoverable, because the mapper emitted no assistant bubble at all for a
+     * terminal-but-empty row. Both are the same question, "what should the merge
+     * believe when the server copy is authoritative but empty", and the answer is
+     * this flag: an unknown answer NEVER overwrites a known one, and an unknown one
+     * left over after the merge is resolved by reading the chunks back
+     * (ChatSession.recoverStreamedAnswer).
+     *
+     * For a view it is a rendering hint and nothing more: a bubble carrying it with
+     * empty content is being fetched, so draw whatever this client draws for a
+     * loading answer. A host that ignores it renders an empty bubble for the second
+     * or two the recovery takes, which is what it would have rendered anyway.
+     *
+     * WHEN IT COMES OFF, because that is the half that loses answers. It comes off
+     * for a FACT about the turn and never for an event in the client: an answer was
+     * recovered and written in, or the chunks were read and were genuinely empty (in
+     * which case the empty bubble is removed as well, restoring the list the mapper
+     * used to produce). It stays ON when the read FAILED, when the read was STOPPED,
+     * and when a live turn settled having painted nothing - three states that say
+     * nothing whatever about the turn, and in which the chunks are all still there.
+     * A marker cleared on one of those is an answer nothing will ever go back for,
+     * so a host may see the same bubble marked across several loads while the reads
+     * keep failing; that is the recoverable state, not a stuck one.
+     */
+    _streamPending?: boolean;
+    /**
+     * IS ANYTHING ACTUALLY DRIVING THIS BUBBLE RIGHT NOW? The second half of
+     * `_streamPending`, and the half a view cannot do without.
+     *
+     * `_streamPending` says the answer is elsewhere; it does NOT say somebody is on
+     * their way to fetch it, and the two are different states that used to render
+     * identically. Recovery is capped per history load (STREAM_RECOVERY_PER_LOAD),
+     * so the third and later marked turns on a page are marked and nobody is reading
+     * them; a read that FAILED leaves the marker on with the attempt forgotten, which
+     * is also nobody. Both drew the same loader as a live turn, so a bubble could
+     * spin for the rest of the session with nothing behind it - the one thing a
+     * spinner must never do, because it is a promise that something is coming.
+     *
+     * Three states, and only the first of them may draw a spinner:
+     *   'active'   a chunk read is in flight or queued for this turn. Something IS
+     *              coming; the loader is honest.
+     *   'failed'   the last read failed. Nothing is coming until somebody asks
+     *              again, so the view owes the reader a way to ask.
+     *   undefined  nothing has been tried, or the attempt is over. Same obligation.
+     *
+     * Written by the engine only, and never persisted anywhere: it describes THIS
+     * session's fetching, not the turn. A fresh history page therefore arrives
+     * without it, and _adoptLocalAnswers re-stamps the page's still-marked bubbles
+     * from the session's own bookkeeping, so a reload during a read does not turn a
+     * live loader into a button (and back a second later).
+     *
+     * Read it through streamRecoveryPhase(msg), never directly: the phase folds in
+     * "does this bubble need the affordance at all", and both clients must not
+     * answer that twice.
+     */
+    _streamRecovery?: 'active' | 'failed';
     _serverItemId?: string;
     _localId?: string;
     _cancelling?: boolean;
@@ -1916,7 +2557,28 @@ type MapHistoryOptions = {
 declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions): {
     messages: any[];
     runningItemIds: string[];
+    streamPendingItemIds: string[];
 };
+/**
+ * Let a LOCAL copy of a turn survive a page whose copy of it is
+ * AUTHORITATIVE-BUT-EMPTY. Mutates `incoming`; returns true when it took anything.
+ *
+ * THE FAILURE THIS PREVENTS. A streamed turn's row goes 'resolved' the moment the
+ * relay finishes, and its answer reaches the row only when csr-finalize stores it,
+ * one poll interval plus a round trip later. A first-page history refetch landing
+ * inside that window maps the row to a `_streamPending` bubble with no content, and
+ * the merge, which believes the server, throws away the local bubble holding the
+ * answer the reader is looking at. The window opens on EVERY streamed turn, and a
+ * refetch fires from visibilitychange, so it is not a corner case.
+ *
+ * The rule is the same one the recovery reads: an UNKNOWN answer never overwrites a
+ * KNOWN one. Where the local copy is still live (pending, or being painted into),
+ * its live-ness is adopted too: without it the merge would hand back a settled
+ * bubble the painter can no longer find (_liveTargetIndex wants isPending or
+ * _streaming) and that _turnAlreadyRendered would then read as already answered, so
+ * the settle would drop the real answer on the floor.
+ */
+declare function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessage): boolean;
 interface RescueDecisionContext {
     /** Is this `_serverItemId` in the page that was just fetched? */
     hasServerId: (id: string) => boolean;
@@ -2559,6 +3221,166 @@ type PollHandle = {
     /** Absent on an older skapi-js that cannot stop an attached poll. */
     stop?: () => void;
 };
+/**
+ * The prefix of a still-arriving answer that is safe to render as markdown.
+ *
+ * Four cuts, each taking the earliest position that could still change meaning:
+ *   1. an UNCLOSED ``` fence (odd number of markers) - everything from its opener;
+ *   2. an UNCLOSED inline link on the last line - `[label` with no `]`, or
+ *      `[label](url` with no `)`, from its `[`;
+ *   3. a trailing bare url or `src::` token, from its first character, because a
+ *      link is minted from whatever is there and a growing url means a chip whose
+ *      href changes on every paint;
+ *   4. an unclosed inline-code span on the last line (odd backtick count).
+ *
+ * Deliberately NOT covered: emphasis markers, half-written table rows and list
+ * bullets. Those degrade to a flicker of STYLING, which self-corrects on the next
+ * paint; the four above degrade to a wrong link, a wrong chip, or prose shown where
+ * a fence was meant, none of which the reader can tell from the real thing.
+ */
+declare function liveSafePrefix(text: string): string;
+/**
+ * Where the typewriter should START revealing `fullText`, given what a live stream
+ * has already painted into the bubble.
+ *
+ * The point is that the settle must not replay an answer the reader has already
+ * watched arrive: the authoritative text REPLACES the live text (it is the only
+ * source of truth), but the characters the two agree on are already on screen and
+ * retyping them from zero is the one thing that would make streaming look worse
+ * than not streaming.
+ *
+ * `regions` are the typewriter's own atomic regions. A resume index landing inside
+ * one is pushed FORWARD to its end rather than back to its start: forward reveals
+ * the link or fence whole, which is the policy those regions exist to enforce, and
+ * backward would make the bubble shrink at the exact moment the answer settles.
+ *
+ * LEADING WHITESPACE IS NORMALISED FIRST, and that is not a nicety. The two strings
+ * come from two places that disagree about it by design: the painter writes the
+ * parser's `text` UNTRIMMED (currentText says why: trimming a render feed would
+ * remove a leading newline and then hand it back when the next delta lands), while
+ * every settle path trims, exactly as it trims a buffered answer. And the extractor
+ * joins text blocks with '\n', so a model that opens an empty text block before its
+ * first tool call, which Claude routinely does, produces a painted answer starting
+ * with a newline the authoritative one does not have. Compared raw, the two agree on
+ * NOTHING (their first characters differ), the resume index is 0, and the reader
+ * watches the entire answer they just read be retyped from zero. Which is the one
+ * thing streaming was supposed to stop happening.
+ */
+declare function typewriterResumeIndex(painted: string, fullText: string, regions: Array<{
+    start: number;
+    end: number;
+}>): number;
+/**
+ * THE KEEP POLICY, in one place, for every path that can reach csr-finalize.
+ *
+ * WHY IT IS A FUNCTION AND NOT A LINE IN EACH CALLER. Finalizing does two things in
+ * one call: it stores what you hand it as the row's permanent answer, and it
+ * DELETES the chunks it was assembled from. Chunks are the only copy of a streamed
+ * answer until that call, and there is no way to release them without also storing
+ * something, so "may this be kept?" is the single decision that separates a
+ * recoverable turn from a permanently truncated one. It was answered in two places
+ * that then disagreed: the live settle refused to finalize a failed or cancelled
+ * turn (its partial text is the only copy there is, and both ways of releasing it
+ * cost something real), while the recovery path computed the same question from
+ * parse completeness ALONE - so recovering a failed row finalized it and released
+ * exactly the chunks the live policy exists to keep. Two halves of one fix, pulling
+ * opposite ways. One predicate, consulted by both, is the fix for that.
+ *
+ * The three terms, and what each of them is protecting:
+ *
+ *   THE ROW'S OWN STATUS wins over anything the bytes say. 'failed' means the
+ *   destination's account of the turn is the error, not the text that arrived
+ *   before it; 'cancelled' means the user's Stop said to discard the half answer,
+ *   so writing it into history as the kept version resurrects exactly what the stop
+ *   was for; 'stopped' is a poll that was ended, which says nothing about the turn
+ *   at all. Pass undefined when the status is genuinely not known (the caller is
+ *   looking only at bytes); pass the status whenever there is one, because a caller
+ *   that omits a status it HAS is asking the wrong question.
+ *
+ *   `errored` covers the same refusal expressed by the bytes rather than by the
+ *   row: an `error` frame, a response.failed, a terminal Response with an error
+ *   payload. See sse.ts's answerComplete for why a terminal event is not the same
+ *   claim as a finished answer.
+ *
+ *   `answerComplete` (NOT `complete`) is the completeness half. A degraded chunk
+ *   read - the poller degrades to "no chunks this tick, more=true" on any transient
+ *   chunk-table error, and caps one read at 500k characters - hands a settle a
+ *   stream that stopped mid-answer while the ROW settles 'resolved' on top of it,
+ *   because the row's status describes the destination's request and not our read
+ *   of it. Anything short of a finished answer leaves the chunks exactly where they
+ *   are, which is what they are for: the turn stays re-readable through
+ *   clientSecretRequestStream and a later load recovers it in full.
+ *
+ *   `unframed` is the one exception to needing a terminal event, and it is not a
+ *   loophole: bytes that were never SSE carry no events at all and none is ever
+ *   coming, so there it IS the row's status that says the response finished - which
+ *   is why this is only ever reached with a 'resolved' row or with no status to
+ *   contradict it.
+ *
+ * Exported so the two clients cannot answer it a third way.
+ */
+declare function mayKeepStreamedAnswer(snap: any, rowStatus?: string | null): boolean;
+/**
+ * WHAT A VIEW SHOULD DRAW FOR A TURN WHOSE ANSWER IS STILL IN THE CHUNK STORE.
+ *
+ * One predicate, on the barrel, because the alternative is each client deciding
+ * for itself when a spinner is honest - and the two clients have forked on
+ * smaller things than this. Returns:
+ *
+ *   ''         not this state at all. Either the bubble is not marked, or it HAS
+ *              content (the merge adopted a local answer onto it, or a recovery
+ *              wrote a truncated one in), in which case there is text to render
+ *              and the recovery, if any, is a background correction the reader
+ *              does not need to be told about.
+ *   'active'   a chunk read is in flight or queued. Draw the loader: this is the
+ *              only phase in which something really is coming.
+ *   'failed'   the last read failed. Draw the failure and an ask-again control.
+ *   'idle'     marked, and nothing is fetching it. Draw an ask-for-it control.
+ *
+ * THE FAILURE THIS EXISTS TO STOP. Recovery is capped at STREAM_RECOVERY_PER_LOAD
+ * per history load, so on a page holding several unfinalized turns the third and
+ * later ones are marked and queued for nobody; a failed read likewise leaves the
+ * marker on deliberately (it is the only thing keeping the answer reachable) with
+ * no attempt behind it. Both used to take the same branch as a live pending turn,
+ * so those bubbles spun forever with nothing driving them and no way for the
+ * reader to resolve them - while the answer sat in the chunk table the whole time,
+ * one recoverStreamedAnswer() call away.
+ *
+ * A bubble with no `_serverItemId` returns '' on purpose: there is no id to hand
+ * recoverStreamedAnswer, so an affordance would be a button that cannot work.
+ * Unreachable today (the mapper only ever marks a row it has an id for), stated so
+ * that it stays unreachable rather than becoming a dead control.
+ */
+declare function streamRecoveryPhase(msg: any): '' | 'active' | 'failed' | 'idle';
+/**
+ * The words for the two phases a reader has to act on. Here rather than in each
+ * client for the same reason as the phase itself: two clients wording the same
+ * state differently is how one of them ends up saying something untrue.
+ *
+ * Neither string claims the answer is lost. It is not: the row is unfinalized, so
+ * the chunks are retained until somebody finalizes them, and that is exactly why
+ * asking again is worth offering.
+ */
+declare function streamRecoveryLabels(phase: string): {
+    note: string;
+    action: string;
+};
+/**
+ * The identity a streamed turn was DISPATCHED under, pinned by the caller.
+ *
+ * Same reason _callProviderFor takes projectId/owner explicitly: a turn can be
+ * acked after the user has moved to another project or platform, and a live
+ * getIdentity() read at that moment describes where the user is now, not where the
+ * turn came from. Every field optional so a caller can pin what it knows and let
+ * the rest fall back to the live read.
+ */
+type StreamDispatchContext = {
+    platform?: string;
+    projectId?: string;
+    owner?: string;
+    /** History cache key (chatCacheKey) of the chat the turn belongs to. */
+    ownerKey?: string;
+};
 declare class ChatSession {
     host: ChatHost;
     state: ChatState;
@@ -2803,7 +3625,7 @@ declare class ChatSession {
      * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
      * the request budget the cap exists to protect.
      */
-    attachForegroundPoll(source: any, itemId: string, opts?: any): any;
+    attachForegroundPoll(source: any, itemId: string, opts?: any, ctx?: StreamDispatchContext): any;
     private _fgPollWithEarlyProbe;
     private _trackPoll;
     /** Background polls currently attached, for the MAX_CONCURRENT_BG_POLLS budget.
@@ -2812,6 +3634,282 @@ declare class ChatSession {
      *  entry left behind by pausePolling on an older skapi-js (no stop handle)
      *  still counts, which is correct — that poll really is still running. */
     private _countBgPolls;
+    /** Live streams by server item id. One per in-flight streamed turn. */
+    private liveStreams;
+    /**
+     * Open (or re-open) the live stream for `itemId`, or null when this poll must
+     * not carry one.
+     *
+     * Re-entrant on purpose: an auth-refresh retry re-dispatches the SAME turn under
+     * a NEW id, and a re-attach after a tab return replays an existing id from seq 0.
+     * Either way the bytes about to arrive are a whole stream, so an existing entry
+     * is discarded and a fresh parser takes its place - feeding a replay into the old
+     * parser would concatenate the answer with itself.
+     *
+     * `ctx` IS THE TURN'S OWN IDENTITY, and every caller that has one passes it.
+     * This used to read the LIVE getIdentity(), which is a bug of exactly the kind
+     * _callProviderFor documents and threads its own parameters to avoid: the user
+     * hits Send, then switches project or platform inside the ack round trip, and the
+     * stream that opens for the OLD turn is stamped with the NEW identity. What that
+     * costs is not cosmetic - `platform` picks which url csr-finalize is addressed
+     * with and which extractor reads the assembled body, `projectId`/`owner` scope
+     * the finalize itself, and `ownerKey` decides which chat the answer is painted
+     * into. Get them from the live read at the wrong moment and the turn is finalized
+     * against the wrong service (so its answer is never stored), parsed with the
+     * wrong provider's extractor, or painted into a conversation it does not belong
+     * to. The live read stays only as the fallback for a caller with nothing pinned.
+     */
+    private _beginLiveStream;
+    /** The chunk sink handed to skapi's poll. Raw relayed text, in order, never parsed
+     *  here: the parser owns the grammar and this owns the pacing. */
+    private _feedLiveStream;
+    /**
+     * Write the safe prefix of the answer so far into the turn's bubble.
+     *
+     * notify() is spent EXACTLY ONCE per turn, on the first paint, because that is a
+     * state change the per-bubble refresh cannot express: the bubble stops being a
+     * "Thinking..." spinner and becomes text. Every paint after it goes through
+     * refreshMessageBubble, which is what keeps a growing answer from rebuilding the
+     * whole display list once a second.
+     */
+    private _paintLiveStream;
+    /** The bubble a live stream paints into: the turn's pending assistant placeholder,
+     *  found by server item id. Not by _localId, deliberately - a history refetch
+     *  replaces the local copy with the server's, and only the id survives that. */
+    private _liveTargetIndex;
+    /** Hand the host its optional observation update. Guarded: this runs on the paint
+     *  path, and a throwing hook must not cost the user the rest of their answer. */
+    private _reportLiveStream;
+    /** Stop painting and (when the turn really ended) assemble the body. `finished`
+     *  is false for a stream being discarded rather than settled: a retry replacing
+     *  it, or a stop, neither of which has an answer to assemble. */
+    private _closeLiveStream;
+    /**
+     * Settle a streamed turn: end the parse, decide the body the rest of the session
+     * will read, and release the chunks.
+     *
+     * The substitution is one-directional and never a merge. A response that is a
+     * real stored body (a buffered turn, or a streamed one somebody already
+     * finalized) is returned untouched, because that is the destination's own answer
+     * and the stream is not entitled to overwrite it. Only a STATUS ENVELOPE - the
+     * shape a streamed row settles as, having stored nothing - is replaced, and then
+     * by the assembled body, which every caller downstream reads with the same
+     * extractor it uses for a buffered reply. Idempotent, because it is reached both
+     * through the poll's onResponse and through the promise it resolves.
+     */
+    private _settleLiveStream;
+    /**
+     * May this parse be STORED as the turn's permanent answer?
+     *
+     * THE FAILURE THIS PREVENTS. Finalizing does two things at once: it stores what
+     * you give it as the row's result, and it DELETES the chunks it was assembled
+     * from. So finalizing a truncated parse is not a cosmetic loss, it is the
+     * permanent one: the truncation becomes the stored answer and the only copy of
+     * the missing part is deleted in the same call. And a truncated parse is a shape
+     * this repo has already paid for - a degraded chunk read (the poller degrades to
+     * "no chunks this tick, more=true" on any transient chunk-table error, and caps
+     * a long answer at 500k characters per response) can hand the settle a stream
+     * that stopped mid-answer. The row can settle 'resolved' on top of that, because
+     * the ROW's status describes the destination's request, not the client's read of
+     * it.
+     *
+     * THE POLICY ITSELF IS mayKeepStreamedAnswer (top of this file), shared with the
+     * recovery path so the two cannot drift apart again - they did, and the drift was
+     * silent: the live settle refused a failed turn while the recovery finalized one.
+     * What is local to this method is only the two things the free function cannot
+     * know: that there is an assembled body at all, and that this call site is
+     * reached only on a row that settled 'resolved' (the caller returns before it
+     * otherwise), which is the status it therefore states.
+     *
+     * The test the policy applies is deliberately NOT `complete`: a terminal event
+     * arrived and the answer finished are two claims, and an `error` frame satisfies
+     * the first while truncating the second. See sse.ts's answerComplete.
+     */
+    private _mayFinalize;
+    /**
+     * Store the assembled body as the version history keeps, which is also what
+     * releases this request's chunks.
+     *
+     * The ASSEMBLED BODY and not the extracted text, because the row is read back by
+     * mapHistoryListToMessages through extractClaudeText / extractOpenAIText: storing
+     * the provider's own document is what makes a streamed turn indistinguishable
+     * from a buffered one on the next load, with no branch anywhere in the mapper.
+     *
+     * BEST EFFORT, and loudly so: the answer is already on screen and already in the
+     * history cache by the time this fires. A failure costs the chunks (they stay,
+     * and the turn stays re-readable) and a row that reads back empty, never the
+     * user's answer in front of them.
+     *
+     * WHAT IS DELIBERATELY NEVER FINALIZED, because finalize is also the only way to
+     * release chunks and it is tempting to reach for it as a cleanup:
+     *
+     *   - an INCOMPLETE parse (see _mayFinalize). Storing a truncation makes it
+     *     permanent AND deletes the part that was missing from it. A stream killed by
+     *     an `error` frame is one of these however terminal it looks: the frame ends
+     *     the stream, so `complete` is true, while the text is only what arrived
+     *     before the error. That is why the gate reads answerComplete.
+     *   - a FAILED turn. Its chunks hold the part of the answer that did arrive,
+     *     which is the only copy of that text there is, and the two ways to release
+     *     them both cost something real: storing the partial makes a truncated answer
+     *     the turn's permanent history AND masks the failure on read (csr-poll hands
+     *     back a finalized body before it ever looks at the row's error, so the turn
+     *     would read back as a clean short answer), while storing the error throws
+     *     the partial away outright. Keeping them costs storage on rows that produced
+     *     bytes and then failed, which is rare - a failure before the first byte (a
+     *     wrong API key, the common case) has no chunks to keep - and the poller
+     *     hands those chunks back alongside the error on every later read, so nothing
+     *     is stranded, only retained. Retention is the honest trade here; deletion is
+     *     not reversible.
+     *   - a CANCELLED turn, for the same reason plus one: the user's Stop means the
+     *     half answer is to be discarded, so writing it into history as the kept
+     *     version would resurrect exactly what the stop was for.
+     */
+    private _finalizeStreamedTurn;
+    /** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
+     *  A pending assistant placeholder is created with content '' by every path that
+     *  makes one, so non-empty content on one can only have been painted here. */
+    private _paintedTextAt;
+    private _streamRecovery?;
+    /** The recovery bookkeeping, created on first touch.
+     *
+     *  LAZY, not constructor-initialised, and for a concrete reason: ChatSession is
+     *  also built with Object.create(ChatSession.prototype) by the engine's own test
+     *  harnesses, which drive one method against a hand-built state rather than a
+     *  whole session. A field only the constructor creates is undefined there, and
+     *  the method that reaches for it throws, turning a test of the settle into a
+     *  crash about bookkeeping. */
+    private _rec;
+    /**
+     * Put this session's fetching state onto the turn's bubble, so a view can tell a
+     * loader that means something from one that means nothing.
+     *
+     * ONLY EVER ONTO A STILL-MARKED BUBBLE. Once `_streamPending` is off the turn has
+     * an answer (or was proven to have none) and this says nothing about it; writing
+     * it there would leave a stale 'active' on a settled bubble forever.
+     *
+     * host.notify() is what redraws the widget, whose renderer is imperative. It is a
+     * no-op in agent.vue, whose state is a Vue reactive() - the property write above
+     * is what redraws there. Both are covered by doing both, and neither is a
+     * substitute for the other.
+     */
+    private _markRecoveryPhase;
+    /**
+     * Let LOCAL answers survive a freshly-mapped page whose copies of them are
+     * authoritative-but-empty. Call with the page BEFORE it replaces or merges into
+     * state.messages; mutates the page's bubbles in place.
+     *
+     * The adoption itself is history.ts's adoptLocalAnswerIntoPage (shared, so the
+     * clients' own mappers cannot fork it). What lives here is the one thing the
+     * pure function cannot know: whether the local text is the WHOLE answer. Text
+     * left by a stream that ended without a terminal event is not, so that bubble
+     * keeps its marker and gets read back even though it has content - otherwise a
+     * truncated answer would adopt itself over the row and never be corrected.
+     */
+    private _adoptLocalAnswers;
+    /**
+     * This session's fetching state for one turn, from the bookkeeping rather than
+     * from any bubble. A queued entry counts as 'active': it is committed to be read,
+     * serially, and the reader has no way to tell "being read" from "next in line"
+     * apart from the wait.
+     */
+    private _recoveryPhaseFor;
+    /**
+     * PUBLIC DELEGATE, for a client that maps and merges its own history page.
+     *
+     * agent.vue keeps a forked mapper and a forked first-page merge (its mount path
+     * runs them, while resumePolling routes through loadHistory below), so both
+     * paths are live for the SAME row inside one component. Adoption is part of the
+     * merge contract, not an optional extra: without it that fork erases a streamed
+     * answer off the screen on every turn, which is the whole of MAJOR 3.
+     *
+     * Exposed rather than reimplemented because the rule needs the session's own
+     * `incomplete` set, which the pure helper (history.ts adoptLocalAnswerIntoPage)
+     * cannot see. A client that reached for the helper alone would adopt a TRUNCATED
+     * answer over the row and clear the marker that would have gone back for the
+     * rest - a fork that reads as correct and loses text.
+     *
+     * Call it exactly where loadHistory does: on the freshly mapped page, after
+     * applyHydratedBodies and BEFORE the page replaces or merges into state.messages.
+     */
+    adoptLocalAnswers(mapped: ChatMessage[], loadKey?: string): void;
+    /**
+     * Queue the on-screen turns whose answer is only in the chunk store, newest
+     * first, and start draining. Never blocks and never throws.
+     *
+     * `ownerKey` is the chat the queue entries belong to, snapshotted by the caller:
+     * a recovery that lands after the user has moved on writes into that chat's
+     * cache, never into whatever list is on screen by then.
+     */
+    private _scheduleStreamRecovery;
+    /**
+     * PUBLIC DELEGATE, the other half of what a forked history path needs.
+     *
+     * Same reason as adoptLocalAnswers: agent.vue's mount path never calls
+     * loadHistory, so without this its pages would MARK unfinalized streamed turns
+     * and then never read them back - CRITICAL 1 left unfixed on the client's
+     * primary path, with the marker making it look handled.
+     *
+     * Takes the load's SNAPSHOTTED identity rather than reading it live, and that is
+     * the reason this exists instead of the caller looping over recoverStreamedAnswer:
+     * that one reads getIdentity() at call time (right, for an on-demand affordance
+     * the user just clicked), which after a project switch racing the load would
+     * finalize the turn against the project they switched TO. Call it AFTER the page
+     * is rendered and the loading flags are cleared - it must never hold up the
+     * conversation it belongs to.
+     */
+    scheduleStreamRecovery(ownerKey: string, platform: 'claude' | 'openai', projectId: string, owner: string): void;
+    /** Serial drain of the recovery queue. Each entry is one full chunk read. */
+    private _drainStreamRecovery;
+    /**
+     * Read one unfinalized streamed turn back out of the chunk store and put its
+     * answer where the turn's answer belongs.
+     *
+     * Public because the cap above is deliberately small: a host that wants to offer
+     * "load the rest" on an older recoverable turn calls this with its
+     * `_serverItemId`, and gets the same path the automatic recovery uses. Safe to
+     * call for an id that turns out not to be recoverable, and safe to call twice -
+     * a second call while the first is still in flight is a no-op.
+     *
+     * THIS IS THE USER ASKING, and that is why it passes `manual`. The automatic
+     * recovery refuses a row it has already tried, so that a re-render, or the
+     * history load that every visibilitychange fires, cannot loop on the same
+     * chunks. A click is neither of those: it is one bounded request that a person
+     * asked for, and applying the loop guard to it made the affordance a button that
+     * silently did nothing for exactly the rows most likely to have it - every row
+     * an earlier read touched and could not settle.
+     */
+    recoverStreamedAnswer(itemId: string): Promise<void>;
+    private _readBackStreamedTurn;
+    /**
+     * Write a recovered answer into the turn's bubble (or into the owning chat's
+     * cache when the reader has moved on), then store it as the version history
+     * keeps.
+     *
+     * FINALIZING IS WHAT MAKES THIS RUN ONCE. It copies the answer onto the row and
+     * releases the chunks, so the next load reads an ordinary turn and no recovery is
+     * scheduled for it ever again, by anyone, in any tab. `store` is the caller's
+     * decision and carries two gates at once: mayKeepStreamedAnswer, the SAME keep
+     * policy the live settle applies (an incomplete, errored or failed read is shown
+     * but never stored, because storing it would make the truncation permanent and
+     * delete the part that was missing), and whether the body is new at all (one
+     * that came off the row is already stored).
+     */
+    private _applyRecoveredAnswer;
+    /**
+     * Take the "answer is elsewhere" marker off a turn once it is settled one way or
+     * the other. `drop` removes an assistant bubble that turned out to have no answer
+     * at all, which restores exactly the list the mapper used to produce for such a
+     * row (none), rather than leaving a permanently empty bubble behind.
+     *
+     * ONLY EVER CALLED FOR A TURN THAT WAS ACTUALLY READ. The marker is the one thing
+     * that keeps an unrecovered answer reachable, so it comes off only on the strength
+     * of an answer (the recovery wrote one) or of a read that came back empty. A read
+     * that FAILED, or one that was STOPPED, knows neither, and taking the marker off
+     * on either of those is how a bubble ends up empty forever with its answer still
+     * in the chunk table. `drop` is likewise never passed for a bubble that HAS
+     * content: an empty row is an empty turn, a failed read is not.
+     */
+    private _clearStreamPendingMark;
     /**
      * Stop and forget one item's poll. Used after a cancel: the row is either gone
      * (cancelled while queued) or flagged cancelled (cancelled while running), so
@@ -3087,9 +4185,9 @@ declare class ChatSession {
      * work, it does not undo it.
      */
     cancelIndexingGroup(group: IndexingGroup): void;
-    typewriteIntoIndex(idx: number, fullText: string, localId?: string): Promise<void>;
+    typewriteIntoIndex(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<void>;
     private typewriterQueue;
-    enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any>;
+    enqueueTypewrite(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<any>;
     typewriteLatestReply(key: string): Promise<any>;
     _removeStrayPendingAssistants(): void;
     /** Index of the USER bubble the message at `idx` belongs to — the nearest one
@@ -3264,4 +4362,171 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RowAnchor, type RunStubInfo, type ScrollAnchor, type ScrollAnchorOptions, TOOL_AND_RESPONSE_BUFFER, type VisionProfile, XML_EXTS, __resetSplitHistoryState, applyEncodingDeclaration, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, composeUserMessage, configureChatEngine, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeTextContent, normalizeTrailingInlineToken, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, readExpiredAttachmentHref, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, shouldRescueInFlightMessage, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, upsertIndexRunRecordSafe, wallClockNow };
+/**
+ * The project's BunnyQuery settings, held as a record in the project's own
+ * database rather than on the skapi service record.
+ *
+ * WHY A RECORD. The upload access group used to live on the service record as
+ * `default_access_group`, which was ALSO the skapi SDK's project-wide default
+ * for `table.access_group`. One field meant two things: "what BunnyQuery indexes
+ * new files at" and "what every SDK record call on this project defaults to".
+ * That coupling is gone. The SDK no longer has a project default at all, so this
+ * setting needs a home of its own, and a plain public record in the customer's
+ * own project is one every client can already reach with the calls it has.
+ *
+ * SHAPE. One record per project, holding an OBJECT rather than a single value:
+ *
+ *     unique_id: 'bq::settings'
+ *     table:     { name: '__SETTINGS__', access_group: 'public' }
+ *     data:      { upload_access_group: 'authorized' }
+ *
+ * One record and one fetch covers every present and future project setting. A
+ * second setting is a new key, not a new record, so the "wait for settings
+ * before the first upload" hand-off below never has to become several waits.
+ *
+ * WHY PUBLIC. The widget reads this, and the widget frequently runs before there
+ * is any session. Group 0 is the only group an unauthenticated caller is served
+ * (`check_rec_access` returns immediately for "00" and refuses the rest). Note
+ * this is NOT sufficient on its own: skapi's `require_login` gate refuses ALL
+ * database reads from a signed-out visitor, and it defaults to true, so on most
+ * projects a signed-out widget still cannot read this and falls back to the
+ * default. That is survivable because the only thing a signed-out visitor could
+ * do with the value is upload, which they cannot do either.
+ *
+ * WHY THE VALUE MATTERS. The file BYTES are not what the access group controls.
+ * BunnyQuery uploads to db storage, whose object key carries no access group and
+ * whose read path performs no access check. What carries the group is the
+ * RECORDS: the `src::` file record in `file_summaries`, the `run::`/`done::`
+ * markers in `__INDEXING__`, and every content record the indexing agent
+ * extracts. Those are what a chat answers from, so those are what decide who the
+ * file is visible to. The same value is also handed to the chat system prompt as
+ * `indexAccessGroup`, because a record written under a different group is in a
+ * different table and never comes back with the rest of the file.
+ *
+ * TRANSPORT-FREE, like the rest of the engine. The store never imports a skapi
+ * instance; the consumer injects a reader. See configureProjectSettings.
+ */
+/** The access groups a BunnyQuery upload may be recorded at. */
+type UploadAccessGroup = 'public' | 'authorized' | 'private';
+declare const UPLOAD_ACCESS_GROUPS: UploadAccessGroup[];
+/**
+ * What the project's upload-access setting may be: one of the three groups the
+ * dashboard offers, or 'ask' to be prompted per upload.
+ *
+ * `'admin'` (99) is deliberately not offered: a file only a master can read is
+ * indistinguishable from one that failed to upload, and no dashboard control
+ * would produce it.
+ */
+type ProjectAccessSetting = UploadAccessGroup | 'ask';
+/**
+ * `authorized` is the default because it is what every record written before
+ * this setting existed was hardcoded to. A project that never opens the setting
+ * keeps exactly the visibility it already had. It is also what the abandoned
+ * `default_access_group` service field was seeded to at project creation, so a
+ * project carrying that old value reads the same before and after the move.
+ */
+declare const DEFAULT_UPLOAD_ACCESS_GROUP: UploadAccessGroup;
+/** Where the settings record lives. Shared so no client re-derives it. */
+declare const PROJECT_SETTINGS_TABLE = "__SETTINGS__";
+declare const PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
+declare const PROJECT_SETTINGS_ACCESS_GROUP = "public";
+declare const UPLOAD_ACCESS_LABELS: Record<UploadAccessGroup, string>;
+declare const UPLOAD_ACCESS_HINTS: Record<UploadAccessGroup, string>;
+/** Menu/modal option list, in the order they should be shown. */
+declare const UPLOAD_ACCESS_OPTIONS: {
+    value: UploadAccessGroup;
+    label: string;
+    hint: string;
+}[];
+/** The settings record's `data`. Open-ended: future settings are new keys. */
+type ProjectSettingsData = {
+    upload_access_group?: unknown;
+    [key: string]: unknown;
+};
+/** Narrow an unknown stored value to a usable group, falling back to the default. */
+declare function normalizeUploadAccessGroup(value: any): UploadAccessGroup;
+/**
+ * The stored setting as written, or null when the project has never set one.
+ *
+ * Returns null rather than a default so callers can tell "unset" from "set to
+ * authorized". The settings page needs that distinction to decide what the
+ * control shows; upload paths do not and use uploadAccessGroupFrom instead.
+ */
+declare function normalizeProjectAccessSetting(value: any): ProjectAccessSetting | null;
+/** The setting held in a settings-record `data`, or null when unset. */
+declare function accessSettingFrom(data: ProjectSettingsData | null | undefined): ProjectAccessSetting | null;
+/** The group an upload lands in when the project is NOT set to 'ask'. */
+declare function uploadAccessGroupFrom(data: ProjectSettingsData | null | undefined): UploadAccessGroup;
+/** True when the project wants to be asked per upload rather than told once. */
+declare function asksUploadAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * Fetch one project's settings record. Resolves the record's `data`, or null
+ * when there is no record.
+ *
+ * MAY REJECT, and the store treats a rejection as "no record": a signed-out
+ * visitor on a `require_login` project gets REQUIRE_LOGIN here, which is a
+ * normal outcome and not an error the user should ever see.
+ */
+type ProjectSettingsReader = (service: string) => Promise<ProjectSettingsData | null>;
+declare function configureProjectSettings(fn: ProjectSettingsReader | null): void;
+/**
+ * Start the fetch and hand back the promise, deduping concurrent callers.
+ *
+ * Never rejects: a failed read settles as null, which every accessor reads as
+ * "unset" and answers with the default. A settings fetch must not be able to
+ * fail an upload.
+ */
+declare function loadProjectSettings(service: string): Promise<ProjectSettingsData | null>;
+/**
+ * Kick the fetch off without waiting for it. Call on chat/page open.
+ *
+ * Fire-and-forget by design: the page paints on the default and the first upload
+ * awaits the real value via readyProjectSettings. Nothing blocks on this.
+ */
+declare function primeProjectSettings(service: string): void;
+/**
+ * Await the settings for this project. What the FIRST upload calls.
+ *
+ * Cheap after the first call: a settled entry resolves immediately, and a
+ * primed-but-unsettled one joins the in-flight request rather than starting a
+ * second.
+ */
+declare function readyProjectSettings(service: string): Promise<ProjectSettingsData | null>;
+/**
+ * The cached data WITHOUT waiting, or null when nothing has settled yet.
+ *
+ * For synchronous readers (a template, a menu's current value). A caller that is
+ * about to WRITE an access group onto a record must use readyProjectSettings
+ * instead: answering from an unsettled cache is how a file lands in the wrong
+ * group on the first upload after a page load.
+ */
+declare function cachedProjectSettings(service: string): ProjectSettingsData | null;
+/** True once this project's settings have been fetched (whether or not one existed). */
+declare function projectSettingsSettled(service: string): boolean;
+/** Sync convenience: the project's setting as stored, or null when unset/unsettled. */
+declare function projectAccessSetting(service: string): ProjectAccessSetting | null;
+/** Sync convenience: the upload group, falling back to the default. */
+declare function projectUploadAccessGroup(service: string): UploadAccessGroup;
+/** Sync convenience: does this project want a per-upload prompt? */
+declare function projectAsksUploadAccess(service: string): boolean;
+/**
+ * Adopt a value the caller just WROTE, so the settings page reflects its own
+ * save without a re-fetch.
+ *
+ * Marks the entry settled: the writer knows the stored value better than a
+ * refetch would, and leaving it unsettled would send the next upload back to the
+ * network for a value already in hand.
+ */
+declare function setProjectSettings(service: string, data: ProjectSettingsData | null): void;
+/** Merge one key into the cached settings, preserving the rest. */
+declare function patchProjectSettings(service: string, patch: ProjectSettingsData): void;
+/**
+ * Drop cached settings. Pass a service to drop one, omit to drop all.
+ *
+ * An in-flight fetch is abandoned rather than cancelled: its `.then` checks that
+ * the entry it is writing into is still its own, so a late response cannot
+ * repopulate a cleared project.
+ */
+declare function clearProjectSettings(service?: string): void;
+
+export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_UPLOAD_ACCESS_GROUP, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, applyEncodingDeclaration, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatStreamWiring, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isErrorResponseBody, isHttpUrlLike, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPreviewableImagePath, isProviderApiKeyError, isServerExtractable, isServiceDbAttachmentHref, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeExt, normalizeProjectAccessSetting, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectSettingsSettled, projectUploadAccessGroup, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow };

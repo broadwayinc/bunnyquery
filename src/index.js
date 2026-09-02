@@ -42,6 +42,22 @@ import {
     buildChatGreeting,
     setProjectContextWindow,
     parseAiAgentValue as engineParseAiAgentValue,
+    // The project's BunnyQuery settings, which now live in a record in the
+    // customer's OWN database ("bq::settings") instead of on the skapi service
+    // record. The fetch, the cache, the group list and the chooser's copy all
+    // belong to the engine so this widget and the console cannot answer "who can
+    // read this upload?" differently. The store is keyed by SERVICE ID, so every
+    // accessor below is called with S.projectId.
+    PROJECT_SETTINGS_UNIQUE_ID,
+    configureProjectSettings,
+    primeProjectSettings,
+    readyProjectSettings,
+    normalizeUploadAccessGroup,
+    projectAsksUploadAccess,
+    projectUploadAccessGroup,
+    UPLOAD_ACCESS_GROUPS,
+    UPLOAD_ACCESS_LABELS,
+    UPLOAD_ACCESS_HINTS,
     // pure helpers (Tier-1.5) — error detection, token budget, link/path, history mapping
     getErrorMessage,
     isErrorResponseBody,
@@ -87,6 +103,18 @@ import {
     // a repair), and every key a file's chips can be marked unavailable under.
     previewMintCacheToken,
     linkUnavailableKeysForPath,
+    // Whether the EMBEDDER's skapi-js can carry skapi's half of the stream flag.
+    // Shared with agent.vue rather than written out twice, because it is exactly the
+    // kind of predicate that forks and the two clients are diffed. See its own note
+    // for what an SDK too old to know the key does (drops it silently, so the
+    // destination streams SSE into a buffered row that reads back empty).
+    skapiSupportsStreaming,
+    // "Is anything actually fetching this turn's answer, and if not, what do we
+    // offer the reader instead of a spinner that never resolves?" Shared with
+    // agent.vue rather than decided here, because a client that answers it on its
+    // own answers it differently, and the symptom is a bubble that spins forever.
+    streamRecoveryPhase,
+    streamRecoveryLabels,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
@@ -1913,10 +1941,15 @@ import {
             // buildGreetingEl, so the two can never disagree.
             greeting: greetingParts().text,
             canUpload: !uploadsFrozenForUser(),
-            // Where THIS project's indexer writes. The MCP's auto-fill assumes
-            // "authorized"; on a project set to public or private that would
-            // search the wrong group and answer "nothing found".
-            indexAccessGroup: projectUploadAccessGroup(),
+            // Where THIS project's indexer writes, from the "bq::settings"
+            // record. The MCP's auto-fill assumes "authorized"; on a project set
+            // to public or private that would search the wrong group and answer
+            // "nothing found". A SYNC CACHE READ, because the engine calls this
+            // hook from paths with nowhere to put an await. Every send that
+            // reaches it has settled the fetch first: sendMessage awaits
+            // readyProjectSettings on the text-only branch, and the attachment
+            // branch resolves the upload group before it dispatches.
+            indexAccessGroup: projectUploadAccessGroup(S.projectId),
             client: "widget",
         });
     }
@@ -2067,7 +2100,22 @@ import {
         CS.drafting = false;
         syncDraftingIndicator();
 
-        if (!hasAttachments) { session.dispatchComposedMessage(text, false); return; }
+        if (!hasAttachments) {
+            // SETTLE THE SETTINGS BEFORE THE PROMPT IS BUILT. This is the only
+            // dispatch that does not pin a prompt, so the engine builds it live
+            // from the sync cache read (buildSystemPrompt -> indexAccessGroup).
+            // Until the settings fetch lands that read answers "authorized", so
+            // a first question typed on a project that indexes at public or
+            // private would send the agent looking in a group its records are
+            // not in, and it would answer "nothing found". The console avoids
+            // this by awaiting before it pins; this is the same guard.
+            // Almost always instant: renderChat primed this fetch when the chat
+            // opened, and the store never rejects.
+            readyProjectSettings(S.projectId).then(function () {
+                session.dispatchComposedMessage(text, false);
+            });
+            return;
+        }
 
         // The turn takes its chips with it (stamped with a batch id) and, when it
         // has text, leaves a staged bubble behind so it holds the position it was
@@ -3613,8 +3661,61 @@ import {
         if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
 
         var bubble;
-        if (msg.isPending) {
+        // THE LIVE-STREAM RENDER CONTRACT, mirrored verbatim in agent.vue's
+        // template: a streaming bubble is STILL a pending bubble (the engine keeps
+        // isPending set because every queue mechanism finds the turn by it), so the
+        // only thing streaming changes here is which half of this branch it takes.
+        // By the time _streaming is set the bubble's `content` already holds a safe
+        // prefix of the answer - liveSafePrefix never leaves it ending inside a
+        // half-arrived link, fence or url - so it renders as ordinary markdown
+        // instead of the dot-trail, and everything else about the bubble is
+        // unchanged.
+        //
+        // _streamPending is the OTHER direction, and it is not a pending turn at
+        // all: the row is terminal, but its answer was streamed and nobody ever
+        // finalized it, so the text is in the chunk store and can be read back
+        // (ChatSession.recoverStreamedAnswer). Empty content there means UNKNOWN,
+        // not "answered nothing". Once it has content (the merge adopted a local
+        // answer onto it) it renders as ordinary text and neither branch is taken.
+        //
+        // WHICH of the two it takes is streamRecoveryPhase's call, and the whole
+        // point of asking is that "the answer is elsewhere" and "somebody is on
+        // their way to get it" are different facts. This used to draw the live
+        // turn's loader for both, so the turns the per-load cap left behind - the
+        // third and later on a page - and every turn whose read had failed spun for
+        // the rest of the session with nothing driving them and no way for the
+        // reader to resolve them. A loader is a promise that something is coming, so
+        // it is now drawn only where something is; the other two phases get the
+        // affordance below. Mirrored in agent.vue's template.
+        //
+        // Both conditions call the shared predicate INLINE rather than through a local
+        // (it is a handful of property reads, so the cost is nothing): the two clients
+        // are diffed on the text of exactly these two expressions, and a local here
+        // would make them un-diffable against a Vue template that cannot declare one.
+        // See tests/stream-client-parity.cjs.
+        if ((msg.isPending && !msg._streaming) || streamRecoveryPhase(msg) === "active") {
             bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+        } else if (streamRecoveryPhase(msg)) {
+            // 'idle' (nobody has been sent for it) and 'failed' (somebody went and
+            // could not read it) differ ONLY in wording, deliberately: both leave the
+            // answer where it is, both are fixed by asking again, and the words come
+            // from the engine so the two clients cannot describe the same state
+            // differently. Nothing here claims the answer is lost - the row is
+            // unfinalized, which is exactly why the chunks are still there to fetch.
+            var labels = streamRecoveryLabels(streamRecoveryPhase(msg));
+            bubble = h("div", { class: "bq-bubble is-stream-recover" + (streamRecoveryPhase(msg) === "failed" ? " is-stream-failed" : "") });
+            bubble.appendChild(h("span", { class: "bq-stream-recover-note", text: labels.note }));
+            var recoverBtn = h("button", { class: "bq-stream-recover-btn", type: "button", text: labels.action });
+            recoverBtn.addEventListener("click", function (e) {
+                e.stopPropagation();
+                // The engine flips the bubble to 'active' synchronously and notifies,
+                // so the click's own feedback is the loader replacing this button. No
+                // local disabled flag: a second click while the read is in flight is
+                // already refused by the engine, and a flag here would be one more
+                // piece of state to leave stuck.
+                session.recoverStreamedAnswer(msg._serverItemId);
+            });
+            bubble.appendChild(recoverBtn);
         } else {
             bubble = h("div", { class: "bq-bubble" });
             if (msg.role === "user" && msg.isPendingQueued) {
@@ -3639,7 +3740,13 @@ import {
             else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
-            var ts = formatChatTimestamp(msg._ts);
+            // NEVER on a bubble that is still running, and streaming is what makes
+            // that worth stating: a live turn now takes this branch WHILE it runs,
+            // and a placeholder mapped from history carries the REQUEST time in _ts,
+            // so it would date the answer before it exists (the settle re-stamps it
+            // with the response time). Before streaming, the spinner branch above
+            // made this implicit. Mirrored in agent.vue's bubbleTime.
+            var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
             if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
         }
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
@@ -4278,8 +4385,12 @@ import {
             return h("div", { class: "bq-history-loading is-initial" },
                 bunnyLoader("Fetching history..."));
         }
+        // The outer element takes NO height in flow (see widget.css): it is a
+        // zero-height sticky hook and the inner strip overflows it, so mounting
+        // and unmounting this bar cannot move the list under the reader.
         return h("div", { class: "bq-history-loading" },
-            h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" }));
+            h("span", { class: "bq-history-loading-inner" },
+                h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" })));
     }
     /* ---- scroll anchoring across a full re-render ---------------------------
      * renderMessages rebuilds the whole list, and detaching every child collapses
@@ -4391,7 +4502,8 @@ import {
             // messages here left the box completely blank for that window
             // (agent.vue's bar has no such requirement either).
             CS.messagesBox.appendChild(h("div", { class: "bq-history-loading" },
-                h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" })));
+                h("span", { class: "bq-history-loading-inner" },
+                    h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" }))));
         }
         // ALWAYS, and always first. The greeting is the opening line of the
         // conversation, not a placeholder for an empty one: it goes in before any
@@ -4597,6 +4709,12 @@ import {
     }
 
     function renderChat() {
+        // Start the project's settings fetch as the chat opens, and do NOT wait
+        // for it: the composer paints on the default, and the only thing that
+        // actually needs the real value is the first upload, which awaits this
+        // same request through readyProjectSettings. Deduped and cached per
+        // project by the engine store, so re-entering the chat costs nothing.
+        primeProjectSettings(S.projectId);
         // reset transient chat state on (re)entry
         // Preview urls are keyed by project, and an identity-blind cache is how
         // one project's content has reached another project's chat before.
@@ -4793,53 +4911,23 @@ import {
     /* ---- upload access group --------------------------------------------- *
      * Who can read what is extracted from a file the visitor uploads.
      *
-     * The project owner sets one value in the dashboard,
-     * conf.default_access_group: a group to use silently, or "ask" to be prompted
-     * per file. It arrives on the unauthenticated getConnectionInfo() response,
-     * so the widget needs no extra call. The value chosen here is applied to the file's "src::" record
-     * AND handed to the engine, which puts it in the indexing prompt so the rows
-     * the agent extracts land in the same group. A record written under a
-     * different group is in a different table and never comes back with the rest
-     * of the file.
+     * The project owner sets one value from the project's settings page: a group
+     * to use silently, or "ask" to be prompted per file. It is stored as the
+     * "bq::settings" record in the project's OWN database, and the engine's
+     * project_settings store owns the fetch, the cache and the fallback (the
+     * reader is wired in init(), and primeProjectSettings starts the fetch when
+     * the chat opens). The group list, its labels and its hints are that store's
+     * constants, imported at the top of this file rather than restated here, so
+     * the widget and the console can never offer different choices.
+     *
+     * The value chosen here is applied to the file's "src::" record AND handed to
+     * the engine, which puts it in the indexing prompt so the rows the agent
+     * extracts land in the same group. A record written under a different group
+     * is in a different table and never comes back with the rest of the file.
      *
      * "authorized" whenever the project said nothing, which is what every record
      * written before this setting existed used.
      */
-    var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
-    var UPLOAD_ACCESS_LABELS = {
-        public: "Public",
-        authorized: "Signed in users",
-        private: "Only me",
-    };
-    var UPLOAD_ACCESS_HINTS = {
-        public: "Anyone can ask about this file, including visitors who are not logged in.",
-        authorized: "Only users signed in to this project can ask about this file.",
-        private: "Only you can ask about this file.",
-    };
-    function normalizeUploadAccessGroup(v) {
-        return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? "authorized" : v;
-    }
-    // The project's single `default_access_group` setting, as stored. May also
-    // hold a raw group number or "admin" (it is the SDK-wide default, which takes
-    // everything table.access_group takes); the widget offers neither, and
-    // normalizeUploadAccessGroup folds anything unrecognised back to the safe
-    // default rather than showing a chooser that cannot represent it.
-    function projectAccessSetting() {
-        var conf = (S.service && S.service.conf) || {};
-        var v = conf.default_access_group;
-        if (v === "ask") return "ask";
-        return UPLOAD_ACCESS_GROUPS.indexOf(v) === -1 ? null : v;
-    }
-    // "authorized" when the project has never set one: that is the group every
-    // BunnyQuery record was hardcoded to before the setting existed, so a project
-    // that never opened the control keeps the visibility its files already had.
-    function projectUploadAccessGroup() {
-        var v = projectAccessSetting();
-        return v && v !== "ask" ? v : "authorized";
-    }
-    function projectAsksUploadAccess() {
-        return projectAccessSetting() === "ask";
-    }
 
     var accessGroupState = { resolver: null, sticky: null, handle: null, applyToAll: false, choice: "authorized", perPath: {} };
     function resetAccessGroupBatch() {
@@ -4862,10 +4950,27 @@ import {
     // concurrently and two files must never fight over the single modal.
     var accessGroupChain = Promise.resolve();
     function resolveUploadAccessGroup(storagePath) {
-        if (!projectAsksUploadAccess()) return Promise.resolve(projectUploadAccessGroup());
+        // WAIT FOR THE SETTINGS RECORD BEFORE DECIDING. The sync accessors answer
+        // from cache and return the "authorized" default until the fetch settles,
+        // so the FIRST upload after a page load is the one that can be decided on
+        // a value the project never chose: a project set to "public" would index
+        // its first file where an anonymous visitor cannot read it, and one set to
+        // "ask" would never open the chooser. Nothing after the upload can move
+        // those records to another group without re-indexing the file, so this is
+        // worth a wait. It is only ever a real wait once: readyProjectSettings
+        // joins the fetch primeProjectSettings started when the chat opened, and
+        // resolves immediately after it has settled. It never rejects, and a read
+        // that failed settles as "unset", which is the default.
+        return readyProjectSettings(S.projectId).then(function () {
+            return decideUploadAccessGroup(storagePath);
+        });
+    }
+    function decideUploadAccessGroup(storagePath) {
+        var svc = S.projectId;
+        if (!projectAsksUploadAccess(svc)) return Promise.resolve(projectUploadAccessGroup(svc));
         // Under "ask" the project names no group, so the modal opens on the same
         // value an unset project would have used.
-        var fallback = projectUploadAccessGroup();
+        var fallback = projectUploadAccessGroup(svc);
         if (accessGroupState.sticky) return Promise.resolve(accessGroupState.sticky);
 
         // ONE answer per file, remembered for the batch. This is asked TWICE per
@@ -5189,6 +5294,24 @@ import {
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
             windowedIndexing: true,
+            // Live streaming of chat turns; read at configureChatEngine time.
+            // OFF until the region's polling worker relays the response bytes:
+            // see the configureChatEngine call for what goes wrong without it.
+            // A REQUEST, not a switch: it is also refused (with a warning, falling
+            // back to buffered) when the embedder's own skapi-js is too old to
+            // carry skapi's half of the stream flag. See skapiSupportsStreaming.
+            liveStreaming: false,
+            // Socket delivery for the streamed reply. OFF unless the embedder asks,
+            // and separately from liveStreaming, because this widget runs on someone
+            // else's page with someone else's skapi instance: skapi's joinRealtime
+            // REPLACES the connection's group rather than adding to it, so for the
+            // length of a turn this would take the room out from under whatever the
+            // host app uses realtime for, and the host would see its own messages
+            // simply stop. Only an embedder who knows their app does not use realtime
+            // (or does not mind) can answer that, so only they can turn it on. It is
+            // purely an accelerator: with it off the reply still streams, just on the
+            // poll's cadence rather than as the text is relayed.
+            liveStreamingRealtime: false,
         }, opts || {});
         S.mountEl = mountEl;
 
@@ -5200,6 +5323,48 @@ import {
         applyTheme(loadTheme());
         S.booted = true;
         console.log("[bunnyquery] v" + BQ_VERSION);
+
+        // The embedder ASKED for streaming; whether they get it depends on the
+        // skapi-js their page pinned. Degrade to BUFFERED rather than to a broken
+        // turn: without skapi's half of the flag the destination still streams SSE
+        // into a buffered row and every answer reads back empty, which is worse than
+        // not streaming in every way. See skapiSupportsStreaming for why the two
+        // methods are the probe. Loud, because an embedder who set the flag and got
+        // nothing has no other way to find out; once, at init, not per turn.
+        var canStream = skapiSupportsStreaming(S.skapi);
+        var liveStreaming = S.opts.liveStreaming === true;
+        if (liveStreaming && !canStream) {
+            liveStreaming = false;
+            console.warn(
+                "[bunnyquery] liveStreaming was requested but this page's skapi-js has no " +
+                "clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the " +
+                "stream flag would be dropped and every reply would read back empty. " +
+                "Falling back to buffered replies - update skapi-js to enable streaming."
+            );
+        }
+
+        // How the engine's project-settings store reads the "bq::settings"
+        // record. Wired ONCE here; every fetch after this is the store's, deduped
+        // and cached per project. Reads S lazily at call time, like the index
+        // marker hooks below, because S.skapi / S.projectId are not populated yet
+        // when init() runs.
+        //
+        // A SIGNED-OUT VISITOR USUALLY READS NOTHING HERE, AND THAT IS FINE. The
+        // record is public (group 0), but skapi's require_login gate refuses ALL
+        // database reads without a session and DEFAULTS TO TRUE, so on most
+        // projects this rejects with REQUIRE_LOGIN for a visitor who has not
+        // logged in. The store swallows that and falls back to "authorized". An
+        // empty read here is not a bug and needs no handling: the only thing the
+        // value is used for is an upload, and a visitor who cannot read the
+        // record cannot upload either.
+        configureProjectSettings(function (service) {
+            if (!S.skapi || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+            return Promise.resolve(S.skapi.getRecords({ service: service, unique_id: PROJECT_SETTINGS_UNIQUE_ID }))
+                .then(function (res) {
+                    var rec = (res && res.list && res.list[0]) || null;
+                    return (rec && rec.data) || null;
+                });
+        });
 
         // Inject this widget's transport + MCP endpoint into the shared chat
         // engine. poll: 0 — the deployed skapi-js@latest returns the early ack
@@ -5234,6 +5399,48 @@ import {
             windowedIndexing: S.opts.windowedIndexing !== false,
             // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
             attachmentParsers: S.opts.attachmentParsers || undefined,
+            // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
+            // Off by default, and for the same shipping-order reason
+            // windowedIndexing had one: THE RELAYING POLLING WORKER MUST SHIP
+            // FIRST. With this on against a region whose worker does not relay,
+            // the request either has its `since` cursor rejected or the row keeps
+            // an SSE transcript where the readers expect a parsed document, and
+            // the turn reads back as an empty answer. A streamed row settles with
+            // a STATUS AND NO BODY on purpose, so there is no fallback to read.
+            // Flip it per environment once the worker is deployed there; the
+            // widget takes it as an init opt because an embed picks its own
+            // region, where agent.vue flips one module constant.
+            // It also needs a skapi-js that supports `stream`/`onStream`, and the
+            // page's pin is the EMBEDDER's, so the request is granted above by
+            // skapiSupportsStreaming rather than taken on trust here.
+            liveStreaming: liveStreaming,
+            // Requires liveStreaming, and cannot outlive it: the AND is what stops an
+            // embedder turning on socket delivery for a reply that is not streamed.
+            liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true,
+            // What stores the version of a streamed turn that history keeps. The
+            // engine sends the ASSEMBLED provider body, so a streamed turn reads
+            // back through exactly the extractors a buffered one does, with no
+            // branch in the mapper; storing is also what releases the chunks.
+            // Called only for a streamed turn, and best-effort inside the engine.
+            // Handed over only when the SDK actually has it, so the engine's own
+            // "is this host able to?" checks answer honestly instead of a call
+            // reaching an undefined method mid-turn.
+            clientSecretRequestFinalize: canStream ? function (requestId, data, options) {
+                return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+            } : undefined,
+            // THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
+            // with a status and NO body: the answer is chunks until finalize copies
+            // a version onto the row. A row that settles while no poll is attached
+            // (the tab was closed, a mobile browser discarded it, the device slept
+            // and the interval stopped) is therefore never finalized, and without
+            // this hook the engine has no way back to it - the answer reads as gone
+            // from the conversation with every byte of it still stored. Given the
+            // request id this drains that turn's chunks in one pass, and the engine
+            // parses them exactly as it parses a live stream, finalizing what it
+            // read so the row becomes ordinary history and is never re-read.
+            clientSecretRequestStream: canStream ? function (requestId, options) {
+                return S.skapi.clientSecretRequestStream(requestId, options);
+            } : undefined,
         });
 
         // Recompute the attachment "...(x) more" overflow when the viewport

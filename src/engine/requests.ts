@@ -12,7 +12,7 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, pollOpt, windowedIndexingEnabled } from './config';
+import { chatEngineConfig, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens } from './budget';
@@ -71,6 +71,85 @@ function mcpEndpointFor(
 	return { url: String(mcpUrl()).replace(/\/+$/, '') + '/p/' + project };
 }
 const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretRequest(opts);
+
+/**
+ * THE two `stream` flags of a streamed chat turn, produced together or not at all.
+ *
+ * There are two of them and they are NOT the same flag:
+ *
+ *   * `transport.stream` is SKAPI's. It tells the polling worker to read the
+ *     destination's response incrementally and append the raw bytes to the chunk
+ *     table, and it is never sent on to the destination.
+ *   * `body.stream` is the DESTINATION's own field, and BunnyQuery is the party
+ *     that may set it: skapi relays bytes and knows no vendor, so it cannot know
+ *     that Anthropic Messages and OpenAI Responses both happen to spell it
+ *     `stream` at the top level of the body.
+ *
+ * Setting one without the other fails QUIETLY, which is why they are produced by
+ * one function from one boolean and returned as one object:
+ *
+ *   * body streams, skapi buffers -> the row stores an SSE TRANSCRIPT where
+ *     extractClaudeText / extractOpenAIText expect a parsed document, so the turn
+ *     reads back as an empty answer with nothing in the logs to say why.
+ *   * skapi streams, the body never asked -> the destination sends one plain
+ *     document, the relay chops it into chunks, the frame parser finds no framing
+ *     at all, and the row settles with a status and no body.
+ *
+ * Two frozen constants rather than a fresh object per call: the pair is a
+ * CONSTANT, and an object literal built at each call site is exactly the shape
+ * that drifts when someone edits one arm.
+ */
+export type ChatStreamWiring = {
+	/** Spread into the clientSecretRequest OPTIONS (skapi's relay switch). `realtime`
+	 *  belongs here and never in `body`: it is skapi's, not the destination's. */
+	transport: { stream?: true; realtime?: true };
+	/** Spread into `data` (the destination's own switch). */
+	body: { stream?: true };
+};
+const CHAT_STREAM_ON: ChatStreamWiring = Object.freeze({
+	transport: Object.freeze({ stream: true as true }),
+	body: Object.freeze({ stream: true as true }),
+}) as ChatStreamWiring;
+const CHAT_STREAM_OFF: ChatStreamWiring = Object.freeze({
+	transport: Object.freeze({}),
+	body: Object.freeze({}),
+}) as ChatStreamWiring;
+
+/**
+ * Both stream flags for a CHAT turn, from the one `liveStreaming` opt-in.
+ *
+ * Chat turns only. Deliberately NOT called from:
+ *   * the model LISTING calls (listClaudeModels / listOpenAIModels) - plain GETs
+ *     with no body at all, and a listing has nothing to stream;
+ *   * notifyAgentSaveAttachment (background INDEXING) - see the note there.
+ *
+ * `queue` is asked for because a chat turn sent WITH ATTACHMENTS runs on the
+ * background queue ("<userId>-bg") so it waits behind its own files, and that one
+ * must not stream either. Not for the indexing reasons above: the reason is
+ * RECOVERY. A streamed row keeps no body, so its only recovery after a reload is a
+ * poll re-attached with a reader, and the re-attach loop classifies everything on
+ * the bg queue as a background poll (flat cadence, no reader, that is what the
+ * MAX_CONCURRENT_BG_POLLS budget is for). Such a turn would therefore settle on an
+ * empty envelope and the answer would be gone. Losing the live rendering on the
+ * one kind of turn that already waited minutes for its files is the cheaper half of
+ * that trade.
+ */
+const CHAT_STREAM_ON_REALTIME: ChatStreamWiring = Object.freeze({
+	// `realtime` rides on the TRANSPORT arm only. It is a skapi option, not a field
+	// the destination understands, so it must never reach `data`: the body arm stays
+	// exactly what it is with the socket off.
+	transport: Object.freeze({ stream: true as true, realtime: true as true }),
+	body: Object.freeze({ stream: true as true }),
+}) as ChatStreamWiring;
+
+export function chatStreamWiring(queue?: string): ChatStreamWiring {
+	if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
+	if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
+	// Socket delivery is a separate opt-in from streaming itself: see
+	// liveStreamingRealtime for why a host that does not own its skapi instance
+	// should leave it off.
+	return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+}
 
 // Resolve the per-image `detail` for OpenAI. The version match tolerates a
 // trailing variant/date suffix (`gpt-5.4-nano`, `-mini`, `-2026-01-01`, …):
@@ -455,6 +534,17 @@ export type CallClaudeWithMcpParams = {
 // engine's own poll sites and imported by agent.vue; the widget carries its own
 // copy in src/index.js that must be kept in step.
 export const POLL_INTERVAL = 3000;
+// Poll cadence while a turn is STREAMING, i.e. while the poll is also reading the
+// relayed chunks. Faster than POLL_INTERVAL because on a streaming poll the tick is
+// not just "is it done yet", it is the delivery of the answer: at 3s the reader
+// watches the text arrive in three-second steps.
+//
+// 1s and not less, because the relay coalesces its writes to about one per second
+// (the worker's byte budget, see the polling worker's _STREAM_FLUSH_INTERVAL_S), so
+// a faster poll reads the same rows again and buys nothing but requests. It is also
+// what makes "roughly one paint per second" fall out of the transport rather than
+// out of a timer the paint path has to guess at.
+export const STREAM_POLL_INTERVAL = 1000;
 // Ceiling on how many BACKGROUND indexing polls may be attached at once, across
 // every poll site (the engine's drain, the engine's history load, and each
 // client's own fallback poller).
@@ -500,12 +590,20 @@ export async function callClaudeWithMcp({
 		mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
 	}
 
+	// ONE decision, spread in TWO places. See chatStreamWiring: the transport half
+	// is skapi's relay switch and the body half is Anthropic's own, and a turn that
+	// carries one without the other fails silently rather than loudly. The queue is
+	// the same expression the request uses below, so an attachment turn (which runs
+	// on the bg queue) is recognised and left buffered.
+	const stream = chatStreamWiring(userId || service);
+
 	return clientSecretRequest({
 		clientSecretName: 'claude',
 		queue: userId || service,
 		service,
 		owner,
 		...pollOpt(),
+		...stream.transport,
 		url: ANTHROPIC_MESSAGES_API_URL,
 		method: 'POST',
 		headers: {
@@ -517,6 +615,9 @@ export async function callClaudeWithMcp({
 		data: {
 			model,
 			max_tokens: maxTokens,
+			// Top level beside model/messages/mcp_servers, which is where the
+			// Messages API takes it.
+			...stream.body,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
 				: {}),
@@ -648,12 +749,16 @@ export async function callOpenAIWithPublicMcp(
 		})),
 	];
 
+	// ONE decision, spread in TWO places - see chatStreamWiring.
+	const stream = chatStreamWiring(userId || service);
+
 	return clientSecretRequest({
 		clientSecretName: 'openai',
 		queue: userId || service,
 		service,
 		owner,
 		...pollOpt(),
+		...stream.transport,
 		url: OPENAI_RESPONSES_API_URL,
 		method: 'POST',
 		headers: {
@@ -663,6 +768,9 @@ export async function callOpenAIWithPublicMcp(
 		data: {
 			model: resolvedModel,
 			max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
+			// Top level beside model/input/tools, which is where the Responses API
+			// takes it.
+			...stream.body,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
 				: {}),
@@ -945,6 +1053,22 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		accessGroup: attachment.accessGroup,
 	});
 
+	// INDEXING NEVER STREAMS, on either platform, whatever `liveStreaming` says.
+	// chatStreamWiring is deliberately not called below, and neither `stream` flag
+	// appears in either branch. Three reasons, any one of which is sufficient:
+	//
+	//   1. Nobody is watching. A pass runs on the background queue behind a chain
+	//      that can span days; there is no bubble to paint it into, so the only
+	//      thing streaming would buy is a chunk table to clean up.
+	//   2. The worker has to READ this response. `auto_continue` (render and window
+	//      passes) decides whether to enqueue the next window from the reply, and
+	//      the truncation and auth-outage checks that stop a chain read it too.
+	//      Those need a real JSON body, and a streamed row settles with a status and
+	//      no body at all.
+	//   3. The worker degrades such a pass anyway (it clears `strm` before the call
+	//      fires), so asking would be a request the backend is guaranteed to refuse
+	//      to honour - and one that leaves the row briefly marked as streaming,
+	//      which is exactly the state csr-finalize gates on.
 	if (platform === 'openai') {
 		const resolvedModel = info.model || DEFAULT_OPENAI_MODEL;
 		const imageDetail = getOpenAIImageDetail(resolvedModel);
@@ -1112,6 +1236,11 @@ export function extractOpenAIText(response: any) {
 	return '';
 }
 
+// MODEL LISTINGS NEVER STREAM. Both are plain GETs with no body: there is no
+// destination-side `stream` field to pair skapi's with, and a listing is one small
+// document that a caller reads whole. Neither carries `poll` either, so there is
+// not even a reader to hand chunks to. chatStreamWiring is deliberately not called
+// here - the pair is chat-turn-only.
 export async function listClaudeModels(service: string, owner: string) {
 	return clientSecretRequest({
 		clientSecretName: 'claude',

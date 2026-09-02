@@ -20,7 +20,73 @@ function isTransientStatus(status: number): boolean {
 	return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+/**
+ * True when a csr-poll answer is the STATUS ENVELOPE rather than a stored body.
+ *
+ * Duck-typed, because the engine does not import skapi-js and the SDK does not
+ * export its own copy. The rule is the SDK's (isPollEnvelope): a request that has
+ * a stored result hands that result back verbatim, every other state hands back
+ * `{ id, status, in_queue, ... }`. A finalized body is the caller's own content
+ * and can itself carry a `status` key (OpenAI's Responses object does), so the
+ * id/in_queue pair is demanded too: a provider body would have to reproduce all
+ * three to be mistaken for an envelope.
+ *
+ * It lives HERE, next to the error readers, rather than in session.ts, because
+ * both of the things that have to recognise an envelope (the settle that
+ * substitutes an assembled body for one, and the error readers below) must agree
+ * on what one is. It was written twice once; that is how the error readers came to
+ * look one level too shallow.
+ */
+export function isCsrStatusEnvelope(res: any): boolean {
+	return !!res && typeof res === 'object' && !Array.isArray(res) &&
+		typeof res.status === 'string' && typeof res.id === 'string' && ('in_queue' in res);
+}
+
+/**
+ * The real error payload inside a FAILED csr-poll status envelope, or undefined
+ * when `input` is not one.
+ *
+ * THE FAILURE THIS PREVENTS, verbatim from the wire. A buffered turn that fails
+ * polls back as the worker's failed payload itself:
+ *
+ *     { status_code: 401, body: { error: { type, message } }, truncated: false }
+ *
+ * ...which every predicate below reads correctly. A STREAMED turn that fails does
+ * not: the poller (client_secret_key_request_polling) cannot return the error
+ * early for a streamed row, because the chunks that arrived before the stream died
+ * have to come back in the same response, so it falls through and ships
+ *
+ *     { id, status: 'failed', queue_name, in_queue, stream, chunks, last_seq,
+ *       more, error: <the payload above> }
+ *
+ * The payload is one level deeper, and every predicate here looked at the top
+ * level: `response.error.message` is undefined on it, `response.status_code` is
+ * absent, and `response.status` is the string 'failed' rather than a number. So a
+ * wrong API key on a streamed turn read as "not an error, and no answer either",
+ * which the caller renders as "No text response received from AI provider": the
+ * one message that tells the user nothing.
+ *
+ * Unwrapping HERE, once, is what makes a streamed error and a buffered error take
+ * the same path through every reader below. Deliberately not recursive: the value
+ * inside an envelope is a provider payload, never another envelope, and a single
+ * unwrap cannot loop on a malformed one.
+ *
+ * A failed envelope with a NULL payload (the worker recorded no detail, or its
+ * spill could not be fetched) still yields an object, because the row's status is
+ * itself the fact: 'failed' with nothing attached must not read as a clean turn.
+ */
+export function csrEnvelopeError(input: any): any {
+	if (!isCsrStatusEnvelope(input)) return undefined;
+	// Only a failure carries one. 'resolved' means the body IS the answer (the
+	// settle substitutes it), and 'cancelled' is settled by its own predicate
+	// upstream, which must keep seeing the envelope it recognises.
+	if (input.status !== 'failed') return undefined;
+	return input.error != null ? input.error : { message: 'The AI provider request failed.' };
+}
+
 export function getErrorMessage(input: any): string {
+	var envErr = csrEnvelopeError(input);
+	if (envErr !== undefined) input = envErr;
 	if (!input) return 'Something went wrong.';
 	if (typeof input === 'string') return input;
 	if (input.error && input.error.message) return input.error.message;
@@ -48,7 +114,11 @@ export function getErrorMessage(input: any): string {
 }
 
 export function isErrorResponseBody(response: any): boolean {
-	if (!response || typeof response !== 'object') return false;
+	// A FAILED streamed row is an error however empty its payload turned out to
+	// be: the status is the fact. See csrEnvelopeError.
+	var envErr = csrEnvelopeError(response);
+	if (envErr !== undefined) response = envErr;
+	if (!response || typeof response !== 'object') return envErr !== undefined;
 	if (typeof response.status_code === 'number' && response.status_code >= 400) return true;
 	if (response.type === 'error') return true;
 	if (response.error && (response.error.message || response.error.type)) return true;
@@ -78,6 +148,11 @@ export function isErrorResponseBody(response: any): boolean {
 // retryable after a token refresh — so 401 (auth) and 429/5xx (transient) are
 // intentionally NOT treated as non-retryable here.
 export function isNonRetryableRequestError(input: any): boolean {
+	// Same one-level unwrap as the readers above: a streamed turn's failure is
+	// wrapped in its poll envelope, and a retry gate that cannot see the payload
+	// would re-send a request the provider has already rejected as malformed.
+	var envErr = csrEnvelopeError(input);
+	if (envErr !== undefined) input = envErr;
 	if (!input || typeof input !== 'object') return false;
 
 	var status = typeof input.status_code === 'number' ? input.status_code
@@ -118,6 +193,12 @@ export function isNonRetryableRequestError(input: any): boolean {
 }
 
 export function isAuthExpiredError(input: any): boolean {
+	// A streamed turn whose bearer expired fails exactly like a buffered one, one
+	// level deeper. Without this unwrap the refresh-and-resend gate never fires on
+	// the streaming path, so an expiry that costs a buffered turn nothing costs a
+	// streamed turn the whole answer.
+	var envErr = csrEnvelopeError(input);
+	if (envErr !== undefined) input = envErr;
 	if (!input) return false;
 	var blobs: string[] = [];
 	var push = function (v: any) { if (typeof v === 'string' && v) blobs.push(v); };
@@ -156,6 +237,11 @@ export function isAuthExpiredError(input: any): boolean {
  * reduced to by getErrorMessage, because the view usually only keeps the text.
  */
 export function isProviderApiKeyError(input: any): boolean {
+	// Same unwrap. A wrong API key on a streamed turn is the exact case CRITICAL 2
+	// was reported for: without this the "check the project's key" affordance never
+	// appears on the platform the user is actually streaming with.
+	var envErr = csrEnvelopeError(input);
+	if (envErr !== undefined) input = envErr;
 	if (!input) return false;
 	var blobs: string[] = [];
 	var push = function (v: any) { if (typeof v === 'string' && v) blobs.push(v); };

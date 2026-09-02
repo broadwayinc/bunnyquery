@@ -6,6 +6,7 @@
  */
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
+import { streamRecoveryEnabled } from './config';
 import { sanitizeAttachmentLinksForHistory } from './links';
 import type { ChatMessage } from './host';
 
@@ -702,8 +703,11 @@ export type MapHistoryOptions = {
 };
 
 export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions) {
-	var mapped: any[] = [], runningItemIds: string[] = [];
+	var mapped: any[] = [], runningItemIds: string[] = [], streamPendingItemIds: string[] = [];
 	var extractAssistantText = platform === 'openai' ? extractOpenAIText : extractClaudeText;
+	// See the `isStreamPending` block below. Read ONCE per call rather than per
+	// item: it is a config lookup, and the answer cannot change mid-list.
+	var canRecoverStreams = streamRecoveryEnabled();
 	var filtered = filterListByClearHorizon(list, opts.clearedAt);
 	filtered.slice().reverse().forEach(function (item) {
 		var requestBody = item && item.request_body;
@@ -727,6 +731,45 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			? ((typeof item.response_text === 'string' ? item.response_text : '').trim())
 			: ((extractAssistantText(response) || '').trim() || ''));
 		var isErrorResponse = !isPending && (isFailed || (!isCompact && isErrorResponseBody(response)));
+		// AN ANSWER THAT IS UNKNOWN, NOT EMPTY.
+		//
+		// A STREAMED turn stores nothing on its row: the relay appends the
+		// destination's bytes to the chunk table and settles the row with a status
+		// and no body, and only csr-finalize ever copies an answer onto the row. So a
+		// row that is terminal, carries no body and carries no error is not a turn
+		// that answered nothing: it is a turn nobody finalized. That happens for one
+		// ordinary reason: the row settled while no poll was attached (the tab was
+		// closed, a mobile browser discarded it, the device slept and the interval
+		// stopped), so the client that would have finalized it was not there.
+		//
+		// Read as "empty" (which is what the `assistantText` guard further down did),
+		// such a row produces NO assistant bubble at all and the answer is simply gone
+		// from the conversation, with every byte of it still sitting in the chunk
+		// table, reachable through clientSecretRequestStream. So it is marked instead,
+		// and the two things that act on the mark are the merge (an unknown answer
+		// never overwrites a known one) and the recovery (an unknown answer is
+		// resolved by reading the chunks back). See ChatMessage._streamPending.
+		//
+		// Deliberately narrow, so nothing that is genuinely an empty turn is caught:
+		//   - only when this host streams AND can read chunks back (see
+		//     streamRecoveryEnabled); a host that does neither behaves exactly as it
+		//     does today, and one that cannot read them back would only trade a
+		//     missing bubble for a permanently empty one;
+		//   - never on the background queue. chatStreamWiring turns streaming OFF for
+		//     every bg-queue turn (an indexing pass must not stream, and an attachment
+		//     turn is left buffered on purpose), so a bg row with no body really did
+		//     answer nothing;
+		//   - never on a compact stub, whose body was withheld by the server rather
+		//     than never stored;
+		//   - 'resolved' only. A FAILED row already renders its error, which is the
+		//     authoritative account of the turn (and, once csrEnvelopeError is in
+		//     play, a truthful one). Its chunks are deliberately kept but not
+		//     rendered. See _finalizeStreamedTurn.
+		var isStreamPending = canRecoverStreams && !isCompact && !isPending && !isCancelledItem
+			&& !isErrorResponse && !item._isBgTask && !item._isOnBgQueue
+			&& item.status === 'resolved'
+			&& (item.response_body == null) && (item.error == null)
+			&& !assistantText;
 		// Record the completion marker, then STRIP it — both, and in that order.
 		// Recording gives the display layer a structured signal instead of a substring
 		// search over model prose. Stripping matches the live resolution path: without
@@ -810,6 +853,14 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			if (replyTs !== undefined) em._ts = replyTs;
 			mapped.push(em);
+		} else if (isStreamPending) {
+			// The bubble stands for the turn so the merge has something to key on and
+			// the recovery has somewhere to write. Its content is UNKNOWN: empty here
+			// is the absence of an answer on the row, not the absence of an answer.
+			var sp: any = { role: 'assistant', content: '', _streamPending: true };
+			if (serverItemId !== undefined) { sp._serverItemId = serverItemId; streamPendingItemIds.push(serverItemId); }
+			if (replyTs !== undefined) sp._ts = replyTs;
+			mapped.push(sp);
 		// `|| reportedComplete`: a pass whose ENTIRE answer was the completion token
 		// strips down to an empty string, and the plain `assistantText` guard then
 		// emitted no bubble at all — while the live path emitted one. The run read as
@@ -837,7 +888,54 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
 		for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
 	}
-	return { messages: mapped, runningItemIds: runningItemIds };
+	// `streamPendingItemIds` is additive: a consumer that only destructures
+	// { messages, runningItemIds } (agent.vue's own call site does) is unaffected.
+	// The engine drives recovery off the BUBBLES rather than this list (the merge
+	// runs between the two and can adopt a local answer onto one of them), so this
+	// is reporting, not the mechanism.
+	return { messages: mapped, runningItemIds: runningItemIds, streamPendingItemIds: streamPendingItemIds };
+}
+
+/**
+ * Let a LOCAL copy of a turn survive a page whose copy of it is
+ * AUTHORITATIVE-BUT-EMPTY. Mutates `incoming`; returns true when it took anything.
+ *
+ * THE FAILURE THIS PREVENTS. A streamed turn's row goes 'resolved' the moment the
+ * relay finishes, and its answer reaches the row only when csr-finalize stores it,
+ * one poll interval plus a round trip later. A first-page history refetch landing
+ * inside that window maps the row to a `_streamPending` bubble with no content, and
+ * the merge, which believes the server, throws away the local bubble holding the
+ * answer the reader is looking at. The window opens on EVERY streamed turn, and a
+ * refetch fires from visibilitychange, so it is not a corner case.
+ *
+ * The rule is the same one the recovery reads: an UNKNOWN answer never overwrites a
+ * KNOWN one. Where the local copy is still live (pending, or being painted into),
+ * its live-ness is adopted too: without it the merge would hand back a settled
+ * bubble the painter can no longer find (_liveTargetIndex wants isPending or
+ * _streaming) and that _turnAlreadyRendered would then read as already answered, so
+ * the settle would drop the real answer on the floor.
+ */
+export function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessage): boolean {
+	if (!incoming || !local || !incoming._streamPending) return false;
+	if (incoming.role !== 'assistant' || local.role !== 'assistant') return false;
+	var hasText = typeof local.content === 'string' && local.content.length > 0;
+	var isLive = !!(local.isPending || local._streaming);
+	if (!hasText && !isLive) return false;
+	if (hasText) {
+		incoming.content = local.content;
+		// The answer is on screen, so nothing has to be read back. Whether the row
+		// itself ever gets a stored body is the live path's business (its finalize is
+		// in flight); if that fails, the NEXT load meets an empty row again and
+		// recovers it then.
+		incoming._streamPending = false;
+	}
+	// Carried whatever the text says: these are what keep a still-running turn
+	// reachable by the painter and by the settle.
+	if (local._localId !== undefined) incoming._localId = local._localId;
+	if (local.isPending) incoming.isPending = true;
+	if (local.isPendingInProcess) incoming.isPendingInProcess = true;
+	if (local._streaming) incoming._streaming = true;
+	return true;
 }
 
 /* ---- rescuing in-flight bubbles across a first-page refetch ---------------
@@ -886,6 +984,19 @@ export function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecisionC
 	// it. Unconditional: applying the pending-assistant test here would delete the
 	// user's message mid-upload whenever some other turn happened to be in flight.
 	if (m._stageId) return true;
+	// A bubble being painted from a LIVE stream, before its dispatch has reported a
+	// server id. Same shape of reason as the staged bubble above: the page identifies
+	// turns by id, so nothing in it can stand for this one, and dropping it would
+	// leave the stream with no bubble to paint into (the painter finds its target by
+	// _serverItemId, and this bubble has none to be found by) - the turn would sit on
+	// "Thinking..." until it settled, with every relayed byte already spent.
+	//
+	// Gated on the missing id rather than on _streaming alone, and deliberately: once
+	// the id IS on the bubble, the tests below are right and the local copy really is
+	// redundant. The page carries the same turn as a pending placeholder with that id,
+	// the painter finds THAT one on its next paint (about a second later), and rescuing
+	// as well would put the same turn on screen twice.
+	if (m._streaming && !m._serverItemId) return true;
 	if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
 	// In flight by its own flags, id or no id. The immediate-send pair is stamped
 	// with its server id as soon as the dispatch reports one, and that id is there

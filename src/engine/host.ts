@@ -130,6 +130,91 @@ export interface ChatMessage {
 	 *  still dimmed. Cleared (with _dimSending) by markStagedMessageReady the moment
 	 *  the queue drains, which is when the turn genuinely becomes "(In queue)". */
 	isAwaitingIndexing?: boolean;
+	/** PROTOCOL + PRESENTATIONAL: this bubble is being painted from a LIVE stream.
+	 *
+	 *  It sits alongside `isPending`, never instead of it. The bubble is still the
+	 *  turn's "Thinking..." placeholder as far as every queue mechanism is concerned
+	 *  (_ownThinkingIndex, resolveQueuedUserBubble, typewriteLatestReply and the
+	 *  stray-pending sweep all find their target by isPending), and clearing that flag
+	 *  to mean "it has text now" would strand the turn's real answer beside an orphan.
+	 *  What this adds is the one thing those mechanisms do not care about and the VIEW
+	 *  does: `content` is already worth rendering, so draw the text instead of the
+	 *  spinner.
+	 *
+	 *  Cleared the moment the turn settles, BEFORE the authoritative answer replaces
+	 *  the live text: from that instant the bubble is an ordinary reply being typed.
+	 *  The partially painted `content` is deliberately left in place across that clear,
+	 *  because it is what the typewriter resumes from instead of replaying from zero.
+	 *
+	 *  Also read by shouldRescueInFlightMessage: a streaming bubble that has no server
+	 *  id yet is unrepresentable in a freshly fetched page, so it must survive the
+	 *  merge or its stream is orphaned with nothing left to paint into. */
+	_streaming?: boolean;
+	/**
+	 * This turn's row is TERMINAL but carries no stored answer, because the answer
+	 * was streamed and nobody ever finalized it: the bytes are in the chunk store,
+	 * not on the row. The bubble's `content` is therefore UNKNOWN, not empty.
+	 *
+	 * That distinction is the whole of the fix for two bugs that looked unrelated.
+	 * A refetch landing in the window between the row going 'resolved' and finalize
+	 * storing the body used to ERASE the answer off the screen (the server copy has
+	 * no content, so the merge dropped the local bubble that did); and a turn that
+	 * settled while no poll was attached (closed tab, slept device) used to be
+	 * unrecoverable, because the mapper emitted no assistant bubble at all for a
+	 * terminal-but-empty row. Both are the same question, "what should the merge
+	 * believe when the server copy is authoritative but empty", and the answer is
+	 * this flag: an unknown answer NEVER overwrites a known one, and an unknown one
+	 * left over after the merge is resolved by reading the chunks back
+	 * (ChatSession.recoverStreamedAnswer).
+	 *
+	 * For a view it is a rendering hint and nothing more: a bubble carrying it with
+	 * empty content is being fetched, so draw whatever this client draws for a
+	 * loading answer. A host that ignores it renders an empty bubble for the second
+	 * or two the recovery takes, which is what it would have rendered anyway.
+	 *
+	 * WHEN IT COMES OFF, because that is the half that loses answers. It comes off
+	 * for a FACT about the turn and never for an event in the client: an answer was
+	 * recovered and written in, or the chunks were read and were genuinely empty (in
+	 * which case the empty bubble is removed as well, restoring the list the mapper
+	 * used to produce). It stays ON when the read FAILED, when the read was STOPPED,
+	 * and when a live turn settled having painted nothing - three states that say
+	 * nothing whatever about the turn, and in which the chunks are all still there.
+	 * A marker cleared on one of those is an answer nothing will ever go back for,
+	 * so a host may see the same bubble marked across several loads while the reads
+	 * keep failing; that is the recoverable state, not a stuck one.
+	 */
+	_streamPending?: boolean;
+	/**
+	 * IS ANYTHING ACTUALLY DRIVING THIS BUBBLE RIGHT NOW? The second half of
+	 * `_streamPending`, and the half a view cannot do without.
+	 *
+	 * `_streamPending` says the answer is elsewhere; it does NOT say somebody is on
+	 * their way to fetch it, and the two are different states that used to render
+	 * identically. Recovery is capped per history load (STREAM_RECOVERY_PER_LOAD),
+	 * so the third and later marked turns on a page are marked and nobody is reading
+	 * them; a read that FAILED leaves the marker on with the attempt forgotten, which
+	 * is also nobody. Both drew the same loader as a live turn, so a bubble could
+	 * spin for the rest of the session with nothing behind it - the one thing a
+	 * spinner must never do, because it is a promise that something is coming.
+	 *
+	 * Three states, and only the first of them may draw a spinner:
+	 *   'active'   a chunk read is in flight or queued for this turn. Something IS
+	 *              coming; the loader is honest.
+	 *   'failed'   the last read failed. Nothing is coming until somebody asks
+	 *              again, so the view owes the reader a way to ask.
+	 *   undefined  nothing has been tried, or the attempt is over. Same obligation.
+	 *
+	 * Written by the engine only, and never persisted anywhere: it describes THIS
+	 * session's fetching, not the turn. A fresh history page therefore arrives
+	 * without it, and _adoptLocalAnswers re-stamps the page's still-marked bubbles
+	 * from the session's own bookkeeping, so a reload during a read does not turn a
+	 * live loader into a button (and back a second later).
+	 *
+	 * Read it through streamRecoveryPhase(msg), never directly: the phase folds in
+	 * "does this bubble need the affordance at all", and both clients must not
+	 * answer that twice.
+	 */
+	_streamRecovery?: 'active' | 'failed';
 	_serverItemId?: string;
 	_localId?: string;
 	_cancelling?: boolean;

@@ -29,6 +29,7 @@ import {
 	extractOpenAIText,
 	getChatHistory,
 	POLL_INTERVAL,
+	STREAM_POLL_INTERVAL,
 	MAX_CONCURRENT_BG_POLLS,
 	bgIndexingQueueName,
 	isBgIndexingQueue,
@@ -41,12 +42,15 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled, chatEngineConfig } from './config';
-import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage } from './errors';
+import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig } from './config';
+// The wire-format knowledge. skapi relays the provider's bytes without reading them,
+// so the session hands them straight to this parser and never inspects a frame itself.
+import { createSseParser, type SseParser } from './sse';
+import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage, isCsrStatusEnvelope } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
-import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage } from './history';
+import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage } from './history';
 import { wallClockNow } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext } from './host';
@@ -156,6 +160,385 @@ export type PollHandle = {
 function isPollStopped(res: any): boolean {
 	return !!res && typeof res === 'object' && res.status === 'stopped';
 }
+
+
+/* ── live streaming: what is safe to show, and where to resume ──────────────
+ *
+ * A streamed answer is rendered while it is still GROWING, which is a different
+ * problem from the typewriter's. The typewriter already holds the whole string and
+ * only has to avoid stopping inside a region it knows the bounds of. Here the end
+ * of the string is not the end of the answer: a `[` may be the start of a link
+ * whose url has not arrived, and three backticks may be the start of a file fence
+ * whose whole point is that it renders as a download chip rather than as prose.
+ *
+ * So the rule is the mirror image of the typewriter's: instead of extending the
+ * reveal past an atomic region, hold it BACK to before whatever the next bytes
+ * could still turn into one. The tail is only ever a paint or two behind, and the
+ * settle re-renders the authoritative text in full anyway, so nothing is lost by
+ * being late and quite a lot is lost by being early (a chip minted from half a
+ * url, a fence opener shown as three literal backticks, a link whose href changes
+ * under the reader's pointer).
+ */
+
+/** How far back from the end an unclosed '[' is still read as "a link about to
+ *  complete". Beyond this it is ordinary prose that happens to contain a bracket,
+ *  and treating it as a pending link would freeze the reveal for the rest of the
+ *  answer: "see [the appendix" never closes, and without a window the reader would
+ *  watch a bubble that stopped growing at the bracket until the turn settled. */
+const LIVE_PENDING_LINK_WINDOW = 512;
+
+/**
+ * How many unfinalized streamed turns ONE history load reads back out of the chunk
+ * store on its own.
+ *
+ * Each read drains a whole turn's chunks, so this is a real request budget, not a
+ * render one. Two, newest first, because that is the shape the case actually has:
+ * a turn is left unfinalized by the tab going away mid-answer, and a user does that
+ * to the turn they were watching, not to twenty of them. A page holding more keeps
+ * the rest marked and picks them up on the next load (each recovery finalizes what
+ * it read, so the backlog strictly shrinks), or the host offers them on demand
+ * through recoverStreamedAnswer().
+ */
+const STREAM_RECOVERY_PER_LOAD = 2;
+
+/**
+ * The prefix of a still-arriving answer that is safe to render as markdown.
+ *
+ * Four cuts, each taking the earliest position that could still change meaning:
+ *   1. an UNCLOSED ``` fence (odd number of markers) - everything from its opener;
+ *   2. an UNCLOSED inline link on the last line - `[label` with no `]`, or
+ *      `[label](url` with no `)`, from its `[`;
+ *   3. a trailing bare url or `src::` token, from its first character, because a
+ *      link is minted from whatever is there and a growing url means a chip whose
+ *      href changes on every paint;
+ *   4. an unclosed inline-code span on the last line (odd backtick count).
+ *
+ * Deliberately NOT covered: emphasis markers, half-written table rows and list
+ * bullets. Those degrade to a flicker of STYLING, which self-corrects on the next
+ * paint; the four above degrade to a wrong link, a wrong chip, or prose shown where
+ * a fence was meant, none of which the reader can tell from the real thing.
+ */
+export function liveSafePrefix(text: string): string {
+	if (!text) return '';
+	var cut = text.length;
+
+	// 1. Fence markers come in pairs. An odd count means the last one opened a block
+	//    that has not closed, and a file fence in particular is the download-chip
+	//    syntax: shown half-arrived it is three backticks and a filename in prose.
+	var fenceAt = -1, fences = 0, from = 0, hit;
+	for (;;) {
+		hit = text.indexOf('```', from);
+		if (hit === -1) break;
+		fences++; fenceAt = hit; from = hit + 3;
+	}
+	if (fences % 2 === 1 && fenceAt !== -1) cut = fenceAt;
+
+	// Rules 2 to 4 look at the last line of what SURVIVED rule 1: an inline link and
+	// an inline-code span cannot span a newline (createInlineLinkRegex's label class
+	// excludes it), so the last line is the whole of what can still be growing.
+	var head = text.slice(0, cut);
+	var lineStart = head.lastIndexOf('\n') + 1;
+	var line = head.slice(lineStart);
+
+	// 2. An inline link whose url has not arrived. Windowed (see the constant): a
+	//    bracket far behind the write head belongs to prose, not to a pending link.
+	var open = line.lastIndexOf('[');
+	if (open !== -1 && (line.length - open) <= LIVE_PENDING_LINK_WINDOW) {
+		var rest = line.slice(open);
+		var close = rest.indexOf(']');
+		if (close === -1) {
+			cut = lineStart + open;
+		} else if (rest.charAt(close + 1) === '(' && rest.indexOf(')', close + 1) === -1) {
+			cut = lineStart + open;
+		}
+	}
+
+	// 3. A trailing bare url / src:: token. Only once it is RECOGNISABLE as one: the
+	//    few characters of a half-written scheme ("https:/") render as plain text and
+	//    linkify nothing, and the monotonic guard in the painter means the reveal
+	//    simply stops there until the whole url has landed rather than retreating.
+	var tokStart = line.length;
+	while (tokStart > 0 && !/\s/.test(line.charAt(tokStart - 1))) tokStart--;
+	var tok = line.slice(tokStart);
+	if (tok && /^(?:https?:\/\/|src::)/i.test(tok)) {
+		var tokCut = lineStart + tokStart;
+		if (tokCut < cut) cut = tokCut;
+	}
+
+	// 4. An unclosed inline-code span. Skipped on a line carrying a fence marker,
+	//    where the backticks are rule 1's business: a CLOSING fence line ("```") has
+	//    an odd count of its own, and cutting there would hide the very marker that
+	//    closes the block and leave an open fence on screen.
+	if (line.indexOf('```') === -1) {
+		var ticks = 0, lastTick = -1;
+		for (var i = 0; i < line.length; i++) {
+			if (line.charAt(i) === '`') { ticks++; lastTick = i; }
+		}
+		if (ticks % 2 === 1 && lastTick !== -1) {
+			var tickCut = lineStart + lastTick;
+			if (tickCut < cut) cut = tickCut;
+		}
+	}
+
+	if (cut >= text.length) return text;
+	if (cut < 0) cut = 0;
+	return text.slice(0, cut);
+}
+
+/** Length of the shared leading run of two strings, never splitting a surrogate
+ *  pair: a resume index landing between the halves of an astral character would
+ *  paint a lone surrogate, which renders as a replacement glyph. */
+function commonPrefixLength(a: string, b: string): number {
+	var n = Math.min(a.length, b.length), i = 0;
+	while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+	if (i > 0) {
+		var prev = a.charCodeAt(i - 1);
+		if (prev >= 0xd800 && prev <= 0xdbff) i--;
+	}
+	return i;
+}
+
+/**
+ * Where the typewriter should START revealing `fullText`, given what a live stream
+ * has already painted into the bubble.
+ *
+ * The point is that the settle must not replay an answer the reader has already
+ * watched arrive: the authoritative text REPLACES the live text (it is the only
+ * source of truth), but the characters the two agree on are already on screen and
+ * retyping them from zero is the one thing that would make streaming look worse
+ * than not streaming.
+ *
+ * `regions` are the typewriter's own atomic regions. A resume index landing inside
+ * one is pushed FORWARD to its end rather than back to its start: forward reveals
+ * the link or fence whole, which is the policy those regions exist to enforce, and
+ * backward would make the bubble shrink at the exact moment the answer settles.
+ *
+ * LEADING WHITESPACE IS NORMALISED FIRST, and that is not a nicety. The two strings
+ * come from two places that disagree about it by design: the painter writes the
+ * parser's `text` UNTRIMMED (currentText says why: trimming a render feed would
+ * remove a leading newline and then hand it back when the next delta lands), while
+ * every settle path trims, exactly as it trims a buffered answer. And the extractor
+ * joins text blocks with '\n', so a model that opens an empty text block before its
+ * first tool call, which Claude routinely does, produces a painted answer starting
+ * with a newline the authoritative one does not have. Compared raw, the two agree on
+ * NOTHING (their first characters differ), the resume index is 0, and the reader
+ * watches the entire answer they just read be retyped from zero. Which is the one
+ * thing streaming was supposed to stop happening.
+ */
+export function typewriterResumeIndex(
+	painted: string,
+	fullText: string,
+	regions: Array<{ start: number; end: number }>,
+): number {
+	if (!painted || !fullText) return 0;
+	// Only when the authoritative text has none of its own: that is the case where
+	// the difference can only be the trim, so dropping it aligns the two. If
+	// fullText DOES start with whitespace (a caller that passes untrimmed text) the
+	// two are already in the same frame and cutting painted would misalign them.
+	if (/^\s/.test(painted) && !/^\s/.test(fullText)) {
+		painted = painted.replace(/^\s+/, '');
+		if (!painted) return 0;
+	}
+	var i = commonPrefixLength(painted, fullText);
+	if (i <= 0) return 0;
+	if (i >= fullText.length) return fullText.length;
+	for (var changed = true; changed;) {
+		changed = false;
+		for (var k = 0; k < regions.length; k++) {
+			var r = regions[k];
+			if (i > r.start && i < r.end) { i = r.end; changed = true; }
+		}
+	}
+	return i > fullText.length ? fullText.length : i;
+}
+
+/**
+ * THE KEEP POLICY, in one place, for every path that can reach csr-finalize.
+ *
+ * WHY IT IS A FUNCTION AND NOT A LINE IN EACH CALLER. Finalizing does two things in
+ * one call: it stores what you hand it as the row's permanent answer, and it
+ * DELETES the chunks it was assembled from. Chunks are the only copy of a streamed
+ * answer until that call, and there is no way to release them without also storing
+ * something, so "may this be kept?" is the single decision that separates a
+ * recoverable turn from a permanently truncated one. It was answered in two places
+ * that then disagreed: the live settle refused to finalize a failed or cancelled
+ * turn (its partial text is the only copy there is, and both ways of releasing it
+ * cost something real), while the recovery path computed the same question from
+ * parse completeness ALONE - so recovering a failed row finalized it and released
+ * exactly the chunks the live policy exists to keep. Two halves of one fix, pulling
+ * opposite ways. One predicate, consulted by both, is the fix for that.
+ *
+ * The three terms, and what each of them is protecting:
+ *
+ *   THE ROW'S OWN STATUS wins over anything the bytes say. 'failed' means the
+ *   destination's account of the turn is the error, not the text that arrived
+ *   before it; 'cancelled' means the user's Stop said to discard the half answer,
+ *   so writing it into history as the kept version resurrects exactly what the stop
+ *   was for; 'stopped' is a poll that was ended, which says nothing about the turn
+ *   at all. Pass undefined when the status is genuinely not known (the caller is
+ *   looking only at bytes); pass the status whenever there is one, because a caller
+ *   that omits a status it HAS is asking the wrong question.
+ *
+ *   `errored` covers the same refusal expressed by the bytes rather than by the
+ *   row: an `error` frame, a response.failed, a terminal Response with an error
+ *   payload. See sse.ts's answerComplete for why a terminal event is not the same
+ *   claim as a finished answer.
+ *
+ *   `answerComplete` (NOT `complete`) is the completeness half. A degraded chunk
+ *   read - the poller degrades to "no chunks this tick, more=true" on any transient
+ *   chunk-table error, and caps one read at 500k characters - hands a settle a
+ *   stream that stopped mid-answer while the ROW settles 'resolved' on top of it,
+ *   because the row's status describes the destination's request and not our read
+ *   of it. Anything short of a finished answer leaves the chunks exactly where they
+ *   are, which is what they are for: the turn stays re-readable through
+ *   clientSecretRequestStream and a later load recovers it in full.
+ *
+ *   `unframed` is the one exception to needing a terminal event, and it is not a
+ *   loophole: bytes that were never SSE carry no events at all and none is ever
+ *   coming, so there it IS the row's status that says the response finished - which
+ *   is why this is only ever reached with a 'resolved' row or with no status to
+ *   contradict it.
+ *
+ * Exported so the two clients cannot answer it a third way.
+ */
+export function mayKeepStreamedAnswer(snap: any, rowStatus?: string | null): boolean {
+	// An absent status is "not known", not "not resolved": a caller reading bytes
+	// alone has no row to consult. A status that IS present must be the resolved one.
+	if (rowStatus !== undefined && rowStatus !== null && rowStatus !== '' && rowStatus !== 'resolved') return false;
+	if (!snap || typeof snap !== 'object') return false;
+	if (snap.errored) return false;
+	if (snap.answerComplete) return true;
+	if (snap.unframed) return true;
+	return false;
+}
+
+/**
+ * WHAT A VIEW SHOULD DRAW FOR A TURN WHOSE ANSWER IS STILL IN THE CHUNK STORE.
+ *
+ * One predicate, on the barrel, because the alternative is each client deciding
+ * for itself when a spinner is honest - and the two clients have forked on
+ * smaller things than this. Returns:
+ *
+ *   ''         not this state at all. Either the bubble is not marked, or it HAS
+ *              content (the merge adopted a local answer onto it, or a recovery
+ *              wrote a truncated one in), in which case there is text to render
+ *              and the recovery, if any, is a background correction the reader
+ *              does not need to be told about.
+ *   'active'   a chunk read is in flight or queued. Draw the loader: this is the
+ *              only phase in which something really is coming.
+ *   'failed'   the last read failed. Draw the failure and an ask-again control.
+ *   'idle'     marked, and nothing is fetching it. Draw an ask-for-it control.
+ *
+ * THE FAILURE THIS EXISTS TO STOP. Recovery is capped at STREAM_RECOVERY_PER_LOAD
+ * per history load, so on a page holding several unfinalized turns the third and
+ * later ones are marked and queued for nobody; a failed read likewise leaves the
+ * marker on deliberately (it is the only thing keeping the answer reachable) with
+ * no attempt behind it. Both used to take the same branch as a live pending turn,
+ * so those bubbles spun forever with nothing driving them and no way for the
+ * reader to resolve them - while the answer sat in the chunk table the whole time,
+ * one recoverStreamedAnswer() call away.
+ *
+ * A bubble with no `_serverItemId` returns '' on purpose: there is no id to hand
+ * recoverStreamedAnswer, so an affordance would be a button that cannot work.
+ * Unreachable today (the mapper only ever marks a row it has an id for), stated so
+ * that it stays unreachable rather than becoming a dead control.
+ */
+export function streamRecoveryPhase(msg: any): '' | 'active' | 'failed' | 'idle' {
+	if (!msg || !msg._streamPending || msg.content || !msg._serverItemId) return '';
+	if (msg._streamRecovery === 'active') return 'active';
+	if (msg._streamRecovery === 'failed') return 'failed';
+	return 'idle';
+}
+
+/**
+ * The words for the two phases a reader has to act on. Here rather than in each
+ * client for the same reason as the phase itself: two clients wording the same
+ * state differently is how one of them ends up saying something untrue.
+ *
+ * Neither string claims the answer is lost. It is not: the row is unfinalized, so
+ * the chunks are retained until somebody finalizes them, and that is exactly why
+ * asking again is worth offering.
+ */
+export function streamRecoveryLabels(phase: string): { note: string; action: string } {
+	if (phase === 'failed') {
+		return { note: 'Could not load this answer.', action: 'Try again' };
+	}
+	return { note: 'This answer was not saved with the conversation.', action: 'Load answer' };
+}
+
+/* isCsrStatusEnvelope - the predicate that tells a STREAMED turn apart at settle,
+ * because a streamed row stores nothing and hands back { id, status, in_queue, ... }
+ * instead - now lives in errors.ts and is imported above.
+ *
+ * It moved because it was written twice: once here for the settle, and (implicitly,
+ * one level too shallow) in the error readers. A streamed FAILURE is that same
+ * envelope with the provider's error nested inside it, so the two had to agree on
+ * what an envelope is before the error readers could see through one. See
+ * csrEnvelopeError. */
+
+/** Floor on the gap between two live paints of the same bubble. The transport
+ *  already paces the answer at about one write per second, so this is not the
+ *  rhythm - it is what stops a BURST (a poll tick carrying a dozen chunks, or a
+ *  re-attach replaying the whole answer at once) from turning into a dozen
+ *  re-renders of the same bubble in the same frame. */
+const LIVE_PAINT_MIN_MS = 250;
+/** Largest growth, in characters, that a single live paint will ANIMATE rather than
+ *  land whole. The transport paces at about one chunk a second and a model writes
+ *  roughly 160 characters in that time, so an ordinary arrival is far under this and
+ *  types. A replay (reopening a chat, recovering an unfinalized turn) delivers the
+ *  whole answer in one feed and is far over it, so it lands at once instead of
+ *  retyping a finished message at the reader. */
+const LIVE_TYPE_MAX_STEP = 1200;
+
+/**
+ * The identity a streamed turn was DISPATCHED under, pinned by the caller.
+ *
+ * Same reason _callProviderFor takes projectId/owner explicitly: a turn can be
+ * acked after the user has moved to another project or platform, and a live
+ * getIdentity() read at that moment describes where the user is now, not where the
+ * turn came from. Every field optional so a caller can pin what it knows and let
+ * the rest fall back to the live read.
+ */
+export type StreamDispatchContext = {
+	platform?: string;
+	projectId?: string;
+	owner?: string;
+	/** History cache key (chatCacheKey) of the chat the turn belongs to. */
+	ownerKey?: string;
+};
+
+/** One in-flight streamed turn. Keyed by server item id in ChatSession.liveStreams. */
+type LiveStreamState = {
+	/** Server item id: the turn's identity everywhere, including on its bubbles. */
+	id: string;
+	/** History cache key the turn belongs to. Painting is skipped while another
+	 *  chat is on screen; parsing and finalizing are not. */
+	ownerKey: string;
+	platform: 'claude' | 'openai';
+	projectId: string;
+	owner: string;
+	parser: SseParser;
+	/** What is currently on screen, so a paint can be skipped when the safe prefix
+	 *  has not grown (see the monotonic guard in _paintLiveStream). */
+	painted: string;
+	/** A first paint has happened, so the one notify() has been spent. */
+	started: boolean;
+	/** At least one chunk arrived. False means the row never streamed, so there is
+	 *  nothing to assemble and nothing to finalize. */
+	fed: boolean;
+	ended: boolean;
+	timer: any;
+	lastPaintAt: number;
+	/** The assembled provider body, built once at end(). */
+	finalBody: any;
+	/** csr-finalize has been fired for this turn. Guards the double settle
+	 *  (onResponse and the promise) from storing the same body twice. */
+	finalized?: boolean;
+	/** How many chunks each of skapi's two transports carried FIRST. Counted, never
+	 *  acted on: both deliver into the same sink by design, so this is the only way
+	 *  a host can tell a websocket-delivered answer from a polled one. */
+	transport: { socket: number; poll: number };
+};
 
 export class ChatSession {
 	host: ChatHost;
@@ -625,12 +1008,77 @@ export class ChatSession {
 	 * and they are the ones bounded by MAX_CONCURRENT_BG_POLLS, so adding probes there would spend
 	 * the request budget the cap exists to protect.
 	 */
-	attachForegroundPoll(source: any, itemId: string, opts?: any): any {
-		return this._fgPollWithEarlyProbe(source, itemId, opts);
+	attachForegroundPoll(source: any, itemId: string, opts?: any, ctx?: StreamDispatchContext): any {
+		return this._fgPollWithEarlyProbe(source, itemId, opts, ctx);
 	}
 
-	private _fgPollWithEarlyProbe(source: any, itemId: string, opts?: any): any {
+	private _fgPollWithEarlyProbe(source: any, itemId: string, opts?: any, ctx?: StreamDispatchContext): any {
 		var self = this;
+
+		// LIVE STREAMING takes over the whole method when it is on, rather than adding
+		// a branch to the probe race, and both halves of that are deliberate.
+		//
+		// It attaches a sink to EVERY foreground poll, not only the one a fresh
+		// dispatch makes: skapi's reader sends `since: 0` on its first tick, so a poll
+		// re-attached after a reload or a tab return REPLAYS the turn from its first
+		// byte. That is the only recovery a streamed turn has, because its row holds a
+		// status and no body until csr-finalize stores one - attaching without a sink
+		// settles it on that envelope and the answer is gone for good. A row that never
+		// streamed simply hands back no chunks, and the substitution below is then a
+		// no-op, so the cost of asking is one unused cursor.
+		//
+		// And it SKIPS the early-probe ladder, because a point lookup cannot answer for
+		// a streamed row (there is no stored body to look up) yet would settle the race
+		// on that empty envelope and stop the poll - killing the delivery of the very
+		// answer it was trying to fetch early. What replaces it is the cadence: a
+		// streaming poll's tick IS the delivery, so it runs at STREAM_POLL_INTERVAL.
+		// A foreground row that turns out not to have streamed loses the 400ms probe
+		// and gets a 1s interval instead of a 3s one, which is the trade.
+		var live = this._beginLiveStream(itemId, ctx);
+		if (live) {
+			var inner = opts || {};
+			var callerResponse = typeof inner.onResponse === 'function' ? inner.onResponse : null;
+			var callerError = typeof inner.onError === 'function' ? inner.onError : null;
+			// Both wrappers are needed and neither is redundant: a poll attached to a
+			// HISTORY ITEM honours the onResponse passed here (that is how the re-attach
+			// path resolves a turn), while a poll attached to a fresh DISPATCH ack takes
+			// its callbacks from the original clientSecretRequest and reports only
+			// through the promise. Substituting in one place would leave the other
+			// reading the envelope.
+			var streamOpts = Object.assign({}, inner, {
+				onStream: function (chunk: string, _seq: number, via?: 'socket' | 'poll') {
+					self._feedLiveStream(live, chunk, via);
+				},
+				onResponse: function (res: any) {
+					var effective = res;
+					if (isPollStopped(res)) self._closeLiveStream(live, false);
+					else effective = self._settleLiveStream(live, res);
+					if (callerResponse) callerResponse(effective);
+				},
+				onError: function (err: any) {
+					self._closeLiveStream(live, false);
+					if (callerError) callerError(err);
+				},
+			});
+			var lp = source.poll(Object.assign({ latency: STREAM_POLL_INTERVAL }, streamOpts));
+			var stopLp = lp && typeof lp.stop === 'function' ? lp.stop.bind(lp) : null;
+			var wrapped: any = Promise.resolve(lp).then(function (res: any) {
+				// A stop is not a result: the turn may still be running server side, so
+				// the stream is discarded rather than assembled and finalized.
+				if (isPollStopped(res)) { self._closeLiveStream(live, false); return res; }
+				return self._settleLiveStream(live, res);
+			}, function (err: any) {
+				self._closeLiveStream(live, false);
+				throw err;
+			});
+			// _trackPoll and the cancel path both reach for .stop, so the wrapper carries it.
+			wrapped.stop = function () {
+				self._closeLiveStream(live, false);
+				if (stopLp) stopLp();
+			};
+			return wrapped;
+		}
+
 		// Callbacks ride along on the interval path exactly as before; the probe path below
 		// fires onResponse itself, because a caller that only reacts through the callback
 		// (the history drain does) would otherwise never learn the probe won.
@@ -716,6 +1164,975 @@ export class ChatSession {
 		});
 		return n;
 	}
+
+	// --- live streaming ----------------------------------------------------
+	//
+	// A streamed turn's answer NEVER reaches the polling row: the relay appends the
+	// destination's raw bytes to a chunk table and the row settles with a status and
+	// nothing else. So for a streamed turn this parser is not a nicety that makes the
+	// wait prettier, it is the only place the answer exists until csr-finalize stores
+	// one. Three things follow, and all three are load-bearing:
+	//
+	//   1. EVERY foreground poll gets a sink while streaming is on, not just the one
+	//      the dispatch attaches. A tab return, a reload, a resumePolling all
+	//      re-attach a poll to a still-running item, and skapi's reader sends
+	//      `since: 0` on its first tick, so a fresh sink REPLAYS the whole stream from
+	//      the beginning. Attaching without one settles that turn on an envelope and
+	//      the user's answer is gone.
+	//   2. The parser is keyed by SERVER ITEM ID, and so is the bubble it paints into.
+	//      A history refetch replaces the local pending bubble with the server's copy
+	//      of the same turn; that copy carries the same _serverItemId, so the next
+	//      paint finds it and carries on. Nothing has to be rescued and nothing can be
+	//      painted twice.
+	//   3. The stream is never the source of truth. At settle the parser's ASSEMBLED
+	//      body (byte equivalent to what a buffered call returns) goes through the
+	//      same extractClaudeText / extractOpenAIText the buffered path uses, and a
+	//      row that does hold a stored body wins outright.
+	//
+	// Background polls never get a sink, and that is safe because nothing on the bg
+	// queue ever streams: an indexing pass must not (the worker READS its reply), and
+	// a chat turn sent with attachments is deliberately left buffered for exactly the
+	// reason point 1 gives, since the re-attach loop would poll it as a background
+	// item and hand it no reader. See chatStreamWiring. A sink there would also spend
+	// the request budget MAX_CONCURRENT_BG_POLLS exists to protect.
+
+	/** Live streams by server item id. One per in-flight streamed turn. */
+	private liveStreams: { [itemId: string]: LiveStreamState } = {};
+
+	/**
+	 * Open (or re-open) the live stream for `itemId`, or null when this poll must
+	 * not carry one.
+	 *
+	 * Re-entrant on purpose: an auth-refresh retry re-dispatches the SAME turn under
+	 * a NEW id, and a re-attach after a tab return replays an existing id from seq 0.
+	 * Either way the bytes about to arrive are a whole stream, so an existing entry
+	 * is discarded and a fresh parser takes its place - feeding a replay into the old
+	 * parser would concatenate the answer with itself.
+	 *
+	 * `ctx` IS THE TURN'S OWN IDENTITY, and every caller that has one passes it.
+	 * This used to read the LIVE getIdentity(), which is a bug of exactly the kind
+	 * _callProviderFor documents and threads its own parameters to avoid: the user
+	 * hits Send, then switches project or platform inside the ack round trip, and the
+	 * stream that opens for the OLD turn is stamped with the NEW identity. What that
+	 * costs is not cosmetic - `platform` picks which url csr-finalize is addressed
+	 * with and which extractor reads the assembled body, `projectId`/`owner` scope
+	 * the finalize itself, and `ownerKey` decides which chat the answer is painted
+	 * into. Get them from the live read at the wrong moment and the turn is finalized
+	 * against the wrong service (so its answer is never stored), parsed with the
+	 * wrong provider's extractor, or painted into a conversation it does not belong
+	 * to. The live read stays only as the fallback for a caller with nothing pinned.
+	 */
+	private _beginLiveStream(itemId: string, ctx?: StreamDispatchContext): LiveStreamState | null {
+		if (!liveStreamingEnabled()) return null;
+		if (!itemId) {
+			// A streamed turn with no id is unreadable: the id is what the cursor polls,
+			// what the bubble is found by, and what csr-finalize addresses. skapi stamps
+			// one on every queued ack, so this should be unreachable - and if it is ever
+			// reached the turn's answer is genuinely lost, which is worth a line in the
+			// console rather than a silent empty bubble.
+			console.warn('[chat-engine] live streaming is on but the dispatch reported no item id');
+			return null;
+		}
+		// Pinned values win over the live read, field by field: a caller may know the
+		// platform the turn was sent on without knowing which chat key it belongs to.
+		var pinnedPlatform = ctx && (ctx.platform === 'claude' || ctx.platform === 'openai') ? ctx.platform : undefined;
+		var ident = (pinnedPlatform && ctx && ctx.projectId !== undefined && ctx.owner !== undefined && ctx.ownerKey !== undefined)
+			? null : this.host.getIdentity();
+		var platform = pinnedPlatform || (ident ? ident.platform : undefined);
+		if (platform !== 'claude' && platform !== 'openai') return null;
+		var projectId = ctx && ctx.projectId !== undefined ? ctx.projectId : (ident ? ident.projectId : '');
+		var owner = ctx && ctx.owner !== undefined ? ctx.owner : (ident ? ident.owner : '');
+		var ownerKey = ctx && ctx.ownerKey !== undefined ? ctx.ownerKey : this.getHistoryCacheKey();
+		var prev = this.liveStreams[itemId];
+		if (prev) this._closeLiveStream(prev, false);
+		var st: LiveStreamState = {
+			id: itemId,
+			ownerKey: ownerKey,
+			platform: platform,
+			projectId: projectId,
+			owner: owner,
+			parser: createSseParser(),
+			painted: '',
+			started: false,
+			fed: false,
+			ended: false,
+			timer: null,
+			lastPaintAt: 0,
+			finalBody: null,
+			transport: { socket: 0, poll: 0 },
+		};
+		this.liveStreams[itemId] = st;
+		return st;
+	}
+
+	/** The chunk sink handed to skapi's poll. Raw relayed text, in order, never parsed
+	 *  here: the parser owns the grammar and this owns the pacing. */
+	private _feedLiveStream(st: LiveStreamState, chunk: string, via?: 'socket' | 'poll'): void {
+		if (st.ended || typeof chunk !== 'string' || !chunk) return;
+		st.fed = true;
+		// Counted before the early-outs below, so a chunk that only joins an already
+		// scheduled paint still tells the host which transport brought it.
+		if (via === 'socket') st.transport.socket++;
+		else if (via === 'poll') st.transport.poll++;
+		st.parser.feed(chunk);
+		if (st.timer) return; // a paint is already scheduled; this chunk joins it
+		var self = this;
+		// One paint per burst, floored at LIVE_PAINT_MIN_MS. A poll tick can deliver a
+		// dozen chunks at once (and a replay delivers the whole answer at once), and
+		// painting per chunk is exactly the 60-renders-a-second the per-bubble refresh
+		// exists to avoid. The transport already paces at about 1/s, so this floor is
+		// only there to survive a burst, not to set the rhythm.
+		// The FIRST paint is immediate: the floor is there to survive a burst, and
+		// spending it on the opening tokens would delay the one moment the whole
+		// feature is for. (It also cannot be measured from lastPaintAt = 0, since
+		// nowMs() is time since page load and is itself small early on.)
+		var wait = st.lastPaintAt ? Math.max(0, LIVE_PAINT_MIN_MS - (nowMs() - st.lastPaintAt)) : 0;
+		st.timer = setTimeout(function () { st.timer = null; self._paintLiveStream(st); }, wait);
+	}
+
+	/**
+	 * Write the safe prefix of the answer so far into the turn's bubble.
+	 *
+	 * notify() is spent EXACTLY ONCE per turn, on the first paint, because that is a
+	 * state change the per-bubble refresh cannot express: the bubble stops being a
+	 * "Thinking..." spinner and becomes text. Every paint after it goes through
+	 * refreshMessageBubble, which is what keeps a growing answer from rebuilding the
+	 * whole display list once a second.
+	 */
+	private _paintLiveStream(st: LiveStreamState): void {
+		if (st.ended) return;
+		st.lastPaintAt = nowMs();
+		// Another project (or another platform) is on screen. The turn keeps parsing -
+		// its answer is still being assembled and will still be finalized - but nothing
+		// is painted, because the index would point into a different chat's list.
+		if (this.getHistoryCacheKey() !== st.ownerKey) return;
+		var idx = this._liveTargetIndex(st.id);
+		if (idx === -1) return;
+		var msg = this.state.messages[idx];
+		if (!msg) return;
+		var snap = st.parser.snapshot();
+		var next = liveSafePrefix(snap.text);
+		// MONOTONIC, and this is the guard that makes liveSafePrefix's cuts safe to
+		// make: a cut can shorten the safe prefix (a '[' arrives, a url starts), and
+		// repainting shorter would have the answer visibly retreat. What was painted
+		// was safe when it was painted, so it stays until there is MORE to show.
+		if (next.length <= st.painted.length) return;
+		var prev = st.painted;
+		st.painted = next;
+
+		// TYPE THE NEW TEXT IN, DO NOT JUMP TO IT.
+		//
+		// This used to assign msg.content directly, which is why a streamed answer
+		// arrived as a series of lumps: the transport paces at about one chunk a
+		// second, so a whole second of text appeared at once, and the only animation a
+		// reader saw was the settle typewriting whatever was left. The point of
+		// streaming is that the answer looks like it is being written, so each arrival
+		// is revealed at the same rate the settle uses. enqueueTypewrite is sequential,
+		// so consecutive chunks queue behind one another and read as one continuous
+		// stream rather than racing each other into the same bubble.
+		//
+		// EXCEPT WHEN THE TEXT ARRIVES ALL AT ONCE, which is the replay path: reopening
+		// a chat, or recovering an unfinalized turn, feeds the entire answer in one go.
+		// Animating that would slowly retype an old message every time it is opened,
+		// which is not a stream, it is a delay. So a jump larger than a live burst
+		// could plausibly be lands whole, exactly as it did before.
+		// SIZE DECIDES, NOT WHICH PAINT IT IS. The first paint of a live turn is a small
+		// step from empty and should type, which is the moment the whole feature exists
+		// for. The first paint of a REPLAY is the entire answer from empty and must not:
+		// gating on "is this the first paint" gets both of those wrong, because they are
+		// the same paint. Only the size tells them apart.
+		var grew = next.length - prev.length;
+		var animate = grew > 0 && grew <= LIVE_TYPE_MAX_STEP;
+
+		if (animate) {
+			// IDENTITY, NOT INDEX. typewriteIntoIndex re-finds its bubble by _localId
+			// and falls back to the raw index when there is none, and that fallback is
+			// unsafe here: a live reveal is in flight for seconds, and anything that
+			// REPLACES the bubble meanwhile (a recovery landing the whole answer, a
+			// history page swapping the list) leaves the stale animation to write its
+			// older text into whatever now occupies that index. Observed: a recovered
+			// answer being overwritten, a character at a time, by the truncation it had
+			// just replaced. Minting an id here restores the bail the re-find exists to
+			// provide, so a superseded reveal writes nothing.
+			if (!msg._localId) msg._localId = this._newLocalId();
+			// Left at its previous text and typed forward from there. The bubble is
+			// never blanked: on a first paint prev is empty anyway, and on a later one
+			// blanking would flash the answer away and retype it.
+			if (!msg._streaming) { msg._streaming = true; this.host.notify(); }
+			this.enqueueTypewrite(idx, next, msg._localId, prev);
+		} else {
+			msg.content = next;
+			if (!msg._streaming) { msg._streaming = true; this.host.notify(); }
+			else this.host.refreshMessageBubble(idx);
+		}
+		// ARRIVAL, not a user action: follow only a reader who is still pinned.
+		this.host.scrollToBottomIfSticky();
+		this._reportLiveStream(st, st.started ? 'update' : 'start', snap, next);
+		st.started = true;
+	}
+
+	/** The bubble a live stream paints into: the turn's pending assistant placeholder,
+	 *  found by server item id. Not by _localId, deliberately - a history refetch
+	 *  replaces the local copy with the server's, and only the id survives that. */
+	private _liveTargetIndex(itemId: string): number {
+		return this.state.messages.findIndex(function (m) {
+			return !!m && m.role === 'assistant' && !m.isBackgroundTask &&
+				m._serverItemId === itemId && (!!m.isPending || !!m._streaming);
+		});
+	}
+
+	/** Hand the host its optional observation update. Guarded: this runs on the paint
+	 *  path, and a throwing hook must not cost the user the rest of their answer. */
+	private _reportLiveStream(st: LiveStreamState, phase: 'start' | 'update' | 'end', snap: any, text: string): void {
+		var hook = chatEngineConfig().onLiveStreamUpdate;
+		if (!hook) return;
+		try {
+			hook({
+				serverItemId: st.id, ownerKey: st.ownerKey, phase: phase, text: text,
+				thinkingText: (snap && snap.thinkingText) || '',
+				toolNames: (snap && snap.toolNames) ? snap.toolNames.slice() : [],
+				complete: !!(snap && snap.complete),
+				// Reported alongside `complete`, never instead of it: a host drawing
+				// "still arriving" wants complete, a host drawing "this answer is
+				// partial" wants this one, and an `error` frame is the case where the
+				// two disagree. See sse.ts answerComplete.
+				answerComplete: !!(snap && snap.answerComplete),
+				errored: !!(snap && snap.errored),
+				transport: { socket: st.transport.socket, poll: st.transport.poll },
+			});
+		} catch (e) { console.warn('[chat-engine] onLiveStreamUpdate threw', e); }
+	}
+
+	/** Stop painting and (when the turn really ended) assemble the body. `finished`
+	 *  is false for a stream being discarded rather than settled: a retry replacing
+	 *  it, or a stop, neither of which has an answer to assemble. */
+	private _closeLiveStream(st: LiveStreamState, finished: boolean): void {
+		// A settle arrives TWICE (the poll's onResponse, then the promise it resolves),
+		// so everything that must happen once hangs off this rather than off `ended`
+		// being read after it is set.
+		var first = !st.ended;
+		if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+		if (first) {
+			st.ended = true;
+			if (finished && st.fed) {
+				st.parser.end();
+				st.finalBody = st.parser.finalBody();
+			}
+		}
+		if (this.liveStreams[st.id] === st) delete this.liveStreams[st.id];
+		// Told BEFORE the ownerKey check below, and only when a 'start' was reported:
+		// a host that drew a "thinking..." or "querying..." row off this stream has to
+		// learn it is over even when the reader has moved to another chat, and telling
+		// it about an end it never saw begin would be noise.
+		if (first && st.started) this._reportLiveStream(st, 'end', st.parser.snapshot(), '');
+		// The bubble stops being a live one from here. Its painted content is left
+		// alone ON PURPOSE: it is what the typewriter resumes from a moment later, and
+		// blanking it would put the answer the reader just watched arrive back to zero.
+		if (this.getHistoryCacheKey() !== st.ownerKey) return;
+		var idx = this._liveTargetIndex(st.id);
+		if (idx !== -1 && this.state.messages[idx] && this.state.messages[idx]._streaming) {
+			this.state.messages[idx]._streaming = false;
+		}
+	}
+
+	/**
+	 * Settle a streamed turn: end the parse, decide the body the rest of the session
+	 * will read, and release the chunks.
+	 *
+	 * The substitution is one-directional and never a merge. A response that is a
+	 * real stored body (a buffered turn, or a streamed one somebody already
+	 * finalized) is returned untouched, because that is the destination's own answer
+	 * and the stream is not entitled to overwrite it. Only a STATUS ENVELOPE - the
+	 * shape a streamed row settles as, having stored nothing - is replaced, and then
+	 * by the assembled body, which every caller downstream reads with the same
+	 * extractor it uses for a buffered reply. Idempotent, because it is reached both
+	 * through the poll's onResponse and through the promise it resolves.
+	 */
+	private _settleLiveStream(st: LiveStreamState, response: any): any {
+		this._closeLiveStream(st, true);
+		if (!isCsrStatusEnvelope(response)) return response;
+		// RESOLVED only, and this is not caution, it is correctness. 'cancelled' is the
+		// envelope the user's own Stop produces, and _isCancelledPollResult downstream
+		// is what settles the turn as stopped: hand it an assembled body instead and a
+		// cancelled turn renders the half answer the stop was meant to discard. Any
+		// other status ('failed' with the destination's error, or a shape this does not
+		// know) is likewise the authoritative account of the turn, and the stream is
+		// never entitled to overwrite one.
+		if (response.status !== 'resolved') return response;
+		// MARKED BEFORE THE finalBody BAIL, and the order is the whole of the fix for
+		// a settle that read NOTHING. A poll whose chunk reads degraded for its entire
+		// life (the poller returns "no chunks this tick, more=true" on any transient
+		// chunk-table error) settles on a resolved row with nothing fed and nothing
+		// assembled. The turn then renders "No text response received from AI
+		// provider" and, with the note skipped, that sentence is adopted over the
+		// row's own empty copy on the next history load and clears the marker that
+		// would have gone back for the answer: unreachable, with every byte of it
+		// still in the chunk table. A turn that painted nothing is EXACTLY as
+		// recoverable as one that was never polled at all - same row, same chunks,
+		// same reason - so it leaves the same note and gets the same marker back.
+		if (!this._mayFinalize(st)) this._rec().incomplete[st.id] = true;
+		if (st.finalBody == null) return response;
+		// An INCOMPLETE parse is still the best answer there is right now - it is what
+		// the reader has been watching arrive - so it is handed downstream and shown.
+		// What it is not is FINISHED, and the difference has to outlive this call:
+		// without the note, the next history refetch would meet a bubble with text in
+		// it, adopt that text over the row's own empty copy, and clear the very marker
+		// that would have gone back for the rest. So the id is remembered, the chunks
+		// are left alone (see _finalizeStreamedTurn), and the recovery replaces this
+		// text with the whole answer on the next load. The note itself is taken above,
+		// before the bail, because a settle that assembled NOTHING needs it just as
+		// badly and used to return before reaching it.
+		this._finalizeStreamedTurn(st);
+		return st.finalBody;
+	}
+
+	/**
+	 * May this parse be STORED as the turn's permanent answer?
+	 *
+	 * THE FAILURE THIS PREVENTS. Finalizing does two things at once: it stores what
+	 * you give it as the row's result, and it DELETES the chunks it was assembled
+	 * from. So finalizing a truncated parse is not a cosmetic loss, it is the
+	 * permanent one: the truncation becomes the stored answer and the only copy of
+	 * the missing part is deleted in the same call. And a truncated parse is a shape
+	 * this repo has already paid for - a degraded chunk read (the poller degrades to
+	 * "no chunks this tick, more=true" on any transient chunk-table error, and caps
+	 * a long answer at 500k characters per response) can hand the settle a stream
+	 * that stopped mid-answer. The row can settle 'resolved' on top of that, because
+	 * the ROW's status describes the destination's request, not the client's read of
+	 * it.
+	 *
+	 * THE POLICY ITSELF IS mayKeepStreamedAnswer (top of this file), shared with the
+	 * recovery path so the two cannot drift apart again - they did, and the drift was
+	 * silent: the live settle refused a failed turn while the recovery finalized one.
+	 * What is local to this method is only the two things the free function cannot
+	 * know: that there is an assembled body at all, and that this call site is
+	 * reached only on a row that settled 'resolved' (the caller returns before it
+	 * otherwise), which is the status it therefore states.
+	 *
+	 * The test the policy applies is deliberately NOT `complete`: a terminal event
+	 * arrived and the answer finished are two claims, and an `error` frame satisfies
+	 * the first while truncating the second. See sse.ts's answerComplete.
+	 */
+	private _mayFinalize(st: LiveStreamState): boolean {
+		if (st.finalBody == null) return false;
+		return mayKeepStreamedAnswer(st.parser.snapshot(), 'resolved');
+	}
+
+	/**
+	 * Store the assembled body as the version history keeps, which is also what
+	 * releases this request's chunks.
+	 *
+	 * The ASSEMBLED BODY and not the extracted text, because the row is read back by
+	 * mapHistoryListToMessages through extractClaudeText / extractOpenAIText: storing
+	 * the provider's own document is what makes a streamed turn indistinguishable
+	 * from a buffered one on the next load, with no branch anywhere in the mapper.
+	 *
+	 * BEST EFFORT, and loudly so: the answer is already on screen and already in the
+	 * history cache by the time this fires. A failure costs the chunks (they stay,
+	 * and the turn stays re-readable) and a row that reads back empty, never the
+	 * user's answer in front of them.
+	 *
+	 * WHAT IS DELIBERATELY NEVER FINALIZED, because finalize is also the only way to
+	 * release chunks and it is tempting to reach for it as a cleanup:
+	 *
+	 *   - an INCOMPLETE parse (see _mayFinalize). Storing a truncation makes it
+	 *     permanent AND deletes the part that was missing from it. A stream killed by
+	 *     an `error` frame is one of these however terminal it looks: the frame ends
+	 *     the stream, so `complete` is true, while the text is only what arrived
+	 *     before the error. That is why the gate reads answerComplete.
+	 *   - a FAILED turn. Its chunks hold the part of the answer that did arrive,
+	 *     which is the only copy of that text there is, and the two ways to release
+	 *     them both cost something real: storing the partial makes a truncated answer
+	 *     the turn's permanent history AND masks the failure on read (csr-poll hands
+	 *     back a finalized body before it ever looks at the row's error, so the turn
+	 *     would read back as a clean short answer), while storing the error throws
+	 *     the partial away outright. Keeping them costs storage on rows that produced
+	 *     bytes and then failed, which is rare - a failure before the first byte (a
+	 *     wrong API key, the common case) has no chunks to keep - and the poller
+	 *     hands those chunks back alongside the error on every later read, so nothing
+	 *     is stranded, only retained. Retention is the honest trade here; deletion is
+	 *     not reversible.
+	 *   - a CANCELLED turn, for the same reason plus one: the user's Stop means the
+	 *     half answer is to be discarded, so writing it into history as the kept
+	 *     version would resurrect exactly what the stop was for.
+	 */
+	private _finalizeStreamedTurn(st: LiveStreamState): void {
+		if (st.finalized) return;
+		if (!this._mayFinalize(st)) return;
+		var fin = chatEngineConfig().clientSecretRequestFinalize;
+		if (!fin || st.finalBody == null) return;
+		st.finalized = true;
+		var url = st.platform === 'openai' ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+		try {
+			Promise.resolve(fin(st.id, st.finalBody, {
+				url: url, method: 'POST', service: st.projectId, owner: st.owner,
+			})).catch(function (err: any) {
+				console.warn('[chat-engine] clientSecretRequestFinalize failed', err);
+			});
+		} catch (e) {
+			console.warn('[chat-engine] clientSecretRequestFinalize threw', e);
+		}
+	}
+
+	/** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
+	 *  A pending assistant placeholder is created with content '' by every path that
+	 *  makes one, so non-empty content on one can only have been painted here. */
+	private _paintedTextAt(idx: number): string {
+		var m = idx >= 0 ? this.state.messages[idx] : undefined;
+		if (!m || m.role !== 'assistant' || typeof m.content !== 'string') return '';
+		return m.content;
+	}
+
+	// --- recovering a streamed turn nobody finalized ------------------------
+	//
+	// ONE QUESTION, TWO BUGS. A streamed row's answer is not on the row: it is in the
+	// chunk store until csr-finalize copies a version onto it. So a history page can
+	// carry a row that is TERMINAL AND EMPTY, and everything downstream has to know
+	// what that means. Read as "this turn answered nothing" it produces two separate
+	// disasters that look unrelated:
+	//
+	//   1. A row that settled while no poll was attached (closed tab, discarded
+	//      background tab, slept device) is never finalized, so it is terminal and
+	//      empty FOREVER and the mapper emitted no assistant bubble for it. The
+	//      answer is gone from the conversation with every byte of it still stored.
+	//   2. A first-page refetch landing between the row going 'resolved' and finalize
+	//      storing the body sees the same terminal-and-empty row for a turn that is
+	//      on screen right now, and the merge - believing the server - drops the
+	//      local bubble holding the answer. Reachable on every single streamed turn,
+	//      since the window is a poll interval plus a round trip and a refetch fires
+	//      on visibilitychange.
+	//
+	// Both are the same question: what should the merge believe when the server copy
+	// is authoritative but empty? The answer is that such a copy is UNKNOWN, not
+	// empty (mapHistoryListToMessages marks it `_streamPending`), and one rule covers
+	// both cases: AN UNKNOWN ANSWER NEVER OVERWRITES A KNOWN ONE, AND AN UNKNOWN ONE
+	// LEFT OVER IS RESOLVED BY READING THE CHUNKS BACK. Bug 2 falls out of the first
+	// half (_adoptLocalAnswers, below), bug 1 out of the second.
+	//
+	// WHAT THE RECOVERY COSTS, and how that is bounded. A replay is a full read of
+	// one turn's chunks - the SDK pages internally until the store is drained, so it
+	// is one round trip for a short answer and a handful for a long one. A history
+	// page could in principle hold several such rows, so:
+	//   * it NEVER blocks the load. It is scheduled after the page has been rendered
+	//     and runs on its own, and the bubble it will fill is already on screen.
+	//   * it is SERIAL. One replay at a time, so a page holding five of them spends
+	//     one connection, not five, and the newest turn (the one the reader is
+	//     looking at) is filled first.
+	//   * it is CAPPED per load (STREAM_RECOVERY_PER_LOAD), newest first. Older ones
+	//     keep their marker and are recovered on a later load, or on demand through
+	//     the public recoverStreamedAnswer().
+	//   * it is ONCE PER ROW, ever: a successful recovery FINALIZES what it read, so
+	//     the row gains a stored body and the next load sees an ordinary turn. Even
+	//     when finalizing is impossible (no hook, a failed call), the id is
+	//     remembered for the session so a re-render cannot loop on it.
+
+	private _streamRecovery?: {
+		/** Streams whose parse ended without a terminal event, so the text handed
+		 *  downstream is not known to be the whole answer. See _settleLiveStream. */
+		incomplete: { [id: string]: true };
+		/** Rows this session has already tried to read back, so a repeated history
+		 *  load (every visibilitychange fires one) cannot re-read the same chunks
+		 *  forever. Deliberately NOT consulted by a user-driven retry: see the
+		 *  `manual` argument to _readBackStreamedTurn. */
+		attempted: { [id: string]: true };
+		/** Rows whose read is in flight RIGHT NOW. Separate from `attempted`, which
+		 *  outlives the request and survives a success: this one is the "something is
+		 *  driving that bubble" fact the view renders its loader from, so it has to
+		 *  come off however the read ends. */
+		inflight: { [id: string]: true };
+		/** Rows whose last read FAILED. The marker stays on for these (the answer is
+		 *  still reachable), so without this the view cannot tell "not tried yet"
+		 *  from "tried and could not read it" and has to word them the same. */
+		failed: { [id: string]: true };
+		queue: Array<{ id: string; ownerKey: string; platform: 'claude' | 'openai'; projectId: string; owner: string }>;
+		running: boolean;
+	};
+
+	/** The recovery bookkeeping, created on first touch.
+	 *
+	 *  LAZY, not constructor-initialised, and for a concrete reason: ChatSession is
+	 *  also built with Object.create(ChatSession.prototype) by the engine's own test
+	 *  harnesses, which drive one method against a hand-built state rather than a
+	 *  whole session. A field only the constructor creates is undefined there, and
+	 *  the method that reaches for it throws, turning a test of the settle into a
+	 *  crash about bookkeeping. */
+	private _rec() {
+		if (!this._streamRecovery) this._streamRecovery = { incomplete: {}, attempted: {}, inflight: {}, failed: {}, queue: [], running: false };
+		return this._streamRecovery;
+	}
+
+	/**
+	 * Put this session's fetching state onto the turn's bubble, so a view can tell a
+	 * loader that means something from one that means nothing.
+	 *
+	 * ONLY EVER ONTO A STILL-MARKED BUBBLE. Once `_streamPending` is off the turn has
+	 * an answer (or was proven to have none) and this says nothing about it; writing
+	 * it there would leave a stale 'active' on a settled bubble forever.
+	 *
+	 * host.notify() is what redraws the widget, whose renderer is imperative. It is a
+	 * no-op in agent.vue, whose state is a Vue reactive() - the property write above
+	 * is what redraws there. Both are covered by doing both, and neither is a
+	 * substitute for the other.
+	 */
+	private _markRecoveryPhase(itemId: string, phase: 'active' | 'failed' | null): void {
+		var changed = false;
+		for (var i = 0; i < this.state.messages.length; i++) {
+			var m: any = this.state.messages[i];
+			if (!m || m.role !== 'assistant' || m._serverItemId !== itemId || !m._streamPending) continue;
+			var next = phase === null ? undefined : phase;
+			if (m._streamRecovery === next) continue;
+			if (next === undefined) delete m._streamRecovery; else m._streamRecovery = next;
+			changed = true;
+		}
+		if (changed) this.host.notify();
+	}
+
+	/**
+	 * Let LOCAL answers survive a freshly-mapped page whose copies of them are
+	 * authoritative-but-empty. Call with the page BEFORE it replaces or merges into
+	 * state.messages; mutates the page's bubbles in place.
+	 *
+	 * The adoption itself is history.ts's adoptLocalAnswerIntoPage (shared, so the
+	 * clients' own mappers cannot fork it). What lives here is the one thing the
+	 * pure function cannot know: whether the local text is the WHOLE answer. Text
+	 * left by a stream that ended without a terminal event is not, so that bubble
+	 * keeps its marker and gets read back even though it has content - otherwise a
+	 * truncated answer would adopt itself over the row and never be corrected.
+	 */
+	private _adoptLocalAnswers(mapped: ChatMessage[], loadKey?: string): void {
+		if (!mapped || !mapped.length) return;
+		var pendingIncoming: ChatMessage[] = [];
+		for (var i = 0; i < mapped.length; i++) {
+			if (mapped[i] && (mapped[i] as any)._streamPending) pendingIncoming.push(mapped[i]);
+		}
+		if (!pendingIncoming.length) return;
+		var locals: { [key: string]: ChatMessage } = {};
+		for (var j = 0; j < this.state.messages.length; j++) {
+			var lm = this.state.messages[j];
+			if (!lm || lm.role !== 'assistant' || !lm._serverItemId) continue;
+			// The same ownership predicate every other merge step uses, against the
+			// load's SNAPSHOTTED key rather than a live read: a project switch mid-fetch
+			// leaves another chat's transcript in state.messages, and ids are unique per
+			// row, but a bubble stamped for another chat must never cross into this one.
+			if (lm._ownerKey !== undefined && loadKey !== undefined && lm._ownerKey !== loadKey) continue;
+			// FIRST wins: a page can only hold one assistant bubble per turn, and if the
+			// local list somehow holds two the older one is the one the merge would
+			// have kept.
+			if (locals[lm._serverItemId] === undefined) locals[lm._serverItemId] = lm;
+		}
+		for (var k = 0; k < pendingIncoming.length; k++) {
+			var inc = pendingIncoming[k];
+			var id = inc._serverItemId;
+			if (!id) continue;
+			var local = locals[id];
+			if (!local) continue;
+			if (!adoptLocalAnswerIntoPage(inc, local)) continue;
+			// Adopted text that is not known to be complete keeps the marker: the read
+			// back is what turns it into the whole answer.
+			if (this._rec().incomplete[id]) inc._streamPending = true;
+		}
+		// CARRY THIS SESSION'S FETCHING STATE ONTO THE FRESH PAGE. `_streamRecovery`
+		// describes the client, not the turn, so the mapper cannot know it and a
+		// freshly mapped bubble arrives without it - which would render a read that is
+		// in flight right now as "nothing is fetching this, press to load", and then
+		// flip back a second later when the read lands. Every load path runs this
+		// (the engine's loadHistory and agent.vue's fork both call it, on the page,
+		// before it merges), so this is where the page learns what is already running.
+		for (var p = 0; p < pendingIncoming.length; p++) {
+			var pi: any = pendingIncoming[p];
+			if (!pi._streamPending || !pi._serverItemId) continue;
+			var phase = this._recoveryPhaseFor(pi._serverItemId);
+			if (phase === null) delete pi._streamRecovery; else pi._streamRecovery = phase;
+		}
+	}
+
+	/**
+	 * This session's fetching state for one turn, from the bookkeeping rather than
+	 * from any bubble. A queued entry counts as 'active': it is committed to be read,
+	 * serially, and the reader has no way to tell "being read" from "next in line"
+	 * apart from the wait.
+	 */
+	private _recoveryPhaseFor(itemId: string): 'active' | 'failed' | null {
+		var rec = this._rec();
+		if (rec.inflight[itemId]) return 'active';
+		for (var i = 0; i < rec.queue.length; i++) if (rec.queue[i].id === itemId) return 'active';
+		if (rec.failed[itemId]) return 'failed';
+		return null;
+	}
+
+	/**
+	 * PUBLIC DELEGATE, for a client that maps and merges its own history page.
+	 *
+	 * agent.vue keeps a forked mapper and a forked first-page merge (its mount path
+	 * runs them, while resumePolling routes through loadHistory below), so both
+	 * paths are live for the SAME row inside one component. Adoption is part of the
+	 * merge contract, not an optional extra: without it that fork erases a streamed
+	 * answer off the screen on every turn, which is the whole of MAJOR 3.
+	 *
+	 * Exposed rather than reimplemented because the rule needs the session's own
+	 * `incomplete` set, which the pure helper (history.ts adoptLocalAnswerIntoPage)
+	 * cannot see. A client that reached for the helper alone would adopt a TRUNCATED
+	 * answer over the row and clear the marker that would have gone back for the
+	 * rest - a fork that reads as correct and loses text.
+	 *
+	 * Call it exactly where loadHistory does: on the freshly mapped page, after
+	 * applyHydratedBodies and BEFORE the page replaces or merges into state.messages.
+	 */
+	adoptLocalAnswers(mapped: ChatMessage[], loadKey?: string): void {
+		this._adoptLocalAnswers(mapped, loadKey);
+	}
+
+	/**
+	 * Queue the on-screen turns whose answer is only in the chunk store, newest
+	 * first, and start draining. Never blocks and never throws.
+	 *
+	 * `ownerKey` is the chat the queue entries belong to, snapshotted by the caller:
+	 * a recovery that lands after the user has moved on writes into that chat's
+	 * cache, never into whatever list is on screen by then.
+	 */
+	private _scheduleStreamRecovery(ownerKey: string, platform: 'claude' | 'openai', projectId: string, owner: string): void {
+		if (!streamRecoveryEnabled()) return;
+		var rec = this._rec();
+		var wanted: string[] = [];
+		for (var i = this.state.messages.length - 1; i >= 0; i--) {
+			var m = this.state.messages[i];
+			if (!m || m.role !== 'assistant' || !(m as any)._streamPending || !m._serverItemId) continue;
+			var id = m._serverItemId;
+			if (rec.attempted[id]) continue;
+			// A turn with a live stream attached is being delivered right now; reading
+			// its chunks in parallel would spend a second full read to arrive at the
+			// same answer the poll is already assembling.
+			if (this.liveStreams[id]) continue;
+			if (rec.queue.some(function (e) { return e.id === id; })) continue;
+			wanted.push(id);
+			if (wanted.length >= STREAM_RECOVERY_PER_LOAD) break;
+		}
+		if (!wanted.length) return;
+		for (var w = 0; w < wanted.length; w++) {
+			rec.queue.push({ id: wanted[w], ownerKey: ownerKey, platform: platform, projectId: projectId, owner: owner });
+			// Marked as the queue is built, NOT as each read starts. Everything above
+			// the cap is committed from this moment and its bubble may honestly spin;
+			// everything the cap left behind is marked and has nobody, and its bubble
+			// must say so rather than spin on a promise this scheduler never made.
+			this._markRecoveryPhase(wanted[w], 'active');
+		}
+		this._drainStreamRecovery();
+	}
+
+	/**
+	 * PUBLIC DELEGATE, the other half of what a forked history path needs.
+	 *
+	 * Same reason as adoptLocalAnswers: agent.vue's mount path never calls
+	 * loadHistory, so without this its pages would MARK unfinalized streamed turns
+	 * and then never read them back - CRITICAL 1 left unfixed on the client's
+	 * primary path, with the marker making it look handled.
+	 *
+	 * Takes the load's SNAPSHOTTED identity rather than reading it live, and that is
+	 * the reason this exists instead of the caller looping over recoverStreamedAnswer:
+	 * that one reads getIdentity() at call time (right, for an on-demand affordance
+	 * the user just clicked), which after a project switch racing the load would
+	 * finalize the turn against the project they switched TO. Call it AFTER the page
+	 * is rendered and the loading flags are cleared - it must never hold up the
+	 * conversation it belongs to.
+	 */
+	scheduleStreamRecovery(ownerKey: string, platform: 'claude' | 'openai', projectId: string, owner: string): void {
+		this._scheduleStreamRecovery(ownerKey, platform, projectId, owner);
+	}
+
+	/** Serial drain of the recovery queue. Each entry is one full chunk read. */
+	private _drainStreamRecovery(): void {
+		var rec = this._rec();
+		if (rec.running) return;
+		var next = rec.queue.shift();
+		if (!next) return;
+		rec.running = true;
+		var self = this;
+		this._readBackStreamedTurn(next.id, next.ownerKey, next.platform, next.projectId, next.owner)
+			.catch(function () { /* every failure is already handled inside */ })
+			.then(function () {
+				self._rec().running = false;
+				self._drainStreamRecovery();
+			});
+	}
+
+	/**
+	 * Read one unfinalized streamed turn back out of the chunk store and put its
+	 * answer where the turn's answer belongs.
+	 *
+	 * Public because the cap above is deliberately small: a host that wants to offer
+	 * "load the rest" on an older recoverable turn calls this with its
+	 * `_serverItemId`, and gets the same path the automatic recovery uses. Safe to
+	 * call for an id that turns out not to be recoverable, and safe to call twice -
+	 * a second call while the first is still in flight is a no-op.
+	 *
+	 * THIS IS THE USER ASKING, and that is why it passes `manual`. The automatic
+	 * recovery refuses a row it has already tried, so that a re-render, or the
+	 * history load that every visibilitychange fires, cannot loop on the same
+	 * chunks. A click is neither of those: it is one bounded request that a person
+	 * asked for, and applying the loop guard to it made the affordance a button that
+	 * silently did nothing for exactly the rows most likely to have it - every row
+	 * an earlier read touched and could not settle.
+	 */
+	recoverStreamedAnswer(itemId: string): Promise<void> {
+		if (!itemId) return Promise.resolve();
+		var id = this.host.getIdentity();
+		var platform = id && id.platform === 'openai' ? 'openai' : 'claude';
+		return this._readBackStreamedTurn(itemId, this.getHistoryCacheKey(), platform as 'claude' | 'openai', id ? id.projectId : '', id ? id.owner : '', true);
+	}
+
+	private _readBackStreamedTurn(itemId: string, ownerKey: string, platform: 'claude' | 'openai', projectId: string, owner: string, manual?: boolean): Promise<void> {
+		var cfg = chatEngineConfig();
+		var read = cfg.clientSecretRequestStream;
+		if (!read || !itemId) return Promise.resolve();
+		// IN FLIGHT is the only refusal a user-driven retry accepts, and it is about
+		// this request rather than about the history of the row: two reads of the same
+		// chunks at once spend a second full read to arrive at the same answer.
+		if (this._rec().inflight[itemId]) return Promise.resolve();
+		if (!manual && this._rec().attempted[itemId]) {
+			// Refused, so nothing is fetching this after all. The scheduler filters
+			// attempted ids out before it queues them, so reaching here means the row
+			// was attempted AFTER being queued and its bubble is already wearing the
+			// 'active' it was promised - which nothing would ever take off again.
+			this._markRecoveryPhase(itemId, null);
+			return Promise.resolve();
+		}
+		// Marked BEFORE the request, not after: a second load firing while this one is
+		// in flight must not start a second read of the same chunks.
+		this._rec().attempted[itemId] = true;
+		this._rec().inflight[itemId] = true;
+		// A retry is not still-failed. Cleared before the request so the bubble stops
+		// offering "try again" the instant it is being tried.
+		delete this._rec().failed[itemId];
+		this._markRecoveryPhase(itemId, 'active');
+		var self = this;
+		var url = platform === 'openai' ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+		// A parser of its own, fed from seq 0. Deliberately NOT registered in
+		// liveStreams: this turn is over, nothing will paint into it, and a live
+		// stream entry would make _beginLiveStream discard a genuinely live one that
+		// happened to share the id after an auth-refresh retry.
+		var parser = createSseParser();
+		var fed = false;
+		return Promise.resolve(read(itemId, {
+			url: url, method: 'POST', service: projectId, owner: owner, since: 0,
+			onStream: function (chunk: string) {
+				if (typeof chunk !== 'string' || !chunk) return;
+				fed = true;
+				parser.feed(chunk);
+			},
+		})).then(function (res: any) {
+			// A STOPPED READ IS NOT AN ANSWER, and it is not an envelope either, which
+			// is exactly how it used to be mistaken for one. skapi's stop resolves the
+			// read with a frozen { id, status: 'stopped' } - no in_queue, so
+			// isCsrStatusEnvelope says no - and "not an envelope" was taken to mean
+			// "the stored body". That object extracts to no text, so the turn was read
+			// as "there was nothing here", its bubble was DELETED and its marker with
+			// it, and the answer became unreachable because a read was cancelled. A
+			// stop says nothing whatsoever about the turn: the chunks are untouched and
+			// the row is still unfinalized, so the only correct move is to change
+			// nothing and stay recoverable. The attempt is forgotten so the next
+			// history load can try again.
+			if (isPollStopped(res)) {
+				delete self._rec().attempted[itemId];
+				delete self._rec().inflight[itemId];
+				// Back to 'idle', not to 'failed': nothing failed and nothing is coming.
+				// The bubble stops spinning and starts offering to be asked again, which
+				// is the truthful account of a read somebody stopped.
+				self._markRecoveryPhase(itemId, null);
+				return;
+			}
+			// The SDK resolves with a STORED BODY when the row turned out to be
+			// finalized after all (somebody else's tab got there first), and with a
+			// status envelope when it replayed chunks. Both are usable: the stored body
+			// is the answer, the replay's assembled body is the answer.
+			var envelope = isCsrStatusEnvelope(res);
+			var body: any = null;
+			if (res && !envelope) {
+				body = res;
+			} else if (fed) {
+				parser.end();
+				body = parser.finalBody();
+			}
+			var snap = parser.snapshot();
+			// A body that came off the ROW is already stored, so re-storing it would be
+			// a round trip that changes nothing; only an assembled one is new.
+			var fromRow = !!(res && !envelope);
+			// THE SAME KEEP POLICY THE LIVE SETTLE USES, not a second computation of
+			// it. This used to ask parse completeness alone, so a row the live path
+			// would never have finalized - one the destination FAILED, one killed by an
+			// error frame - was finalized here instead, releasing precisely the chunks
+			// that policy exists to keep. The row's own status is handed over with the
+			// bytes: a replay of a failed row comes back as a 'failed' envelope, and
+			// that is the authoritative account of the turn.
+			var rowStatus = envelope && typeof res.status === 'string' ? res.status : undefined;
+			// A DEGRADED READ IS NOT A FACT ABOUT THE TURN. csr-poll answers `more: true`
+			// when a cap, or a transient chunk-table error, stopped the read short of the
+			// end of the partition, which is the throttle shape this repo has already paid
+			// for once. What came back is then a prefix of the answer, or nothing at all,
+			// and neither says anything about what the turn actually contains. Treated as
+			// an answer it is silent data loss twice over: an empty degraded read spliced
+			// the bubble out as "this turn was empty", and a partial one cleared the
+			// marker, so the truncation was adopted as the turn's answer and nothing ever
+			// went back for the rest. `store` is already safe here (an unterminated parse
+			// fails mayKeepStreamedAnswer), so this only has to keep the turn RECOVERABLE.
+			var degraded = !!(envelope && res && res.more === true);
+			var store = !fromRow && !degraded && body != null && mayKeepStreamedAnswer(snap, rowStatus);
+			// The read is over however it settles below. Cleared BEFORE the apply, which
+			// usually replaces the bubble outright: leaving it set would strand 'active'
+			// on the one case the apply cannot touch (the reader has moved to another
+			// chat), and that bubble would spin on its owner's next visit.
+			delete self._rec().inflight[itemId];
+			delete self._rec().failed[itemId];
+			self._markRecoveryPhase(itemId, null);
+			if (degraded) {
+				// Forget the attempt so the next history load queues this row again,
+				// exactly as the read-failed arm below does. Same reason: nothing
+				// conclusive is known, so nothing may be made permanent.
+				delete self._rec().attempted[itemId];
+			}
+			self._applyRecoveredAnswer(itemId, ownerKey, platform, projectId, owner, body, store, degraded);
+		}, function (err: any) {
+			// THE READ ITSELF FAILED, which is a different fact from "I read it and
+			// there was nothing there", and the two must not settle the same way. This
+			// used to clear the marker, which left the bubble empty on screen with
+			// nothing on it for the recovery to find again: the answer was unreachable
+			// for the rest of the session because one request 500'd. Nothing is known,
+			// so nothing is changed - the CHUNKS are untouched, the row is still
+			// unfinalized, the marker stays on and keeps rendering as "being fetched",
+			// and the attempt is forgotten so the next history load queues it again.
+			// (The "there was nothing there" case is _applyRecoveredAnswer's, and it
+			// still drops the bubble, because an empty row really does mean an empty
+			// turn.)
+			//
+			// What DID change is who is fetching it: nobody. Recorded so the view can
+			// say "could not load this answer, try again" instead of drawing the same
+			// loader a live turn draws - a spinner with nothing behind it is a promise
+			// the client cannot keep, and this one used to be kept up for the rest of
+			// the session.
+			console.warn('[chat-engine] could not read back a streamed turn', itemId, err);
+			delete self._rec().attempted[itemId];
+			delete self._rec().inflight[itemId];
+			self._rec().failed[itemId] = true;
+			self._markRecoveryPhase(itemId, 'failed');
+		});
+	}
+
+	/**
+	 * Write a recovered answer into the turn's bubble (or into the owning chat's
+	 * cache when the reader has moved on), then store it as the version history
+	 * keeps.
+	 *
+	 * FINALIZING IS WHAT MAKES THIS RUN ONCE. It copies the answer onto the row and
+	 * releases the chunks, so the next load reads an ordinary turn and no recovery is
+	 * scheduled for it ever again, by anyone, in any tab. `store` is the caller's
+	 * decision and carries two gates at once: mayKeepStreamedAnswer, the SAME keep
+	 * policy the live settle applies (an incomplete, errored or failed read is shown
+	 * but never stored, because storing it would make the truncation permanent and
+	 * delete the part that was missing), and whether the body is new at all (one
+	 * that came off the row is already stored).
+	 */
+	private _applyRecoveredAnswer(
+		itemId: string, ownerKey: string, platform: 'claude' | 'openai',
+		projectId: string, owner: string, body: any, store: boolean, degraded?: boolean,
+	): void {
+		var text = '';
+		var isErr = isErrorResponseBody(body);
+		if (body != null && !isErr) {
+			text = ((platform === 'openai' ? extractOpenAIText(body) : extractClaudeText(body)) || '').trim();
+		}
+		if (!text && !isErr) {
+			if (degraded) {
+				// The read was cut short, so "no text" is a fact about the READ and not
+				// about the turn. Dropping the bubble here would delete an answer whose
+				// every byte is still sitting in the chunk table. Change nothing and stay
+				// recoverable, exactly as a read that threw does.
+				return;
+			}
+			// Nothing there. Either the row never streamed after all, or its chunks are
+			// genuinely empty. Drop the marker and let the bubble go, which leaves the
+			// list looking exactly as it did before any of this existed.
+			this._clearStreamPendingMark(itemId, ownerKey, true);
+			return;
+		}
+		var reply: ChatMessage = isErr
+			? { role: 'assistant', content: getErrorMessage(body), isError: true, _serverItemId: itemId }
+			: { role: 'assistant', content: text, _serverItemId: itemId };
+		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+			// The reader is in another chat. Settle it where it belongs and touch
+			// nothing on screen - state.messages is a different conversation's list.
+			this._applyReplyToCache(ownerKey, reply, itemId);
+		} else {
+			var idx = -1;
+			for (var i = 0; i < this.state.messages.length; i++) {
+				var m = this.state.messages[i];
+				if (m && m.role === 'assistant' && m._serverItemId === itemId) { idx = i; break; }
+			}
+			if (idx === -1) {
+				// The bubble is gone (a clear, a project switch that replaced the list).
+				// The cache is still the right place for it.
+				this._applyReplyToCache(ownerKey, reply, itemId);
+			} else {
+				var prev = this.state.messages[idx];
+				if (prev._ts !== undefined) reply._ts = prev._ts;
+				if (prev._ownerKey !== undefined) reply._ownerKey = prev._ownerKey;
+				this.state.messages[idx] = reply;
+				this.updateHistoryCache();
+				this.host.notify();
+			}
+		}
+		// The marker comes off for an INCOMPLETE read, but NOT for a DEGRADED one, and
+		// the difference is which side the incompleteness is on. A stream that genuinely
+		// died mid-answer has chunks that will be incomplete forever, so leaving the
+		// marker on would re-read the whole thing on every tab return to arrive at the
+		// same partial: what the reader has is what there is. A DEGRADED read is the
+		// other case entirely, the READER stopped early and the rest of the answer is
+		// still in the chunk table, so clearing here would show a truncation, let
+		// _adoptLocalAnswers carry it forward as the turn's answer, and leave nothing
+		// to go back for the missing part.
+		if (!degraded) delete this._rec().incomplete[itemId];
+		if (!store || body == null || isErr) return;
+		var fin = chatEngineConfig().clientSecretRequestFinalize;
+		if (!fin) return;
+		var url = platform === 'openai' ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+		try {
+			Promise.resolve(fin(itemId, body, { url: url, method: 'POST', service: projectId, owner: owner }))
+				.catch(function (err: any) {
+					// The answer is on screen and in the cache; only the chunks are left
+					// behind, and the row stays re-readable, which is what they are for.
+					console.warn('[chat-engine] finalize of a recovered turn failed', err);
+				});
+		} catch (e) {
+			console.warn('[chat-engine] finalize of a recovered turn threw', e);
+		}
+	}
+
+	/**
+	 * Take the "answer is elsewhere" marker off a turn once it is settled one way or
+	 * the other. `drop` removes an assistant bubble that turned out to have no answer
+	 * at all, which restores exactly the list the mapper used to produce for such a
+	 * row (none), rather than leaving a permanently empty bubble behind.
+	 *
+	 * ONLY EVER CALLED FOR A TURN THAT WAS ACTUALLY READ. The marker is the one thing
+	 * that keeps an unrecovered answer reachable, so it comes off only on the strength
+	 * of an answer (the recovery wrote one) or of a read that came back empty. A read
+	 * that FAILED, or one that was STOPPED, knows neither, and taking the marker off
+	 * on either of those is how a bubble ends up empty forever with its answer still
+	 * in the chunk table. `drop` is likewise never passed for a bubble that HAS
+	 * content: an empty row is an empty turn, a failed read is not.
+	 */
+	private _clearStreamPendingMark(itemId: string, ownerKey: string, drop: boolean): void {
+		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) return;
+		var changed = false;
+		for (var i = this.state.messages.length - 1; i >= 0; i--) {
+			var m = this.state.messages[i];
+			if (!m || m.role !== 'assistant' || m._serverItemId !== itemId) continue;
+			if (!(m as any)._streamPending) continue;
+			if (drop && !m.content) { this.state.messages.splice(i, 1); changed = true; continue; }
+			(m as any)._streamPending = false;
+			changed = true;
+		}
+		if (changed) { this.updateHistoryCache(); this.host.notify(); }
+	}
+
 
 	/**
 	 * Stop and forget one item's poll. Used after a cancel: the row is either gone
@@ -1107,7 +2524,13 @@ export class ChatSession {
 						// so this reports every time, not once.
 						if (typeof params.onItemId === 'function') params.onItemId(initial.id);
 					}
-					var dp = self._fgPollWithEarlyProbe(initial, initial.id);
+					// The turn's OWN identity, not a live read: this dispatch already
+					// pinned projectId/owner (see _callProviderFor) and the ack can land
+					// after the user has moved elsewhere. params.key is that chat's
+					// history cache key, which is what the painter compares against.
+					var dp = self._fgPollWithEarlyProbe(initial, initial.id, undefined, {
+						platform: params.aiPlatform, projectId: params.projectId, owner: params.owner, ownerKey: params.key,
+					});
 					if (initial.id) self._trackPoll(initial.id, 'fg', dp);
 					return dp;
 				}
@@ -1631,7 +3054,13 @@ export class ChatSession {
 					if (result && result.poll && (result.status === 'pending' || result.status === 'running')) {
 						// Track this queued item's poll so a remount/refetch dedups
 						// against it instead of attaching a duplicate history poll.
-						var qp = self._fgPollWithEarlyProbe(result, serverId);
+						// Pinned exactly like the request itself (id.projectId/id.owner were
+						// snapshotted before the send, capturedKey before the ack): the user
+						// can switch project inside this round trip, and a live identity read
+						// here would finalize this turn against the project they switched TO.
+						var qp = self._fgPollWithEarlyProbe(result, serverId, undefined, {
+							platform: capturedPlatform, projectId: id.projectId, owner: id.owner, ownerKey: capturedKey,
+						});
 						if (serverId) self._trackPoll(serverId, 'fg', qp);
 						return qp
 							.then(function (res: any) { if (isPollStopped(res)) return; return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
@@ -1976,8 +3405,19 @@ export class ChatSession {
 			answer = (answer || '').trim() || 'No text response received from AI provider.';
 			var lid = this._newLocalId();
 			if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
-				this.state.messages[targetIdx] = { role: 'assistant', content: '', _localId: lid };
-				this.host.notify(); this.enqueueTypewrite(targetIdx, answer, lid);
+				// Same resume as the immediate-send path: keep what the stream painted
+				// and let the typewriter carry on from where the two texts diverge.
+				var qPainted = this._paintedTextAt(targetIdx);
+				// Same identity carry-over as the immediate-send settle above, for the same
+				// reason: a rebuilt bubble with no `_serverItemId` is invisible to
+				// _adoptLocalAnswers, so a refetch in the finalize window adopts the row's
+				// empty answer over what the reader already read.
+				var prevQ: any = this.state.messages[targetIdx] || {};
+				var qSettled: any = { role: 'assistant', content: qPainted, _localId: lid };
+				if (prevQ._serverItemId) qSettled._serverItemId = prevQ._serverItemId;
+				if (prevQ._ownerKey) qSettled._ownerKey = prevQ._ownerKey;
+				this.state.messages[targetIdx] = qSettled;
+				this.host.notify(); this.enqueueTypewrite(targetIdx, answer, lid, qPainted);
 			} else if (targetIdx >= 0) {
 				this.state.messages.splice(targetIdx, 0, { role: 'assistant', content: '', _localId: lid });
 				this.host.notify(); this.enqueueTypewrite(targetIdx, answer, lid);
@@ -2265,7 +3705,14 @@ export class ChatSession {
 	//     renders self-throttles to what the machine can actually paint.
 	//   * rAF paces us to the browser's paint cycle and pauses in background
 	//     tabs, so we never queue work faster than it can be drawn.
-	typewriteIntoIndex(idx: number, fullText: string, localId?: string): Promise<void> {
+	//
+	// `paintedText` is what a LIVE STREAM already put in this bubble. The reveal
+	// starts from the point the two texts stop agreeing rather than from zero: the
+	// authoritative answer still replaces the live one character for character (it is
+	// the only source of truth, and this method writes fullText and nothing else), but
+	// retyping a paragraph the reader has just watched arrive is the one thing that
+	// would make a streamed turn look worse than an unstreamed one.
+	typewriteIntoIndex(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<void> {
 		var self = this;
 		if (!fullText) return Promise.resolve();
 
@@ -2286,7 +3733,10 @@ export class ChatSession {
 		regions.sort(function (a, b) { return a.start - b.start; });
 
 		this.state.typing = true; this.state.typingAbort = false;
-		var i = 0;
+		// Resume point, computed against the SAME regions the reveal below honours, so
+		// a resume landing inside a link or a fence starts at that region's end and the
+		// region is never on screen half-revealed.
+		var i = paintedText ? typewriterResumeIndex(paintedText, fullText, regions) : 0;
 		var last = nowMs();
 
 		return new Promise<void>(function (resolve) {
@@ -2300,16 +3750,31 @@ export class ChatSession {
 				if (done) return;
 				done = true;
 				cleanup();
-				if (!self.state.typingAbort) {
-					// Re-find the bubble by localId and, if it's gone, bail WITHOUT
-					// writing — never fall back to the numeric idx, which a concurrent
-					// array mutation may have repurposed for an unrelated message
-					// (mirrors frame()'s currentIdx===-1 bail below).
-					var fi = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
-					if (fi !== -1) {
-						var t = self.state.messages[fi];
-						if (t) { t.content = fullText; self.host.refreshMessageBubble(fi); }
-					}
+				// THE AUTHORITATIVE TEXT ALWAYS WINS, ABORT OR NOT. This write used to
+				// be skipped on abort, which is a rule that made sense when the bubble
+				// held a PREFIX of fullText: stopping early left the reader with less
+				// of the right answer, and the list was about to be replaced anyway.
+				// Live streaming broke that premise. The bubble now starts out holding
+				// the text the STREAM painted, which is a different string from the
+				// authoritative one (the parser's untrimmed render feed, cut at a safe
+				// reveal boundary, possibly a truncation of a degraded read), and
+				// skipping the write leaves THAT as the turn's rendered answer. An
+				// abort is a reason to stop animating; it is never a reason to keep the
+				// provisional text over the settled one.
+				//
+				// Re-find the bubble by localId and, if it's gone, bail WITHOUT
+				// writing, and never fall back to the numeric idx, which a concurrent
+				// array mutation may have repurposed for an unrelated message
+				// (mirrors frame()'s currentIdx===-1 bail below). That bail is what
+				// keeps this safe on the two paths that abort: a history page that
+				// REPLACED the list has already dropped this bubble (and any copy of it
+				// the merge adopted carries the same _localId, which is precisely the
+				// bubble that should receive the answer), and a view teardown has no
+				// bubble on screen to disturb.
+				var fi = localId ? self.state.messages.findIndex(function (mm) { return mm._localId === localId; }) : idx;
+				if (fi !== -1) {
+					var t = self.state.messages[fi];
+					if (t) { t.content = fullText; self.host.refreshMessageBubble(fi); }
 				}
 				self.state.typing = false;
 				resolve();
@@ -2360,7 +3825,7 @@ export class ChatSession {
 	}
 
 	private typewriterQueue: Promise<any> = Promise.resolve();
-	enqueueTypewrite(idx: number, fullText: string, localId?: string): Promise<any> {
+	enqueueTypewrite(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<any> {
 		var self = this;
 		// Stamp the reply bubble's display time as it starts revealing. This is the
 		// single chokepoint every typed reply (immediate, queued, and bg-resolution)
@@ -2368,7 +3833,14 @@ export class ChatSession {
 		// timestamp; a history reload later replaces it with the server `updated`.
 		var target = this.state.messages[idx];
 		if (target && target._ts === undefined) target._ts = wallClockNow();
-		this.typewriterQueue = this.typewriterQueue.then(function () { return self.typewriteIntoIndex(idx, fullText, localId); });
+		// SELF-HEALING, because this is now reached from the live paint path too. The
+		// queue is a class field, so it is only initialised by the constructor; any
+		// caller holding a ChatSession built another way (the engine tests drive
+		// Object.create(ChatSession.prototype) deliberately, to exercise one method
+		// without a host) previously never touched it, and now does. An uninitialised
+		// queue would throw here and take the whole answer down over bookkeeping.
+		if (!this.typewriterQueue) this.typewriterQueue = Promise.resolve();
+		this.typewriterQueue = this.typewriterQueue.then(function () { return self.typewriteIntoIndex(idx, fullText, localId, paintedText); });
 		return this.typewriterQueue;
 	}
 
@@ -2398,12 +3870,32 @@ export class ChatSession {
 			this.promoteNextQueuedToRunning();
 			return Promise.resolve();
 		}
+		// Whatever the live stream painted into this bubble stays on screen across the
+		// swap and becomes the typewriter's starting point. Blanking it here would be a
+		// visible reset of an answer the reader already read: the bubble would go empty
+		// and retype itself, and worse, it can sit empty for a while, because
+		// enqueueTypewrite lands BEHIND any typewriter still running.
+		var painted = this._paintedTextAt(pendingIdx);
 		var lid = this._newLocalId();
-		this.state.messages[pendingIdx] = { role: 'assistant', content: '', isPending: false, _localId: lid };
+		// CARRY THE IDENTITY FIELDS ACROSS THE REBUILD. This replaces the bubble object
+		// wholesale, and a fresh literal has neither `_serverItemId` nor `_ownerKey`. That
+		// is not cosmetic on a streamed turn: `_adoptLocalAnswers` finds the local donor
+		// for an incoming server copy BY `_serverItemId`, and a streamed row settles with
+		// no body of its own, so a first-page refetch landing between the settle and
+		// csr-finalize finds no donor, adopts the server's empty answer over the text the
+		// reader is looking at, and the answer disappears off the screen. That race is the
+		// whole reason adoptLocalAnswerIntoPage exists, and dropping the id here is what
+		// re-opened it. `_ownerKey` goes with it so the settled bubble stays stamped to
+		// this chat instead of waiting for the next history load to restamp it.
+		var prevSettled: any = this.state.messages[pendingIdx] || {};
+		var settled: any = { role: 'assistant', content: painted, isPending: false, _localId: lid };
+		if (prevSettled._serverItemId) settled._serverItemId = prevSettled._serverItemId;
+		if (prevSettled._ownerKey) settled._ownerKey = prevSettled._ownerKey;
+		this.state.messages[pendingIdx] = settled;
 		this._removeStrayPendingAssistants();
 		this.host.notify();
 		this.promoteNextQueuedToRunning();
-		return this.enqueueTypewrite(pendingIdx, latest.content, lid);
+		return this.enqueueTypewrite(pendingIdx, latest.content, lid, painted);
 	}
 
 	// Remove leftover non-background pending ("Thinking…") assistant bubbles: the
@@ -2434,6 +3926,13 @@ export class ChatSession {
 		for (var k = this.state.messages.length - 1; k >= 0; k--) {
 			var m = this.state.messages[k];
 			if (!m || !m.isPending || m.role !== 'assistant' || m.isBackgroundTask) continue;
+			// A bubble with a live stream running into it is never a stray, whatever its
+			// user bubble looks like: deleting it would leave the stream painting into
+			// nothing and throw away the answer already on screen. (A QUEUED turn's user
+			// bubble is still pending while it streams, so _isLiveImmediatePlaceholder
+			// below does not cover this one.) _streaming is cleared at settle, so this
+			// never keeps a bubble the sweep should have taken.
+			if (m._streaming) continue;
 			if (this._isLiveImmediatePlaceholder(k)) continue;
 			this.state.messages.splice(k, 1);
 		}
@@ -2662,9 +4161,13 @@ export class ChatSession {
 				this.state.messages[idx] = { role: 'assistant', content: stripMarker(text) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...(reportedComplete ? { _indexComplete: true } : {}) };
 				this.host.notify(); this.updateHistoryCache(); return;
 			}
+			// Same live-stream resume as the two send paths: a streamed turn re-attached
+			// after a reload settles HERE, and its bubble is already carrying the text
+			// the reader watched arrive.
+			var hPainted = this._paintedTextAt(idx);
 			var lid = this._newLocalId();
-			this.state.messages[idx] = { role: 'assistant', content: '', _localId: lid, _serverItemId: itemId };
-			this.host.notify(); this.enqueueTypewrite(idx, text, lid);
+			this.state.messages[idx] = { role: 'assistant', content: hPainted, _localId: lid, _serverItemId: itemId };
+			this.host.notify(); this.enqueueTypewrite(idx, text, lid, hPainted);
 			this.updateHistoryCache(); return;
 		}
 		var userIdx = this.state.messages.findIndex(function (m) {
@@ -3509,6 +5012,14 @@ export class ChatSession {
 			// fresh stubs, and without this a bubble the user already expanded
 			// would silently revert to its 200-char head.
 			self.applyHydratedBodies(mapped);
+			// AN UNKNOWN ANSWER NEVER OVERWRITES A KNOWN ONE. Before either merge
+			// below, any page bubble whose row is terminal-but-empty takes the answer
+			// the local list already holds for that turn (and its live state, if the
+			// turn is still running). Without this, a refetch landing in the window
+			// between a streamed row resolving and its finalize storing the body erases
+			// the answer from the screen, on every streamed turn, since a refetch
+			// fires on visibilitychange. See _adoptLocalAnswers.
+			self._adoptLocalAnswers(mapped, loadKey);
 
 			// Set when a first-page refresh re-prepended already-loaded older pages,
 			// so the cursor reset below knows not to rewind to page 1's boundary.
@@ -3755,6 +5266,13 @@ export class ChatSession {
 			self.updateHistoryCache();
 			self.host.notify();
 
+			// AND AN UNKNOWN ANSWER LEFT OVER IS RESOLVED BY READING THE CHUNKS BACK.
+			// Fired AFTER the page is rendered and the flags are cleared, never before:
+			// a streamed turn nobody finalized is a turn whose answer is sitting in the
+			// chunk store, and going to fetch it must not hold up the conversation it
+			// belongs to. Bounded and serial: see _scheduleStreamRecovery.
+			self._scheduleStreamRecovery(loadKey, platform, projectId, owner);
+
 			// ── deferred indexing-stub batch (first-paint split) ──────────────
 			// The conversation is already on screen; when the stub batch lands it
 			// is classified/mapped like any page and STRIP-THEN-MERGED: existing
@@ -3953,7 +5471,13 @@ export class ChatSession {
 					};
 					var pp = isBg
 						? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts))
-						: self._fgPollWithEarlyProbe(item, capturedId, pollOpts);
+						// Pinned to the chat this LOAD is for, snapshotted at its start
+						// (loadKey/platform/projectId/owner), never a live read: a load can
+						// still be attaching polls after the user has moved on, and a stream
+						// stamped with where they moved to would paint into that chat.
+						: self._fgPollWithEarlyProbe(item, capturedId, pollOpts, {
+							platform: platform, projectId: projectId, owner: owner, ownerKey: loadKey,
+						});
 					// Anything on the BACKGROUND queue is pausable, not just items whose
 					// prompt text we recognise as an indexing task. _isBgTask vs
 					// _isOnBgQueue is a DISPLAY distinction ("Indexing: file" vs a normal
