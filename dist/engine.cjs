@@ -7920,6 +7920,29 @@ function isHiddenPass(m) {
   }
   return !!m.isPending;
 }
+function overlayRunRecordVerdict(grp, rec, liveIndexKeys) {
+  if (!grp.members.length || grp.status === "active" || grp.cancelling) return;
+  if (rec.status === "working" || typeof rec.started !== "number") return;
+  if (liveIndexKeys[grp.key] || liveIndexKeys[canonIndexKey(grp.key)]) return;
+  var firstTs = grp.members[0].msg._ts;
+  var lastTs = grp.members[grp.members.length - 1].msg._ts;
+  if (typeof lastTs !== "number" || typeof firstTs !== "number") return;
+  if (rec.started > lastTs) return;
+  var when = typeof rec.finished === "number" ? rec.finished : void 0;
+  if (when === void 0) return;
+  if (when < firstTs) return;
+  if (when < lastTs - 5e3) return;
+  if (rec.status === "error" || rec.status === "cancelled") {
+    grp.status = rec.status;
+  } else if (rec.status === "done") {
+    grp.status = "done";
+  } else {
+    return;
+  }
+  grp.finished = true;
+  grp.resolving = false;
+  grp.resolvingReason = void 0;
+}
 function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
   var liveIndexKeys = opts && opts.liveIndexKeys || {};
@@ -8235,6 +8258,7 @@ function buildChatDisplayList(messages, opts) {
       suppressAnchor[order[ti2]] = true;
       tg.runKey = "run:" + (tg.path || tg.key) + "#" + trec.started;
       stubList.push({ started: trec.started, group: tg });
+      overlayRunRecordVerdict(tg, trec, liveIndexKeys);
     }
   }
   stubList.sort(function(a, b) {

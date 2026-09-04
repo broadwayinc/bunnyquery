@@ -3245,12 +3245,6 @@ declare function parseIndexingLabel(content: string): {
     continued: boolean;
     isReindex: boolean;
 } | null;
-/**
- * Collapse background-indexing turns into per-file groups.
- *
- * Messages that are not background-indexing pass through untouched, at their
- * original positions and with their original indices.
- */
 declare function buildChatDisplayList(messages: ChatMessage[], opts?: BuildDisplayListOptions): DisplayEntry[];
 
 /**

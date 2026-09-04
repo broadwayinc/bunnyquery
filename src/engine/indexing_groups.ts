@@ -395,6 +395,48 @@ function isHiddenPass(m: ChatMessage): boolean {
  * Messages that are not background-indexing pass through untouched, at their
  * original positions and with their original indices.
  */
+/**
+ * A loaded group reads its state off its newest loaded pass, and for a run the WORKER
+ * ended (three failed retries, a stale grant, a cap-out) that pass looks settled: the
+ * model answered normally, the failure happened after. The run:: record is the only
+ * thing that knows, and until now it was consulted for record-only stubs alone, so
+ * the chat row said "Indexed", the files page took that as a verdict and painted the
+ * badge green over the record's "error". The record's terminal verdict is laid over
+ * the group when it describes THIS run (started no later than the newest loaded pass)
+ * and is newer than that pass; visible work and a live queue hit still outrank it.
+ */
+function overlayRunRecordVerdict(
+	grp: IndexingGroup,
+	rec: RunStubInfo,
+	liveIndexKeys: { [key: string]: boolean },
+): void {
+	if (!grp.members.length || grp.status === 'active' || grp.cancelling) return;
+	if (rec.status === 'working' || typeof rec.started !== 'number') return;
+	if (liveIndexKeys[grp.key] || liveIndexKeys[canonIndexKey(grp.key)]) return;
+	var firstTs = grp.members[0].msg._ts;
+	var lastTs = grp.members[grp.members.length - 1].msg._ts;
+	if (typeof lastTs !== 'number' || typeof firstTs !== 'number') return;
+	// a record that started after the newest loaded pass is a LATER run, not this one
+	if (rec.started > lastTs) return;
+	var when = typeof rec.finished === 'number' ? rec.finished : undefined;
+	if (when === undefined) return;
+	// a record that ENDED before this run began describes a previous run
+	if (when < firstTs) return;
+	// the record's verdict must be at least as new as the pass it would override
+	// (a few seconds of slack: the worker closes the record right after the pass lands)
+	if (when < lastTs - 5000) return;
+	if (rec.status === 'error' || rec.status === 'cancelled') {
+		grp.status = rec.status;
+	} else if (rec.status === 'done') {
+		grp.status = 'done';
+	} else {
+		return;
+	}
+	grp.finished = true;
+	grp.resolving = false;
+	grp.resolvingReason = undefined;
+}
+
 export function buildChatDisplayList(
 	messages: ChatMessage[],
 	opts?: BuildDisplayListOptions,
@@ -991,6 +1033,7 @@ export function buildChatDisplayList(
 			// record-only to loaded-passes keeps its DOM node and its position.
 			tg.runKey = 'run:' + (tg.path || tg.key) + '#' + trec.started;
 			stubList.push({ started: trec.started, group: tg });
+			overlayRunRecordVerdict(tg, trec, liveIndexKeys);
 		}
 	}
 	stubList.sort(function (a, b) { return a.started - b.started; });
