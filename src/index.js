@@ -1900,6 +1900,7 @@ import {
             css: "text/css", xml: "application/xml", yaml: "text/yaml", yml: "text/yaml",
             pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
             gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+            eml: "message/rfc822",
         };
         return map[ext] || null;
     }
@@ -2753,7 +2754,7 @@ import {
     var ESTIMATED_BYTES_PER_TOKEN = 3;
     var ESTIMATED_PDF_BYTES_PER_TOKEN = 5000;
     var ESTIMATED_IMAGE_TOKENS = 800;
-    var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock)$/i;
+    var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock|eml)$/i;
     var PDF_EXTENSION_RE = /\.pdf$/i;
     var IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg)$/i;
     function estimateFileTokenCost(file) {

@@ -33,6 +33,9 @@ export {
 export {
 	isServerExtractable,
 	isOfficeFile,
+	isPagedReadFile,
+	isImageVisionFile,
+	isWindowedReadFile,
 	makeExtractPlaceholder,
 	composeUserMessage,
 	type ExtractDirective,

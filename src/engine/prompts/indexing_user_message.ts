@@ -36,8 +36,9 @@ export type IndexingAttachmentInfo = {
 
 export type BuildIndexingUserMessageOptions = {
 	/**
-	 * For files with no paged reader (.epub/.hwp/.doc/.rtf, source code) the model can't read the binary via
-	 * web_fetch, so the proxy worker extracts the text server-side and replaces
+	 * For files the layer parses server-side (office, e-book, email, source code)
+	 * the model can't read the raw bytes via web_fetch, so the proxy worker
+	 * extracts the text server-side and replaces
 	 * this exact token with it. When provided, the message embeds the token (and
 	 * drops the temporary-URL line - there is nothing for the model to fetch).
 	 */

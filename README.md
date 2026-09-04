@@ -199,6 +199,7 @@ declaring itself finished.
 .xls .xlsx .xlsm .ods      grids (rows plus embedded photos)
 .csv .tsv .tab             row-bounded windows with absolute row numbers
 .docx .pptx                documents
+.eml                       email: headers, body, attachment text
 .txt .md .markdown .log    plain text
 .json .jsonl .ndjson .xml .yaml .yml
 ```
@@ -225,10 +226,16 @@ The skapi proxy downloads the file, extracts its text **server-side**, and
 inlines that text into the request, so the model reads it directly with no
 fetching. This keeps indexing consistent across model providers.
 
-**Office & e-book** (binary/zip, parsed; includes legacy binary `.doc`/`.xls`/`.ppt`
-and the macro-enabled `.docm`/`.xlsm`/`.pptm`):
+**Office, e-book & email** (binary/zip/MIME, parsed; includes legacy binary
+`.doc`/`.xls`/`.ppt` and the macro-enabled `.docm`/`.xlsm`/`.pptm`):
 `.doc` · `.docx` · `.docm` · `.xls` · `.xlsx` · `.xlsm` · `.ppt` · `.pptx` · `.pptm`
-· `.hwp` · `.hwpx` · `.ods` · `.odt` · `.odp` · `.epub`
+· `.hwp` · `.hwpx` · `.ods` · `.odt` · `.odp` · `.epub` · `.eml`
+
+An `.eml` email yields its header block, its body and the text of every attached
+document (spreadsheet, document, csv, calendar, the text layer of a PDF) inline;
+pictures attached to or embedded in it are extracted into `__MEDIA__` like the
+pictures in any other document, and every other attachment is listed by name
+only, never saved as a separate file.
 
 **Text, data, markup & source code** (decoded as text; `.html`/`.htm` have their
 tags stripped):
@@ -289,7 +296,7 @@ display.
 
 By default the chat agent reads images with vision/OCR, renders PDF pages to
 images, reads large documents and spreadsheets window by window, and extracts
-Office/OpenDocument/EPUB and text/data/code files on the server. See
+Office/OpenDocument/EPUB/email and text/data/code files on the server. See
 [Supported file types](#supported-file-types). For any format read by **none**
 of these (e.g. a proprietary binary format), register a **parser plugin**: it
 runs in the browser, turns the uploaded file into text (or an HTML string), and

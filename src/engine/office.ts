@@ -2,7 +2,8 @@
  * Office-file server-side extraction helpers.
  *
  * Office documents (Microsoft .docx/.xlsx/.pptx, Hancom .hwpx, etc.) can't be
- * read by web_fetch (binary/zip). The proxy worker downloads them from db
+ * read by web_fetch (binary/zip), and neither can an RFC822 email (.eml), whose
+ * body and attachments are MIME-encoded. The proxy worker downloads them from db
  * storage, extracts their text server-side, and substitutes that text for a
  * placeholder token in the request body (carried under the reserved
  * `_skapi_extract` key, which the producer strips before the upstream call).
@@ -36,7 +37,11 @@ export type FileUrlDirective = {
 // Files whose text the worker extracts SERVER-SIDE and inlines for indexing,
 // instead of handing the agent a URL to fetch. Two groups:
 //   (1) BINARY document formats the model can't read at all (OOXML, Hancom
-//       HWP/HWPX, OpenDocument, EPUB) — the worker parses them.
+//       HWP/HWPX, OpenDocument, EPUB): the worker parses them. RFC822 email
+//       (.eml) belongs here although it is nominally text: it is a MIME
+//       container whose body is quoted-printable/base64 and whose attachments
+//       are base64 blobs, so it must be PARSED on the server, never decoded as
+//       text (a text route would inline the attachment blobs as prose).
 //   (2) TEXT/data/markup/code formats. These ARE readable via web_fetch, BUT
 //       some providers (OpenAI's Responses API) have no working file-fetch tool,
 //       so the agent can't retrieve the URL at all. Extracting them server-side
@@ -48,6 +53,7 @@ const OFFICE_FILE_EXTENSIONS = new Set([
 	'hwp', 'hwpx',
 	'ods', 'odt', 'odp',
 	'epub',
+	'eml',
 ]);
 
 const TEXT_FILE_EXTENSIONS = new Set([
@@ -129,6 +135,11 @@ export const isOfficeFile = isServerExtractable;
 // .sql, .css, .toml ...). They are windowable, but adding them moves every small code
 // upload from one pass to multi-pass worker indexing, which is a cost change that wants
 // measuring on its own rather than riding along with this one.
+//
+// .eml is paged for the same reason the documents are: an email carrying a
+// spreadsheet or a long reply thread routinely exceeds the 200k one-shot cap, and
+// its layer extractor ships in the same change as this entry (listed before the
+// layer lands, it would page UNSUPPORTED_FORMAT on every window).
 const PAGED_READ_EXTENSIONS = new Set([
 	// grids
 	'xls', 'xlsx', 'xlsm', 'ods',
@@ -142,6 +153,7 @@ const PAGED_READ_EXTENSIONS = new Set([
 	'odt', 'odp',
 	// other long-form documents
 	'epub', 'rtf', 'html', 'htm',
+	'eml', // email (RFC822): body plus attachment text, char-windowed
 	// plain text / data / markup
 	'txt', 'md', 'markdown', 'log', 'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml',
 ]);
@@ -239,8 +251,8 @@ export interface ComposedUserMessage {
 
 // Compose the user's chat message from the typed text + uploaded attachment URLs.
 // Identical for every consumer (agent.vue + the BunnyQuery widget): appends a
-// markdown "Attached files" link block, and for office files
-// (.docx/.xlsx/.pptx/.hwpx) adds inline extraction placeholders to the LLM copy
+// markdown "Attached files" link block, and for server-extractable files
+// (.docx/.xlsx/.pptx/.hwpx/.eml, text/data/code) adds inline extraction placeholders to the LLM copy
 // ONLY (the proxy worker substitutes their text server-side; the display/history
 // copy stays clean so stale tokens never accumulate across replayed turns).
 // The directive `path` is the db storage path (uid-prefixed where applicable),

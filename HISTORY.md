@@ -19,6 +19,43 @@ A few notes on how to read this:
 
 ---
 
+## 1.10.0 (2026-09-04, unpublished)
+
+Email (`.eml`) is read, windowed and indexed like any other document.
+
+### Email (.eml) indexing
+
+- `.eml` (RFC822 email) joins the server-extractable set and the paged set, so a
+  message of any size is read end to end instead of being decoded as text
+  (which would have inlined its base64 attachment blobs as prose). The layer
+  parses the MIME container and hands back one text: a header block (Subject,
+  From, To, Cc, Reply-To, Date as ISO 8601, Message-ID, In-Reply-To,
+  References), the body (`text/plain` preferred over its html twin, which is
+  tag-stripped when it is all there is), and the text of every attached
+  document under its own `=== ATTACHMENT i/N ===` heading: spreadsheets,
+  documents, csv, calendars and the text layer of a PDF. A forwarded message
+  nested inside is rendered as its own `=== EMAIL ===` block.
+- Pictures attached to or inlined in a message are extracted into `__MEDIA__`
+  like the pictures embedded in any other document, with the media anchor
+  quoted on the `[picture ...]` line. Every other attachment is read inline and
+  never saved as a separate file; signed, encrypted and `winmail.dat` parts are
+  marked and skipped, and a scanned PDF attachment yields a marker, not pages.
+- New indexing rule: one record per email message in `email_messages` (a
+  forwarded message gets its own), indexed on the ISO date and tagged with the
+  sender, every recipient and the subject; attachment text is datafied by its
+  own kind and every record carries the email's `src::` reference.
+- `.eml` reaches the widget's MIME map (`message/rfc822`) and token estimator,
+  the console's estimator, the landing-page format list, the MCP
+  `readFileContent` description and both READMEs. The engine now also exports
+  `isPagedReadFile`, `isImageVisionFile` and `isWindowedReadFile`, pinned by the
+  new `tests/email-format.cjs`.
+- Deploy order: the OfficeExtractionPy layer (the admin-stack worker AND the
+  record-stack ExtractFileText, per region) must land BEFORE this package is
+  republished. In the reverse order every `.eml` is paged and answered with
+  UNSUPPORTED_FORMAT on every window until the layer arrives.
+
+---
+
 ## 1.8.0 (2026-07-27, published)
 
 A date-and-time under every message, the export-link fix, and the indexing

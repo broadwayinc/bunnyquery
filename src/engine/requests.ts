@@ -15,7 +15,7 @@ import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedRead
 import { chatEngineConfig, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
-import { getMaxOutputTokens } from './budget';
+import { getMaxOutputTokens, getModelContextWindow } from './budget';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODELS_API_URL = 'https://api.anthropic.com/v1/models';
@@ -58,20 +58,50 @@ const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
  * predates it ignores the parameter and serves the full list, and a client that predates
  * it just sends no parameter. Neither needs the other deployed first.
  */
-const mcpIndexingUrl = () => {
-	const base = mcpUrl();
+/**
+ * Append query parameters to an MCP endpoint, preserving any the base already carries.
+ *
+ * An explicit path before the query. The configured base has no trailing slash
+ * ("https://mcp-dev.broadwayinc.computer"), and appending "?profile=index" straight onto an
+ * authority with no path yields a URL that is legal but that intermediaries and clients
+ * normalise inconsistently. "/?profile=index" is unambiguous everywhere.
+ *
+ * Every parameter here is a HINT the server may ignore, which is what lets the two sides
+ * deploy in either order: a server that predates one ignores it, and a client that predates
+ * it sends nothing. The worker strips the whole query before appending its own /internal
+ * paths (_mcp_endpoint_and_token), so nothing added here reaches those routes.
+ */
+function withMcpParams(base: string, params: Record<string, string | number | undefined>): string {
 	if (!base) return base;
-	// An explicit path before the query. The configured base has no trailing slash
-	// ("https://mcp-dev.broadwayinc.computer"), and appending "?profile=index" straight
-	// onto an authority with no path yields a URL that is legal but that intermediaries
-	// and clients normalise inconsistently. "/?profile=index" is unambiguous everywhere.
+	const pairs = Object.keys(params)
+		.filter(k => params[k] !== undefined && params[k] !== null && params[k] !== '')
+		.map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k])));
+	if (!pairs.length) return base;
 	const [addr, existing] = base.split('?');
 	// Only supply the missing root path. Appending a slash to a base that ALREADY has a
 	// path would change where the request lands on a server mounted under one.
 	const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
 	const path = hasPath ? addr : addr.replace(/\/+$/, '') + '/';
-	return path + '?' + (existing ? existing + '&' : '') + 'profile=index';
-};
+	return path + '?' + (existing ? existing + '&' : '') + pairs.join('&');
+}
+
+/**
+ * How large a page of a paginated tool result this model can afford.
+ *
+ * The server slices big results into pages and the model spends one round trip per page, so
+ * the page size sets how long reading a large record set takes: 1000 spreadsheet records is
+ * 74 round trips at the server's floor of 10,000 chars and 13 at 60,000. The server cannot
+ * know which model is on the other end of an MCP connection, so it is told.
+ *
+ * The MODEL's own ceiling, not getContextWindow(): the project's context-window setting
+ * budgets this client's FIRST request, while these pages accumulate in the provider's
+ * server-side tool loop, which runs against what the model can actually hold.
+ */
+const mcpContextParam = (platform: 'claude' | 'openai', model?: string) =>
+	getModelContextWindow(platform, model);
+
+const mcpIndexingUrl = (platform: 'claude' | 'openai' = 'openai', model?: string) =>
+	withMcpParams(mcpUrl(), { profile: 'index', ctx: mcpContextParam(platform, model) });
 
 /**
  * Where a chat turn's MCP tools point, and what they authenticate with.
@@ -731,7 +761,9 @@ export async function callClaudeWithPublicMcp(
 		fileUrls,
 		mcpServer: {
 			name: MCP_NAME,
-			url: endpoint.url,
+			url: withMcpParams(endpoint.url, {
+				ctx: mcpContextParam('claude', model || DEFAULT_CLAUDE_MODEL),
+			}),
 			// Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
 			// guard below drops the key rather than sending an empty one.
 			authorizationToken: endpoint.token,
@@ -816,7 +848,7 @@ export async function callOpenAIWithPublicMcp(
 				{
 					type: 'mcp',
 					server_label: MCP_NAME,
-					server_url: endpoint.url,
+					server_url: withMcpParams(endpoint.url, { ctx: mcpContextParam('openai', resolvedModel) }),
 					require_approval: 'never',
 					// No `headers` at all for an anonymous turn: `Bearer ` with an
 					// empty token is a credential the MCP server rejects, and the
@@ -1138,7 +1170,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					{
 						type: 'mcp',
 						server_label: MCP_NAME,
-						server_url: mcpIndexingUrl(),
+						server_url: mcpIndexingUrl('openai', resolvedModel),
 						require_approval: 'never',
 						headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
 					},
@@ -1194,7 +1226,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				{
 					type: 'url',
 					name: MCP_NAME,
-					url: mcpIndexingUrl(),
+					url: mcpIndexingUrl('claude', resolvedModel),
 					authorization_token: '$ACCESS_TOKEN',
 				},
 			],
