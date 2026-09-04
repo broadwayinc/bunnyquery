@@ -40,6 +40,40 @@ export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 
 /**
+ * The MCP endpoint an INDEXING pass points at.
+ *
+ * Same server, same auth, same tools it can actually call: `?profile=index` only narrows
+ * the tools/list the model is SHOWN. An indexing pass reads one window of one file and
+ * writes records for it, so being told about deleteRecords, exportRecordsToFile,
+ * writeReport, getTemporaryUrl, getProfile and getProjectInfos costs about 2,400 tokens
+ * on every pass of every file and buys nothing: there is no user attached to hand a
+ * download or a report to, and re-index clears old records server-side before the pass
+ * runs. Measured: 30,577 B -> 20,755 B.
+ *
+ * A CHAT turn keeps the full list and always will. It is open ended, a person can ask
+ * for anything, and a tool that is missing from the list is a dead end the model cannot
+ * reason its way out of.
+ *
+ * Degrades in both directions, which is why it is a query param: an MCP server that
+ * predates it ignores the parameter and serves the full list, and a client that predates
+ * it just sends no parameter. Neither needs the other deployed first.
+ */
+const mcpIndexingUrl = () => {
+	const base = mcpUrl();
+	if (!base) return base;
+	// An explicit path before the query. The configured base has no trailing slash
+	// ("https://mcp-dev.broadwayinc.computer"), and appending "?profile=index" straight
+	// onto an authority with no path yields a URL that is legal but that intermediaries
+	// and clients normalise inconsistently. "/?profile=index" is unambiguous everywhere.
+	const [addr, existing] = base.split('?');
+	// Only supply the missing root path. Appending a slash to a base that ALREADY has a
+	// path would change where the request lands on a server mounted under one.
+	const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
+	const path = hasPath ? addr : addr.replace(/\/+$/, '') + '/';
+	return path + '?' + (existing ? existing + '&' : '') + 'profile=index';
+};
+
+/**
  * Where a chat turn's MCP tools point, and what they authenticate with.
  *
  * A SIGNED-IN turn uses the server's root endpoint with the literal
@@ -1086,7 +1120,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			},
 			data: {
 				model: resolvedModel,
-				max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
+				max_output_tokens: getMaxOutputTokens('openai', resolvedModel, 'indexing'),
 				// Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
 				...variantIndexingOptions(resolvedModel),
 				...skapiExtract,
@@ -1104,7 +1138,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					{
 						type: 'mcp',
 						server_label: MCP_NAME,
-						server_url: mcpUrl(),
+						server_url: mcpIndexingUrl(),
 						require_approval: 'never',
 						headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
 					},
@@ -1138,7 +1172,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		},
 		data: {
 			model: resolvedModel,
-			max_tokens: getMaxOutputTokens('claude', resolvedModel),
+			max_tokens: getMaxOutputTokens('claude', resolvedModel, 'indexing'),
 			...skapiExtract,
 			...skapiRender,
 			...skapiWindow,
@@ -1160,7 +1194,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				{
 					type: 'url',
 					name: MCP_NAME,
-					url: mcpUrl(),
+					url: mcpIndexingUrl(),
 					authorization_token: '$ACCESS_TOKEN',
 				},
 			],

@@ -318,6 +318,9 @@ function buildChatSystemPrompt(params) {
 You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
+NUMBERS FROM A SPREADSHEET: use queryGrid, never mental arithmetic over records. A total, a count, an average, a "how many mention X", a "which one is biggest" - all of those are computed server-side over EVERY row of the file and come back with the sheet, the row count and the row numbers they were made from. Records are a SAMPLE, and a sample added up is a confident wrong number. Quote the row count and the sheet alongside the figure so the reader can check it.
+CALL queryGrid describe FIRST, before any figure. Workbooks routinely state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that each re-total it, plus a summary sheet whose bottom row is the file total. Those look like four different answers and are one. describe names which sheets restate which, and which rows are totals. Pick ONE sheet, say which you picked, and never add figures across a sheet and its summary. If the reply carries a warning about restatement, repeat it to the user.
+A FILE TOTAL IS NOT A ROW'S TOTAL. The biggest number on a summary sheet is the whole file, not the thing that was asked about. Before quoting any figure, check it is scoped to what the question named: filter by the column that identifies it and report how many rows matched.
 Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized", but THIS project indexes at access_group ${indexGroupLiteral}, so pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name here, index or tag or plain - the auto-fill would search a group this project's data is not in and come back empty, and leaving access_group off a plain table query does NOT mean "all groups": unless you are the project's owner the server reads a table with no group as access_group 0 (public only), so a table indexed at ${indexGroupLiteral} comes back empty with its records sitting right there. Files uploaded before the project's setting changed may sit at another group, so when a scoped query comes back empty, retry it across the other groups (0, 1, "private") before concluding there is nothing, while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups ONLY for the project's owner, and only its access_group 0 records for any other user, so name the group whenever you name a table. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
 Embedded values: a search term is often stored inside a larger string. A merchant "BAKSA" appears as "DNH*BAKSA#4070277042", and a card as "5860****5173". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
@@ -382,6 +385,8 @@ function buildIndexingSystemPrompt(params) {
 - REACHABILITY (hard rule): every record you write while indexing this file MUST be reachable from the file's "src::<storage path>" record by following reference - either reference that record directly, or reference something that already reaches it. A record with no reference, or one pointing outside this file's chain, is an ORPHAN: deleting or re-indexing the file removes the reachable records and leaves the orphan behind forever, where it keeps turning up in later answers as stale data. If you create an intermediate record that OTHER records reference (a page record that rows hang off, a sheet or section record), set source.can_remove_referencing_records to true on it; the delete cascade passes a delete through a record only when that record carries the flag OR a unique_id starting "src::" (the file record cascades because its unique_id starts with "src::"; the intermediates you create carry no "src::" id, so they need the flag), and it cascades ONE LEVEL AT A TIME, so EVERY intermediate record in a chain needs its own marker - an unmarked link stops the cascade there and everything below it survives as orphans. When in doubt, reference the file record directly and keep the chain flat.
 - TABULAR data (any spreadsheet - .csv/.tsv/.xlsx/.xls/.ods, or sheet-like rows): you MUST save EVERY data row as its own record (ONE record per row) with that row's actual column values in the record's "data", keyed by the header names, in a table named EXACTLY "spreadsheet_rows". Do NOT summarize, sample only a few rows, or save just file metadata - index the whole sheet, window by window, until it ends. Make MULTIPLE postRecords calls in batches (e.g. 30-50 rows per call) rather than one oversized call. This per-row completeness OVERRIDES brevity. The file-level "src::" record ALREADY EXISTS - the upload pipeline creates it before indexing starts - so do NOT create it. Link EVERY per-row record to it via reference (set each row record's reference to exactly "src::" + the storage path, with NO sheet/window/summary suffix added; the row records themselves do NOT carry a src:: unique_id). Enrich that same record with sheet name(s), column headers and total row count via updateRecords rather than posting another one. The per-row records AND this reference linkage are BOTH mandatory: the linkage is what lets the whole sheet be found and cleaned up together when the file is re-indexed. INDEX each row record on the row's most useful NUMERIC column (named by its header) so rows sort and range-query; when the row has no numeric column, index the grid row number instead. TAG each row record with the sheet name, the file name, and the row's categorical values (a status, a category, a type) - tags are how rows are filtered without scanning the table.
 - ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
+- THE FILE NAME AND ITS FOLDERS ARE EVIDENCE ABOUT WHAT THE DATA MEANS, and often the only evidence there is. A grid of bare figures filed under "2026/Q2/royalties" is a quarterly royalty settlement; the same grid under "inspections/KCG-B507" is one aircraft's inspection. Nothing inside the sheet says so. Read the trail in the metadata block and use it: name the period, the entity, the counterparty or the subject in the file record's description, and TAG the records with the meaningful parts of it (the client, the aircraft, the quarter, the site), so a later question about that entity finds this file at all. A folder that is only an id or a date is still worth a tag; a folder like "uploads", "new" or "temp" is not.
+- BUT NEVER INSTEAD OF READING. The path tells you what the data is ABOUT; only the content tells you what it SAYS. Never infer a value, a column meaning, a row count or a total from a name, never let a name override what the cells actually contain, and never derive a TABLE name from a folder or a file name - table names are fixed (see below), and a table named after a folder scatters one kind of record across as many tables as the user has folders. Where the name and the content disagree, the content wins and the disagreement is worth recording.
 - FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "book_chapters" for a chapter record, and "file_summaries" for the file-level record (which already exists, so update it and never post it). Embedded photos and other embedded files get NO table of your choosing: their records already exist in table "__MEDIA__", see EXTRACTED MEDIA below. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (inspection_items / item_records / sheet_items / inspection_data are four names for what is one table).
 - EXTRACTED MEDIA: every PICTURE embedded in an uploaded document (photos, diagrams, chart images) is pulled out and saved as a real permanent file under "__MEDIA__/<the document's storage path>/<name>", and a record for each one ALREADY EXISTS in table "__MEDIA__" with unique_id "src::<that path>", reference "src::<the document>", and its path, anchor and sheet already in data. Do NOT create it - the unique_id is taken and your post is rejected. UPDATE it with updateRecords, addressed by that unique_id, adding what the file actually SHOWS plus TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). An update REPLACES the fields you send, so send the existing tags back with your new ones and keep every field already in data (path, anchor, sheet, source, mime, bytes). ONE FILE, ONE RECORD: never also create a photo record in another table. If the update reports that the record does not exist, create it with that same unique_id, reference and data.path - the path must never be lost. Audio and video clips and non-picture attachments are NOT extracted, so never claim a separate file or a "__MEDIA__" record exists for one of those.
 - AUDIO files: transcribe the speech, and capture speakers (named where identifiable), the topics discussed, and timestamps of key moments in the record's data. TAG the language, the audio type (call, meeting, dictation, music), each speaker and every named entity; INDEX the duration in seconds as duration_seconds. VIDEO files: everything audio gets, PLUS transcribe on-screen text verbatim (same transcription discipline as photos) and capture the visual timeline - scene changes and what each scene shows, with timestamps. Same tags as audio plus every entity visible on screen, and INDEX duration_seconds here too. These audio and video rules apply to files UPLOADED AS FILES: the transcript and timeline land on the file's own "src::" record, which already exists. Audio or video embedded inside a document is NOT extracted, so never look for or promise a "__MEDIA__" record for it.
@@ -403,13 +408,21 @@ function indexingAccessGroup(attachment) {
   const g = attachment && attachment.accessGroup;
   return g === "public" || g === "private" ? g : "authorized";
 }
+function indexingFolderTrail(storagePath) {
+  if (typeof storagePath !== "string" || !storagePath) return "";
+  const parts = storagePath.split("/").filter(Boolean);
+  parts.pop();
+  return parts.join(" / ");
+}
 function buildIndexingUserMessage(attachment, options) {
   const head = `A new file has just been uploaded. Index it now.
 
 File metadata:
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
-` + (attachment.mime ? `- mime type: ${attachment.mime}
+` + // Context, not an address. See indexingFolderTrail.
+  (indexingFolderTrail(attachment.storagePath) ? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}
+` : "") + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + (typeof attachment.size === "number" ? `- size (bytes): ${attachment.size}
 ` : "") + // Stated in the metadata block as well as the system prompt because this is
   // the per-FILE value: one project can hold public and private files at once,
@@ -462,7 +475,9 @@ function buildRenderMeta(attachment) {
   return `File metadata:
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
-` + (attachment.mime ? `- mime type: ${attachment.mime}
+` + // Context, not an address. See indexingFolderTrail.
+  (indexingFolderTrail(attachment.storagePath) ? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}
+` : "") + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
 `;
 }
@@ -506,7 +521,9 @@ function buildIndexingContinueMessage(attachment) {
 File metadata:
 - name: ${attachment.name}
 - storage path: ${attachment.storagePath}
-` + (attachment.mime ? `- mime type: ${attachment.mime}
+` + // Context, not an address. See indexingFolderTrail.
+  (indexingFolderTrail(attachment.storagePath) ? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}
+` : "") + (attachment.mime ? `- mime type: ${attachment.mime}
 ` : "") + `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
 
 Records for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). First call getRecords with reference "${src}" to see how far the previous pass got (the furthest row/window already saved). The reference ALONE is the whole query: it returns every record written from this file across ALL tables and ALL access groups, so do NOT add table_name or access_group to narrow it. The response is PAGED, so keep fetching pages until it reports there are no more, and take the furthest point from the WHOLE set, never from the first page. Then call readFileContent with the storage path above and a CURSOR that RESUMES just after that point - do NOT start at the beginning. The cursor is derivable from what you already saved:
@@ -1097,6 +1114,7 @@ function getProjectContextWindow(projectId) {
   return key && projectContextWindows[key] ? projectContextWindows[key] : null;
 }
 var MAX_OUTPUT_TOKENS = 25e3;
+var INDEXING_MAX_OUTPUT_TOKENS = 64e3;
 var OUTPUT_TOKEN_RESERVE = MAX_OUTPUT_TOKENS;
 var TOOL_AND_RESPONSE_BUFFER = 4e3;
 var MIN_INPUT_TOKEN_BUDGET = 8e3;
@@ -1128,9 +1146,10 @@ function resolveByModelId(apiTable, staticTable, model) {
 function getModelContextWindow(platform, model) {
   return resolveByModelId(apiReportedContextWindows, CONTEXT_WINDOW_BY_MODEL, model) || CONTEXT_WINDOW_DEFAULT[platform];
 }
-function getMaxOutputTokens(platform, model) {
+function getMaxOutputTokens(platform, model, purpose) {
+  var want = purpose === "indexing" ? INDEXING_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
   var cap = resolveByModelId(apiReportedMaxOutput, MAX_OUTPUT_BY_MODEL, model);
-  return cap ? Math.min(MAX_OUTPUT_TOKENS, cap) : MAX_OUTPUT_TOKENS;
+  return cap ? Math.min(want, cap) : want;
 }
 function getContextWindow(platform, model, projectId) {
   var ceiling = getModelContextWindow(platform, model);
@@ -2122,6 +2141,14 @@ var MCP_NAME = "BunnyQuery";
 var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
 var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
+var mcpIndexingUrl = () => {
+  const base = mcpUrl();
+  if (!base) return base;
+  const [addr, existing] = base.split("?");
+  const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
+  const path = hasPath ? addr : addr.replace(/\/+$/, "") + "/";
+  return path + "?" + (existing ? existing + "&" : "") + "profile=index";
+};
 function mcpEndpointFor(anonymous, publicProjectId, service) {
   if (!anonymous) return { url: mcpUrl(), token: "$ACCESS_TOKEN" };
   const project = publicProjectId || service;
@@ -2586,7 +2613,7 @@ async function notifyAgentSaveAttachment(info) {
       },
       data: {
         model: resolvedModel2,
-        max_output_tokens: getMaxOutputTokens("openai", resolvedModel2),
+        max_output_tokens: getMaxOutputTokens("openai", resolvedModel2, "indexing"),
         // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
         ...variantIndexingOptions(resolvedModel2),
         ...skapiExtract,
@@ -2604,7 +2631,7 @@ async function notifyAgentSaveAttachment(info) {
           {
             type: "mcp",
             server_label: MCP_NAME,
-            server_url: mcpUrl(),
+            server_url: mcpIndexingUrl(),
             require_approval: "never",
             headers: { Authorization: "Bearer $ACCESS_TOKEN" }
           },
@@ -2635,7 +2662,7 @@ async function notifyAgentSaveAttachment(info) {
     },
     data: {
       model: resolvedModel,
-      max_tokens: getMaxOutputTokens("claude", resolvedModel),
+      max_tokens: getMaxOutputTokens("claude", resolvedModel, "indexing"),
       ...skapiExtract,
       ...skapiRender,
       ...skapiWindow,
@@ -2657,7 +2684,7 @@ async function notifyAgentSaveAttachment(info) {
         {
           type: "url",
           name: MCP_NAME,
-          url: mcpUrl(),
+          url: mcpIndexingUrl(),
           authorization_token: "$ACCESS_TOKEN"
         }
       ],
@@ -8359,6 +8386,7 @@ exports.HTML_EXTS = HTML_EXTS;
 exports.HTML_HEAD_WINDOW = HTML_HEAD_WINDOW;
 exports.IMAGE_PREVIEWS_PER_MESSAGE = IMAGE_PREVIEWS_PER_MESSAGE;
 exports.INDEXING_COMPLETE_MARKER = INDEXING_COMPLETE_MARKER;
+exports.INDEXING_MAX_OUTPUT_TOKENS = INDEXING_MAX_OUTPUT_TOKENS;
 exports.INLINE_LINK_GLYPH = INLINE_LINK_GLYPH;
 exports.INLINE_LINK_UNAVAILABLE_GLYPH = INLINE_LINK_UNAVAILABLE_GLYPH;
 exports.INLINE_LINK_UNAVAILABLE_SUFFIX = INLINE_LINK_UNAVAILABLE_SUFFIX;

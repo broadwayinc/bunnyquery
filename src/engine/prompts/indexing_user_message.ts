@@ -65,6 +65,28 @@ export function indexingAccessGroup(attachment: { accessGroup?: string }): 'publ
 	return g === 'public' || g === 'private' ? g : 'authorized';
 }
 
+/**
+ * The folders a file was uploaded into, as a readable trail.
+ *
+ * WHY IT IS ITS OWN LINE and not left implicit in the storage path: people file things
+ * meaningfully. "2026/Q2/royalties/settlement.xlsx" says what the numbers ARE in a way no
+ * amount of reading the grid recovers, and a sheet of bare figures under
+ * "inspections/KCG-B507/" is about one aircraft. The path is already in the metadata block,
+ * but as one string it reads as an address to pass to a tool, which is how it has been used.
+ *
+ * Returns '' for a file at the root, so the line simply does not appear rather than showing
+ * an empty value.
+ */
+export function indexingFolderTrail(storagePath: string): string {
+	if (typeof storagePath !== 'string' || !storagePath) return '';
+	const parts = storagePath.split('/').filter(Boolean);
+	// The last segment is the file itself, and a folder named only by a date or an id tells
+	// the reader nothing this line is for, so it is kept rather than filtered: deciding which
+	// folder names are meaningful is the model's job, not this function's.
+	parts.pop();
+	return parts.join(' / ');
+}
+
 export function buildIndexingUserMessage(
 	attachment: IndexingAttachmentInfo,
 	options?: BuildIndexingUserMessageOptions,
@@ -74,6 +96,10 @@ export function buildIndexingUserMessage(
 		`File metadata:\n` +
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
+		// Context, not an address. See indexingFolderTrail.
+		(indexingFolderTrail(attachment.storagePath)
+			? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}\n`
+			: '') +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
 		(typeof attachment.size === 'number' ? `- size (bytes): ${attachment.size}\n` : '') +
 		// Stated in the metadata block as well as the system prompt because this is
@@ -194,6 +220,10 @@ function buildRenderMeta(attachment: IndexingAttachmentInfo): string {
 		`File metadata:\n` +
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
+		// Context, not an address. See indexingFolderTrail.
+		(indexingFolderTrail(attachment.storagePath)
+			? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}\n`
+			: '') +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
 		`- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}\n`
 	);
@@ -287,6 +317,10 @@ export function buildIndexingContinueMessage(attachment: IndexingAttachmentInfo)
 		`File metadata:\n` +
 		`- name: ${attachment.name}\n` +
 		`- storage path: ${attachment.storagePath}\n` +
+		// Context, not an address. See indexingFolderTrail.
+		(indexingFolderTrail(attachment.storagePath)
+			? `- folders it was filed under: ${indexingFolderTrail(attachment.storagePath)}\n`
+			: '') +
 		(attachment.mime ? `- mime type: ${attachment.mime}\n` : '') +
 		`- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}\n` +
 		`\nRecords for the earlier windows/pages of this file are ALREADY saved (they reference "${src}"). ` +
