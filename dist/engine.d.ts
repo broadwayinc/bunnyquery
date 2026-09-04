@@ -614,10 +614,11 @@ type IndexingAttachmentInfo = {
 };
 type BuildIndexingUserMessageOptions = {
     /**
-     * For files the layer parses server-side (office, e-book, email, source code)
-     * the model can't read the raw bytes via web_fetch, so the proxy worker
-     * extracts the text server-side and replaces
-     * this exact token with it. When provided, the message embeds the token (and
+     * For files the layer parses server-side (office, e-book, email) and for text
+     * files, the text is inlined server-side: a binary container cannot be read via
+     * web_fetch, and a text file is inlined so providers without a file-fetch tool
+     * still see it. The proxy worker extracts the text and replaces this exact
+     * token with it. When provided, the message embeds the token (and
      * drops the temporary-URL line - there is nothing for the model to fetch).
      */
     inlineContentPlaceholder?: string;

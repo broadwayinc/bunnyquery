@@ -5,10 +5,15 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The latest version on npm is **1.7.0**. Version
-  **1.8.0** is built in the source tree but not yet published, and is marked as
+- **Published vs built.** The latest version on npm is **1.9.10**. Version
+  **1.10.0** is built in the source tree but not yet published, and is marked as
   such. (1.6.3 and 1.6.4 were never published on their own; their changes reached
-  npm inside 1.7.0.)
+  npm inside 1.7.0. 1.8.7, 1.9.2 and 1.9.12 are source bumps that never reached
+  npm either.)
+- **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
+  their own entries here, so their changes are not itemized below. Two features
+  landed in that window and are documented only in the README: the widget's
+  `allowAnonymous` option, and the expanded extractable-document set.
 - **Missing patch numbers.** A few versions on npm (1.2.1 most notably) are
   republishes with no distinct source commit behind them, so they have no entry
   here. Version 1.6.1 is the reverse case: it has commits but was never
@@ -29,8 +34,9 @@ Email (`.eml`) is read, windowed and indexed like any other document.
   message of any size is read end to end instead of being decoded as text
   (which would have inlined its base64 attachment blobs as prose). The layer
   parses the MIME container and hands back one text: a header block (Subject,
-  From, To, Cc, Reply-To, Date as ISO 8601, Message-ID, In-Reply-To,
-  References), the body (`text/plain` preferred over its html twin, which is
+  From, To, Cc, Bcc, Reply-To, Date as ISO 8601 when it parses (else the raw
+  header text), Message-ID, In-Reply-To, References, and an `Attachments: N`
+  count when the message has any), the body (`text/plain` preferred over its html twin, which is
   tag-stripped when it is all there is), and the text of every attached
   document under its own `=== ATTACHMENT i/N ===` heading: spreadsheets,
   documents, csv, calendars and the text layer of a PDF. A forwarded message
@@ -44,9 +50,12 @@ Email (`.eml`) is read, windowed and indexed like any other document.
   forwarded message gets its own), indexed on the ISO date and tagged with the
   sender, every recipient and the subject; attachment text is datafied by its
   own kind and every record carries the email's `src::` reference.
-- `.eml` reaches the widget's MIME map (`message/rfc822`) and token estimator,
-  the console's estimator, the landing-page format list, the MCP
-  `readFileContent` description and both READMEs. The engine now also exports
+- `.eml` reaches the widget's MIME map (`message/rfc822`), the landing-page
+  format list, the MCP `readFileContent` description and both READMEs. The
+  widget and console token estimators count an `.eml` like any other
+  server-parsed container (0), not as text: its bytes are mostly base64
+  attachment blobs, and a 380 KB mail with one photo had estimated at 127k
+  tokens and disabled Send. The engine now also exports
   `isPagedReadFile`, `isImageVisionFile` and `isWindowedReadFile`, pinned by the
   new `tests/email-format.cjs`.
 - Deploy order: the OfficeExtractionPy layer (the admin-stack worker AND the

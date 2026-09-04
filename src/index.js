@@ -2754,7 +2754,11 @@ import {
     var ESTIMATED_BYTES_PER_TOKEN = 3;
     var ESTIMATED_PDF_BYTES_PER_TOKEN = 5000;
     var ESTIMATED_IMAGE_TOKENS = 800;
-    var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock|eml)$/i;
+    // No eml here: an .eml is a server-parsed container like .docx (its bytes are
+    // mostly base64 attachment blobs that go to __MEDIA__ or are never inlined), and
+    // counting them at 3 bytes/token estimated a 380 KB mail with one photo at 127k
+    // tokens and disabled Send. Mirrored byte-for-byte in agent.vue.
+    var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock)$/i;
     var PDF_EXTENSION_RE = /\.pdf$/i;
     var IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg)$/i;
     function estimateFileTokenCost(file) {

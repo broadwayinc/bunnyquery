@@ -27,7 +27,8 @@ you can build your own chat UI on top of it. See
   prompt when an upload hits a file that already exists (skip / reindex only /
   overwrite, with "apply to all remaining"). Images are read with vision/OCR,
   large documents and spreadsheets are read window by window, PDFs are rendered
-  to page images, and everything else extractable is inlined as text. See
+  to page images, emails are read as their headers, body and attachment text,
+  and everything else extractable is inlined as text. See
   [Supported file types](#supported-file-types).
 - **Background indexing**: an uploaded file is indexed in the background,
   across as many passes as it takes. A file's passes collapse into a single
@@ -124,7 +125,9 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `hostDomain`             | `string`  | `null`   | db-CDN host for temporary file URLs. Defaults to `skapi.app` (dev) / `skapi.com` (prod).     |
 | `attachmentParsers`      | `array`   | `null`   | Client-side attachment parsers. See [Attachment parser plugins](#attachment-parser-plugins). |
 | `windowedIndexing`       | `boolean` | `true`   | Server-driven windowed indexing for text and grid files (see [file types](#supported-file-types)). Pass `false` to fall back to agent-driven paging, which keeps the traversal inside the model's turn budget and the tab open. |
+| `allowAnonymous`         | `boolean` | `null`   | Open the chat with no login for visitors without an account. `null` follows the project's own "Allow anonymous users" setting (`getConnectionInfo().conf.require_login`); `true`/`false` pins it. |
 | `liveStreaming`          | `boolean` | `false`  | Paint a chat answer into its bubble as it arrives, instead of at the end. A **request**, not a switch: the widget honours it only when your page's `skapi-js` actually carries skapi's half of the stream flag (it checks for `clientSecretRequestStream` and `clientSecretRequestFinalize`), and otherwise warns once and falls back to buffered replies. An older SDK silently drops the flag, which would leave the destination streaming SSE into a buffered row that reads back empty. It still also needs a polling worker that relays the response bytes, which the widget cannot check, so leave it off until the region you talk to is deployed. |
+| `liveStreamingRealtime`  | `boolean` | `false`  | Deliver streamed chunks over skapi's websocket instead of waiting for the next poll tick. Requires `liveStreaming`. Off unless you ask for it: skapi's `joinRealtime` **replaces** the connection's group, so for the length of a turn it takes the room out from under whatever else your app uses realtime for. Purely an accelerator; with it off the reply still streams, on the poll's cadence. |
 
 ### Methods
 
@@ -159,9 +162,11 @@ configure.
 An attachment is used in two places, and they take different routes:
 
 - **In the chat message.** Extractable files are inlined as text; anything else
-  (PDFs, images) is handed over as a temporary link, which the proxy worker
-  re-mints just before the upstream call so a queued message can never hand the
-  model a stale URL.
+  (PDFs, images) is handed over as a temporary link. Server-side re-minting of
+  chat links is deliberately off (an S3 presign is signed for GET only and 403s
+  the HEAD probe OpenAI sends before downloading), so the CDN link is left in
+  place; the turn is instead dispatched only once the indexing queue has drained,
+  which is what keeps the link fresh.
 - **In background indexing**, where the file is read in full and saved into the
   project's knowledge. This is the path with the window and page loops below.
 
@@ -183,10 +188,12 @@ may have expired).
 `.pdf`
 
 PDF text layers are often absent or unreliable, so a PDF is indexed **visually**:
-the proxy worker renders a window of pages (5 at a time) to images and injects
-them as image blocks in the indexing message. Tool-result images render on
-neither provider, which is why the pages have to be in the message itself. That
-makes scanned PDFs work as well as digital ones.
+the proxy worker renders a window of pages to images and injects them as image
+blocks in the indexing message. The window is five pages on Claude and on the
+OpenAI models that accept full-resolution images, and two on OpenAI's
+downsampled and nano tiers. Tool-result images render on neither provider, which
+is why the pages have to be in the message itself. That makes scanned PDFs work
+as well as digital ones.
 
 The worker advances the window itself, off its renderer's true page count, and
 enqueues the next pass. Indexing a long document therefore does not depend on
@@ -196,9 +203,14 @@ declaring itself finished.
 ### 3. Large documents, spreadsheets & data: read window by window
 
 ```
-.xls .xlsx .xlsm .ods      grids (rows plus embedded photos)
+.xls .xlsx .xlsm           grids: sheet-by-sheet row windows, plus embedded photos
+.ods                       OpenDocument sheets: character windows, plus photos
 .csv .tsv .tab             row-bounded windows with absolute row numbers
-.docx .pptx                documents
+.doc .docx .docm           word processor documents
+.ppt .pptx .pptm           slide decks
+.hwp .hwpx                 Hancom word processor
+.odt .odp                  OpenDocument text and slides
+.epub .rtf .html .htm      other long-form documents
 .eml                       email: headers, body, attachment text
 .txt .md .markdown .log    plain text
 .json .jsonl .ndjson .xml .yaml .yml
@@ -238,7 +250,7 @@ pictures in any other document, and every other attachment is listed by name
 only, never saved as a separate file.
 
 **Text, data, markup & source code** (decoded as text; `.html`/`.htm` have their
-tags stripped):
+tags stripped and `.rtf` is parsed, control words and non-text groups discarded):
 
 ```
 .csv .tsv .tab .txt .text .log .md .markdown .rst .json .ndjson .jsonl .geojson
@@ -251,10 +263,18 @@ Plus a **MIME fallback**: any file whose content type is text-like (`text/*`,
 `application/json`, `application/xml`, `*+json`, `*+xml`, `*+yaml`, …) is decoded
 even when its extension isn't in the list above.
 
-Encoding is auto-detected: UTF-8 (BOM-aware), then CP949/EUC-KR (Korean), then
-Latin-1. Extracted text is capped at **200,000 characters**; longer files are
-truncated with a `...[truncated for length; original N characters]` marker. The
-formats listed in section 3 are windowed precisely so they never hit that cap.
+Encoding is auto-detected: a UTF-32 or UTF-16 BOM is taken as definitive,
+otherwise UTF-8 (BOM-aware), CP949/EUC-KR (Korean) and Latin-1 are all decoded
+and scored, and the one producing the least mojibake wins. It is a scoring pass,
+not a first-that-succeeds ladder, so one stray byte in a clean Korean file no
+longer dumps the whole file into Latin-1. Extracted text is capped at **200,000
+characters**; longer files are truncated with a `...[truncated for length;
+showing the first 200000 of N characters. To read and index the WHOLE file, call
+the readFileContent tool with this file's storage path; it returns the file
+window by window (with images for scanned/photo content).]` marker. (The separate
+client-side parser-plugin cap uses the shorter `...[truncated for length;
+original N characters]` marker.) The formats listed in section 3 are windowed
+precisely so they never hit that cap.
 
 Note the overlap between sections 3 and 4 is deliberate: a `.docx` or a `.csv`
 is windowed when it is indexed, and extracted whole when it rides along in a
@@ -440,6 +460,11 @@ helpers. See the `.d.ts` shipped with `bunnyquery/engine`.
 | `clientSecretRequestFinalize` | `function?` | `skapi.clientSecretRequestFinalize`, bound to your Skapi instance. Stores the version of a streamed turn that history keeps (the engine sends the assembled provider body, so it reads back exactly like a buffered turn) and releases that request's chunks. Without it a streamed turn is never finalized and its row stays empty. |
 | `clientSecretRequestStream`   | `function?` | `skapi.clientSecretRequestStream`, bound to your Skapi instance. The **second half of the durability guarantee**: a row that settles while no poll is attached (closed tab, discarded background tab, slept device) is never finalized, so its answer stays in the chunk store and its history row is terminal and empty. Given the request id this drains that turn's chunks in one pass; the engine parses them exactly as it parses a live stream and finalizes what it read, so each row is recovered at most once. Without it the engine mints no recovery marker at all and behaves as it did before streaming. |
 | `onLiveStreamUpdate`          | `function?` | Observation hook for a streaming turn (`{ serverItemId, ownerKey, phase, text, thinkingText, toolNames, complete, errored }`). The engine already paints the answer text itself, so this is only for affordances it does not decide the presentation of. Never throw from it. |
+| `liveStreamingRealtime`       | `boolean?`  | Push relayed chunks over skapi's websocket as well. Requires `liveStreaming`. Off by default: `joinRealtime` replaces the connection's group for the length of a turn, so only a host that owns its skapi instance should opt in. |
+| `streamRecovery`              | `boolean?`  | Set `false` to force the read-back of already-streamed turns **off**, even though the chunk reader is injected. There is no need to set it to turn recovery on: injecting `clientSecretRequestStream` is what arms it. |
+| `mintIndexDoneMarker`         | `function?` | Write the durable "indexing finished" marker (`done::<path>`, reference `src::<path>`, table `__INDEXING__`) for the runs this client knows are complete. Best-effort, must never throw. Without it the engine falls back to inference. |
+| `upsertIndexRunRecord`        | `function?` | Create-or-update the per-file run record (`run::<path>`, reference `src::<path>`, table `__INDEXING__`), which is what lets chat rows and files-page badges paint without scanning background history. You implement the upsert (the records API has none) and the status precedence: `'working'` must never overwrite a terminal status. Without it the engine uses the legacy scan/probe path. |
+| `csrHistoryItemLookup`        | `function?` | Single-item `csr-poll` point lookup, used by `ChatSession.hydrateCompactItems` to fetch a compact history stub's real body when an indexing row is expanded. Without it stubs keep their server-extracted heads. |
 
 ### Display and paging helpers
 
@@ -492,9 +517,10 @@ boot-time fallback for when the silent path cannot refresh.
   `height: 100dvh`) or it will collapse.
 - File and folder uploads are stored in your Skapi project's database storage and
   served from a temporary db-CDN URL (`hostDomain`); links in chat refresh on expiry.
-  Links a queued message carries are re-minted server-side immediately before the
-  upstream call, so a message that waits in the queue never hands the model a dead
-  URL.
+  Links a background **indexing** pass carries are re-minted server-side
+  immediately before the upstream call (`_skapi_file_urls`), so a pass that waits
+  days behind a bulk upload never hands the model a dead URL. Chat-message links
+  are not re-minted; a chat turn waits for the indexing queue to drain instead.
 - The number of files attachable to a single message is capped, and beyond a
   point the chips collapse into a "...(n) more" pill rather than being rendered.
   Very large batches belong on a dedicated upload page, not the chat composer.

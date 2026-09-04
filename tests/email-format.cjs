@@ -95,6 +95,61 @@ test('the indexing system prompt carries the email rule', () => {
     assert.ok(sys.includes('=== ATTACHMENT'), 'the ATTACHMENT heading is not described');
 });
 
+/* ---- the two chat clients agree on what an .eml costs ------------------- */
+
+const fs = require('fs');
+const path = require('path');
+
+function textlikeRegexOf(file) {
+    // The estimator regexes are hand-mirrored between the widget and the console;
+    // nothing else enforces the mirror, so the test reads both sources.
+    const src = fs.readFileSync(file, 'utf8');
+    const m = src.match(/TEXTLIKE_EXTENSION_RE\s*=\s*\n?\s*(\/[^\n]*\/i);/);
+    assert.ok(m, 'no TEXTLIKE_EXTENSION_RE literal in ' + file);
+    return m[1];
+}
+
+test('the token estimators do not count an .eml as text', () => {
+    // An .eml is mostly base64 attachment bytes that never reach the model, so
+    // charging size/3 tokens estimated a 380 KB mail with one photo at 127k
+    // tokens and disabled Send under the OpenAI default budget.
+    const widget = textlikeRegexOf(path.join(__dirname, '..', 'src', 'index.js'));
+    const console_ = textlikeRegexOf(path.join(__dirname, '..', '..', 'www.bunnyquery.com', 'src', 'views', 'service', 'agent.vue'));
+    assert.strictEqual(widget, console_, 'widget and console TEXTLIKE_EXTENSION_RE differ');
+    const re = new Function('return ' + widget)();
+    assert.strictEqual(re.test('mail.eml'), false, '.eml is still counted as text');
+    assert.strictEqual(re.test('MAIL.EML'), false);
+    assert.strictEqual(re.test('notes.txt'), true, 'the regex lost its text extensions');
+});
+
+/* ---- the prompts and the layer say the same thing ----------------------- */
+
+test('the indexing prompt describes the headings the layer emits', () => {
+    const sys = buildIndexingSystemPrompt({ projectId: 'p' });
+    // The layer writes "(depth d)" on every forwarded heading and never emits an
+    // ISO date for a Date header it could not parse.
+    assert.ok(sys.includes('=== FORWARDED MESSAGE k (depth d) ==='), 'forwarded heading lacks (depth d)');
+    assert.ok(sys.includes('otherwise the raw header text'), 'date rule claims an ISO string unconditionally');
+    assert.ok(sys.includes('always start at column 0'), 'the column-0 heading rule is missing');
+});
+
+test('email_messages is a FIXED table name, not one the model may choose', () => {
+    const sys = buildIndexingSystemPrompt({ projectId: 'p' });
+    const fixed = sys.split('\n').find((l) => l.startsWith('- FIXED TABLE NAMES'));
+    assert.ok(fixed, 'no FIXED TABLE NAMES rule');
+    assert.ok(fixed.includes('"email_messages"'), 'FIXED TABLE NAMES does not name email_messages');
+});
+
+test('no prompt tells the model an email attachment was not extracted', () => {
+    // The email window shows the attachment's extracted text; a sentence saying
+    // "non-picture attachments are NOT extracted" beside it contradicted the
+    // EMAIL rule that orders records for that text.
+    for (const sys of [buildIndexingSystemPrompt({ projectId: 'p' }), buildChatSystemPrompt({ projectId: 'p' })]) {
+        assert.ok(!sys.includes('non-picture attachments are NOT extracted'), 'stale "NOT extracted" wording');
+        assert.ok(sys.includes('never saved as separate files'), 'the files-not-extraction wording is missing');
+    }
+});
+
 /* ---- report ------------------------------------------------------------- */
 
 let failed = 0;
