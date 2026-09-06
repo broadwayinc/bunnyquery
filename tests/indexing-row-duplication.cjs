@@ -18,8 +18,9 @@
  * folder painted a finished stub yellow, and a locally minted record carrying no platform
  * (shown in both chats).
  *
- * The last two cases below are the regression guards: a REAL re-index must still produce
- * two rows, and a legacy pathless prompt must still match by name.
+ * The re-index cases below pin the display policy: a REAL re-index is a separate RUN
+ * (never merged into the old one), but only the newest run of a file draws a row once
+ * the older ones have settled. A legacy pathless prompt must still match by name.
  *
  * Run: node ./tests/indexing-row-duplication.cjs
  */
@@ -57,10 +58,33 @@ r = rows([chat(T), up('a1',P,T+100), ar('a1',T+110), up('a1',P,T+100), ar('a1',T
          { liveIndexChecked:true, liveIndexKeys:{} });
 ok('duplicate copy does not split the run', r.length===1, 'got '+r.length);
 
-console.log('--- genuine re-index still opens a second run');
-r = rows([chat(T), up('a1',P,T+100), ar('a1',T+110), up('b1',P,T+900,true), ar('b1',T+910)],
+console.log('--- genuine re-index: separate run, but only the newest run draws a row');
+// Reported 2026-09-06: files re-indexed during testing showed two green "Indexed"
+// rows each (28 + 14 passes for one xlsx, 3 + 4 for another). Every row was a real
+// run, so the runs stay attributed separately, and the older ones are hidden once
+// they have settled. A settled older run never reappears as loose bubbles either.
+const reindexed = [chat(T), up('a1',P,T+100), ar('a1',T+110), up('b1',P,T+900,true), ar('b1',T+910)];
+r = rows(reindexed, { liveIndexChecked:true, liveIndexKeys:{} });
+ok('re-index gives one row', r.length===1, 'got '+r.length);
+ok('the row is the NEWEST run', r.length===1 && r[0].group.members[0].msg._serverItemId==='b1' && r[0].group.passCount===1,
+   r.length ? r[0].group.members[0].msg._serverItemId+' passes='+r[0].group.passCount : 'no row');
+const loose = buildChatDisplayList(reindexed, { liveIndexChecked:true, liveIndexKeys:{} }).filter(e => e.kind === 'message');
+ok('the superseded run\'s passes are not demoted to ordinary bubbles', loose.length===1, 'got '+loose.length+' message entries');
+
+console.log('--- an older run still WORKING stays visible beside the re-index');
+r = rows([chat(T), up('a1',P,T+100), ar('a1',T+110), uc('a2',P,T+200,true), up('b1',P,T+900,true)],
          { liveIndexChecked:true, liveIndexKeys:{} });
-ok('re-index gives two rows', r.length===2, 'got '+r.length);
+ok('two rows while both chains are live', r.length===2 && r.every(x => x.group.status==='active'),
+   'got '+r.length+' -> '+r.map(x=>x.group.status).join(','));
+r = rows([chat(T), up('a1',P,T+100), ar('a1',T+110), uc('a2',P,T+200), ar('a2',T+210), up('b1',P,T+900,true)],
+         { liveIndexChecked:true, liveIndexKeys:{} });
+ok('one row once the older chain settled', r.length===1 && r[0].group.members[0].msg._serverItemId==='b1',
+   'got '+r.length+' -> '+r.map(x=>x.group.members[0].msg._serverItemId).join(','));
+const arErr = (id, ts) => Object.assign(ar(id, ts), { isError:true, content:'boom' });
+r = rows([chat(T), up('a1',P,T+100), arErr('a1',T+110), up('b1',P,T+900), ar('b1',T+910)],
+         { liveIndexChecked:true, liveIndexKeys:{} });
+ok('an older run that ERRORED is hidden behind the newer success', r.length===1 && r[0].group.status==='done',
+   'got '+r.length+' -> '+r.map(x=>x.group.status).join(','));
 
 console.log('--- whitespace path: stub suppressed by its real group');
 const WS = 'uid/docs/report.pdf ';

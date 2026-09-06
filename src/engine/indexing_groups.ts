@@ -36,6 +36,17 @@
  * loaded (`mayHaveOlder`), and it is the same event that already re-derives
  * `runKey` — so the view treats it as a new row either way.
  *
+ * One row per FILE, not per run. A file indexed and later indexed again (a
+ * re-upload, an explicit Reindex, a retry after a failure) has several RUNS in
+ * the transcript, each opened by its own "A new file has just been uploaded"
+ * pass. They are attributed as separate groups (mixing their passes would let an
+ * old failure be painted over by a new success, or a new run inherit an old
+ * stop), but only the NEWEST run of a file is rendered once the older ones have
+ * settled. Two green "Indexed" rows for one file read as a duplicate, not as
+ * history, and a superseded run's verdict is not the file's state. An older run
+ * that is still working stays visible until it settles, so a double dispatch is
+ * never hidden while both chains are live and its Stop button stays reachable.
+ *
  * The group deliberately reports no authoritative pass TOTAL. History is paged
  * newest-first, so any total computed from loaded messages is a lower bound that
  * a later scroll-up would contradict. It reports STATE (indexing / indexed /
@@ -75,12 +86,13 @@ export type IndexingGroup = {
 	 *  surprised out of. */
 	key: string;
 	/** Identity of this ROW: one indexing RUN of that file. A file indexed on
-	 *  Monday and re-indexed on Wednesday is two runs, and collapsing them into
-	 *  one row erased Monday's from Monday's place in the conversation, claimed
-	 *  its passes for Wednesday, and let Monday's failure be overwritten by
-	 *  Wednesday's success. Named after the run's FIRST loaded pass (see where it
-	 *  is assigned below), so passes appended to the run and other runs appearing
-	 *  on either side of it never rename a row already on screen.
+	 *  Monday and re-indexed on Wednesday is two runs, and merging them into one
+	 *  group claimed Monday's passes for Wednesday and let Monday's failure be
+	 *  overwritten by Wednesday's success. They stay separate groups; what the
+	 *  view gets is only the newest of them once the rest have settled (see the
+	 *  file docstring). Named after the run's FIRST loaded pass (see where it is
+	 *  assigned below), so passes appended to the run and other runs appearing on
+	 *  either side of it never rename a row already on screen.
 	 *
 	 *  This is the RENDER key, and only that. It is renamed when the run's true
 	 *  first pass finally loads — routine while a worker-driven chain is running,
@@ -854,6 +866,28 @@ export function buildChatDisplayList(
 		}
 	}
 
+	// --- superseded runs -------------------------------------------------------
+	// Every run of a file but its newest is history the newest run replaced: the
+	// file's state is the newest run's, and a second "Indexed" row for the same
+	// file reads as a duplicate (reported as exactly that, for files re-indexed
+	// during testing). Such a run keeps its group (its passes stay attributed to
+	// it, never demoted to loose "Indexing: ..." bubbles) but draws no row.
+	//
+	// ONLY once it has settled. An older run that is still working, or still
+	// stopping, is live work the user can see the effects of and may want to stop,
+	// and hiding it would also hide a double dispatch (two chains reading one file)
+	// for as long as both ran. Runs open in walk order, and the walk is request
+	// creation order, so the last run of a key is its newest.
+	var superseded: { [runId: string]: boolean } = {};
+	for (var sk in runsOfKey) {
+		var srs = runsOfKey[sk];
+		for (var sri = 0; sri < srs.length - 1; sri++) {
+			var sgp = groups[srs[sri]];
+			if (!sgp || sgp.status === 'active' || sgp.cancelling) continue;
+			superseded[srs[sri]] = true;
+		}
+	}
+
 	// --- durable run:: stubs ---------------------------------------------------
 	// A run record whose passes are not among the loaded messages still deserves
 	// a row: on a fresh open the bg history is deferred, and a run older than the
@@ -1058,7 +1092,9 @@ export function buildChatDisplayList(
 		// Every other member of the run is represented by the row at the anchor —
 		// unless the row is timestamp-anchored (incomplete run with a run::
 		// record), in which case the flush above already emitted it.
-		if (groups[r].anchorIndex === j && !suppressAnchor[r]) {
+		// ...or the run is superseded, in which case nothing is emitted for it at
+		// all: its members are represented by the newer run's row.
+		if (groups[r].anchorIndex === j && !suppressAnchor[r] && !superseded[r]) {
 			out.push({ kind: 'indexing', group: groups[r], index: j });
 		}
 	}

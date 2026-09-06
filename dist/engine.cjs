@@ -8150,6 +8150,15 @@ function buildChatDisplayList(messages, opts) {
       grp.resolving = false;
     }
   }
+  var superseded = {};
+  for (var sk in runsOfKey) {
+    var srs = runsOfKey[sk];
+    for (var sri = 0; sri < srs.length - 1; sri++) {
+      var sgp = groups[srs[sri]];
+      if (!sgp || sgp.status === "active" || sgp.cancelling) continue;
+      superseded[srs[sri]] = true;
+    }
+  }
   var stubList = [];
   var runStubs = opts && opts.runStubs;
   if (runStubs) {
@@ -8279,7 +8288,7 @@ function buildChatDisplayList(messages, opts) {
       out.push({ kind: "message", msg: list[j], index: j });
       continue;
     }
-    if (groups[r].anchorIndex === j && !suppressAnchor[r]) {
+    if (groups[r].anchorIndex === j && !suppressAnchor[r] && !superseded[r]) {
       out.push({ kind: "indexing", group: groups[r], index: j });
     }
   }

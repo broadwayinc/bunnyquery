@@ -8006,6 +8006,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         grp.resolving = false;
       }
     }
+    var superseded = {};
+    for (var sk in runsOfKey) {
+      var srs = runsOfKey[sk];
+      for (var sri = 0; sri < srs.length - 1; sri++) {
+        var sgp = groups[srs[sri]];
+        if (!sgp || sgp.status === "active" || sgp.cancelling) continue;
+        superseded[srs[sri]] = true;
+      }
+    }
     var stubList = [];
     var runStubs = opts && opts.runStubs;
     if (runStubs) {
@@ -8135,7 +8144,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         out.push({ kind: "message", msg: list[j], index: j });
         continue;
       }
-      if (groups[r].anchorIndex === j && !suppressAnchor[r]) {
+      if (groups[r].anchorIndex === j && !suppressAnchor[r] && !superseded[r]) {
         out.push({ kind: "indexing", group: groups[r], index: j });
       }
     }
@@ -8229,7 +8238,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.10.0" ;
+    var BQ_VERSION = "1.10.1" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
