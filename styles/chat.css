@@ -419,6 +419,26 @@
     text-decoration: none;
     cursor: default;
 }
+/* An assistant bubble's chips are emitted by renderInlineLinkHtml INSIDE the
+   v-html `.bq-md` block, where `.bq-md a` below (underline at rest, none on
+   hover -- the prose-link convention) is (0,1,1) and outranks .bq-link-button
+   at (0,1,0). So those chips rendered the exact inverse of the rule above:
+   underlined at rest, underline gone under the pointer, while the same chip on
+   a user bubble (outside .bq-md) behaved. Restate the chip rule at a
+   specificity that wins inside .bq-md, the dead chip included. */
+.bq-md a.bq-link-button { text-decoration: none; }
+.bq-md a.bq-link-button:hover { text-decoration: underline; }
+.bq-md a.bq-link-button.is-unavailable:hover { text-decoration: none; }
+/* The ↗ / ✕ glyph is never underlined, at rest or on hover. Underlines propagate
+   into every in-flow inline descendant and a descendant cannot cancel them, so
+   `text-decoration: none` on the glyph alone does nothing; an atomic inline
+   (inline-block) is exempt, and the spacing is a margin so no decorated space
+   character carries the line up to the glyph. */
+.bq-link-glyph {
+    display: inline-block;
+    text-decoration: none;
+    margin-right: 0.3em;
+}
 
 /* ---- inline image previews ----------------------------------------------*/
 /* The anchor IS the preview: picture on top, the ordinary chip underneath as a

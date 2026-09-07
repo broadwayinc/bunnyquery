@@ -2294,8 +2294,11 @@ import {
         return href;
     }
     function fileToAnchorHtml(filename, href) {
-        var text = "↗ " + filename;
-        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
+        // Same glyph element as the engine's renderInlineLinkHtml, for the same
+        // reason: chat.css makes .bq-link-glyph an atomic inline so the anchor's
+        // hover underline stops before the ↗ instead of running under it.
+        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">'
+            + '<span class="bq-link-glyph" translate="no">↗</span>' + escapeHtml(filename) + "</a>";
     }
     // The markup is the ENGINE's (renderInlineLinkHtml): this used to be a byte
     // for byte copy of agent.vue's emitter, and the image preview would have had

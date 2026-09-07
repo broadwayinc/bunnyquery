@@ -1330,7 +1330,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (refreshing) cls.push("is-refreshing");
     if (unavailable) cls.push("is-unavailable");
     if (preview) cls.push("is-image-preview");
-    var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + " " + link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : "");
+    var glyphHtml = '<span class="bq-link-glyph" translate="no">' + (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + "</span>";
+    var labelHtml = glyphHtml + escapeInlineHtml(link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : ""));
     var attrs = ['class="' + cls.join(" ") + '"'];
     if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
     else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
@@ -1341,8 +1342,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (link.expiredHref) attrs.push('data-bq-expired-href="' + escapeInlineHtml(link.expiredHref) + '"');
     if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
     if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
-    if (!preview) return "<a " + attrs.join(" ") + ">" + escapeInlineHtml(labelText) + "</a>";
-    return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + "</span></a>";
+    if (!preview) return "<a " + attrs.join(" ") + ">" + labelHtml + "</a>";
+    return "<a " + attrs.join(" ") + '><img class="bq-img-preview" alt="' + escapeInlineHtml(full) + '" data-bq-img-path="' + escapeInlineHtml(link.remotePath || "") + '" data-bq-img-type="' + escapeInlineHtml(link.image ? link.image.contentType : "") + '" decoding="async"><span class="bq-loader" data-bq-img-loader="1"></span><span class="bq-img-preview-caption" translate="no">' + labelHtml + "</span></a>";
   }
 
   // src/engine/image_preview.ts
@@ -8238,7 +8239,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.10.1" ;
+    var BQ_VERSION = "1.10.2" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -10332,8 +10333,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return href;
     }
     function fileToAnchorHtml(filename, href) {
-      var text = "\u2197 " + filename;
-      return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
+      return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer"><span class="bq-link-glyph" translate="no">\u2197</span>' + escapeHtml(filename) + "</a>";
     }
     function linkToAnchorHtml(link, allowImagePreview) {
       return renderInlineLinkHtml(link, {
