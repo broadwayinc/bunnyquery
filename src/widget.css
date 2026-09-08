@@ -355,9 +355,9 @@
     border: 0;
     padding: 0;
     font-family: var(--bq-mono);
-    text-decoration: underline;
+    text-decoration: none;
 }
-.bq-link:hover { text-decoration: none; }
+.bq-link:hover { text-decoration: underline; }
 .bq-link.disabled { opacity: 0.4; pointer-events: none; }
 
 .bq-checkbox {
