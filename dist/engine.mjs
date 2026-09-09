@@ -3244,6 +3244,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (item._isBgTask) em.isBackgroundTask = true;
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
       if (replyTs !== void 0) em._ts = replyTs;
+      if (indexFile && isFinite(executedTs) && executedTs > 0) em._tsStart = executedTs;
       mapped.push(em);
     } else if (isStreamPending) {
       var sp = { role: "assistant", content: "", _streamPending: true };

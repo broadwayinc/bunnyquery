@@ -858,6 +858,13 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (item._isBgTask) em.isBackgroundTask = true;
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			if (replyTs !== undefined) em._ts = replyTs;
+			// A pass that FAILED still ran, and how long it ran before failing is worth
+			// as much as a successful pass's duration -- often more, since that is where
+			// a timeout shows itself. `att` is stamped before the upstream call fires,
+			// so a failed row carries it exactly as a resolved one does. (Same stamp as
+			// the success branch below; the stream-pending branch deliberately has none,
+			// having no end time yet.)
+			if (indexFile && isFinite(executedTs) && executedTs > 0) em._tsStart = executedTs;
 			mapped.push(em);
 		} else if (isStreamPending) {
 			// The bubble stands for the turn so the merge has something to key on and

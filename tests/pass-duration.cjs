@@ -134,6 +134,21 @@ test('a zero/!finite `executed` is treated as absent', () => {
     assert.strictEqual(replyOf(INDEX_ITEM({ created: QUEUED, executed: null, updated: DONE }))._tsStart, undefined);
 });
 
+test('a FAILED pass still reports how long it ran before it failed', () => {
+    // It ran: `att` is stamped before the upstream call fires, so a failed row
+    // carries it exactly as a resolved one does. This is where a timeout is most
+    // worth seeing, and the error branch used to drop it.
+    const failed = Object.assign(INDEX_ITEM({ created: QUEUED, executed: RAN, updated: DONE }), {
+        status: 'failed',
+        response_body: undefined,
+        error: { message: 'upstream timed out' },
+    });
+    const reply = replyOf(failed);
+    assert.ok(reply.isError, 'expected the error branch');
+    assert.strictEqual(reply._tsStart, RAN);
+    assert.strictEqual(formatDuration(reply._ts - reply._tsStart), '1m 4s');
+});
+
 test('an ORDINARY reply carries no _tsStart, which is what scopes the duration', () => {
     const ordinary = Object.assign(INDEX_ITEM({ created: QUEUED, executed: RAN, updated: DONE }), {
         _isBgTask: false,
