@@ -94,8 +94,40 @@ export const UPLOAD_ACCESS_OPTIONS = UPLOAD_ACCESS_GROUPS.map((value) => ({
 /** The settings record's `data`. Open-ended: future settings are new keys. */
 export type ProjectSettingsData = {
 	upload_access_group?: unknown;
+	chat_greeting?: unknown;
 	[key: string]: unknown;
 };
+
+/**
+ * Longest custom opening line the dashboard will store.
+ *
+ * The bubble is chrome, not content: it is painted before the conversation and
+ * cannot be scrolled past, so an essay here pushes the composer off a phone
+ * screen. It is ALSO handed to the model verbatim as "what you opened with"
+ * (buildChatSystemPrompt's `greeting`), so every turn of every chat pays for its
+ * length in tokens. Enforced where it is SAVED as well as where it is read, so a
+ * value written by something other than the settings page cannot bloat either.
+ */
+export const CHAT_GREETING_MAX_LENGTH = 400;
+
+/**
+ * Narrow a stored greeting to a usable line: '' means "use the built-in".
+ *
+ * Anything that is not a string is unset rather than an error -- this record is
+ * public and a client must never break on a value it did not write.
+ */
+export function normalizeChatGreeting(value: any): string {
+	if (typeof value !== 'string') return '';
+	// Collapse the runs of blank lines a textarea makes easy to leave behind, so
+	// the bubble cannot open with vertical whitespace.
+	const trimmed = value.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+	return trimmed.slice(0, CHAT_GREETING_MAX_LENGTH);
+}
+
+/** The project's custom opening line, or '' when it has never set one. */
+export function chatGreetingFrom(data: ProjectSettingsData | null | undefined): string {
+	return normalizeChatGreeting(data?.chat_greeting);
+}
 
 /** Narrow an unknown stored value to a usable group, falling back to the default. */
 export function normalizeUploadAccessGroup(value: any): UploadAccessGroup {
@@ -268,6 +300,18 @@ export function projectUploadAccessGroup(service: string): UploadAccessGroup {
 /** Sync convenience: does this project want a per-upload prompt? */
 export function projectAsksUploadAccess(service: string): boolean {
 	return asksUploadAccessFrom(cachedProjectSettings(service));
+}
+
+/**
+ * Sync convenience: the project's custom opening line, '' when unset.
+ *
+ * Answers '' until the fetch settles, which is why both clients repaint the
+ * greeting once readyProjectSettings resolves: a cold cache would otherwise
+ * leave a project that HAS set a line showing the built-in one for the life of
+ * the page.
+ */
+export function projectChatGreeting(service: string): string {
+	return chatGreetingFrom(cachedProjectSettings(service));
 }
 
 /**

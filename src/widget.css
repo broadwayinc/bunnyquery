@@ -576,18 +576,9 @@
     font-size: 0.8rem;
     color: var(--bq-muted);
 }
-.bq-brand-icon {
-    width: 1.1rem;
-    height: 1.1rem;
-    object-fit: contain;
-    flex: 0 0 auto;
-}
-.bq-brand-name,
-.bq-brand-sep {
-    flex: 0 0 auto;
-    white-space: nowrap;
-}
-.bq-brand-project {
+/* One element (see brandTitleEl): the whole title ellipsizes rather than only
+   the project half, which is what lets `opts.title` be an arbitrary string. */
+.bq-brand-title {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;

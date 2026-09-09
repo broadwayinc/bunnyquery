@@ -539,6 +539,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
 
 // src/engine/greeting.ts
 function buildChatGreeting(params) {
+  const custom = typeof params.custom === "string" ? params.custom.trim() : "";
+  if (custom) return { lead: custom, name: "", tail: "", text: custom };
   const name = params.projectName ? '"' + params.projectName + '"' : "";
   const lead = params.canUpload === false ? "Hi! Ask me anything about the data in your project" : "Hi! Start by attaching the files related to your project";
   const tail = params.canUpload === false ? "." : ", or pasting plain text into the chat. Once they are indexed, ask me anything about that data.";
@@ -8321,6 +8323,15 @@ var UPLOAD_ACCESS_OPTIONS = UPLOAD_ACCESS_GROUPS.map((value) => ({
   label: UPLOAD_ACCESS_LABELS[value],
   hint: UPLOAD_ACCESS_HINTS[value]
 }));
+var CHAT_GREETING_MAX_LENGTH = 400;
+function normalizeChatGreeting(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return trimmed.slice(0, CHAT_GREETING_MAX_LENGTH);
+}
+function chatGreetingFrom(data) {
+  return normalizeChatGreeting(data?.chat_greeting);
+}
 function normalizeUploadAccessGroup(value) {
   return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? DEFAULT_UPLOAD_ACCESS_GROUP : value;
 }
@@ -8392,6 +8403,9 @@ function projectUploadAccessGroup(service) {
 function projectAsksUploadAccess(service) {
   return asksUploadAccessFrom(cachedProjectSettings(service));
 }
+function projectChatGreeting(service) {
+  return chatGreetingFrom(cachedProjectSettings(service));
+}
 function setProjectSettings(service, data) {
   if (!service) return;
   cache.set(service, { data: data || null, settled: true, inflight: null });
@@ -8409,6 +8423,7 @@ function clearProjectSettings(service) {
 exports.BG_INDEXING_QUEUE_SUFFIX = BG_INDEXING_QUEUE_SUFFIX;
 exports.BOM = BOM;
 exports.BOM_EXTS = BOM_EXTS;
+exports.CHAT_GREETING_MAX_LENGTH = CHAT_GREETING_MAX_LENGTH;
 exports.CLAUDE_INPUT_CAP_RATIO = CLAUDE_INPUT_CAP_RATIO;
 exports.CLAUDE_PER_REQUEST_INPUT_CAP = CLAUDE_PER_REQUEST_INPUT_CAP;
 exports.CONTEXT_WINDOW_BY_MODEL = CONTEXT_WINDOW_BY_MODEL;
@@ -8493,6 +8508,7 @@ exports.callOpenAIWithPublicMcp = callOpenAIWithPublicMcp;
 exports.canonicalizePathForm = canonicalizePathForm;
 exports.chatCacheKey = chatCacheKey;
 exports.chatEngineConfig = chatEngineConfig;
+exports.chatGreetingFrom = chatGreetingFrom;
 exports.chatStreamWiring = chatStreamWiring;
 exports.classifyInlineLink = classifyInlineLink;
 exports.clearAttachmentParsers = clearAttachmentParsers;
@@ -8573,6 +8589,7 @@ exports.mayKeepStreamedAnswer = mayKeepStreamedAnswer;
 exports.mintCacheBustStamp = mintCacheBustStamp;
 exports.needsBomForExt = needsBomForExt;
 exports.normalizeAttachmentPathCandidate = normalizeAttachmentPathCandidate;
+exports.normalizeChatGreeting = normalizeChatGreeting;
 exports.normalizeExt = normalizeExt;
 exports.normalizeProjectAccessSetting = normalizeProjectAccessSetting;
 exports.normalizeTextContent = normalizeTextContent;
@@ -8594,6 +8611,7 @@ exports.previewableExtOf = previewableExtOf;
 exports.primeProjectSettings = primeProjectSettings;
 exports.projectAccessSetting = projectAccessSetting;
 exports.projectAsksUploadAccess = projectAsksUploadAccess;
+exports.projectChatGreeting = projectChatGreeting;
 exports.projectSettingsSettled = projectSettingsSettled;
 exports.projectUploadAccessGroup = projectUploadAccessGroup;
 exports.readExpiredAttachmentHref = readExpiredAttachmentHref;

@@ -263,6 +263,11 @@ export {
 	UPLOAD_ACCESS_HINTS,
 	UPLOAD_ACCESS_OPTIONS,
 	DEFAULT_UPLOAD_ACCESS_GROUP,
+	// the project's custom opening line (same record, its own key)
+	CHAT_GREETING_MAX_LENGTH,
+	normalizeChatGreeting,
+	chatGreetingFrom,
+	projectChatGreeting,
 	// pure readers over a settings `data` object
 	normalizeUploadAccessGroup,
 	normalizeProjectAccessSetting,

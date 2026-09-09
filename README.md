@@ -116,6 +116,10 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | Option                   | Type      | Default  | Description                                                                                  |
 | ------------------------ | --------- | -------- | -------------------------------------------------------------------------------------------- |
 | `theme`                  | `string`  | `"light"`| Initial theme, `"light"` or `"dark"`. Overridden by a remembered choice or OS preference.    |
+| `title`                  | `string`  | `null`   | Header title text. `null` keeps `"BunnyQuery · <project name>"`; any string replaces the whole line, and `""` leaves the header title empty. It is one element, so it ellipsizes as a unit. |
+| `inputPlaceholder`       | `string`  | `null`   | Placeholder in the chat composer. `null` keeps `"Ask anything about: <project name>"`; `""` shows no placeholder.                    |
+| `showLogin`              | `boolean` | `true`   | Whether an **anonymous** visitor is offered a `Login` button in the chat header. Signed-in users are unaffected: they get the settings gear in that slot either way. Set `false` for an embed that handles its own auth, or that does not want visitors making accounts. |
+| `bubbleFace`             | `string`  | `null`   | Image for the little face on assistant chat bubbles. Any value a CSS `url()` accepts: an `https` URL or a `data:` URI. `null` keeps the bundled bunny. Applied as the `--bq-bubble-face` custom property on the widget's own root, so two widgets on one page can carry different faces. |
 | `signup`                 | `boolean` | `false`  | Enable signup flows (and account remove/recover). When `false`, only existing users can log in. |
 | `googleClientId`         | `string`  | `null`   | Google OAuth client ID. Set this to show "Sign in with Google".                              |
 | `googleClientSecretName` | `string`  | `"ggl"`  | The Skapi client-secret name holding your Google OAuth secret.                               |
@@ -128,6 +132,26 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `allowAnonymous`         | `boolean` | `null`   | Open the chat with no login for visitors without an account. `null` follows the project's own "Allow anonymous users" setting (`getConnectionInfo().conf.require_login`); `true`/`false` pins it. |
 | `liveStreaming`          | `boolean` | `false`  | Paint a chat answer into its bubble as it arrives, instead of at the end. A **request**, not a switch: the widget honours it only when your page's `skapi-js` actually carries skapi's half of the stream flag (it checks for `clientSecretRequestStream` and `clientSecretRequestFinalize`), and otherwise warns once and falls back to buffered replies. An older SDK silently drops the flag, which would leave the destination streaming SSE into a buffered row that reads back empty. It still also needs a polling worker that relays the response bytes, which the widget cannot check, so leave it off until the region you talk to is deployed. |
 | `liveStreamingRealtime`  | `boolean` | `false`  | Deliver streamed chunks over skapi's websocket instead of waiting for the next poll tick. Requires `liveStreaming`. Off unless you ask for it: skapi's `joinRealtime` **replaces** the connection's group, so for the length of a turn it takes the room out from under whatever else your app uses realtime for. Purely an accelerator; with it off the reply still streams, on the poll's cadence. |
+
+### Rebranding the widget
+
+Every piece of visible chrome the widget owns can be replaced from `init()`,
+with no stylesheet override:
+
+```js
+BunnyQuery.init(skapi, "chatbox", {
+  title: "Acme Support",                              // the header line, as ONE string
+  inputPlaceholder: "Ask us anything...",             // the composer's placeholder
+  showLogin: false,                                   // no Login button for anonymous visitors
+  bubbleFace: "https://acme.example/avatar.png",      // our face on assistant bubbles
+  theme: "dark",                                      // and the colour scheme
+});
+```
+
+The header is a single element reading `BunnyQuery · <project name>` by default;
+`title` replaces that whole string rather than a part of it. For anything past
+these four, the widget is themed with CSS custom properties; see
+[Theming](#theming).
 
 ### Methods
 
