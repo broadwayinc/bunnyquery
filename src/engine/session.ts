@@ -81,6 +81,13 @@ const INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1000;
 // that is still alive. Fixed and finite: this must never become a poll.
 const WORKER_PASS_ADOPT_ATTEMPTS = [0, 2000, 6000];
 
+/** How recent a loaded indexing pass has to be to count as evidence that a worker
+ *  chain may still be advancing. Generous on purpose: it only has to outlast the
+ *  gap between two passes of one file, and the cost of being wrong is three queue
+ *  round trips, while the cost of being too tight is a file that reads "Indexed"
+ *  while it is still being read. */
+const RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1000;
+
 // awaitIndexingDrained: how often it re-asks the background-indexing queue, and
 // how many consecutive empty answers it needs before believing the chains are
 // over. More than one for the same reason the adopt ladder above looks twice —
@@ -4435,7 +4442,38 @@ export class ChatSession {
 		// full passive ladder for indexing that does not exist.
 		var found = false;
 		this.historyItemPolls.forEach(function (h: any) { if (h && h.kind === 'bg') found = true; });
-		return found;
+		if (found) return true;
+
+		// A chain this client did not START leaves none of the three signals above,
+		// and they are all signals of LOCAL DISPATCH: the bgTaskQueue entry covers
+		// only the pass this page sent and is spliced out as soon as it settles, a
+		// reload clears that array outright, and liveIndexKeys is empty in exactly
+		// the moment the probe just missed. A run begun on the db-files page and
+		// then opened in the chat has none of them, so the ladder never climbed for
+		// it: one probe landing in the gap between pass N resolving and pass N+1
+		// being enqueued marked the file finished, and with no local pass left to
+		// settle, nothing asked again. The row stayed green on a file still being
+		// read.
+		//
+		// The passes themselves are the evidence in that case. Bounded by recency,
+		// because the thing this gate exists to prevent is the climb running on an
+		// idle tab whose indexing finished long ago - and such a chat's newest
+		// indexing pass is hours or days old, so it still does not climb.
+		// Date.now(), NOT nowMs(): `_ts` is a wall-clock epoch (the same clock the
+		// run:: records are stamped with), while nowMs() is performance.now() --
+		// milliseconds since process start. Subtracting the window from that gives a
+		// NEGATIVE cutoff, every epoch `_ts` clears it, and the gate would then be
+		// true for any chat that has ever indexed anything: exactly the always-climb
+		// this gate was added to stop.
+		var cutoff = Date.now() - RECENT_INDEX_PASS_EVIDENCE_MS;
+		var msgs = this.state.messages;
+		for (var mi = msgs.length - 1; mi >= 0; mi--) {
+			var m = msgs[mi];
+			if (!m || !m._indexFile) continue;
+			if (typeof m._ts !== 'number') continue;
+			if (m._ts >= cutoff) return true;
+		}
+		return false;
 	}
 
 	/** Any of these ids still queued or still polled, i.e. surviving work. */

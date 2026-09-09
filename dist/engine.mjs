@@ -3641,6 +3641,7 @@ var WORKER_PASS_ADOPT_LIMIT = 20;
 var LIVE_INDEX_SNAPSHOT_MAX_AGE_MS = 5e3;
 var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
+var RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1e3;
 var EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
 var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -6833,7 +6834,16 @@ var ChatSession = class {
     this.historyItemPolls.forEach(function(h) {
       if (h && h.kind === "bg") found = true;
     });
-    return found;
+    if (found) return true;
+    var cutoff = Date.now() - RECENT_INDEX_PASS_EVIDENCE_MS;
+    var msgs = this.state.messages;
+    for (var mi = msgs.length - 1; mi >= 0; mi--) {
+      var m = msgs[mi];
+      if (!m || !m._indexFile) continue;
+      if (typeof m._ts !== "number") continue;
+      if (m._ts >= cutoff) return true;
+    }
+    return false;
   }
   /** Any of these ids still queued or still polled, i.e. surviving work. */
   _isTrackingAny(ids) {
