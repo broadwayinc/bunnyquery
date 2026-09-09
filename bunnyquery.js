@@ -1487,6 +1487,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return "";
     }
   }
+  function formatDuration(ms) {
+    if (typeof ms !== "number" || !isFinite(ms) || ms < 1e3) return "";
+    var total = Math.floor(ms / 1e3);
+    var h = Math.floor(total / 3600);
+    var m = Math.floor(total % 3600 / 60);
+    var s = total % 60;
+    var out = [];
+    if (h) out.push(h + "h");
+    if (m) out.push(m + "m");
+    out.push(s + "s");
+    return out.join(" ");
+  }
 
   // src/engine/ai_agent.ts
   function normalizePlatform(raw) {
@@ -3037,6 +3049,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
       var createdTs = Number(item && item.created);
       var updatedTs = Number(item && item.updated);
+      var executedTs = Number(item && item.executed);
       var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : isFinite(updatedTs) && updatedTs > 0 ? updatedTs : void 0;
       var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : isFinite(createdTs) && createdTs > 0 ? createdTs : void 0;
       if (userText) {
@@ -3105,6 +3118,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isCompact) okm._compact = true;
         if (serverItemId !== void 0) okm._serverItemId = serverItemId;
         if (replyTs !== void 0) okm._ts = replyTs;
+        if (indexFile && isFinite(executedTs) && executedTs > 0) okm._tsStart = executedTs;
         if (reportedComplete) okm._indexComplete = true;
         mapped.push(okm);
       }
@@ -8263,7 +8277,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.10.6" ;
+    var BQ_VERSION = "1.10.7" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -11540,6 +11554,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
         if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
         var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
+        if (ts && typeof msg._ts === "number" && typeof msg._tsStart === "number") {
+          var dur = formatDuration(msg._ts - msg._tsStart);
+          if (dur) ts += " (" + dur + ")";
+        }
         if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
       }
       return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);

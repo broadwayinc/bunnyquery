@@ -329,7 +329,13 @@ const AGENT_LOADER = /\.bq-bubble\(v-if="([^"]+)"\)/;
 const WIDGET_RECOVER = /\}\s*else if \((streamRecoveryPhase\(msg\))\)\s*\{/;
 const AGENT_RECOVER = /v-else-if="(streamRecoveryPhase\(row\.msg\))"/;
 const WIDGET_TIME = /var ts = (msg\.isPending \? "" : formatChatTimestamp\(msg\._ts\));/;
-const AGENT_TIME = /const bubbleTime = \(msg: ChatMessage\): string =>\s*\n?\s*(msg\?\.isPending \? "" : formatChatTimestamp\(msg\?\._ts\));/;
+const AGENT_TIME = /let ts = (msg\?\.isPending \? "" : formatChatTimestamp\(msg\?\._ts\));/;
+// The fourth: how long an indexing pass took, appended to its own end time. Two
+// more hand-duplicated lines, held identical for the same reason as the three
+// above -- and with a specific way to drift: a client that subtracted without
+// testing BOTH stamps would print a duration off `undefined` as NaN.
+const WIDGET_DUR = /if \(ts && (typeof msg\._ts === "number" && typeof msg\._tsStart === "number")\) \{/;
+const AGENT_DUR = /if \(ts && (typeof msg\?\._ts === "number" && typeof msg\?\._tsStart === "number")\) \{/;
 
 await test('the widget draws the loader ONLY where something is actually fetching the answer', () => {
     // A loader is a promise that something is coming. `_streamPending` alone is not
@@ -353,6 +359,7 @@ if (!hasAgent) {
     skip('and agent.vue draws exactly the same one', 'www.bunnyquery.com is not checked out beside this package');
     skip('and agent.vue offers the affordance on exactly the same phases', 'www.bunnyquery.com is not checked out beside this package');
     skip('both clients suppress the timestamp on exactly the same bubbles', 'www.bunnyquery.com is not checked out beside this package');
+    skip('both clients gate the pass duration on the same two stamps', 'www.bunnyquery.com is not checked out beside this package');
     skip('neither client decides the recovery phase or its wording for itself', 'www.bunnyquery.com is not checked out beside this package');
 } else {
     await test('and agent.vue draws exactly the same one', () => {
@@ -379,6 +386,10 @@ if (!hasAgent) {
         // answer before it exists. Before streaming, the spinner branch made this
         // implicit in both clients, which is exactly how a rule like this drifts.
         assert.strictEqual(renderExpr(agent, AGENT_TIME, 'bubbleTime expression'), renderExpr(widget, WIDGET_TIME, 'timestamp expression'));
+    });
+
+    await test('both clients gate the pass duration on the same two stamps', () => {
+        assert.strictEqual(renderExpr(agent, AGENT_DUR, 'duration guard'), renderExpr(widget, WIDGET_DUR, 'duration guard'));
     });
 
     await test('neither client decides the recovery phase or its wording for itself', () => {

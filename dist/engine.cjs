@@ -1561,6 +1561,18 @@ function formatChatTimestamp(ms) {
     return "";
   }
 }
+function formatDuration(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 1e3) return "";
+  var total = Math.floor(ms / 1e3);
+  var h = Math.floor(total / 3600);
+  var m = Math.floor(total % 3600 / 60);
+  var s = total % 60;
+  var out = [];
+  if (h) out.push(h + "h");
+  if (m) out.push(m + "m");
+  out.push(s + "s");
+  return out.join(" ");
+}
 
 // src/engine/ai_agent.ts
 function normalizePlatform(raw) {
@@ -3181,6 +3193,7 @@ function mapHistoryListToMessages(list, platform, opts) {
     var serverItemId = item && typeof item.id === "string" && item.id ? item.id : void 0;
     var createdTs = Number(item && item.created);
     var updatedTs = Number(item && item.updated);
+    var executedTs = Number(item && item.executed);
     var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : isFinite(updatedTs) && updatedTs > 0 ? updatedTs : void 0;
     var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : isFinite(createdTs) && createdTs > 0 ? createdTs : void 0;
     if (userText) {
@@ -3249,6 +3262,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       if (isCompact) okm._compact = true;
       if (serverItemId !== void 0) okm._serverItemId = serverItemId;
       if (replyTs !== void 0) okm._ts = replyTs;
+      if (indexFile && isFinite(executedTs) && executedTs > 0) okm._tsStart = executedTs;
       if (reportedComplete) okm._indexComplete = true;
       mapped.push(okm);
     }
@@ -8551,6 +8565,7 @@ exports.fillHistoryViewport = fillHistoryViewport;
 exports.filterListByClearHorizon = filterListByClearHorizon;
 exports.findAttachmentParser = findAttachmentParser;
 exports.formatChatTimestamp = formatChatTimestamp;
+exports.formatDuration = formatDuration;
 exports.getAttachmentParsers = getAttachmentParsers;
 exports.getChatHistory = getChatHistory;
 exports.getContextWindow = getContextWindow;

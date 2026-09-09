@@ -792,6 +792,12 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		// if one is missing (older records only carried `updated`).
 		var createdTs = Number(item && item.created);
 		var updatedTs = Number(item && item.updated);
+		// When the WORKER began executing this pass, not when it was enqueued. The
+		// SDK normalises it to ms (the worker stamps it in seconds). Absent on a row
+		// that never ran, and on rows written before the SDK projected it -- in both
+		// cases the pass simply shows no duration, which is right: the honest answer
+		// to "how long did it take" is nothing, not the queue wait dressed up as it.
+		var executedTs = Number(item && item.executed);
 		var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : (isFinite(updatedTs) && updatedTs > 0 ? updatedTs : undefined);
 		var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : (isFinite(createdTs) && createdTs > 0 ? createdTs : undefined);
 
@@ -874,6 +880,17 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (isCompact) okm._compact = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
+			// How long THIS pass took: from the moment the worker began EXECUTING it to
+			// the moment it resolved. Carried on the reply so the bubble can show it
+			// without its request bubble (a continuation's request is hidden from the
+			// expanded row). Only for an indexing pass: `_tsStart`'s presence is what
+			// scopes the duration to indexing responses in both views.
+			//
+			// Deliberately NOT `created`: that is the enqueue time, so a pass that sat
+			// in the queue for an hour before running would have reported the wait as
+			// though it were the read. No fallback to it either, for the same reason --
+			// a missing `executed` means no duration is shown at all.
+			if (indexFile && isFinite(executedTs) && executedTs > 0) okm._tsStart = executedTs;
 			if (reportedComplete) okm._indexComplete = true;
 			mapped.push(okm);
 		}

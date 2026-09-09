@@ -86,6 +86,7 @@ import {
     classifyInlineLink,
     normalizeTrailingInlineToken,
     formatChatTimestamp,
+    formatDuration,
     // Inline image previews: the chip/preview markup is shared with agent.vue so
     // the two clients cannot drift, and the url mint is cached outside the parse.
     renderInlineLinkHtml,
@@ -3765,6 +3766,14 @@ import {
             // with the response time). Before streaming, the spinner branch above
             // made this implicit. Mirrored in agent.vue's bubbleTime.
             var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
+            // How long an indexing pass took, appended to its own end time.
+            // `_tsStart` is stamped only on an indexing pass's reply, so this needs
+            // no second test to stay off ordinary answers. Empty for anything under
+            // a second, which is what a one-sided server timestamp collapses to.
+            if (ts && typeof msg._ts === "number" && typeof msg._tsStart === "number") {
+                var dur = formatDuration(msg._ts - msg._tsStart);
+                if (dur) ts += " (" + dur + ")";
+            }
             if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
         }
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);

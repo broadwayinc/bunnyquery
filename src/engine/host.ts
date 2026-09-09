@@ -225,6 +225,16 @@ export interface ChatMessage {
 	 *  it is created, then reconciled to the server value on the next history load.
 	 *  Absent while a turn is still pending, so no time shows on a "Thinking" bubble. */
 	_ts?: number;
+	/** Epoch ms the worker began EXECUTING this indexing pass (the SDK's `executed`,
+	 *  not the enqueue time `created`), carried on the ASSISTANT bubble so it can
+	 *  show how long the pass actually took
+	 *  without reaching for its request bubble (a continuation's request is
+	 *  deliberately hidden from the expanded row, so it is not always there).
+	 *
+	 *  Stamped ONLY on an indexing pass's reply. Its presence is therefore also
+	 *  what SCOPES the duration to indexing responses: an ordinary chat answer
+	 *  never carries it, so neither view needs a second test. */
+	_tsStart?: number;
 	// History cache key (`projectId#platform`) this bubble was created under.
 	// Stamped on LOCALLY-created bubbles only (the optimistic user message and
 	// its "Thinking..." placeholder); server-mapped bubbles are identified by
