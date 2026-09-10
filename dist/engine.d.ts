@@ -2082,6 +2082,9 @@ type BgTaskEntry = {
     status: 'running' | 'pending';
     poll: ((opts: {
         latency: number;
+        onResponse?: (res: any, meta?: {
+            executed?: number;
+        }) => void;
     }) => Promise<any>) | undefined;
     /** How many CONTINUE passes have already run for this file (resume-across-passes). */
     resumePass?: number;
@@ -4309,7 +4312,22 @@ declare class ChatSession {
     private _isOwnPlaceholderOf;
     _clearPendingUserBubble(itemId: string): void;
     resumePendingRequest(token: number): Promise<void>;
-    handleHistoryItemResolution(itemId: string, response: any, platform: string): void;
+    /** Record how long a background indexing pass took, on the bubble that just
+     *  settled, so the duration shows immediately instead of waiting for whatever
+     *  next refetches history.
+     *
+     *  `_tsStart` is otherwise written only by the history mapper, which reads the
+     *  row's `executed`; a live settle never sees the row at all (the poll resolves
+     *  with the destination's body). This is the same value by the other route.
+     *
+     *  `_ts` is stamped too when the branch that built the bubble left it without
+     *  one: it is the END of the pass, and the pass ended now. A later history load
+     *  replaces both with the server's own numbers.
+     *
+     *  Indexing passes only: an ordinary turn has no duration to show, and
+     *  `_tsStart`'s presence is what both views read to decide. */
+    private _stampPassDuration;
+    handleHistoryItemResolution(itemId: string, response: any, platform: string, executedAt?: number): void;
     /** The file an already-rendered background pass is about, off its request
      *  bubble. Null for an ordinary turn, which is most of them. */
     private _indexRefOfItem;

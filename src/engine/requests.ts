@@ -1452,7 +1452,11 @@ export type BgTaskEntry = {
 	mime?: string;
 	size?: number;
 	status: 'running' | 'pending';
-	poll: ((opts: { latency: number }) => Promise<any>) | undefined;
+	// `onResponse` receives the settled value plus a `meta` of facts about the
+	// REQUEST rather than the response: `executed` is when the worker began
+	// running it, which rides on a running poll tick's status envelope and is
+	// therefore free to a caller already polling.
+	poll: ((opts: { latency: number; onResponse?: (res: any, meta?: { executed?: number }) => void }) => Promise<any>) | undefined;
 	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
 	resumePass?: number;
 	/** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).

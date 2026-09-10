@@ -4025,7 +4025,52 @@ export class ChatSession {
 	}
 
 	// --- background-task resolution + drain -------------------------------
-	handleHistoryItemResolution(itemId: string, response: any, platform: string): void {
+	/** Record how long a background indexing pass took, on the bubble that just
+	 *  settled, so the duration shows immediately instead of waiting for whatever
+	 *  next refetches history.
+	 *
+	 *  `_tsStart` is otherwise written only by the history mapper, which reads the
+	 *  row's `executed`; a live settle never sees the row at all (the poll resolves
+	 *  with the destination's body). This is the same value by the other route.
+	 *
+	 *  `_ts` is stamped too when the branch that built the bubble left it without
+	 *  one: it is the END of the pass, and the pass ended now. A later history load
+	 *  replaces both with the server's own numbers.
+	 *
+	 *  Indexing passes only: an ordinary turn has no duration to show, and
+	 *  `_tsStart`'s presence is what both views read to decide. */
+	private _stampPassDuration(itemId: string, executedAt?: number): void {
+		if (!itemId) return;
+		if (!this._indexRefOfItem(itemId)) return;
+		var hasStart = typeof executedAt === 'number' && executedAt > 0;
+		for (var i = this.state.messages.length - 1; i >= 0; i--) {
+			var m: any = this.state.messages[i];
+			if (!m || m.role !== 'assistant' || m._serverItemId !== itemId) continue;
+			if (m.isPending) continue;
+			// `_ts` is stamped whether or not an execution start arrived. The two
+			// background reply builds in applyHistoryItemResolution are the only ones
+			// in the engine that bypass both enqueueTypewrite and insertAtTarget --
+			// they write a literal and return -- so this is where an indexing reply
+			// gets its timestamp at all. Leaving it inside the duration guard meant a
+			// pass with no `executed` (the poll never saw a running tick) rendered with
+			// NO TIME LINE whatsoever, because both clients gate the whole element on
+			// `_ts`. Losing the duration is the intended degradation; losing the
+			// timestamp with it was not.
+			if (typeof m._ts !== 'number') m._ts = Date.now();
+			if (hasStart) m._tsStart = executedAt;
+			// Both of these, because the stamp lands AFTER applyHistoryItemResolution
+			// has already notified and cached. Without the notify the widget never
+			// repaints (its notify() IS the render, so the duration only appeared on
+			// the next unrelated render); without the re-cache the entry written a
+			// moment ago is the one missing `_tsStart`, so a rebuild from cache -- a
+			// remount, a tab return -- silently dropped the duration again.
+			this.host.notify();
+			this.updateHistoryCache();
+			break;
+		}
+	}
+
+	handleHistoryItemResolution(itemId: string, response: any, platform: string, executedAt?: number): void {
 		// Which file this turn was indexing, read BEFORE the resolution rewrites the
 		// bubbles. Every settling turn funnels through here — the bg drain's own
 		// poll, the history poll, and agent.vue's forked history poll, which calls
@@ -4033,6 +4078,17 @@ export class ChatSession {
 		// makes it work in both clients without either of them forking a call site.
 		var indexRef = this._indexRefOfItem(itemId);
 		this.applyHistoryItemResolution(itemId, response, platform);
+		// After the settle, never inside it: applyHistoryItemResolution builds the
+		// assistant bubble in four separate branches (answer, empty reply, error,
+		// bg) and stamping in each would be four chances to forget one.
+		//
+		// It lives HERE rather than at the call sites because this method is the one
+		// funnel every settle goes through, and the call sites are the thing that
+		// kept getting missed: agent.vue runs its OWN forked history poll, and that
+		// fork -- not the engine's drain -- is what settles a pass uploaded from the
+		// files page, so a stamp wired only into the drain never ran for the exact
+		// case it was written for. A fourth caller added later inherits this for free.
+		this._stampPassDuration(itemId, executedAt);
 		this.promoteNextBgQueuedToRunning();
 		// applyHistoryItemResolution just released this item's poll slot. Under
 		// MAX_CONCURRENT_BG_POLLS that slot is what the next-oldest unpolled entry
@@ -4678,13 +4734,25 @@ export class ChatSession {
 				var capturedId = entry.id, capturedPlat = plat;
 				var capturedEntry = entry;
 				var wasStopped = false;
-				var bp = entry.poll({ latency: POLL_INTERVAL });
+				// When the worker BEGAN running this pass. It rides on the poll's status
+				// envelope (a running tick), never on the terminal read, which hands back
+				// the destination's own body. Captured here so a settled pass can show how
+				// long it took WITHOUT a second request: the alternative is waiting for
+				// whatever next refetches history, which for a pass that settles in front
+				// of the user is not until they leave the chat and come back.
+				var executedAt: number | undefined;
+				var bp = entry.poll({
+					latency: POLL_INTERVAL,
+					onResponse: function (_res: any, meta: any) {
+						if (meta && typeof meta.executed === 'number' && meta.executed > 0) executedAt = meta.executed;
+					},
+				});
 				self._trackPoll(entry.id, 'bg', bp);
 				bp.then(function (response: any) {
 					// A stopped poll is not a result: leave the bubble and the queue entry
 					// exactly as they were so resumePolling can re-attach.
 					if (isPollStopped(response)) { wasStopped = true; return; }
-					self.handleHistoryItemResolution(capturedId, response, capturedPlat);
+					self.handleHistoryItemResolution(capturedId, response, capturedPlat, executedAt);
 					self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
 				}).catch(function (err: any) {
 					self.historyItemPolls.delete(capturedId);
@@ -5466,7 +5534,15 @@ export class ChatSession {
 					// items keep the flat cadence: nobody is watching, and they are what the
 					// MAX_CONCURRENT_BG_POLLS budget exists to protect.
 					var pollOpts = {
-						onResponse: function (response: any) { if (isPollStopped(response)) return; self.handleHistoryItemResolution(capturedId, response, platform); },
+						// `meta.executed` rides on the poll's running ticks, so a pass this
+						// path re-attached to (a reload or a remount while its chain was
+						// still going) shows its duration at settle exactly as one polled
+						// from the drain does. Without it, only passes started in this page
+						// life would be stamped.
+						onResponse: function (response: any, meta: any) {
+							if (isPollStopped(response)) return;
+							self.handleHistoryItemResolution(capturedId, response, platform, meta && meta.executed);
+						},
 						onError: function (err: any) {
 							self.historyItemPolls.delete(capturedId);
 							var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));

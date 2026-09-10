@@ -6548,9 +6548,39 @@ var ChatSession = class {
     });
   }
   // --- background-task resolution + drain -------------------------------
-  handleHistoryItemResolution(itemId, response, platform) {
+  /** Record how long a background indexing pass took, on the bubble that just
+   *  settled, so the duration shows immediately instead of waiting for whatever
+   *  next refetches history.
+   *
+   *  `_tsStart` is otherwise written only by the history mapper, which reads the
+   *  row's `executed`; a live settle never sees the row at all (the poll resolves
+   *  with the destination's body). This is the same value by the other route.
+   *
+   *  `_ts` is stamped too when the branch that built the bubble left it without
+   *  one: it is the END of the pass, and the pass ended now. A later history load
+   *  replaces both with the server's own numbers.
+   *
+   *  Indexing passes only: an ordinary turn has no duration to show, and
+   *  `_tsStart`'s presence is what both views read to decide. */
+  _stampPassDuration(itemId, executedAt) {
+    if (!itemId) return;
+    if (!this._indexRefOfItem(itemId)) return;
+    var hasStart = typeof executedAt === "number" && executedAt > 0;
+    for (var i = this.state.messages.length - 1; i >= 0; i--) {
+      var m = this.state.messages[i];
+      if (!m || m.role !== "assistant" || m._serverItemId !== itemId) continue;
+      if (m.isPending) continue;
+      if (typeof m._ts !== "number") m._ts = Date.now();
+      if (hasStart) m._tsStart = executedAt;
+      this.host.notify();
+      this.updateHistoryCache();
+      break;
+    }
+  }
+  handleHistoryItemResolution(itemId, response, platform, executedAt) {
     var indexRef = this._indexRefOfItem(itemId);
     this.applyHistoryItemResolution(itemId, response, platform);
+    this._stampPassDuration(itemId, executedAt);
     this.promoteNextBgQueuedToRunning();
     this.drainBgTaskQueue();
     if (indexRef) this._followWorkerIndexingChain(indexRef.name, indexRef.mime);
@@ -6997,14 +7027,20 @@ var ChatSession = class {
         var capturedId = entry2.id, capturedPlat = plat;
         var capturedEntry = entry2;
         var wasStopped = false;
-        var bp = entry2.poll({ latency: POLL_INTERVAL });
+        var executedAt;
+        var bp = entry2.poll({
+          latency: POLL_INTERVAL,
+          onResponse: function(_res, meta) {
+            if (meta && typeof meta.executed === "number" && meta.executed > 0) executedAt = meta.executed;
+          }
+        });
         self._trackPoll(entry2.id, "bg", bp);
         bp.then(function(response) {
           if (isPollStopped(response)) {
             wasStopped = true;
             return;
           }
-          self.handleHistoryItemResolution(capturedId, response, capturedPlat);
+          self.handleHistoryItemResolution(capturedId, response, capturedPlat, executedAt);
           self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
         }).catch(function(err) {
           self.historyItemPolls.delete(capturedId);
@@ -7573,9 +7609,14 @@ var ChatSession = class {
           var capturedId = item.id;
           var isBg = !!(item._isBgTask || item._isOnBgQueue);
           var pollOpts = {
-            onResponse: function(response) {
+            // `meta.executed` rides on the poll's running ticks, so a pass this
+            // path re-attached to (a reload or a remount while its chain was
+            // still going) shows its duration at settle exactly as one polled
+            // from the drain does. Without it, only passes started in this page
+            // life would be stamped.
+            onResponse: function(response, meta) {
               if (isPollStopped(response)) return;
-              self.handleHistoryItemResolution(capturedId, response, platform);
+              self.handleHistoryItemResolution(capturedId, response, platform, meta && meta.executed);
             },
             onError: function(err) {
               self.historyItemPolls.delete(capturedId);
