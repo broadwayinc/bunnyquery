@@ -423,10 +423,17 @@ if (!hasAgent) {
     await test('both clients hand the engine the chunk reader', () => {
         // Without it a streamed turn is only as durable as the tab that started it:
         // the engine marks the row and has no way back to the bytes.
-        assert.ok(/clientSecretRequestStream/.test(widget), 'widget does not wire clientSecretRequestStream');
-        assert.ok(/clientSecretRequestStream/.test(aiAgent), 'ai_agent.ts does not wire clientSecretRequestStream');
-        assert.ok(/clientSecretRequestFinalize/.test(widget), 'widget does not wire clientSecretRequestFinalize');
-        assert.ok(/clientSecretRequestFinalize/.test(aiAgent), 'ai_agent.ts does not wire clientSecretRequestFinalize');
+        //
+        // Under either spelling. The engine takes forwardRequestStream and
+        // forwardRequestFinalize or their deprecated clientSecretRequest* names, and
+        // each client moves to the new keys on its own schedule; which family the
+        // widget hands over is held by forward-request-widget-probe.cjs.
+        const READER = /forwardRequestStream|clientSecretRequestStream/;
+        const FINALIZE = /forwardRequestFinalize|clientSecretRequestFinalize/;
+        assert.ok(READER.test(widget), 'widget does not wire the chunk reader');
+        assert.ok(READER.test(aiAgent), 'ai_agent.ts does not wire the chunk reader');
+        assert.ok(FINALIZE.test(widget), 'widget does not wire finalize');
+        assert.ok(FINALIZE.test(aiAgent), 'ai_agent.ts does not wire finalize');
     });
 
     await test('both clients gate liveStreaming on the SHARED capability predicate', () => {

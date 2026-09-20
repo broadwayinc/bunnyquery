@@ -4,13 +4,22 @@
  * The engine is framework- and transport-agnostic: it never imports a skapi
  * instance or `import.meta.env`. Each consumer calls `configureChatEngine()`
  * once at startup to inject the skapi transport functions, the MCP base URL,
- * and (optionally) the `poll` value to attach to clientSecretRequest.
+ * and (optionally) the `poll` value to attach to every forwarded request.
  *
  * Why `poll` is configurable: agent.vue uses the npm-bundled skapi-js and OMITS
- * `poll` (its clientSecretRequest auto-resolves with the final body), whereas
+ * `poll` (its request auto-resolves with the final body), whereas
  * the BunnyQuery widget uses the deployed skapi-js@latest and must pass
  * `poll: 0` to get the early ack + a manual `.poll()` handle (needed for queued-
  * send cancel). So the request builders include `poll` only when it is set.
+ *
+ * THE TRANSPORT HAS TWO SPELLINGS, and a host may inject either. skapi-js renamed
+ * clientSecretRequest and its companions to the forwardRequest family, and kept
+ * every old name working. So this config accepts both families of keys, prefers
+ * the new one, and every call goes through the resolveForwardRequest* functions
+ * below, which are the only code in the engine that knows there are two. The old
+ * keys are not a courtesy: this package is pinned with a caret range, so a host
+ * written against an earlier release takes this one on its next install with
+ * nothing but the old keys injected, and it has to keep working unchanged.
  */
 
 import { type AttachmentParser, registerAttachmentParser } from './attachment_parsers';
@@ -61,15 +70,78 @@ export interface LiveStreamUpdate {
     transport: { socket: number; poll: number };
 }
 
+/** The finalize call, identical under its new and its deprecated key. */
+type ForwardRequestFinalizeFn = (
+    requestId: string,
+    data: any,
+    options: { url: string; method: string; service?: string; owner?: string },
+) => Promise<any>;
+
+/** The chunk read-back call, identical under its new and its deprecated key. */
+type ForwardRequestStreamFn = (
+    requestId: string,
+    options: {
+        url: string;
+        method: string;
+        onStream?: (chunk: string, seq: number) => void;
+        since?: number;
+        poll?: number;
+        service?: string;
+        owner?: string;
+    },
+) => Promise<any>;
+
 export interface ChatEngineConfig {
-    /** skapi.clientSecretRequest, bound to the consumer's skapi instance. */
-    clientSecretRequest: (opts: any) => Promise<any>;
-    /** skapi.clientSecretRequestHistory, bound to the consumer's skapi instance. */
-    clientSecretRequestHistory: (params: any, fetchOptions: any) => Promise<any>;
+    /**
+     * skapi.forwardRequest, bound to the consumer's skapi instance.
+     *
+     * The engine always calls it as `forwardRequest(null, opts)`. Null because it
+     * never has a form: every request it builds carries its whole body in
+     * `opts.data`, the `_skapi_*` directives included, and the stored secret is
+     * named with `secretName`.
+     *
+     * INJECT IT ONLY FROM AN SKAPI-JS THAT HAS THE WHOLE FORWARDREQUEST FAMILY. An
+     * older skapi-js also has a method called forwardRequest, taking the same two
+     * arguments, and it is a different thing entirely: the retired streaming
+     * forwarder, which posts to another endpoint and never queues, so a chat turn
+     * handed to it goes somewhere else and comes back as nothing the engine can
+     * read. A host that cannot be sure which skapi-js it holds (the widget, which
+     * is given the embedder's) decides by a companion only the new SDK has,
+     * `forwardRequestHistory`, and never by this method's presence.
+     *
+     * This or the deprecated `clientSecretRequest` is required; with both, this
+     * one is used. See resolveForwardRequest.
+     */
+    forwardRequest?: (form: any, opts: any) => Promise<any>;
+    /**
+     * skapi.forwardRequestHistory, bound to the consumer's skapi instance. This or
+     * the deprecated `clientSecretRequestHistory` is required; with both, this one
+     * is used. Same arguments either way.
+     */
+    forwardRequestHistory?: (params: any, fetchOptions: any) => Promise<any>;
+    /**
+     * @deprecated Inject `forwardRequest` instead.
+     *
+     * skapi.clientSecretRequest, bound to the consumer's skapi instance. Still
+     * accepted as a COMPATIBILITY CONTRACT, not a leftover: a host that injects
+     * only the old keys must keep working on this release. Used only when
+     * `forwardRequest` is absent, and handed the engine's request with `secretName`
+     * moved back to `clientSecretName`, which is exactly the request it was handed
+     * before the rename (see resolveForwardRequest).
+     */
+    clientSecretRequest?: (opts: any) => Promise<any>;
+    /**
+     * @deprecated Inject `forwardRequestHistory` instead.
+     *
+     * skapi.clientSecretRequestHistory, bound to the consumer's skapi instance.
+     * Kept for the same compatibility contract as `clientSecretRequest`, and used
+     * only when `forwardRequestHistory` is absent.
+     */
+    clientSecretRequestHistory?: (params: any, fetchOptions: any) => Promise<any>;
     /** MCP server base URL (prod vs dev resolved by the consumer). */
     mcpBaseUrl: string;
     /**
-     * Value to attach as `poll` on every clientSecretRequest. When `undefined`
+     * Value to attach as `poll` on every forwarded request. When `undefined`
      * the `poll` key is omitted entirely (agent.vue). BunnyQuery sets `0`.
      */
     poll?: number;
@@ -145,9 +217,10 @@ export interface ChatEngineConfig {
      * answer. So it stays off until the worker is deployed, then flips per
      * environment.
      *
-     * It also needs `clientSecretRequestFinalize` below: without it a streamed
-     * turn is never finalized, so its row keeps a status and no body forever and
-     * a later history load shows the question with an empty answer.
+     * It also needs `forwardRequestFinalize` below (or its deprecated name,
+     * `clientSecretRequestFinalize`): without it a streamed turn is never
+     * finalized, so its row keeps a status and no body forever and a later
+     * history load shows the question with an empty answer.
      */
     liveStreaming?: boolean;
     /**
@@ -165,24 +238,30 @@ export interface ChatEngineConfig {
      */
     liveStreamingRealtime?: boolean;
     /**
-     * skapi.clientSecretRequestFinalize, bound to the consumer's skapi instance.
+     * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
      * sends the ASSEMBLED provider body, so history reads it exactly as it reads
      * a buffered turn) and releases that request's chunks. Optional: a host
      * without it can still stream, it just leaves the chunks and an empty row.
+     * Takes precedence over the deprecated `clientSecretRequestFinalize`.
      */
-    clientSecretRequestFinalize?: (
-        requestId: string,
-        data: any,
-        options: { url: string; method: string; service?: string; owner?: string },
-    ) => Promise<any>;
+    forwardRequestFinalize?: ForwardRequestFinalizeFn;
     /**
-     * skapi.clientSecretRequestStream, bound to the consumer's skapi instance.
+     * @deprecated Inject `forwardRequestFinalize` instead.
+     *
+     * skapi.clientSecretRequestFinalize, the same call under its old name. Kept
+     * for the compatibility contract `clientSecretRequest` describes, and used
+     * only when `forwardRequestFinalize` is absent.
+     */
+    clientSecretRequestFinalize?: ForwardRequestFinalizeFn;
+    /**
+     * skapi.forwardRequestStream, bound to the consumer's skapi instance. Takes
+     * precedence over the deprecated `clientSecretRequestStream`.
      *
      * THE SECOND HALF OF THE DURABILITY GUARANTEE, and without it a streamed turn
      * is only as durable as the tab that started it. A streamed row settles with a
      * status and NO body; the answer is stored as chunks until
-     * clientSecretRequestFinalize says what to keep. A row that settles while no
+     * forwardRequestFinalize says what to keep. A row that settles while no
      * poll is attached (the user closed the tab, a mobile browser discarded it,
      * the device slept and the interval stopped) is therefore never finalized, and
      * a later history load sees a terminal row with no body and used to emit no
@@ -204,18 +283,16 @@ export interface ChatEngineConfig {
      * NOTE THAT THIS HOOK, NOT `liveStreaming`, IS WHAT ARMS RECOVERY. See
      * streamRecoveryEnabled() below for why the two decisions are separate.
      */
-    clientSecretRequestStream?: (
-        requestId: string,
-        options: {
-            url: string;
-            method: string;
-            onStream?: (chunk: string, seq: number) => void;
-            since?: number;
-            poll?: number;
-            service?: string;
-            owner?: string;
-        },
-    ) => Promise<any>;
+    forwardRequestStream?: ForwardRequestStreamFn;
+    /**
+     * @deprecated Inject `forwardRequestStream` instead.
+     *
+     * skapi.clientSecretRequestStream, the same call under its old name. Kept for
+     * the compatibility contract `clientSecretRequest` describes, and used only
+     * when `forwardRequestStream` is absent. It arms recovery exactly as the new
+     * key does.
+     */
+    clientSecretRequestStream?: ForwardRequestStreamFn;
     /**
      * Observation hook for a live-streaming turn, called at most once per paint
      * (about once a second) plus once when the turn settles.
@@ -235,7 +312,8 @@ export interface ChatEngineConfig {
      * reader is injected.
      *
      * There is no need to set it to turn recovery ON: injecting
-     * `clientSecretRequestStream` is what arms it (see streamRecoveryEnabled).
+     * `forwardRequestStream` (or its deprecated name, `clientSecretRequestStream`)
+     * is what arms it (see streamRecoveryEnabled).
      * This exists only as the way back out for a host that wants byte-for-byte the
      * pre-recovery rendering of a terminal-but-empty row - no bubble, no marker, no
      * chunk read - while keeping the reader available for its own use. Omit it and
@@ -269,6 +347,108 @@ export function chatEngineConfig(): ChatEngineConfig {
         );
     }
     return _config;
+}
+
+/* ---- the transport, resolved from whichever family the host injected ------------
+ *
+ * One resolver per operation, and nothing else in the engine reads the transport
+ * keys. Each prefers the forwardRequest key and falls back to the deprecated
+ * clientSecretRequest one, and each reads the config at CALL time rather than
+ * caching: a host may inject through a getter (agent.vue's finalize and stream hooks
+ * are getters, so its capability probe runs on first use) or re-configure, and the
+ * request has to go through whatever is there when it leaves.
+ *
+ * A key counts only when it holds a FUNCTION. `forwardRequestFinalize: undefined`
+ * beside a working old key is a host saying "not this one", and the old key answers.
+ */
+
+/**
+ * Sends one request the engine built, through whichever family the host injected.
+ *
+ * Every builder in requests.ts produces the NEW spelling, `secretName`, and hands the
+ * options here. A host that injected `forwardRequest` gets `forwardRequest(null,
+ * opts)`: null because the engine never has a form, the whole body is already in
+ * `opts.data`. A host that injected only the deprecated `clientSecretRequest` gets it
+ * with `secretName` moved back to `clientSecretName` and placed first, which is key
+ * for key, in the same order, the request it was handed before the rename. Nothing
+ * else about the options is touched on either path: `service`, `owner`, `queue`,
+ * `poll`, the stream flags, `headers` and `data` pass through as the builder made them.
+ *
+ * THE RENAME LIVES HERE AND NOWHERE ELSE. Done at each call site it is six copies of
+ * one translation, and the copy that drifts sends a request naming no secret at all.
+ * The old SDK refuses that; the new one, where the secret is optional, forwards it
+ * WITHOUT resolving anything, so the provider receives a literal "$CLIENT_SECRET" as
+ * its api key and the turn fails at the far end with nothing here to say why.
+ *
+ * Called as a method of the config, as the engine always called the transport, so a
+ * host that relied on `this` sees what it saw before.
+ *
+ * Throws when the host injected neither, with a message that names the fix. The
+ * builders that call this are async, so it reaches the caller as a rejected request,
+ * which is the shape the old "is not a function" TypeError had.
+ */
+export function resolveForwardRequest(): (opts: any) => Promise<any> {
+    const cfg = chatEngineConfig();
+    const fwd = cfg.forwardRequest;
+    if (typeof fwd === 'function') {
+        return (opts: any) => fwd.call(cfg, null, opts);
+    }
+    const legacy = cfg.clientSecretRequest;
+    if (typeof legacy === 'function') {
+        return (opts: any) => {
+            if (!opts || typeof opts !== 'object' || !('secretName' in opts)) return legacy.call(cfg, opts);
+            const { secretName, ...rest } = opts;
+            return legacy.call(cfg, Object.assign({ clientSecretName: secretName }, rest));
+        };
+    }
+    throw new Error(
+        '[chat-engine] No request transport: configureChatEngine() needs forwardRequest '
+        + '(or the deprecated clientSecretRequest), bound to a skapi instance.',
+    );
+}
+
+/**
+ * Lists chat history through whichever family the host injected. The two names take
+ * the same arguments and return the same thing, so this is a pure preference with no
+ * translation. Throws, like resolveForwardRequest, when the host injected neither.
+ */
+export function resolveForwardRequestHistory(): (params: any, fetchOptions: any) => Promise<any> {
+    const cfg = chatEngineConfig();
+    const hist = typeof cfg.forwardRequestHistory === 'function'
+        ? cfg.forwardRequestHistory
+        : cfg.clientSecretRequestHistory;
+    if (typeof hist === 'function') {
+        return (params: any, fetchOptions: any) => hist.call(cfg, params, fetchOptions);
+    }
+    throw new Error(
+        '[chat-engine] No history transport: configureChatEngine() needs forwardRequestHistory '
+        + '(or the deprecated clientSecretRequestHistory), bound to a skapi instance.',
+    );
+}
+
+/**
+ * The finalize hook, from whichever family the host injected, or undefined when it
+ * injected neither. Optional by design (a host without it still streams, it just
+ * leaves the chunks), so absence is an answer here and not an error. Returned
+ * unbound, because the engine has always called it as a plain function.
+ */
+export function resolveForwardRequestFinalize(): ForwardRequestFinalizeFn | undefined {
+    const cfg = chatEngineConfig();
+    if (typeof cfg.forwardRequestFinalize === 'function') return cfg.forwardRequestFinalize;
+    if (typeof cfg.clientSecretRequestFinalize === 'function') return cfg.clientSecretRequestFinalize;
+    return undefined;
+}
+
+/**
+ * The chunk reader, from whichever family the host injected, or undefined when it
+ * injected neither. Optional, and its presence is what arms recovery (see
+ * streamRecoveryEnabled), so both spellings arm it alike. Returned unbound, as above.
+ */
+export function resolveForwardRequestStream(): ForwardRequestStreamFn | undefined {
+    const cfg = chatEngineConfig();
+    if (typeof cfg.forwardRequestStream === 'function') return cfg.forwardRequestStream;
+    if (typeof cfg.clientSecretRequestStream === 'function') return cfg.clientSecretRequestStream;
+    return undefined;
 }
 
 /** True when the consumer has opted in to server-driven windowed indexing. */
@@ -313,10 +493,18 @@ export function liveStreamingEnabled(): boolean {
  * whose body the worker never managed to spill). That read finds no chunks, the
  * bubble is dropped, and the list looks exactly as it did before. Set
  * `streamRecovery: false` to opt out of even that.
+ *
+ * The reader is asked for through resolveForwardRequestStream, so either spelling of
+ * it arms recovery: `forwardRequestStream`, or the deprecated
+ * `clientSecretRequestStream` a host written before the rename still injects. Asked
+ * for the new key alone, this would quietly disarm recovery for every such host on
+ * its next install, which is the stranding described above arriving by a rename.
  */
 export function streamRecoveryEnabled(): boolean {
-    if (_config?.streamRecovery === false) return false;
-    return typeof _config?.clientSecretRequestStream === 'function';
+    // Unconfigured is "no reader", never a throw: this is asked on render paths.
+    if (!_config) return false;
+    if (_config.streamRecovery === false) return false;
+    return typeof resolveForwardRequestStream() === 'function';
 }
 
 /**
@@ -328,9 +516,10 @@ export function streamRecoveryEnabled(): boolean {
  * streamed turn carries TWO `stream` flags: skapi's (relay the destination's bytes
  * into the chunk table) and the DESTINATION's own field inside `data`, which
  * BunnyQuery is the party that sets, because skapi relays bytes and knows no
- * vendor. clientSecretRequest validates its params against a schema and KEEPS ONLY
- * THE KEYS IN THAT SCHEMA, so an skapi-js predating the feature does not reject
- * `stream` - it silently DROPS it. What ships is then the exact split
+ * vendor. skapi validates the request's params against a schema and KEEPS ONLY
+ * THE KEYS IN THAT SCHEMA, so an skapi-js predating the feature (whose only door
+ * was clientSecretRequest) does not reject `stream` - it silently DROPS it. What
+ * ships is then the exact split
  * chatStreamWiring exists to make impossible: the destination is asked to answer in
  * SSE frames, skapi waits and stores the whole transcript on the row, and
  * extractClaudeText / extractOpenAIText read a wall of `data: {...}` lines where a
@@ -356,11 +545,32 @@ export function streamRecoveryEnabled(): boolean {
  * able to fetch it. There is no cheap DIRECT probe of the schema: the only way to
  * learn that `stream` was dropped is to send a real request and read an empty
  * answer, which is the bug itself.
+ *
+ * EITHER SPELLING OF THE PAIR ANSWERS YES, and it has to be a whole pair. skapi-js
+ * renamed the two to forwardRequestStream and forwardRequestFinalize and kept the old
+ * names as aliases, so three SDKs are out there: the renamed one carries both pairs,
+ * one from the streaming release up to the rename carries only the old pair, and one
+ * that predates streaming carries neither. Accepting the old pair is what keeps an
+ * embed page pinned between the two releases streaming; accepting the new pair is
+ * what keeps this answering yes once the old aliases are finally removed. The
+ * reasoning above holds for both: each pair shipped in the same change as, or after,
+ * the `stream` key, and each IS the capability rather than a proxy for it. A mixed
+ * half of each is not a pair and is refused, because no real SDK has that shape and
+ * the engine would still be missing one half of the protocol under the name it asks
+ * for.
+ *
+ * A presence probe is safe for these two names in a way it is NOT for forwardRequest
+ * itself: no skapi-js ever shipped a forwardRequestStream or forwardRequestFinalize
+ * that meant something else, while an older forwardRequest exists and is the retired
+ * streaming forwarder. That is why the widget's family probe asks for
+ * forwardRequestHistory instead.
  */
 export function skapiSupportsStreaming(sk: any): boolean {
-    return !!sk
-        && typeof sk.clientSecretRequestStream === 'function'
-        && typeof sk.clientSecretRequestFinalize === 'function';
+    if (!sk) return false;
+    return (typeof sk.forwardRequestStream === 'function'
+            && typeof sk.forwardRequestFinalize === 'function')
+        || (typeof sk.clientSecretRequestStream === 'function'
+            && typeof sk.clientSecretRequestFinalize === 'function');
 }
 
 /** Spread helper: `{ ...pollOpt() }` adds `poll` only when configured. */

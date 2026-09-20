@@ -745,7 +745,7 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		// Read as "empty" (which is what the `assistantText` guard further down did),
 		// such a row produces NO assistant bubble at all and the answer is simply gone
 		// from the conversation, with every byte of it still sitting in the chunk
-		// table, reachable through clientSecretRequestStream. So it is marked instead,
+		// table, reachable through forwardRequestStream. So it is marked instead,
 		// and the two things that act on the mark are the merge (an unknown answer
 		// never overwrites a known one) and the recovery (an unknown answer is
 		// resolved by reading the chunks back). See ChatMessage._streamPending.

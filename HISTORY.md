@@ -24,6 +24,33 @@ A few notes on how to read this:
 
 ---
 
+## Unreleased (2026-09-18)
+
+The engine and the widget move to skapi-js's `forwardRequest` family, which replaces the
+`clientSecretRequest` family. Nothing an existing host does changes.
+
+### Engine
+
+- New `configureChatEngine` keys: `forwardRequest`, `forwardRequestHistory`,
+  `forwardRequestFinalize` and `forwardRequestStream`. The engine calls
+  `forwardRequest(null, opts)` and sends the secret's name as `secretName`.
+- The old keys, `clientSecretRequest`, `clientSecretRequestHistory`,
+  `clientSecretRequestFinalize` and `clientSecretRequestStream`, are still accepted and marked
+  deprecated. Through them the engine sends `clientSecretName` exactly as before, so a host
+  written against an earlier release keeps working unchanged. Where both spellings are given,
+  the new one wins. A host that injects neither fails with a message naming both.
+- `skapiSupportsStreaming` and `streamRecoveryEnabled` accept either spelling. A streaming SDK
+  still has to carry a whole pair, reader and finalize, under one spelling.
+
+### Widget
+
+- The widget picks the family on each embedder's page. It uses the `forwardRequest` family when
+  the page's skapi-js has `forwardRequestHistory`, and the `clientSecretRequest` family otherwise.
+  It never decides by `forwardRequest` alone, because on an earlier skapi-js that name is a
+  different, retired method with its own endpoint.
+- The chat transport, the queued-send cancel and the Google sign-in code exchange all go through
+  that one decision.
+
 ## 1.10.0 (2026-09-04, unpublished)
 
 Email (`.eml`) is read, windowed and indexed like any other document.

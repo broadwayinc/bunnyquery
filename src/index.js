@@ -169,8 +169,9 @@ import {
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
 
-    // Google OAuth endpoint (token exchange goes through skapi clientSecretRequest
-    // with the project's "ggl" client secret, exactly like bunnyquery oauth.ts).
+    // Google OAuth endpoint. The token exchange goes through skapi with the project's
+    // "ggl" client secret, exactly like bunnyquery oauth.ts: forwardRequest, or
+    // clientSecretRequest on an older skapi-js (see skapiForwardWithSecret).
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
     var GOOGLE_SCOPE =
@@ -476,7 +477,7 @@ import {
         }
     }
 
-    // Force a fresh JWT so the next clientSecretRequest carries a valid
+    // Force a fresh JWT so the next forwarded request carries a valid
     // $ACCESS_TOKEN (the MCP server validates it via loginWithToken).
     function refreshSkapiSession() {
         return getProfile(true).then(function (u) { return !!u; });
@@ -501,6 +502,116 @@ import {
                 return conn;
             })
             .catch(function () { return null; });
+    }
+
+    // WHICH REQUEST FAMILY THE EMBEDDER'S SKAPI-JS SPEAKS, asked in one place.
+    //
+    // skapi-js renamed clientSecretRequest and its companions to the forwardRequest
+    // family and kept every old name working, so a new SDK answers to both names and
+    // an old one only to the old. This widget is handed the EMBEDDER's instance, and
+    // its version is whatever their page pinned, so the widget has to ask rather
+    // than assume.
+    //
+    // NEVER BY forwardRequest ALONE. An older skapi-js also has a method called
+    // forwardRequest, taking the same (form, options), and it means something else
+    // entirely: the retired streaming forwarder, which posts to a different endpoint
+    // and injects the project's api key. A presence check on that name answers "new"
+    // for exactly the SDKs that are old, and every chat turn, cancel and Google
+    // sign-in would then go down the wrong path. forwardRequestHistory is the
+    // discriminator: it shipped with the rename, and no skapi-js before it has
+    // anything by that name. forwardRequest is asked for too only because it is the
+    // method the new branch then calls.
+    //
+    // Everything in the widget that touches the family goes through this: the
+    // engine's transport (skapiEngineTransport), the queued-send cancel
+    // (skapiCancelRequest) and the Google code exchange (skapiForwardWithSecret).
+    // Two call sites asking two different questions is how half a widget ends up on
+    // each family, which on an old SDK means a turn sent one way and cancelled the
+    // other.
+    function skapiHasForwardRequest(sk) {
+        return !!sk
+            && typeof sk.forwardRequestHistory === "function"
+            && typeof sk.forwardRequest === "function";
+    }
+
+    // One request of the widget's OWN (the engine's go through skapiEngineTransport),
+    // through whichever family the embedder's skapi-js speaks. `request` is everything
+    // except the secret's name, because that is the one field the two families spell
+    // differently: "secretName" on the new one, "clientSecretName" on the old one,
+    // where this is byte for byte the call the widget always made. The new method's
+    // first argument is the form, and this widget never has one.
+    function skapiForwardWithSecret(secretName, request) {
+        if (skapiHasForwardRequest(S.skapi)) {
+            return S.skapi.forwardRequest(null, Object.assign({ secretName: secretName }, request));
+        }
+        return S.skapi.clientSecretRequest(Object.assign({ clientSecretName: secretName }, request));
+    }
+
+    // Cancel a queued or running turn through the family that sent it. Same probe as
+    // the transport, so the two can never disagree about which one that was.
+    function skapiCancelRequest(opts) {
+        return skapiHasForwardRequest(S.skapi)
+            ? S.skapi.cancelForwardRequest(opts)
+            : S.skapi.cancelClientSecretRequest(opts);
+    }
+
+    // The transport keys handed to configureChatEngine, all from ONE family.
+    //
+    // A new skapi-js gets the new keys and an old one gets the old keys, exactly as
+    // this widget injected them before the rename. The engine accepts either family
+    // and prefers the new one, so injecting both would work too; one family is
+    // injected so that what the engine calls is plainly what the probe decided.
+    //
+    // `canStream` is skapiSupportsStreaming's answer for this instance, and it means
+    // the same thing under both families: on a new skapi-js the old names are aliases
+    // of the new ones, so an instance that has either pair has the one used here.
+    //
+    // What the two optional hooks are for, since they are the half of this that is
+    // easy to drop:
+    //
+    // FINALIZE stores the version of a streamed turn that history keeps. The engine
+    // sends the ASSEMBLED provider body, so a streamed turn reads back through exactly
+    // the extractors a buffered one does, with no branch in the mapper; storing is
+    // also what releases the chunks. Called only for a streamed turn, and best-effort
+    // inside the engine.
+    //
+    // STREAM is THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
+    // with a status and NO body: the answer is chunks until finalize copies a version
+    // onto the row. A row that settles while no poll is attached (the tab was closed,
+    // a mobile browser discarded it, the device slept and the interval stopped) is
+    // therefore never finalized, and without this hook the engine has no way back to
+    // it - the answer reads as gone from the conversation with every byte of it still
+    // stored. Given the request id this drains that turn's chunks in one pass, and the
+    // engine parses them exactly as it parses a live stream, finalizing what it read
+    // so the row becomes ordinary history and is never re-read.
+    //
+    // Both are handed over only when the SDK actually has them, so the engine's own
+    // "is this host able to?" checks answer honestly instead of a call reaching an
+    // undefined method mid-turn.
+    function skapiEngineTransport(canStream) {
+        if (skapiHasForwardRequest(S.skapi)) {
+            return {
+                forwardRequest: function (form, o) { return S.skapi.forwardRequest(form, o); },
+                forwardRequestHistory: function (p, f) { return S.skapi.forwardRequestHistory(p, f); },
+                forwardRequestFinalize: canStream ? function (requestId, data, options) {
+                    return S.skapi.forwardRequestFinalize(requestId, data, options);
+                } : undefined,
+                forwardRequestStream: canStream ? function (requestId, options) {
+                    return S.skapi.forwardRequestStream(requestId, options);
+                } : undefined,
+            };
+        }
+        // An older skapi-js: the deprecated keys, which the engine still accepts.
+        return {
+            clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
+            clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
+            clientSecretRequestFinalize: canStream ? function (requestId, data, options) {
+                return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+            } : undefined,
+            clientSecretRequestStream: canStream ? function (requestId, options) {
+                return S.skapi.clientSecretRequestStream(requestId, options);
+            } : undefined,
+        };
     }
 
     /* ========================================================================
@@ -844,8 +955,7 @@ import {
         var redirectUrl = ssGet(skey(SK.googleRedirect)) || (window.location.origin + window.location.pathname);
         var secretName = S.opts.googleClientSecretName || "ggl";
 
-        return S.skapi.clientSecretRequest({
-            clientSecretName: secretName,
+        return skapiForwardWithSecret(secretName, {
             url: GOOGLE_TOKEN_URL,
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1440,12 +1550,22 @@ import {
                 h("div", { class: "bq-account-value" + (opts.muted ? " is-muted" : "") }, valueNodes)),
             onAction ? h("button", { class: "bq-link" + (opts.dangerAction ? " bq-link--danger" : ""), type: "button", onclick: onAction, text: actionLabel || "Change" }) : null);
     }
-    function getNewsletterStatus() {
+    // Always asks about ONE user: the signed-in visitor. Called without "user_id" the
+    // route answers an admin of the project (access groups 90 ~ 99) with the whole
+    // group's subscriber list instead of that person's own row, so a staff visitor of
+    // a customer's site pulled that customer's subscriber list into this page, and the
+    // checkbox below was then set from whichever row happened to come back first. The
+    // dashboards pass "user_id" the same way whenever they want a single user.
+    function getNewsletterStatus(user) {
         // getNewsletterSubscription returns [{ active, group, subscribed_email, timestamp }]
         // (or a DatabaseResponse with that as .list). An UNSUBSCRIBED user can still have a
         // record with active:false, so check for an *active* record in the authorized group (1).
+        var userId = user && typeof user.user_id === "string" ? user.user_id : null;
+        // No signed-in user means there is no own subscription to report. Falling back to
+        // a user_id-less call here is exactly the whole-list request this guard prevents.
+        if (!userId) return Promise.resolve(false);
         try {
-            return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized" }))
+            return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized", user_id: userId }))
                 .then(function (res) {
                     var list = res && res.list ? res.list : res;
                     if (!Array.isArray(list)) return false;
@@ -1486,9 +1606,13 @@ import {
         clear(CS.messagesBox);
         CS.messagesBox.appendChild(h("div", { class: "bq-chat-settings" },
             h("div", { class: "bq-chat-settings-loading" }, bunnyLoader("Loading..."))));
-        Promise.all([getProfile(), getNewsletterStatus()]).then(function (res) {
-            if (res[0]) S.user = res[0];
-            S.newsletterSubscribed = res[1];
+        // Sequential, not Promise.all: the newsletter lookup needs the signed-in user's
+        // user_id to stay scoped to their own subscription, so the profile has to land first.
+        getProfile().then(function (user) {
+            if (user) S.user = user;
+            return getNewsletterStatus(S.user);
+        }).then(function (subscribed) {
+            S.newsletterSubscribed = subscribed;
             renderSettingsIntoBox();
         }).catch(function () { renderSettingsIntoBox(); });
     }
@@ -1844,7 +1968,7 @@ import {
             if (!fetchMore) ensureHistoryFillsViewport(token);
         },
         settleScroll: function () { settleScrollAfterRefresh(); },
-        cancelRequest: function (opts) { return S.skapi.cancelClientSecretRequest(opts); },
+        cancelRequest: function (opts) { return skapiCancelRequest(opts); },
         refreshSession: function () { return refreshSkapiSession(); },
         formatIndexingLabel: function (name, mime, size, storagePath, reindex, continued) {
             return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
@@ -5417,14 +5541,16 @@ import {
         // turn: without skapi's half of the flag the destination still streams SSE
         // into a buffered row and every answer reads back empty, which is worse than
         // not streaming in every way. See skapiSupportsStreaming for why the two
-        // methods are the probe. Loud, because an embedder who set the flag and got
-        // nothing has no other way to find out; once, at init, not per turn.
+        // methods are the probe, under either family's names. Loud, because an
+        // embedder who set the flag and got nothing has no other way to find out;
+        // once, at init, not per turn.
         var canStream = skapiSupportsStreaming(S.skapi);
         var liveStreaming = S.opts.liveStreaming === true;
         if (liveStreaming && !canStream) {
             liveStreaming = false;
             console.warn(
-                "[bunnyquery] liveStreaming was requested but this page's skapi-js has no " +
+                "[bunnyquery] liveStreaming was requested but this page's skapi-js has neither " +
+                "forwardRequestStream/forwardRequestFinalize nor the older " +
                 "clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the " +
                 "stream flag would be dropped and every reply would read back empty. " +
                 "Falling back to buffered replies - update skapi-js to enable streaming."
@@ -5458,9 +5584,12 @@ import {
         // engine. poll: 0 — the deployed skapi-js@latest returns the early ack
         // (with id + a manual .poll()) only when poll===0, which queued-send
         // cancel relies on (the agent.vue build omits poll; see chat-engine).
-        configureChatEngine({
-            clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
-            clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
+        //
+        // The transport itself (dispatch, history, finalize and the chunk reader)
+        // comes from skapiEngineTransport, which picks ONE family by the embedder's
+        // skapi-js and is assigned over the rest below. See skapiHasForwardRequest
+        // for why that probe is not forwardRequest's own presence.
+        configureChatEngine(Object.assign({
             // Single-item csr-poll point lookup: how the engine hydrates a
             // compact history stub's real body when an indexing row expands.
             csrHistoryItemLookup: function (fullId, service, owner) {
@@ -5505,31 +5634,12 @@ import {
             // Requires liveStreaming, and cannot outlive it: the AND is what stops an
             // embedder turning on socket delivery for a reply that is not streamed.
             liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true,
-            // What stores the version of a streamed turn that history keeps. The
-            // engine sends the ASSEMBLED provider body, so a streamed turn reads
-            // back through exactly the extractors a buffered one does, with no
-            // branch in the mapper; storing is also what releases the chunks.
-            // Called only for a streamed turn, and best-effort inside the engine.
-            // Handed over only when the SDK actually has it, so the engine's own
-            // "is this host able to?" checks answer honestly instead of a call
-            // reaching an undefined method mid-turn.
-            clientSecretRequestFinalize: canStream ? function (requestId, data, options) {
-                return S.skapi.clientSecretRequestFinalize(requestId, data, options);
-            } : undefined,
-            // THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
-            // with a status and NO body: the answer is chunks until finalize copies
-            // a version onto the row. A row that settles while no poll is attached
-            // (the tab was closed, a mobile browser discarded it, the device slept
-            // and the interval stopped) is therefore never finalized, and without
-            // this hook the engine has no way back to it - the answer reads as gone
-            // from the conversation with every byte of it still stored. Given the
-            // request id this drains that turn's chunks in one pass, and the engine
-            // parses them exactly as it parses a live stream, finalizing what it
-            // read so the row becomes ordinary history and is never re-read.
-            clientSecretRequestStream: canStream ? function (requestId, options) {
-                return S.skapi.clientSecretRequestStream(requestId, options);
-            } : undefined,
-        });
+            // The transport: dispatch and history, plus the finalize hook that stores
+            // a streamed turn's kept version and the chunk reader that is the second
+            // half of the durability guarantee. The two optional hooks are handed
+            // over only when canStream says the SDK has them. skapiEngineTransport
+            // says what each one is for, and picks the family.
+        }, skapiEngineTransport(canStream)));
 
         // Recompute the attachment "...(x) more" overflow when the viewport
         // changes (no-op when the chat/attachments aren't mounted).

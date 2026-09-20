@@ -42,7 +42,7 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig } from './config';
+import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream } from './config';
 // The wire-format knowledge. skapi relays the provider's bytes without reading them,
 // so the session hands them straight to this parser and never inspects a frame itself.
 import { createSseParser, type SseParser } from './sse';
@@ -398,7 +398,7 @@ export function typewriterResumeIndex(
  *   because the row's status describes the destination's request and not our read
  *   of it. Anything short of a finished answer leaves the chunks exactly where they
  *   are, which is what they are for: the turn stays re-readable through
- *   clientSecretRequestStream and a later load recovers it in full.
+ *   forwardRequestStream and a later load recovers it in full.
  *
  *   `unframed` is the one exception to needing a terminal event, and it is not a
  *   loophole: bytes that were never SSE carry no events at all and none is ever
@@ -1049,7 +1049,7 @@ export class ChatSession {
 			// Both wrappers are needed and neither is redundant: a poll attached to a
 			// HISTORY ITEM honours the onResponse passed here (that is how the re-attach
 			// path resolves a turn), while a poll attached to a fresh DISPATCH ack takes
-			// its callbacks from the original clientSecretRequest and reports only
+			// its callbacks from the original forwardRequest and reports only
 			// through the promise. Substituting in one place would leave the other
 			// reading the envelope.
 			var streamOpts = Object.assign({}, inner, {
@@ -1566,7 +1566,7 @@ export class ChatSession {
 	private _finalizeStreamedTurn(st: LiveStreamState): void {
 		if (st.finalized) return;
 		if (!this._mayFinalize(st)) return;
-		var fin = chatEngineConfig().clientSecretRequestFinalize;
+		var fin = resolveForwardRequestFinalize();
 		if (!fin || st.finalBody == null) return;
 		st.finalized = true;
 		var url = st.platform === 'openai' ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
@@ -1574,10 +1574,10 @@ export class ChatSession {
 			Promise.resolve(fin(st.id, st.finalBody, {
 				url: url, method: 'POST', service: st.projectId, owner: st.owner,
 			})).catch(function (err: any) {
-				console.warn('[chat-engine] clientSecretRequestFinalize failed', err);
+				console.warn('[chat-engine] forwardRequestFinalize failed', err);
 			});
 		} catch (e) {
-			console.warn('[chat-engine] clientSecretRequestFinalize threw', e);
+			console.warn('[chat-engine] forwardRequestFinalize threw', e);
 		}
 	}
 
@@ -1888,8 +1888,7 @@ export class ChatSession {
 	}
 
 	private _readBackStreamedTurn(itemId: string, ownerKey: string, platform: 'claude' | 'openai', projectId: string, owner: string, manual?: boolean): Promise<void> {
-		var cfg = chatEngineConfig();
-		var read = cfg.clientSecretRequestStream;
+		var read = resolveForwardRequestStream();
 		if (!read || !itemId) return Promise.resolve();
 		// IN FLIGHT is the only refusal a user-driven retry accepts, and it is about
 		// this request rather than about the history of the row: two reads of the same
@@ -2097,7 +2096,7 @@ export class ChatSession {
 		// to go back for the missing part.
 		if (!degraded) delete this._rec().incomplete[itemId];
 		if (!store || body == null || isErr) return;
-		var fin = chatEngineConfig().clientSecretRequestFinalize;
+		var fin = resolveForwardRequestFinalize();
 		if (!fin) return;
 		var url = platform === 'openai' ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
 		try {

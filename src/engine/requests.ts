@@ -3,7 +3,11 @@
  *
  * Ported from www.skapi.com/src/code/ai_agent.ts. The only changes vs the
  * original are dependency-injection seams:
- *   - `skapi.clientSecretRequest*`  -> chatEngineConfig().clientSecretRequest*
+ *   - `skapi.clientSecretRequest*`  -> resolveForwardRequest*() in config.ts,
+ *                                    which dispatches through the host's
+ *                                    `forwardRequest*` keys, or the deprecated
+ *                                    `clientSecretRequest*` ones a host written
+ *                                    before the rename still injects
  *   - MCP endpoint URL              -> chatEngineConfig().mcpBaseUrl
  *   - `poll` on each request        -> pollOpt() (set per consumer; see config.ts)
  *   - Vue `reactive`/`ref` removed  (bgTaskQueue/agentViewMounted are app-level
@@ -12,7 +16,7 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens, getModelContextWindow } from './budget';
@@ -134,7 +138,11 @@ function mcpEndpointFor(
 	const project = publicProjectId || service;
 	return { url: String(mcpUrl()).replace(/\/+$/, '') + '/p/' + project };
 }
-const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretRequest(opts);
+// Every request below is built with `secretName` and sent through here. Which of
+// the host's two transport families it reaches, and the rename back to
+// `clientSecretName` for a host on the old one, is decided in resolveForwardRequest
+// and nowhere else, so no builder ever spells the old name.
+const forwardRequest = (opts: any) => resolveForwardRequest()(opts);
 
 /**
  * THE two `stream` flags of a streamed chat turn, produced together or not at all.
@@ -164,7 +172,7 @@ const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretReques
  * that drifts when someone edits one arm.
  */
 export type ChatStreamWiring = {
-	/** Spread into the clientSecretRequest OPTIONS (skapi's relay switch). `realtime`
+	/** Spread into the forwardRequest OPTIONS (skapi's relay switch). `realtime`
 	 *  belongs here and never in `body`: it is skapi's, not the destination's. */
 	transport: { stream?: true; realtime?: true };
 	/** Spread into `data` (the destination's own switch). */
@@ -661,8 +669,8 @@ export async function callClaudeWithMcp({
 	// on the bg queue) is recognised and left buffered.
 	const stream = chatStreamWiring(userId || service);
 
-	return clientSecretRequest({
-		clientSecretName: 'claude',
+	return forwardRequest({
+		secretName: 'claude',
 		queue: userId || service,
 		service,
 		owner,
@@ -818,8 +826,8 @@ export async function callOpenAIWithPublicMcp(
 	// ONE decision, spread in TWO places - see chatStreamWiring.
 	const stream = chatStreamWiring(userId || service);
 
-	return clientSecretRequest({
-		clientSecretName: 'openai',
+	return forwardRequest({
+		secretName: 'openai',
 		queue: userId || service,
 		service,
 		owner,
@@ -1138,8 +1146,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	if (platform === 'openai') {
 		const resolvedModel = info.model || DEFAULT_OPENAI_MODEL;
 		const imageDetail = getOpenAIImageDetail(resolvedModel);
-		return tapDispatchFailure(clientSecretRequest({
-			clientSecretName: 'openai',
+		return tapDispatchFailure(forwardRequest({
+			secretName: 'openai',
 			queue: bgIndexingQueueName(info.userId, service),
 			service,
 			owner,
@@ -1188,8 +1196,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	}
 
 	const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-	return tapDispatchFailure(clientSecretRequest({
-		clientSecretName: 'claude',
+	return tapDispatchFailure(forwardRequest({
+		secretName: 'claude',
 		queue: bgIndexingQueueName(info.userId, service),
 		service,
 		owner,
@@ -1308,8 +1316,8 @@ export function extractOpenAIText(response: any) {
 // not even a reader to hand chunks to. chatStreamWiring is deliberately not called
 // here - the pair is chat-turn-only.
 export async function listClaudeModels(service: string, owner: string) {
-	return clientSecretRequest({
-		clientSecretName: 'claude',
+	return forwardRequest({
+		secretName: 'claude',
 		service,
 		owner,
 		url: ANTHROPIC_MODELS_API_URL,
@@ -1322,8 +1330,8 @@ export async function listClaudeModels(service: string, owner: string) {
 }
 
 export async function listOpenAIModels(service: string, owner: string) {
-	return clientSecretRequest({
-		clientSecretName: 'openai',
+	return forwardRequest({
+		secretName: 'openai',
 		service,
 		owner,
 		url: OPENAI_MODELS_API_URL,
@@ -1544,7 +1552,7 @@ export async function getChatHistory(
 		params.queue_exclude ? { queue_exclude: params.queue_exclude } : {},
 	);
 
-	return chatEngineConfig().clientSecretRequestHistory(
+	return resolveForwardRequestHistory()(
 		p as { url: string; method: 'POST'; queue?: string; status?: string },
 		Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions),
 	);

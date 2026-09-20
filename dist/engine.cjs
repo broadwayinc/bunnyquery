@@ -61,6 +61,46 @@ function chatEngineConfig() {
   }
   return _config;
 }
+function resolveForwardRequest() {
+  const cfg = chatEngineConfig();
+  const fwd = cfg.forwardRequest;
+  if (typeof fwd === "function") {
+    return (opts) => fwd.call(cfg, null, opts);
+  }
+  const legacy = cfg.clientSecretRequest;
+  if (typeof legacy === "function") {
+    return (opts) => {
+      if (!opts || typeof opts !== "object" || !("secretName" in opts)) return legacy.call(cfg, opts);
+      const { secretName, ...rest } = opts;
+      return legacy.call(cfg, Object.assign({ clientSecretName: secretName }, rest));
+    };
+  }
+  throw new Error(
+    "[chat-engine] No request transport: configureChatEngine() needs forwardRequest (or the deprecated clientSecretRequest), bound to a skapi instance."
+  );
+}
+function resolveForwardRequestHistory() {
+  const cfg = chatEngineConfig();
+  const hist = typeof cfg.forwardRequestHistory === "function" ? cfg.forwardRequestHistory : cfg.clientSecretRequestHistory;
+  if (typeof hist === "function") {
+    return (params, fetchOptions) => hist.call(cfg, params, fetchOptions);
+  }
+  throw new Error(
+    "[chat-engine] No history transport: configureChatEngine() needs forwardRequestHistory (or the deprecated clientSecretRequestHistory), bound to a skapi instance."
+  );
+}
+function resolveForwardRequestFinalize() {
+  const cfg = chatEngineConfig();
+  if (typeof cfg.forwardRequestFinalize === "function") return cfg.forwardRequestFinalize;
+  if (typeof cfg.clientSecretRequestFinalize === "function") return cfg.clientSecretRequestFinalize;
+  return void 0;
+}
+function resolveForwardRequestStream() {
+  const cfg = chatEngineConfig();
+  if (typeof cfg.forwardRequestStream === "function") return cfg.forwardRequestStream;
+  if (typeof cfg.clientSecretRequestStream === "function") return cfg.clientSecretRequestStream;
+  return void 0;
+}
 function windowedIndexingEnabled() {
   return _config?.windowedIndexing === true;
 }
@@ -71,11 +111,13 @@ function liveStreamingEnabled() {
   return _config?.liveStreaming === true;
 }
 function streamRecoveryEnabled() {
-  if (_config?.streamRecovery === false) return false;
-  return typeof _config?.clientSecretRequestStream === "function";
+  if (!_config) return false;
+  if (_config.streamRecovery === false) return false;
+  return typeof resolveForwardRequestStream() === "function";
 }
 function skapiSupportsStreaming(sk) {
-  return !!sk && typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
+  if (!sk) return false;
+  return typeof sk.forwardRequestStream === "function" && typeof sk.forwardRequestFinalize === "function" || typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
 }
 function pollOpt() {
   const p = _config?.poll;
@@ -2177,7 +2219,7 @@ function mcpEndpointFor(anonymous, publicProjectId, service) {
   const project = publicProjectId || service;
   return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
 }
-var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
+var forwardRequest = (opts) => resolveForwardRequest()(opts);
 var CHAT_STREAM_ON = Object.freeze({
   transport: Object.freeze({ stream: true }),
   body: Object.freeze({ stream: true })
@@ -2368,8 +2410,8 @@ async function callClaudeWithMcp({
     mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
   }
   const stream = chatStreamWiring(userId || service);
-  return clientSecretRequest({
-    clientSecretName: "claude",
+  return forwardRequest({
+    secretName: "claude",
     queue: userId || service,
     service,
     owner,
@@ -2474,8 +2516,8 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
     }))
   ];
   const stream = chatStreamWiring(userId || service);
-  return clientSecretRequest({
-    clientSecretName: "openai",
+  return forwardRequest({
+    secretName: "openai",
     queue: userId || service,
     service,
     owner,
@@ -2624,8 +2666,8 @@ async function notifyAgentSaveAttachment(info) {
   if (platform === "openai") {
     const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
     const imageDetail = getOpenAIImageDetail(resolvedModel2);
-    return tapDispatchFailure(clientSecretRequest({
-      clientSecretName: "openai",
+    return tapDispatchFailure(forwardRequest({
+      secretName: "openai",
       queue: bgIndexingQueueName(info.userId, service),
       service,
       owner,
@@ -2671,8 +2713,8 @@ async function notifyAgentSaveAttachment(info) {
     }));
   }
   const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-  return tapDispatchFailure(clientSecretRequest({
-    clientSecretName: "claude",
+  return tapDispatchFailure(forwardRequest({
+    secretName: "claude",
     queue: bgIndexingQueueName(info.userId, service),
     service,
     owner,
@@ -2763,8 +2805,8 @@ function extractOpenAIText(response) {
   return "";
 }
 async function listClaudeModels(service, owner) {
-  return clientSecretRequest({
-    clientSecretName: "claude",
+  return forwardRequest({
+    secretName: "claude",
     service,
     owner,
     url: ANTHROPIC_MODELS_API_URL,
@@ -2776,8 +2818,8 @@ async function listClaudeModels(service, owner) {
   });
 }
 async function listOpenAIModels(service, owner) {
-  return clientSecretRequest({
-    clientSecretName: "openai",
+  return forwardRequest({
+    secretName: "openai",
     service,
     owner,
     url: OPENAI_MODELS_API_URL,
@@ -2831,7 +2873,7 @@ async function getChatHistory(params, fetchOptions) {
     params.compact ? { compact: true } : {},
     params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
   );
-  return chatEngineConfig().clientSecretRequestHistory(
+  return resolveForwardRequestHistory()(
     p,
     Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
   );
@@ -4604,7 +4646,7 @@ var ChatSession = class {
   _finalizeStreamedTurn(st) {
     if (st.finalized) return;
     if (!this._mayFinalize(st)) return;
-    var fin = chatEngineConfig().clientSecretRequestFinalize;
+    var fin = resolveForwardRequestFinalize();
     if (!fin || st.finalBody == null) return;
     st.finalized = true;
     var url = st.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
@@ -4615,10 +4657,10 @@ var ChatSession = class {
         service: st.projectId,
         owner: st.owner
       })).catch(function(err) {
-        console.warn("[chat-engine] clientSecretRequestFinalize failed", err);
+        console.warn("[chat-engine] forwardRequestFinalize failed", err);
       });
     } catch (e) {
-      console.warn("[chat-engine] clientSecretRequestFinalize threw", e);
+      console.warn("[chat-engine] forwardRequestFinalize threw", e);
     }
   }
   /** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
@@ -4833,8 +4875,7 @@ var ChatSession = class {
     return this._readBackStreamedTurn(itemId, this.getHistoryCacheKey(), platform, id ? id.projectId : "", id ? id.owner : "", true);
   }
   _readBackStreamedTurn(itemId, ownerKey, platform, projectId, owner, manual) {
-    var cfg = chatEngineConfig();
-    var read = cfg.clientSecretRequestStream;
+    var read = resolveForwardRequestStream();
     if (!read || !itemId) return Promise.resolve();
     if (this._rec().inflight[itemId]) return Promise.resolve();
     if (!manual && this._rec().attempted[itemId]) {
@@ -4947,7 +4988,7 @@ var ChatSession = class {
     }
     if (!degraded) delete this._rec().incomplete[itemId];
     if (!store || body == null || isErr) return;
-    var fin = chatEngineConfig().clientSecretRequestFinalize;
+    var fin = resolveForwardRequestFinalize();
     if (!fin) return;
     var url = platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
     try {

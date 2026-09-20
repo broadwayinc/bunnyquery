@@ -56,6 +56,46 @@
     }
     return _config;
   }
+  function resolveForwardRequest() {
+    const cfg = chatEngineConfig();
+    const fwd = cfg.forwardRequest;
+    if (typeof fwd === "function") {
+      return (opts) => fwd.call(cfg, null, opts);
+    }
+    const legacy = cfg.clientSecretRequest;
+    if (typeof legacy === "function") {
+      return (opts) => {
+        if (!opts || typeof opts !== "object" || !("secretName" in opts)) return legacy.call(cfg, opts);
+        const { secretName, ...rest } = opts;
+        return legacy.call(cfg, Object.assign({ clientSecretName: secretName }, rest));
+      };
+    }
+    throw new Error(
+      "[chat-engine] No request transport: configureChatEngine() needs forwardRequest (or the deprecated clientSecretRequest), bound to a skapi instance."
+    );
+  }
+  function resolveForwardRequestHistory() {
+    const cfg = chatEngineConfig();
+    const hist = typeof cfg.forwardRequestHistory === "function" ? cfg.forwardRequestHistory : cfg.clientSecretRequestHistory;
+    if (typeof hist === "function") {
+      return (params, fetchOptions) => hist.call(cfg, params, fetchOptions);
+    }
+    throw new Error(
+      "[chat-engine] No history transport: configureChatEngine() needs forwardRequestHistory (or the deprecated clientSecretRequestHistory), bound to a skapi instance."
+    );
+  }
+  function resolveForwardRequestFinalize() {
+    const cfg = chatEngineConfig();
+    if (typeof cfg.forwardRequestFinalize === "function") return cfg.forwardRequestFinalize;
+    if (typeof cfg.clientSecretRequestFinalize === "function") return cfg.clientSecretRequestFinalize;
+    return void 0;
+  }
+  function resolveForwardRequestStream() {
+    const cfg = chatEngineConfig();
+    if (typeof cfg.forwardRequestStream === "function") return cfg.forwardRequestStream;
+    if (typeof cfg.clientSecretRequestStream === "function") return cfg.clientSecretRequestStream;
+    return void 0;
+  }
   function windowedIndexingEnabled() {
     return _config?.windowedIndexing === true;
   }
@@ -66,11 +106,13 @@
     return _config?.liveStreaming === true;
   }
   function streamRecoveryEnabled() {
-    if (_config?.streamRecovery === false) return false;
-    return typeof _config?.clientSecretRequestStream === "function";
+    if (!_config) return false;
+    if (_config.streamRecovery === false) return false;
+    return typeof resolveForwardRequestStream() === "function";
   }
   function skapiSupportsStreaming(sk) {
-    return !!sk && typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
+    if (!sk) return false;
+    return typeof sk.forwardRequestStream === "function" && typeof sk.forwardRequestFinalize === "function" || typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
   }
   function pollOpt() {
     const p = _config?.poll;
@@ -2092,7 +2134,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const project = publicProjectId || service;
     return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
   }
-  var clientSecretRequest = (opts) => chatEngineConfig().clientSecretRequest(opts);
+  var forwardRequest = (opts) => resolveForwardRequest()(opts);
   var CHAT_STREAM_ON = Object.freeze({
     transport: Object.freeze({ stream: true }),
     body: Object.freeze({ stream: true })
@@ -2283,8 +2325,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
     }
     const stream = chatStreamWiring(userId || service);
-    return clientSecretRequest({
-      clientSecretName: "claude",
+    return forwardRequest({
+      secretName: "claude",
       queue: userId || service,
       service,
       owner,
@@ -2389,8 +2431,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }))
     ];
     const stream = chatStreamWiring(userId || service);
-    return clientSecretRequest({
-      clientSecretName: "openai",
+    return forwardRequest({
+      secretName: "openai",
       queue: userId || service,
       service,
       owner,
@@ -2539,8 +2581,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (platform === "openai") {
       const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
       const imageDetail = getOpenAIImageDetail(resolvedModel2);
-      return tapDispatchFailure(clientSecretRequest({
-        clientSecretName: "openai",
+      return tapDispatchFailure(forwardRequest({
+        secretName: "openai",
         queue: bgIndexingQueueName(info.userId, service),
         service,
         owner,
@@ -2586,8 +2628,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }));
     }
     const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-    return tapDispatchFailure(clientSecretRequest({
-      clientSecretName: "claude",
+    return tapDispatchFailure(forwardRequest({
+      secretName: "claude",
       queue: bgIndexingQueueName(info.userId, service),
       service,
       owner,
@@ -2721,7 +2763,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       params.compact ? { compact: true } : {},
       params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
     );
-    return chatEngineConfig().clientSecretRequestHistory(
+    return resolveForwardRequestHistory()(
       p,
       Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
     );
@@ -4460,7 +4502,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     _finalizeStreamedTurn(st) {
       if (st.finalized) return;
       if (!this._mayFinalize(st)) return;
-      var fin = chatEngineConfig().clientSecretRequestFinalize;
+      var fin = resolveForwardRequestFinalize();
       if (!fin || st.finalBody == null) return;
       st.finalized = true;
       var url = st.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
@@ -4471,10 +4513,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           service: st.projectId,
           owner: st.owner
         })).catch(function(err) {
-          console.warn("[chat-engine] clientSecretRequestFinalize failed", err);
+          console.warn("[chat-engine] forwardRequestFinalize failed", err);
         });
       } catch (e) {
-        console.warn("[chat-engine] clientSecretRequestFinalize threw", e);
+        console.warn("[chat-engine] forwardRequestFinalize threw", e);
       }
     }
     /** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
@@ -4689,8 +4731,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return this._readBackStreamedTurn(itemId, this.getHistoryCacheKey(), platform, id ? id.projectId : "", id ? id.owner : "", true);
     }
     _readBackStreamedTurn(itemId, ownerKey, platform, projectId, owner, manual) {
-      var cfg = chatEngineConfig();
-      var read = cfg.clientSecretRequestStream;
+      var read = resolveForwardRequestStream();
       if (!read || !itemId) return Promise.resolve();
       if (this._rec().inflight[itemId]) return Promise.resolve();
       if (!manual && this._rec().attempted[itemId]) {
@@ -4803,7 +4844,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       if (!degraded) delete this._rec().incomplete[itemId];
       if (!store || body == null || isErr) return;
-      var fin = chatEngineConfig().clientSecretRequestFinalize;
+      var fin = resolveForwardRequestFinalize();
       if (!fin) return;
       var url = platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
       try {
@@ -8587,6 +8628,50 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return null;
       });
     }
+    function skapiHasForwardRequest(sk) {
+      return !!sk && typeof sk.forwardRequestHistory === "function" && typeof sk.forwardRequest === "function";
+    }
+    function skapiForwardWithSecret(secretName, request) {
+      if (skapiHasForwardRequest(S.skapi)) {
+        return S.skapi.forwardRequest(null, Object.assign({ secretName }, request));
+      }
+      return S.skapi.clientSecretRequest(Object.assign({ clientSecretName: secretName }, request));
+    }
+    function skapiCancelRequest(opts) {
+      return skapiHasForwardRequest(S.skapi) ? S.skapi.cancelForwardRequest(opts) : S.skapi.cancelClientSecretRequest(opts);
+    }
+    function skapiEngineTransport(canStream) {
+      if (skapiHasForwardRequest(S.skapi)) {
+        return {
+          forwardRequest: function(form, o) {
+            return S.skapi.forwardRequest(form, o);
+          },
+          forwardRequestHistory: function(p, f) {
+            return S.skapi.forwardRequestHistory(p, f);
+          },
+          forwardRequestFinalize: canStream ? function(requestId, data, options) {
+            return S.skapi.forwardRequestFinalize(requestId, data, options);
+          } : void 0,
+          forwardRequestStream: canStream ? function(requestId, options) {
+            return S.skapi.forwardRequestStream(requestId, options);
+          } : void 0
+        };
+      }
+      return {
+        clientSecretRequest: function(o) {
+          return S.skapi.clientSecretRequest(o);
+        },
+        clientSecretRequestHistory: function(p, f) {
+          return S.skapi.clientSecretRequestHistory(p, f);
+        },
+        clientSecretRequestFinalize: canStream ? function(requestId, data, options) {
+          return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+        } : void 0,
+        clientSecretRequestStream: canStream ? function(requestId, options) {
+          return S.skapi.clientSecretRequestStream(requestId, options);
+        } : void 0
+      };
+    }
     function render(viewName, builder) {
       if (!S.root) return;
       S.view = viewName;
@@ -8880,8 +8965,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var code = getQueryParam("code");
       var redirectUrl = ssGet(skey(SK.googleRedirect)) || window.location.origin + window.location.pathname;
       var secretName = S.opts.googleClientSecretName || "ggl";
-      return S.skapi.clientSecretRequest({
-        clientSecretName: secretName,
+      return skapiForwardWithSecret(secretName, {
         url: GOOGLE_TOKEN_URL,
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -9559,9 +9643,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         onAction ? h("button", { class: "bq-link" + (opts.dangerAction ? " bq-link--danger" : ""), type: "button", onclick: onAction, text: actionLabel || "Change" }) : null
       );
     }
-    function getNewsletterStatus() {
+    function getNewsletterStatus(user) {
+      var userId = user && typeof user.user_id === "string" ? user.user_id : null;
+      if (!userId) return Promise.resolve(false);
       try {
-        return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized" })).then(function(res) {
+        return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized", user_id: userId })).then(function(res) {
           var list = res && res.list ? res.list : res;
           if (!Array.isArray(list)) return false;
           return list.some(function(s) {
@@ -9601,9 +9687,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         { class: "bq-chat-settings" },
         h("div", { class: "bq-chat-settings-loading" }, bunnyLoader("Loading..."))
       ));
-      Promise.all([getProfile(), getNewsletterStatus()]).then(function(res) {
-        if (res[0]) S.user = res[0];
-        S.newsletterSubscribed = res[1];
+      getProfile().then(function(user) {
+        if (user) S.user = user;
+        return getNewsletterStatus(S.user);
+      }).then(function(subscribed) {
+        S.newsletterSubscribed = subscribed;
         renderSettingsIntoBox();
       }).catch(function() {
         renderSettingsIntoBox();
@@ -10080,7 +10168,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         settleScrollAfterRefresh();
       },
       cancelRequest: function(opts) {
-        return S.skapi.cancelClientSecretRequest(opts);
+        return skapiCancelRequest(opts);
       },
       refreshSession: function() {
         return refreshSkapiSession();
@@ -12852,7 +12940,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (liveStreaming && !canStream) {
         liveStreaming = false;
         console.warn(
-          "[bunnyquery] liveStreaming was requested but this page's skapi-js has no clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Falling back to buffered replies - update skapi-js to enable streaming."
+          "[bunnyquery] liveStreaming was requested but this page's skapi-js has neither forwardRequestStream/forwardRequestFinalize nor the older clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Falling back to buffered replies - update skapi-js to enable streaming."
         );
       }
       configureProjectSettings(function(service) {
@@ -12862,13 +12950,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           return rec && rec.data || null;
         });
       });
-      configureChatEngine({
-        clientSecretRequest: function(o) {
-          return S.skapi.clientSecretRequest(o);
-        },
-        clientSecretRequestHistory: function(p, f) {
-          return S.skapi.clientSecretRequestHistory(p, f);
-        },
+      configureChatEngine(Object.assign({
         // Single-item csr-poll point lookup: how the engine hydrates a
         // compact history stub's real body when an indexing row expands.
         csrHistoryItemLookup: function(fullId, service, owner) {
@@ -12912,32 +12994,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         liveStreaming,
         // Requires liveStreaming, and cannot outlive it: the AND is what stops an
         // embedder turning on socket delivery for a reply that is not streamed.
-        liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true,
-        // What stores the version of a streamed turn that history keeps. The
-        // engine sends the ASSEMBLED provider body, so a streamed turn reads
-        // back through exactly the extractors a buffered one does, with no
-        // branch in the mapper; storing is also what releases the chunks.
-        // Called only for a streamed turn, and best-effort inside the engine.
-        // Handed over only when the SDK actually has it, so the engine's own
-        // "is this host able to?" checks answer honestly instead of a call
-        // reaching an undefined method mid-turn.
-        clientSecretRequestFinalize: canStream ? function(requestId, data, options) {
-          return S.skapi.clientSecretRequestFinalize(requestId, data, options);
-        } : void 0,
-        // THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
-        // with a status and NO body: the answer is chunks until finalize copies
-        // a version onto the row. A row that settles while no poll is attached
-        // (the tab was closed, a mobile browser discarded it, the device slept
-        // and the interval stopped) is therefore never finalized, and without
-        // this hook the engine has no way back to it - the answer reads as gone
-        // from the conversation with every byte of it still stored. Given the
-        // request id this drains that turn's chunks in one pass, and the engine
-        // parses them exactly as it parses a live stream, finalizing what it
-        // read so the row becomes ordinary history and is never re-read.
-        clientSecretRequestStream: canStream ? function(requestId, options) {
-          return S.skapi.clientSecretRequestStream(requestId, options);
-        } : void 0
-      });
+        liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true
+        // The transport: dispatch and history, plus the finalize hook that stores
+        // a streamed turn's kept version and the chunk reader that is the second
+        // half of the durability guarantee. The two optional hooks are handed
+        // over only when canStream says the SDK has them. skapiEngineTransport
+        // says what each one is for, and picks the family.
+      }, skapiEngineTransport(canStream)));
       if (!S._resizeBound && typeof window !== "undefined" && window.addEventListener) {
         S._resizeBound = true;
         window.addEventListener("resize", function() {

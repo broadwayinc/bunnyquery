@@ -86,6 +86,11 @@ call `BunnyQuery.init()`:
 That's it. BunnyQuery takes over the `#chatbox` element and renders the login or
 chat view depending on the user's session.
 
+The widget works with whichever `skapi-js` your page loads. On a current SDK it calls the
+`forwardRequest` family, and on an earlier one it falls back to the `clientSecretRequest` family,
+deciding by whether the SDK has `forwardRequestHistory`. It never decides by `forwardRequest` alone,
+because on an earlier SDK that name belongs to a different, retired method.
+
 ## What's in the package
 
 | Path                          | Purpose                                                                          |
@@ -130,7 +135,7 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `attachmentParsers`      | `array`   | `null`   | Client-side attachment parsers. See [Attachment parser plugins](#attachment-parser-plugins). |
 | `windowedIndexing`       | `boolean` | `true`   | Server-driven windowed indexing for text and grid files (see [file types](#supported-file-types)). Pass `false` to fall back to agent-driven paging, which keeps the traversal inside the model's turn budget and the tab open. |
 | `allowAnonymous`         | `boolean` | `null`   | Open the chat with no login for visitors without an account. `null` follows the project's own "Allow anonymous users" setting (`getConnectionInfo().conf.require_login`); `true`/`false` pins it. |
-| `liveStreaming`          | `boolean` | `false`  | Paint a chat answer into its bubble as it arrives, instead of at the end. A **request**, not a switch: the widget honours it only when your page's `skapi-js` actually carries skapi's half of the stream flag (it checks for `clientSecretRequestStream` and `clientSecretRequestFinalize`), and otherwise warns once and falls back to buffered replies. An older SDK silently drops the flag, which would leave the destination streaming SSE into a buffered row that reads back empty. It still also needs a polling worker that relays the response bytes, which the widget cannot check, so leave it off until the region you talk to is deployed. |
+| `liveStreaming`          | `boolean` | `false`  | Paint a chat answer into its bubble as it arrives, instead of at the end. A **request**, not a switch: the widget honours it only when your page's `skapi-js` actually carries skapi's half of the stream flag (it checks for `forwardRequestStream` and `forwardRequestFinalize`, or their older names `clientSecretRequestStream` and `clientSecretRequestFinalize` on an earlier `skapi-js`), and otherwise warns once and falls back to buffered replies. An older SDK silently drops the flag, which would leave the destination streaming SSE into a buffered row that reads back empty. It still also needs a polling worker that relays the response bytes, which the widget cannot check, so leave it off until the region you talk to is deployed. |
 | `liveStreamingRealtime`  | `boolean` | `false`  | Deliver streamed chunks over skapi's websocket instead of waiting for the next poll tick. Requires `liveStreaming`. Off unless you ask for it: skapi's `joinRealtime` **replaces** the connection's group, so for the length of a turn it takes the room out from under whatever else your app uses realtime for. Purely an accelerator; with it off the reply still streams, on the poll's cadence. |
 
 ### Rebranding the widget
@@ -447,9 +452,9 @@ import 'bunnyquery/styles/chat.css';
 
 // 1. Inject the skapi transport + MCP endpoint ONCE at startup.
 configureChatEngine({
-  clientSecretRequest: (opts) => skapi.clientSecretRequest(opts),
-  clientSecretRequestHistory: (params, fetchOptions) =>
-    skapi.clientSecretRequestHistory(params, fetchOptions),
+  forwardRequest: (form, opts) => skapi.forwardRequest(form, opts),
+  forwardRequestHistory: (params, fetchOptions) =>
+    skapi.forwardRequestHistory(params, fetchOptions),
   mcpBaseUrl: 'https://mcp.broadwayinc.computer',
   poll: 0, // see the note below
 });
@@ -474,21 +479,28 @@ helpers. See the `.d.ts` shipped with `bunnyquery/engine`.
 
 | Option                        | Type       | Description                                                                                                   |
 | ----------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
-| `clientSecretRequest`         | `function` | `skapi.clientSecretRequest`, bound to your Skapi instance. **Required.**                                      |
-| `clientSecretRequestHistory`  | `function` | `skapi.clientSecretRequestHistory`, bound to your Skapi instance. **Required.**                              |
+| `forwardRequest`              | `function` | `skapi.forwardRequest`, bound to your Skapi instance. The engine calls it as `forwardRequest(null, opts)`. **Required**, or its deprecated alias below. |
+| `forwardRequestHistory`       | `function` | `skapi.forwardRequestHistory`, bound to your Skapi instance. **Required**, or its deprecated alias below.   |
 | `mcpBaseUrl`                  | `string`   | MCP server base URL (you resolve prod vs dev). **Required.**                                                  |
-| `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `clientSecretRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel, the widget's case). |
+| `poll`                        | `number?`  | Value attached as `poll` on every request. Omit it if your `forwardRequest` already resolves with the final body; pass `0` for the deployed `skapi-js@latest` (needed for the early ack + a manual `.poll()` handle that powers queued-send cancel, the widget's case). |
 | `attachmentParsers`           | `array?`   | Client-side attachment parsers, registered at configure time. More can be added later with `registerAttachmentParser()`. See [Attachment parser plugins](#attachment-parser-plugins). |
 | `windowedIndexing`            | `boolean?` | Opt in to **server-driven** windowed indexing for text and grid files (see [file types](#supported-file-types)). Off by default in the engine; the widget passes it as `true`. The deployed skapi workers support it; only leave it off against a self-hosted worker that does not yet strip the `_skapi_window` directive, where it would reach the provider as an unknown body field and fail the call terminally with no retry. |
-| `liveStreaming`               | `boolean?` | Opt in to **live streaming** of chat turns. Off by default, and the backend ships first: a streamed row settles with a status and NO body (the answer was the stream), so against a worker that does not relay, the turn reads back empty. Pair it with `clientSecretRequestFinalize` and `clientSecretRequestStream`, and gate it on `skapiSupportsStreaming(skapi)`. |
-| `clientSecretRequestFinalize` | `function?` | `skapi.clientSecretRequestFinalize`, bound to your Skapi instance. Stores the version of a streamed turn that history keeps (the engine sends the assembled provider body, so it reads back exactly like a buffered turn) and releases that request's chunks. Without it a streamed turn is never finalized and its row stays empty. |
-| `clientSecretRequestStream`   | `function?` | `skapi.clientSecretRequestStream`, bound to your Skapi instance. The **second half of the durability guarantee**: a row that settles while no poll is attached (closed tab, discarded background tab, slept device) is never finalized, so its answer stays in the chunk store and its history row is terminal and empty. Given the request id this drains that turn's chunks in one pass; the engine parses them exactly as it parses a live stream and finalizes what it read, so each row is recovered at most once. Without it the engine mints no recovery marker at all and behaves as it did before streaming. |
+| `liveStreaming`               | `boolean?` | Opt in to **live streaming** of chat turns. Off by default, and the backend ships first: a streamed row settles with a status and NO body (the answer was the stream), so against a worker that does not relay, the turn reads back empty. Pair it with `forwardRequestFinalize` and `forwardRequestStream`, and gate it on `skapiSupportsStreaming(skapi)`. |
+| `forwardRequestFinalize`      | `function?` | `skapi.forwardRequestFinalize`, bound to your Skapi instance. Stores the version of a streamed turn that history keeps (the engine sends the assembled provider body, so it reads back exactly like a buffered turn) and releases that request's chunks. Without it a streamed turn is never finalized and its row stays empty. |
+| `forwardRequestStream`        | `function?` | `skapi.forwardRequestStream`, bound to your Skapi instance. The **second half of the durability guarantee**: a row that settles while no poll is attached (closed tab, discarded background tab, slept device) is never finalized, so its answer stays in the chunk store and its history row is terminal and empty. Given the request id this drains that turn's chunks in one pass; the engine parses them exactly as it parses a live stream and finalizes what it read, so each row is recovered at most once. Without it the engine mints no recovery marker at all and behaves as it did before streaming. |
 | `onLiveStreamUpdate`          | `function?` | Observation hook for a streaming turn (`{ serverItemId, ownerKey, phase, text, thinkingText, toolNames, complete, errored }`). The engine already paints the answer text itself, so this is only for affordances it does not decide the presentation of. Never throw from it. |
 | `liveStreamingRealtime`       | `boolean?`  | Push relayed chunks over skapi's websocket as well. Requires `liveStreaming`. Off by default: `joinRealtime` replaces the connection's group for the length of a turn, so only a host that owns its skapi instance should opt in. |
-| `streamRecovery`              | `boolean?`  | Set `false` to force the read-back of already-streamed turns **off**, even though the chunk reader is injected. There is no need to set it to turn recovery on: injecting `clientSecretRequestStream` is what arms it. |
+| `streamRecovery`              | `boolean?`  | Set `false` to force the read-back of already-streamed turns **off**, even though the chunk reader is injected. There is no need to set it to turn recovery on: injecting `forwardRequestStream` is what arms it. |
 | `mintIndexDoneMarker`         | `function?` | Write the durable "indexing finished" marker (`done::<path>`, reference `src::<path>`, table `__INDEXING__`) for the runs this client knows are complete. Best-effort, must never throw. Without it the engine falls back to inference. |
 | `upsertIndexRunRecord`        | `function?` | Create-or-update the per-file run record (`run::<path>`, reference `src::<path>`, table `__INDEXING__`), which is what lets chat rows and files-page badges paint without scanning background history. You implement the upsert (the records API has none) and the status precedence: `'working'` must never overwrite a terminal status. Without it the engine uses the legacy scan/probe path. |
 | `csrHistoryItemLookup`        | `function?` | Single-item `csr-poll` point lookup, used by `ChatSession.hydrateCompactItems` to fetch a compact history stub's real body when an indexing row is expanded. Without it stubs keep their server-extracted heads. |
+
+**Deprecated config keys.** `clientSecretRequest`, `clientSecretRequestHistory`,
+`clientSecretRequestFinalize` and `clientSecretRequestStream` are still accepted, so a host written
+against an earlier release keeps working unchanged. When both spellings are given the new one wins.
+Through the old `clientSecretRequest` key the engine sends the secret's name as `clientSecretName`,
+exactly as before, and through `forwardRequest` it sends `secretName`. Every request also names the
+project it runs against in `service` and `owner`, and both keys pass those through.
 
 ### Display and paging helpers
 

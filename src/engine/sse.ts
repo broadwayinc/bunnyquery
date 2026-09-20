@@ -3,7 +3,7 @@
  * buffered call would have returned out.
  *
  * WHY THIS FILE EXISTS, AND WHY IT IS HERE AND NOT IN SKAPI.
- * skapi's clientSecretRequest is a byte relay. On a streamed turn the worker reads
+ * skapi's forwardRequest is a byte relay. On a streamed turn the worker reads
  * the destination's response incrementally and appends the raw bytes to a chunk
  * table; it settles the polling row with STATUS ONLY, no body, because the content
  * lives in the chunks. skapi therefore does not know that Anthropic or OpenAI
