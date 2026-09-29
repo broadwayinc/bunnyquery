@@ -18,9 +18,10 @@
  * no exports. They touch nothing but `S`, so they are lifted out of the source text
  * and run against fake skapi instances shaped like the real SDKs. The lift asserts
  * its own markers, so a rename fails this test loudly rather than passing on
- * nothing. The fakes are modelled on the builds actually on disk: skapi-js 2.0.5
- * (what www.bunnyquery.com installs) has forwardRequest with apiKeyHeader and no
- * forwardRequestHistory.
+ * nothing. The fakes are modelled on the builds actually on disk: skapi-js 2.0.2
+ * (what www.skapi.com installs) has forwardRequest with apiKeyHeader and no
+ * forwardRequestHistory, and skapi-js 2.2.2 (what www.bunnyquery.com installs)
+ * carries the rename.
  *
  * Run: node ./tests/forward-request-widget-probe.cjs
  */
@@ -67,7 +68,7 @@ function recorder(calls, name, result) {
     return function () { calls.push({ name: name, args: Array.prototype.slice.call(arguments) }); return Promise.resolve(result); };
 }
 
-/** skapi-js 2.0.5: the old family, plus the RETIRED forwardRequest. */
+/** skapi-js 2.0.x: the old family, plus the RETIRED forwardRequest. */
 function oldSdk(opts) {
     const calls = [];
     const sk = {
@@ -222,7 +223,7 @@ await test('END TO END, new SDK: a chat request reaches forwardRequest(null, {se
 // SKIPS rather than fails when a checkout is absent, because this package is also
 // published and tested on its own.
 const REAL_SDKS = [
-    ['skapi-js 2.0.5, as www.bunnyquery.com installs it', '../../www.bunnyquery.com/node_modules/skapi-js/dist/skapi.cjs', false],
+    ['skapi-js 2.2.2, as www.bunnyquery.com installs it', '../../www.bunnyquery.com/node_modules/skapi-js/dist/skapi.cjs', true],
     ['skapi-js 2.0.2, as www.skapi.com installs it', '../../www.skapi.com/node_modules/skapi-js/dist/skapi.cjs', false],
     ['the local skapi-js build carrying the rename', '../../skapi-js/dist/skapi.cjs', true],
 ];
@@ -235,8 +236,10 @@ for (const [label, rel, isNew] of REAL_SDKS) {
         const Skapi = m.Skapi || (m.default && m.default.Skapi) || m.default;
         proto = Skapi && Skapi.prototype;
     } catch (e) { proto = null; }
-    // A local build is only "the rename" once it has been rebuilt with it.
-    if (proto && isNew && typeof proto.forwardRequestHistory !== 'function') proto = null;
+    // A local build is only "the rename" once it has been rebuilt with it. An INSTALLED
+    // build is never excused: it is the version its row names, or the row is out of date.
+    const installed = rel.indexOf('node_modules') !== -1;
+    if (proto && isNew && !installed && typeof proto.forwardRequestHistory !== 'function') proto = null;
     if (!proto) { results.push([true, name + ' (SKIPPED: not on disk)']); continue; }
     await test(name, () => {
         const inst = Object.create(proto);
