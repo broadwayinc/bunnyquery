@@ -19,6 +19,8 @@ export var CONTEXT_WINDOW_DEFAULT: Record<string, number> = { claude: 200000, op
 // 128,000 output cap, i.e. the ~922,000 of usable input quoted for it elsewhere.
 export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 	// claude, exact ids
+	'claude-fable-5-1': 1000000, 'claude-opus-5-5': 1000000,
+	'claude-sonnet-5-5': 1000000,
 	'claude-fable-5': 1000000, 'claude-opus-5': 1000000,
 	'claude-opus-4-8': 1000000, 'claude-opus-4-7': 1000000,
 	'claude-opus-4-6': 1000000, 'claude-opus-4-5': 200000,
@@ -26,13 +28,14 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 	'claude-sonnet-4-5': 1000000, 'claude-sonnet-4': 200000,
 	'claude-haiku-4-5': 200000, 'claude-3-5-sonnet': 200000,
 	// openai, exact ids
+	'gpt-6-astra': 1050000, 'gpt-6-sol': 1050000, 'gpt-6-luna': 1050000,
 	'gpt-5.6-sol': 1050000, 'gpt-5.6-terra': 1050000, 'gpt-5.6-luna': 1050000,
 	'gpt-5.5': 1000000, 'gpt-5.4': 1050000,
 	'gpt-5.4-mini': 400000, 'gpt-5.4-nano': 400000,
 	'gpt-4.1': 1040000, 'gpt-4o': 128000, 'o1': 200000, 'o1-pro': 200000,
 	// family keys
 	'claude-fable': 1000000, 'claude-opus': 1000000, 'claude-sonnet': 1000000,
-	'claude-haiku': 200000, 'gpt-5.6': 1050000, 'gpt-5': 128000,
+	'claude-haiku': 200000, 'gpt-6': 1050000, 'gpt-5.6': 1050000, 'gpt-5': 128000,
 };
 // Two rows above are load-bearing rather than redundant, both because the family
 // walk drops trailing segments:
@@ -44,6 +47,10 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 //     matters most in practice: the indexing path selects it by name.
 // The bare 'gpt-5' family stays deliberately low: it is the catch-all for gpt-5
 // variants not listed here, and a mini-class variant is the likelier unknown.
+// 'gpt-6' is a family key at the full window for the opposite reason: every
+// gpt-6 tier is 1050000, luna (the smallest) included, and without the key an
+// id this table has not met yet drops to the 128000 platform default, which is
+// what astra, sol and luna did on the day they were added to the model list.
 //
 // One asymmetry these rows expose: a total minus our output reserve can exceed a
 // model's separately-published INPUT ceiling (gpt-5.4-nano is 400000 total but
@@ -58,23 +65,26 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 // flat 25000 the request builder used to send unconditionally.
 export var MAX_OUTPUT_BY_MODEL: Record<string, number> = {
 	// claude
+	'claude-fable-5-1': 128000, 'claude-opus-5-5': 128000,
+	'claude-sonnet-5-5': 128000,
 	'claude-fable-5': 128000, 'claude-opus-5': 128000,
 	'claude-opus-4-8': 128000, 'claude-sonnet-5': 128000,
 	'claude-sonnet-4-6': 64000, 'claude-haiku-4-5': 64000,
 	'claude-3-5-sonnet': 8000,
 	// openai
+	'gpt-6-astra': 128000, 'gpt-6-sol': 128000, 'gpt-6-luna': 128000,
 	'gpt-5.6-sol': 128000, 'gpt-5.6-terra': 128000, 'gpt-5.6-luna': 128000,
 	'gpt-5.5': 128000, 'gpt-5.4': 128000,
 	'gpt-5.4-mini': 128000, 'gpt-5.4-nano': 128000,
 	'gpt-4.1': 16000, 'gpt-4o': 4000, 'o1': 100000, 'o1-pro': 100000,
 	// family keys
 	'claude-fable': 128000, 'claude-opus': 128000, 'claude-sonnet': 64000,
-	'claude-haiku': 64000, 'gpt-5.6': 128000, 'gpt-5': 128000,
+	'claude-haiku': 64000, 'gpt-6': 128000, 'gpt-5.6': 128000, 'gpt-5': 128000,
 };
 
 // The window a project runs at when nobody has touched the setting, clamped per
 // model by getContextWindow. Deliberately BELOW every frontier ceiling it can
-// resolve against (1,000,000 on the Claude 5 line, 1,050,000 on gpt-5.6) because
+// resolve against (1,000,000 on the Claude 5 line, 1,050,000 on gpt-5.6 and gpt-6) because
 // the client-side budget covers only the FIRST request: after that the model
 // runs a server-side tool loop whose web_fetch and MCP results accumulate in the
 // same conversation and are not counted here. The gap (120k and 170k

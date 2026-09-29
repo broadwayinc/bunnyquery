@@ -1024,6 +1024,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var CONTEXT_WINDOW_DEFAULT = { claude: 2e5, openai: 128e3 };
   var CONTEXT_WINDOW_BY_MODEL = {
     // claude, exact ids
+    "claude-fable-5-1": 1e6,
+    "claude-opus-5-5": 1e6,
+    "claude-sonnet-5-5": 1e6,
     "claude-fable-5": 1e6,
     "claude-opus-5": 1e6,
     "claude-opus-4-8": 1e6,
@@ -1037,6 +1040,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-haiku-4-5": 2e5,
     "claude-3-5-sonnet": 2e5,
     // openai, exact ids
+    "gpt-6-astra": 105e4,
+    "gpt-6-sol": 105e4,
+    "gpt-6-luna": 105e4,
     "gpt-5.6-sol": 105e4,
     "gpt-5.6-terra": 105e4,
     "gpt-5.6-luna": 105e4,
@@ -1053,11 +1059,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-opus": 1e6,
     "claude-sonnet": 1e6,
     "claude-haiku": 2e5,
+    "gpt-6": 105e4,
     "gpt-5.6": 105e4,
     "gpt-5": 128e3
   };
   var MAX_OUTPUT_BY_MODEL = {
     // claude
+    "claude-fable-5-1": 128e3,
+    "claude-opus-5-5": 128e3,
+    "claude-sonnet-5-5": 128e3,
     "claude-fable-5": 128e3,
     "claude-opus-5": 128e3,
     "claude-opus-4-8": 128e3,
@@ -1066,6 +1076,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-haiku-4-5": 64e3,
     "claude-3-5-sonnet": 8e3,
     // openai
+    "gpt-6-astra": 128e3,
+    "gpt-6-sol": 128e3,
+    "gpt-6-luna": 128e3,
     "gpt-5.6-sol": 128e3,
     "gpt-5.6-terra": 128e3,
     "gpt-5.6-luna": 128e3,
@@ -1082,6 +1095,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-opus": 128e3,
     "claude-sonnet": 64e3,
     "claude-haiku": 64e3,
+    "gpt-6": 128e3,
     "gpt-5.6": 128e3,
     "gpt-5": 128e3
   };
