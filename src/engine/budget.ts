@@ -140,6 +140,40 @@ export function getProjectContextWindow(projectId: string): number | null {
 // actual request cannot drift: they were 22000 and 25000 respectively, which
 // under-reserved by 3k on a window spent to the last token.
 export var MAX_OUTPUT_TOKENS = 25000;
+
+/**
+ * The same ceiling for an INDEXING pass, which is a different job with a different shape.
+ *
+ * A chat turn has a person waiting, so a long reply is a worse outcome than a truncated
+ * one and 25,000 is generous for it. An indexing pass has nobody waiting and one job:
+ * emit records for the window it was shown. When it runs out of budget mid-window the
+ * worker halves the window and re-sends it (`window_scale 1.0 -> 0.5`), so the file pays
+ * roughly twice the passes for the rest of its length.
+ *
+ * WHY 64,000, measured on a live 465-row spreadsheet (9 passes, project ap21U8y5byIbkGSv):
+ *   - gpt-5.6-luna allows 128,000 output tokens, so 25,000 was 19.5% of what it permits.
+ *   - Only 1 of those 9 passes hit the cap; the median used 6,370. A cap is a CEILING, not
+ *     a target: the model stops when it is done, so raising it costs nothing on the eight
+ *     passes that never approach it. It only changes the one that would have truncated.
+ *   - Fitting duration against output tokens across the nine: `55.4s + output / 131 tok/s`
+ *     (R^2 0.906). The binding constraint is TIME, not the model.
+ *   - The worker's upstream timeout is 870s and its Lambda is 900s with a 30s settle
+ *     reserve, which puts the theoretical ceiling near 103,000 tokens. 64,000 lands at
+ *     about 544s and leaves roughly 300s of margin for a slow provider hour or a pass with
+ *     more tool round trips. Spending that margin buys nothing: 64,000 is already enough
+ *     for a full 250-row window to finish in one pass, which is the whole point.
+ *
+ * It does NOT feed OUTPUT_TOKEN_RESERVE below. That reserve exists to size the INPUT
+ * budget for buildBoundedChatMessages, which only the chat path calls; an indexing message
+ * is built from a file window, not from bounded history. Wiring this into the reserve would
+ * shrink a budget this number has nothing to do with.
+ *
+ * Re-derive rather than nudge: re-run the fit if the model, the Lambda timeout or
+ * REQUEST_TIMEOUT changes, and note that a model whose own ceiling is lower still wins
+ * (getMaxOutputTokens clamps, so gpt-4o stays at its 4,000).
+ */
+export var INDEXING_MAX_OUTPUT_TOKENS = 64000;
+
 export var OUTPUT_TOKEN_RESERVE = MAX_OUTPUT_TOKENS;
 export var TOOL_AND_RESPONSE_BUFFER = 4000;
 export var MIN_INPUT_TOKEN_BUDGET = 8000;
@@ -225,9 +259,19 @@ export function getModelContextWindow(platform: string, model?: string): number 
  * but a model whose own cap is lower rejects the request outright, so clamp to
  * whichever is smaller. Models with no known cap keep MAX_OUTPUT_TOKENS.
  */
-export function getMaxOutputTokens(platform: string, model?: string): number {
+export function getMaxOutputTokens(
+	platform: string,
+	model?: string,
+	/** 'indexing' asks for INDEXING_MAX_OUTPUT_TOKENS instead. Omitted means chat, so every
+	 *  existing caller keeps the number it had. */
+	purpose?: 'chat' | 'indexing',
+): number {
+	var want = purpose === 'indexing' ? INDEXING_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
+	// The model's own ceiling still wins. This is the whole reason the clamp lives here and
+	// not at the call sites: gpt-4o caps output at 4,000 and legacy 3.5 Sonnet at 8,000, and
+	// asking either for 64,000 is a rejected request, not a long answer.
 	var cap = resolveByModelId(apiReportedMaxOutput, MAX_OUTPUT_BY_MODEL, model);
-	return cap ? Math.min(MAX_OUTPUT_TOKENS, cap) : MAX_OUTPUT_TOKENS;
+	return cap ? Math.min(want, cap) : want;
 }
 
 /**

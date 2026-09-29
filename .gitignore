@@ -2,3 +2,5 @@
 /instructions.md
 /node_modules
 deploy.sh
+# Claude Code agent worktrees (nested checkouts, never commit)
+.claude/worktrees/

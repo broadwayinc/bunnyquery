@@ -355,9 +355,9 @@
     border: 0;
     padding: 0;
     font-family: var(--bq-mono);
-    text-decoration: underline;
+    text-decoration: none;
 }
-.bq-link:hover { text-decoration: none; }
+.bq-link:hover { text-decoration: underline; }
 .bq-link.disabled { opacity: 0.4; pointer-events: none; }
 
 .bq-checkbox {
@@ -576,18 +576,9 @@
     font-size: 0.8rem;
     color: var(--bq-muted);
 }
-.bq-brand-icon {
-    width: 1.1rem;
-    height: 1.1rem;
-    object-fit: contain;
-    flex: 0 0 auto;
-}
-.bq-brand-name,
-.bq-brand-sep {
-    flex: 0 0 auto;
-    white-space: nowrap;
-}
-.bq-brand-project {
+/* One element (see brandTitleEl): the whole title ellipsizes rather than only
+   the project half, which is what lets `opts.title` be an arbitrary string. */
+.bq-brand-title {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -659,23 +650,42 @@
     background: var(--bq-paper);
 }
 
+/* ZERO HEIGHT IN FLOW, DELIBERATELY. Mirrors agent.vue, where the reasoning is
+   written out in full: this bar mounts when a history fetch starts and unmounts
+   when the page lands, both while the reader sits at the top of the list, and as
+   an in-flow sticky element it moved every row by its own height each time
+   (measured in Chrome with overflow-anchor:none). The outer box now contributes
+   nothing to layout and the inner strip overflows it, so the bar still sits
+   pinned at the top of the viewport while mounting it moves nothing. */
 .bq-history-loading {
     position: sticky;
     top: 0;
     z-index: 1;
+    height: 0;
+    padding: 0;
+    overflow: visible;
+    pointer-events: none;
+}
+.bq-history-loading-inner {
     display: flex;
+    align-items: center;
     justify-content: center;
     gap: 0.1em;
     padding: 0.5rem 0 1rem;
     font-size: 0.8rem;
     color: var(--bq-muted);
-    background: var(--bq-paper);
+    background: linear-gradient(to bottom, var(--bq-paper) 70%, transparent);
 }
-/* initial first-page load: center it in the (empty) messages area */
+/* initial first-page load: center it in the (empty) messages area. A full-box
+   overlay rather than a top strip, so it takes its height back - and it replaces
+   an EMPTY messages area, so it has nothing to move. */
 .bq-history-loading.is-initial {
     position: absolute;
     inset: 0;
+    height: auto;
+    display: flex;
     align-items: center;
+    justify-content: center;
     padding: 0;
 }
 
@@ -1012,6 +1022,39 @@
     user-select: none;
 }
 .bq-overwrite-applyall input { cursor: pointer; margin: 0; }
+
+/* Access-group chooser (who may read a file once it is indexed). A radio list
+   rather than a row of buttons: the three answers are not equally weighted and
+   the hint under each is what actually distinguishes them. */
+.bq-access-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin: 0 0 1rem;
+}
+.bq-access-option {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: baseline;
+    column-gap: 0.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid transparent;
+    cursor: pointer;
+    user-select: none;
+}
+.bq-access-option:hover { background: var(--bq-hover-bg); }
+.bq-access-option input { cursor: pointer; margin: 0; }
+.bq-access-option-label {
+    font-size: 0.88rem;
+    color: var(--bq-ink);
+}
+.bq-access-option-hint {
+    grid-column: 2;
+    font-size: 0.76rem;
+    line-height: 1.35;
+    color: var(--bq-muted);
+    margin-top: 0.15rem;
+}
 
 /* ============================================================================
  * RESPONSIVE

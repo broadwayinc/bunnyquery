@@ -5,10 +5,15 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The latest version on npm is **1.7.0**. Version
-  **1.8.0** is built in the source tree but not yet published, and is marked as
+- **Published vs built.** The latest version on npm is **1.9.10**. Version
+  **1.10.0** is built in the source tree but not yet published, and is marked as
   such. (1.6.3 and 1.6.4 were never published on their own; their changes reached
-  npm inside 1.7.0.)
+  npm inside 1.7.0. 1.8.7, 1.9.2 and 1.9.12 are source bumps that never reached
+  npm either.)
+- **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
+  their own entries here, so their changes are not itemized below. Two features
+  landed in that window and are documented only in the README: the widget's
+  `allowAnonymous` option, and the expanded extractable-document set.
 - **Missing patch numbers.** A few versions on npm (1.2.1 most notably) are
   republishes with no distinct source commit behind them, so they have no entry
   here. Version 1.6.1 is the reverse case: it has commits but was never
@@ -16,6 +21,74 @@ A few notes on how to read this:
 - Both chat clients (this widget and `agent.vue` on www.bunnyquery.com) consume
   the same engine, so an engine fix only reaches www.bunnyquery.com once the
   package is republished.
+
+---
+
+## Unreleased (2026-09-18)
+
+The engine and the widget move to skapi-js's `forwardRequest` family, which replaces the
+`clientSecretRequest` family. Nothing an existing host does changes.
+
+### Engine
+
+- New `configureChatEngine` keys: `forwardRequest`, `forwardRequestHistory`,
+  `forwardRequestFinalize` and `forwardRequestStream`. The engine calls
+  `forwardRequest(null, opts)` and sends the secret's name as `secretName`.
+- The old keys, `clientSecretRequest`, `clientSecretRequestHistory`,
+  `clientSecretRequestFinalize` and `clientSecretRequestStream`, are still accepted and marked
+  deprecated. Through them the engine sends `clientSecretName` exactly as before, so a host
+  written against an earlier release keeps working unchanged. Where both spellings are given,
+  the new one wins. A host that injects neither fails with a message naming both.
+- `skapiSupportsStreaming` and `streamRecoveryEnabled` accept either spelling. A streaming SDK
+  still has to carry a whole pair, reader and finalize, under one spelling.
+
+### Widget
+
+- The widget picks the family on each embedder's page. It uses the `forwardRequest` family when
+  the page's skapi-js has `forwardRequestHistory`, and the `clientSecretRequest` family otherwise.
+  It never decides by `forwardRequest` alone, because on an earlier skapi-js that name is a
+  different, retired method with its own endpoint.
+- The chat transport, the queued-send cancel and the Google sign-in code exchange all go through
+  that one decision.
+
+## 1.10.0 (2026-09-04, unpublished)
+
+Email (`.eml`) is read, windowed and indexed like any other document.
+
+### Email (.eml) indexing
+
+- `.eml` (RFC822 email) joins the server-extractable set and the paged set, so a
+  message of any size is read end to end instead of being decoded as text
+  (which would have inlined its base64 attachment blobs as prose). The layer
+  parses the MIME container and hands back one text: a header block (Subject,
+  From, To, Cc, Bcc, Reply-To, Date as ISO 8601 when it parses (else the raw
+  header text), Message-ID, In-Reply-To, References, and an `Attachments: N`
+  count when the message has any), the body (`text/plain` preferred over its html twin, which is
+  tag-stripped when it is all there is), and the text of every attached
+  document under its own `=== ATTACHMENT i/N ===` heading: spreadsheets,
+  documents, csv, calendars and the text layer of a PDF. A forwarded message
+  nested inside is rendered as its own `=== EMAIL ===` block.
+- Pictures attached to or inlined in a message are extracted into `__MEDIA__`
+  like the pictures embedded in any other document, with the media anchor
+  quoted on the `[picture ...]` line. Every other attachment is read inline and
+  never saved as a separate file; signed, encrypted and `winmail.dat` parts are
+  marked and skipped, and a scanned PDF attachment yields a marker, not pages.
+- New indexing rule: one record per email message in `email_messages` (a
+  forwarded message gets its own), indexed on the ISO date and tagged with the
+  sender, every recipient and the subject; attachment text is datafied by its
+  own kind and every record carries the email's `src::` reference.
+- `.eml` reaches the widget's MIME map (`message/rfc822`), the landing-page
+  format list, the MCP `readFileContent` description and both READMEs. The
+  widget and console token estimators count an `.eml` like any other
+  server-parsed container (0), not as text: its bytes are mostly base64
+  attachment blobs, and a 380 KB mail with one photo had estimated at 127k
+  tokens and disabled Send. The engine now also exports
+  `isPagedReadFile`, `isImageVisionFile` and `isWindowedReadFile`, pinned by the
+  new `tests/email-format.cjs`.
+- Deploy order: the OfficeExtractionPy layer (the admin-stack worker AND the
+  record-stack ExtractFileText, per region) must land BEFORE this package is
+  republished. In the reverse order every `.eml` is paged and answered with
+  UNSUPPORTED_FORMAT on every window until the layer arrives.
 
 ---
 

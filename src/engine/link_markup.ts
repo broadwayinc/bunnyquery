@@ -77,8 +77,15 @@ export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLi
 	if (unavailable) cls.push('is-unavailable');
 	if (preview) cls.push('is-image-preview');
 
-	var labelText = (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + ' ' + link.label
-		+ (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? ' (fetching...)' : '');
+	// The glyph is its own element so chat.css can make it an atomic inline: an
+	// underline propagates into every in-flow inline descendant of the anchor and
+	// nothing inside can cancel it, so the ↗ was underlined along with the label
+	// whenever the chip was. The spacing that used to be a literal space is a
+	// margin on the span for the same reason (a space is decorated too).
+	var glyphHtml = '<span class="bq-link-glyph" translate="no">'
+		+ (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + '</span>';
+	var labelHtml = glyphHtml + escapeInlineHtml(link.label
+		+ (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? ' (fetching...)' : ''));
 	var attrs = ['class="' + cls.join(' ') + '"'];
 	// NO href when the file is unavailable. That is what disables the click:
 	// an anchor with no href does not navigate, is not a tab stop and takes the
@@ -99,7 +106,7 @@ export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLi
 	if (link.remotePath) attrs.push('data-bq-remote-path="' + escapeInlineHtml(link.remotePath) + '"');
 	if (link.fullLabel) attrs.push('data-bq-full-label="' + escapeInlineHtml(link.fullLabel) + '"');
 
-	if (!preview) return '<a ' + attrs.join(' ') + '>' + escapeInlineHtml(labelText) + '</a>';
+	if (!preview) return '<a ' + attrs.join(' ') + '>' + labelHtml + '</a>';
 
 	// NO src attribute. A stored file always classifies as the _expired_.url
 	// placeholder until something mints a real url, so a src written here would be
@@ -127,6 +134,6 @@ export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLi
 		// dot trail, never the jumping bunny. CSS hides it the moment the <img>
 		// gains a src, so no JS removes DOM and nothing re-parses.
 		'<span class="bq-loader" data-bq-img-loader="1"></span>' +
-		'<span class="bq-img-preview-caption" translate="no">' + escapeInlineHtml(labelText) + '</span>' +
+		'<span class="bq-img-preview-caption" translate="no">' + labelHtml + '</span>' +
 		'</a>';
 }

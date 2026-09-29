@@ -42,6 +42,24 @@ import {
     buildChatGreeting,
     setProjectContextWindow,
     parseAiAgentValue as engineParseAiAgentValue,
+    // The project's BunnyQuery settings, which now live in a record in the
+    // customer's OWN database ("bq::settings") instead of on the skapi service
+    // record. The fetch, the cache, the group list and the chooser's copy all
+    // belong to the engine so this widget and the console cannot answer "who can
+    // read this upload?" differently. The store is keyed by SERVICE ID, so every
+    // accessor below is called with S.projectId.
+    PROJECT_SETTINGS_UNIQUE_ID,
+    configureProjectSettings,
+    primeProjectSettings,
+    readyProjectSettings,
+    normalizeUploadAccessGroup,
+    projectAsksUploadAccess,
+    projectUploadAccessGroup,
+    // The project's own opening line, from the same bq::settings record.
+    projectChatGreeting,
+    UPLOAD_ACCESS_GROUPS,
+    UPLOAD_ACCESS_LABELS,
+    UPLOAD_ACCESS_HINTS,
     // pure helpers (Tier-1.5) — error detection, token budget, link/path, history mapping
     getErrorMessage,
     isErrorResponseBody,
@@ -68,6 +86,7 @@ import {
     classifyInlineLink,
     normalizeTrailingInlineToken,
     formatChatTimestamp,
+    formatDuration,
     // Inline image previews: the chip/preview markup is shared with agent.vue so
     // the two clients cannot drift, and the url mint is cached outside the parse.
     renderInlineLinkHtml,
@@ -87,6 +106,18 @@ import {
     // a repair), and every key a file's chips can be marked unavailable under.
     previewMintCacheToken,
     linkUnavailableKeysForPath,
+    // Whether the EMBEDDER's skapi-js can carry skapi's half of the stream flag.
+    // Shared with agent.vue rather than written out twice, because it is exactly the
+    // kind of predicate that forks and the two clients are diffed. See its own note
+    // for what an SDK too old to know the key does (drops it silently, so the
+    // destination streams SSE into a buffered row that reads back empty).
+    skapiSupportsStreaming,
+    // "Is anything actually fetching this turn's answer, and if not, what do we
+    // offer the reader instead of a spinner that never resolves?" Shared with
+    // agent.vue rather than decided here, because a client that answers it on its
+    // own answers it differently, and the symptom is a bubble that spins forever.
+    streamRecoveryPhase,
+    streamRecoveryLabels,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
@@ -138,8 +169,9 @@ import {
 
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
 
-    // Google OAuth endpoint (token exchange goes through skapi clientSecretRequest
-    // with the project's "ggl" client secret, exactly like bunnyquery oauth.ts).
+    // Google OAuth endpoint. The token exchange goes through skapi with the project's
+    // "ggl" client secret, exactly like bunnyquery oauth.ts: forwardRequest, or
+    // clientSecretRequest on an older skapi-js (see skapiForwardWithSecret).
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
     var GOOGLE_SCOPE =
@@ -157,6 +189,7 @@ import {
         googleInProgress: "bq_embed:google_in_progress", // sessionStorage
         googleRedirect: "bq_embed:google_redirect", // sessionStorage
         clearHorizon: "bq_embed:clearedAt",
+        anonId: "bq_embed:anon_id",     // per-project anonymous device id
     };
 
     /* ========================================================================
@@ -311,6 +344,82 @@ import {
         return base + ":" + (S.projectId || "default");
     }
 
+    /* ---- anonymous visitors --------------------------------------------- *
+     * A project whose owner turned "Allow anonymous users" on serves the chat
+     * with no login wall. Two things follow from that.
+     *
+     * 1. WHO IS ALLOWED. The switch is the project's `require_login` flag, read
+     *    off the unauthenticated getConnectionInfo() response, so the widget
+     *    needs no extra call and no credentials to know. `opts.allowAnonymous`
+     *    overrides it either way, for a page that wants to pin the behaviour.
+     *
+     *    NOT `prevent_anonymous`. That one governs anonymous record WRITES at
+     *    the skapi layer; it never gated reading public records, and the
+     *    BunnyQuery MCP refuses anonymous writes whatever it says. The two
+     *    settings are unrelated and must not be conflated again.
+     *
+     * 2. WHOSE CHAT IS IT. The backend identifies an unauthenticated requester as
+     *    `ip + "(" + user_agent + ")"`, which is not a device: two phones on one
+     *    office wifi produce the same string and would read each other's
+     *    transcript. So the widget mints its own id, keeps it in localStorage,
+     *    and uses it as the chat identity — which becomes the request QUEUE name,
+     *    and a queue is listed by its own name, not by the caller's ip. The id is
+     *    per project so two BunnyQuery widgets on one site do not share a chat.
+     *
+     *    This id is a NAME, not a secret: the queue listing is not user-scoped
+     *    server-side, so anyone who learns another device's id could read that
+     *    conversation. Anonymous chats are non-confidential by construction, and
+     *    anonymous visitors cannot upload or write records at all.
+     */
+    function anonymousAllowed() {
+        if (S.opts && typeof S.opts.allowAnonymous === "boolean") return S.opts.allowAnonymous;
+        var conf = (S.service && S.service.conf) || null;
+        // Unknown until service info lands. Default to NOT allowed so a failed
+        // or slow load shows the login page rather than a chat that cannot send.
+        // Only an explicit `false` opens it, which is the same way
+        // aiClientSecretGrp decides the client secret's access group - so the
+        // flag and the key can never disagree about which way they fail.
+        if (!conf) return false;
+        return conf.require_login === false;
+    }
+
+    // True when this page is being used by a visitor with no account.
+    function isAnonymousSession() {
+        return !S.user && anonymousAllowed();
+    }
+
+    function randomId() {
+        try {
+            var buf = new Uint8Array(16);
+            (window.crypto || window.msCrypto).getRandomValues(buf);
+            var out = "";
+            for (var i = 0; i < buf.length; i++) out += ("0" + buf[i].toString(16)).slice(-2);
+            return out;
+        } catch (e) {
+            // Storage-less/crypto-less fallback. Weaker, but this value only has
+            // to be unlikely to collide, never unguessable.
+            return "x" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        }
+    }
+
+    // The stable per-device, per-project anonymous id. Minted on first use.
+    // Falls back to an in-memory value when localStorage is unavailable (private
+    // mode, blocked site data), which keeps ONE tab's conversation coherent even
+    // though it cannot survive a reload.
+    var _anonIdMemo = null;
+    function anonDeviceId() {
+        if (_anonIdMemo) return _anonIdMemo;
+        var key = skey(SK.anonId);
+        var stored = lsGet(key);
+        if (stored) { _anonIdMemo = stored; return stored; }
+        var minted = "anon_" + randomId();
+        lsSet(key, minted);
+        // Read back: when storage is blocked lsSet silently no-ops, and holding
+        // the value in memory is the only way the same tab keeps one queue.
+        _anonIdMemo = lsGet(key) || minted;
+        return _anonIdMemo;
+    }
+
     /* ========================================================================
      * 4. THEME
      * ======================================================================*/
@@ -368,7 +477,7 @@ import {
         }
     }
 
-    // Force a fresh JWT so the next clientSecretRequest carries a valid
+    // Force a fresh JWT so the next forwarded request carries a valid
     // $ACCESS_TOKEN (the MCP server validates it via loginWithToken).
     function refreshSkapiSession() {
         return getProfile(true).then(function (u) { return !!u; });
@@ -395,6 +504,116 @@ import {
             .catch(function () { return null; });
     }
 
+    // WHICH REQUEST FAMILY THE EMBEDDER'S SKAPI-JS SPEAKS, asked in one place.
+    //
+    // skapi-js renamed clientSecretRequest and its companions to the forwardRequest
+    // family and kept every old name working, so a new SDK answers to both names and
+    // an old one only to the old. This widget is handed the EMBEDDER's instance, and
+    // its version is whatever their page pinned, so the widget has to ask rather
+    // than assume.
+    //
+    // NEVER BY forwardRequest ALONE. An older skapi-js also has a method called
+    // forwardRequest, taking the same (form, options), and it means something else
+    // entirely: the retired streaming forwarder, which posts to a different endpoint
+    // and injects the project's api key. A presence check on that name answers "new"
+    // for exactly the SDKs that are old, and every chat turn, cancel and Google
+    // sign-in would then go down the wrong path. forwardRequestHistory is the
+    // discriminator: it shipped with the rename, and no skapi-js before it has
+    // anything by that name. forwardRequest is asked for too only because it is the
+    // method the new branch then calls.
+    //
+    // Everything in the widget that touches the family goes through this: the
+    // engine's transport (skapiEngineTransport), the queued-send cancel
+    // (skapiCancelRequest) and the Google code exchange (skapiForwardWithSecret).
+    // Two call sites asking two different questions is how half a widget ends up on
+    // each family, which on an old SDK means a turn sent one way and cancelled the
+    // other.
+    function skapiHasForwardRequest(sk) {
+        return !!sk
+            && typeof sk.forwardRequestHistory === "function"
+            && typeof sk.forwardRequest === "function";
+    }
+
+    // One request of the widget's OWN (the engine's go through skapiEngineTransport),
+    // through whichever family the embedder's skapi-js speaks. `request` is everything
+    // except the secret's name, because that is the one field the two families spell
+    // differently: "secretName" on the new one, "clientSecretName" on the old one,
+    // where this is byte for byte the call the widget always made. The new method's
+    // first argument is the form, and this widget never has one.
+    function skapiForwardWithSecret(secretName, request) {
+        if (skapiHasForwardRequest(S.skapi)) {
+            return S.skapi.forwardRequest(null, Object.assign({ secretName: secretName }, request));
+        }
+        return S.skapi.clientSecretRequest(Object.assign({ clientSecretName: secretName }, request));
+    }
+
+    // Cancel a queued or running turn through the family that sent it. Same probe as
+    // the transport, so the two can never disagree about which one that was.
+    function skapiCancelRequest(opts) {
+        return skapiHasForwardRequest(S.skapi)
+            ? S.skapi.cancelForwardRequest(opts)
+            : S.skapi.cancelClientSecretRequest(opts);
+    }
+
+    // The transport keys handed to configureChatEngine, all from ONE family.
+    //
+    // A new skapi-js gets the new keys and an old one gets the old keys, exactly as
+    // this widget injected them before the rename. The engine accepts either family
+    // and prefers the new one, so injecting both would work too; one family is
+    // injected so that what the engine calls is plainly what the probe decided.
+    //
+    // `canStream` is skapiSupportsStreaming's answer for this instance, and it means
+    // the same thing under both families: on a new skapi-js the old names are aliases
+    // of the new ones, so an instance that has either pair has the one used here.
+    //
+    // What the two optional hooks are for, since they are the half of this that is
+    // easy to drop:
+    //
+    // FINALIZE stores the version of a streamed turn that history keeps. The engine
+    // sends the ASSEMBLED provider body, so a streamed turn reads back through exactly
+    // the extractors a buffered one does, with no branch in the mapper; storing is
+    // also what releases the chunks. Called only for a streamed turn, and best-effort
+    // inside the engine.
+    //
+    // STREAM is THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
+    // with a status and NO body: the answer is chunks until finalize copies a version
+    // onto the row. A row that settles while no poll is attached (the tab was closed,
+    // a mobile browser discarded it, the device slept and the interval stopped) is
+    // therefore never finalized, and without this hook the engine has no way back to
+    // it - the answer reads as gone from the conversation with every byte of it still
+    // stored. Given the request id this drains that turn's chunks in one pass, and the
+    // engine parses them exactly as it parses a live stream, finalizing what it read
+    // so the row becomes ordinary history and is never re-read.
+    //
+    // Both are handed over only when the SDK actually has them, so the engine's own
+    // "is this host able to?" checks answer honestly instead of a call reaching an
+    // undefined method mid-turn.
+    function skapiEngineTransport(canStream) {
+        if (skapiHasForwardRequest(S.skapi)) {
+            return {
+                forwardRequest: function (form, o) { return S.skapi.forwardRequest(form, o); },
+                forwardRequestHistory: function (p, f) { return S.skapi.forwardRequestHistory(p, f); },
+                forwardRequestFinalize: canStream ? function (requestId, data, options) {
+                    return S.skapi.forwardRequestFinalize(requestId, data, options);
+                } : undefined,
+                forwardRequestStream: canStream ? function (requestId, options) {
+                    return S.skapi.forwardRequestStream(requestId, options);
+                } : undefined,
+            };
+        }
+        // An older skapi-js: the deprecated keys, which the engine still accepts.
+        return {
+            clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
+            clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
+            clientSecretRequestFinalize: canStream ? function (requestId, data, options) {
+                return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+            } : undefined,
+            clientSecretRequestStream: canStream ? function (requestId, options) {
+                return S.skapi.clientSecretRequestStream(requestId, options);
+            } : undefined,
+        };
+    }
+
     /* ========================================================================
      * 6. VIEW MANAGER
      * ======================================================================*/
@@ -412,16 +631,27 @@ import {
     // Standalone-page parent: a padded scroll container wrapping the centered
     // .bq-settings content. (The chat view supplies its own padding on
     // .bq-messages / .bq-input-row, so page padding lives here.)
-    // [bunny] BunnyQuery · <project> — the brand row shared by the chat header
-    // and the standalone (logged-out) pages, so every view opens with the same
-    // top-left identity. The project name is the only shrinkable piece
-    // (.bq-brand-project ellipsizes); it is simply absent until known.
+    /** The header title: "BunnyQuery · <project>", or whatever `opts.title` says.
+     *
+     *  ONE element, not four. It used to be an icon plus name/separator/project
+     *  spans so the project could ellipsize on its own, but that made the title
+     *  impossible to replace as a unit -- an embedder overriding it would have
+     *  had to know which of the pieces to write into. One string in, one node
+     *  out, and the whole line ellipsizes. */
+    /** Chat composer placeholder. `opts.inputPlaceholder` replaces it outright,
+     *  including with "" for no placeholder at all. */
+    function composerPlaceholder() {
+        if (typeof S.opts.inputPlaceholder === "string") return S.opts.inputPlaceholder;
+        return "Ask anything about: " + (S.serviceName || "your project");
+    }
+    function brandTitleText() {
+        if (typeof S.opts.title === "string") return S.opts.title;
+        return "BunnyQuery" + (S.serviceName ? " \u00b7 " + S.serviceName : "");
+    }
     function brandTitleEl() {
+        var text = brandTitleText();
         return h("div", { class: "bq-title-left bq-brand" },
-            h("img", { class: "bq-brand-icon", src: BQ_LOGO_URI, alt: "", "aria-hidden": "true" }),
-            h("span", { class: "bq-brand-name", text: "BunnyQuery" }),
-            S.serviceName ? h("span", { class: "bq-brand-sep", text: "·" }) : null,
-            S.serviceName ? h("span", { class: "bq-brand-project", title: S.serviceName, text: S.serviceName }) : null);
+            h("span", { class: "bq-brand-title", title: text, text: text }));
     }
     function pageRoot(content) {
         // Same top-left header the chat/settings views use (.bq-section-title >
@@ -451,9 +681,6 @@ import {
     var BUNNY_FRAME_A = "  (\\(\\\n  ( - -)\n c(\")(\")";
     var BUNNY_FRAME_B = "  /)/)\n ( . .)\nc(\")(\")";
 
-    // Bunny mark for the chat header, inlined so the embedded widget never
-    // depends on the host page (or our site) serving an image file.
-    var BQ_LOGO_URI = "data:image/png;base64,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";
     function bunnyLoader(label, overlay) {
         return h("div", {
                 class: "bq-bunny-loader" + (overlay ? " bq-bunny-loader--overlay" : ""),
@@ -728,8 +955,7 @@ import {
         var redirectUrl = ssGet(skey(SK.googleRedirect)) || (window.location.origin + window.location.pathname);
         var secretName = S.opts.googleClientSecretName || "ggl";
 
-        return S.skapi.clientSecretRequest({
-            clientSecretName: secretName,
+        return skapiForwardWithSecret(secretName, {
             url: GOOGLE_TOKEN_URL,
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -954,6 +1180,13 @@ import {
                     onclick: function () { renderSignup(); }, text: "Sign up →" }));
             }
 
+            // On a project that allows anonymous users the login page is a
+            // detour, not a wall: the visitor arrived here from the chat's own
+            // Login link and has to be able to go back without an account.
+            // Only when there is no session, since a logged-in user reaching the
+            // login page is a different situation entirely.
+            var canReturnToChat = !S.user && anonymousAllowed();
+
             var form = h("form", { class: "bq-form", onsubmit: submit },
                 h("label", { class: "bq-label" }, h("span", { text: "Email" }), emailInput),
                 h("label", { class: "bq-label" }, h("span", { text: "Password" }), pwInput),
@@ -962,7 +1195,14 @@ import {
                 h("div", { class: "bq-form-bottom" }, submitBtn)
             );
 
-            var children = authHeader("Login").concat([form]);
+            var children = [];
+            if (canReturnToChat) {
+                children.push(h("div", { class: "bq-settings-top" },
+                    h("button", { class: "bq-link", type: "button",
+                        onclick: function () { enterAfterLogin(); },
+                        text: "← Back to chat" })));
+            }
+            children = children.concat(authHeader("Login")).concat([form]);
 
             if (googleEnabled()) {
                 children.push(
@@ -1310,12 +1550,22 @@ import {
                 h("div", { class: "bq-account-value" + (opts.muted ? " is-muted" : "") }, valueNodes)),
             onAction ? h("button", { class: "bq-link" + (opts.dangerAction ? " bq-link--danger" : ""), type: "button", onclick: onAction, text: actionLabel || "Change" }) : null);
     }
-    function getNewsletterStatus() {
+    // Always asks about ONE user: the signed-in visitor. Called without "user_id" the
+    // route answers an admin of the project (access groups 90 ~ 99) with the whole
+    // group's subscriber list instead of that person's own row, so a staff visitor of
+    // a customer's site pulled that customer's subscriber list into this page, and the
+    // checkbox below was then set from whichever row happened to come back first. The
+    // dashboards pass "user_id" the same way whenever they want a single user.
+    function getNewsletterStatus(user) {
         // getNewsletterSubscription returns [{ active, group, subscribed_email, timestamp }]
         // (or a DatabaseResponse with that as .list). An UNSUBSCRIBED user can still have a
         // record with active:false, so check for an *active* record in the authorized group (1).
+        var userId = user && typeof user.user_id === "string" ? user.user_id : null;
+        // No signed-in user means there is no own subscription to report. Falling back to
+        // a user_id-less call here is exactly the whole-list request this guard prevents.
+        if (!userId) return Promise.resolve(false);
         try {
-            return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized" }))
+            return Promise.resolve(S.skapi.getNewsletterSubscription({ group: "authorized", user_id: userId }))
                 .then(function (res) {
                     var list = res && res.list ? res.list : res;
                     if (!Array.isArray(list)) return false;
@@ -1356,9 +1606,13 @@ import {
         clear(CS.messagesBox);
         CS.messagesBox.appendChild(h("div", { class: "bq-chat-settings" },
             h("div", { class: "bq-chat-settings-loading" }, bunnyLoader("Loading..."))));
-        Promise.all([getProfile(), getNewsletterStatus()]).then(function (res) {
-            if (res[0]) S.user = res[0];
-            S.newsletterSubscribed = res[1];
+        // Sequential, not Promise.all: the newsletter lookup needs the signed-in user's
+        // user_id to stay scoped to their own subscription, so the profile has to land first.
+        getProfile().then(function (user) {
+            if (user) S.user = user;
+            return getNewsletterStatus(S.user);
+        }).then(function (subscribed) {
+            S.newsletterSubscribed = subscribed;
             renderSettingsIntoBox();
         }).catch(function () { renderSettingsIntoBox(); });
     }
@@ -1686,7 +1940,15 @@ import {
                 return undefined;
             })(),
             owner: S.owner,
-            userId: (S.user && S.user.user_id) || S.projectId,
+            // The chat identity, which the engine turns into the request queue
+            // name. An anonymous visitor gets their DEVICE id rather than the
+            // project id: the old fallback gave every anonymous visitor of a
+            // project the same queue, so they would have shared one transcript
+            // and head-of-line-blocked each other's turns on a single FIFO.
+            userId: (S.user && S.user.user_id) || (isAnonymousSession() ? anonDeviceId() : S.projectId),
+            // Sends the turn's MCP tools to the project-scoped, credential-free
+            // endpoint instead of the root one with an empty bearer.
+            anonymous: isAnonymousSession(),
             platform: S.aiPlatform, model: S.aiModel || undefined,
             serviceName: S.serviceName, serviceDescription: S.serviceDescription,
         };
@@ -1706,7 +1968,7 @@ import {
             if (!fetchMore) ensureHistoryFillsViewport(token);
         },
         settleScroll: function () { settleScrollAfterRefresh(); },
-        cancelRequest: function (opts) { return S.skapi.cancelClientSecretRequest(opts); },
+        cancelRequest: function (opts) { return skapiCancelRequest(opts); },
         refreshSession: function () { return refreshSkapiSession(); },
         formatIndexingLabel: function (name, mime, size, storagePath, reindex, continued) {
             return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
@@ -1717,11 +1979,20 @@ import {
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
         deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
-        ensureFileIndexRecord: function (path, meta) { return ensureFileIndexRecordDb(path, meta); },
+        ensureFileIndexRecord: function (path, meta) {
+            // Resolve the group FIRST and remember it: the engine asks for it
+            // straight after, and both the record and the answer have to be the
+            // same decision or the file's own record and its extracted rows end
+            // up in different tables.
+            return resolveUploadAccessGroup(path).then(function (g) {
+                return ensureFileIndexRecordDb(path, meta, g);
+            });
+        },
+        uploadAccessGroup: function (path) { return resolveUploadAccessGroup(path); },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
-        resetOverwriteBatch: function () { return resetOverwriteBatch(); },
+        resetOverwriteBatch: function () { resetOverwriteBatch(); resetAccessGroupBatch(); },
         renderAttachmentChips: function () { renderAttachmentChips(); },
         updateComposerControls: function () { updateComposerControls(); },
     });
@@ -1764,6 +2035,7 @@ import {
             css: "text/css", xml: "application/xml", yaml: "text/yaml", yml: "text/yaml",
             pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
             gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+            eml: "message/rfc822",
         };
         return map[ext] || null;
     }
@@ -1805,6 +2077,15 @@ import {
             // buildGreetingEl, so the two can never disagree.
             greeting: greetingParts().text,
             canUpload: !uploadsFrozenForUser(),
+            // Where THIS project's indexer writes, from the "bq::settings"
+            // record. The MCP's auto-fill assumes "authorized"; on a project set
+            // to public or private that would search the wrong group and answer
+            // "nothing found". A SYNC CACHE READ, because the engine calls this
+            // hook from paths with nowhere to put an await. Every send that
+            // reaches it has settled the fetch first: sendMessage awaits
+            // readyProjectSettings on the text-only branch, and the attachment
+            // branch resolves the upload group before it dispatches.
+            indexAccessGroup: projectUploadAccessGroup(S.projectId),
             client: "widget",
         });
     }
@@ -1955,7 +2236,22 @@ import {
         CS.drafting = false;
         syncDraftingIndicator();
 
-        if (!hasAttachments) { session.dispatchComposedMessage(text, false); return; }
+        if (!hasAttachments) {
+            // SETTLE THE SETTINGS BEFORE THE PROMPT IS BUILT. This is the only
+            // dispatch that does not pin a prompt, so the engine builds it live
+            // from the sync cache read (buildSystemPrompt -> indexAccessGroup).
+            // Until the settings fetch lands that read answers "authorized", so
+            // a first question typed on a project that indexes at public or
+            // private would send the agent looking in a group its records are
+            // not in, and it would answer "nothing found". The console avoids
+            // this by awaiting before it pins; this is the same guard.
+            // Almost always instant: renderChat primed this fetch when the chat
+            // opened, and the store never rejects.
+            readyProjectSettings(S.projectId).then(function () {
+                session.dispatchComposedMessage(text, false);
+            });
+            return;
+        }
 
         // The turn takes its chips with it (stamped with a batch id) and, when it
         // has text, leaves a staged bubble behind so it holds the position it was
@@ -2133,8 +2429,11 @@ import {
         return href;
     }
     function fileToAnchorHtml(filename, href) {
-        var text = "↗ " + filename;
-        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(text) + "</a>";
+        // Same glyph element as the engine's renderInlineLinkHtml, for the same
+        // reason: chat.css makes .bq-link-glyph an atomic inline so the anchor's
+        // hover underline stops before the ↗ instead of running under it.
+        return '<a class="bq-file-download" href="' + escapeHtml(href) + '" download="' + escapeHtml(filename) + '" target="_blank" rel="noopener noreferrer">'
+            + '<span class="bq-link-glyph" translate="no">↗</span>' + escapeHtml(filename) + "</a>";
     }
     // The markup is the ENGINE's (renderInlineLinkHtml): this used to be a byte
     // for byte copy of agent.vue's emitter, and the image preview would have had
@@ -2476,12 +2775,12 @@ import {
     // "__MEDIA__" media-index writes, which land while window 1 is still being BUILT, before
     // the model's first turn could create anything. Best-effort: losing the guarantee must
     // not lose the upload.
-    function ensureFileIndexRecordDb(storagePath, meta) {
+    function ensureFileIndexRecordDb(storagePath, meta, accessGroup) {
         if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
         return Promise.resolve(S.skapi.postRecord(null, {
             service: S.projectId,
             unique_id: "src::" + storagePath,
-            table: { name: "file_summaries", access_group: "authorized" },
+            table: { name: "file_summaries", access_group: normalizeUploadAccessGroup(accessGroup) },
             // Deleting the file record must cascade to every record referencing it.
             source: { can_remove_referencing_records: true },
             data: {
@@ -2593,6 +2892,10 @@ import {
     var ESTIMATED_BYTES_PER_TOKEN = 3;
     var ESTIMATED_PDF_BYTES_PER_TOKEN = 5000;
     var ESTIMATED_IMAGE_TOKENS = 800;
+    // No eml here: an .eml is a server-parsed container like .docx (its bytes are
+    // mostly base64 attachment blobs that go to __MEDIA__ or are never inlined), and
+    // counting them at 3 bytes/token estimated a 380 KB mail with one photo at 127k
+    // tokens and disabled Send. Mirrored byte-for-byte in agent.vue.
     var TEXTLIKE_EXTENSION_RE = /\.(txt|md|markdown|rst|csv|tsv|json|jsonl|ndjson|ya?ml|xml|html?|css|less|scss|sass|js|mjs|cjs|ts|tsx|jsx|vue|svelte|astro|py|rb|go|rs|java|kt|swift|c|h|hpp|cpp|cc|cs|php|sh|bash|zsh|ps1|sql|log|conf|cfg|ini|toml|env|gitignore|dockerfile|makefile|lock)$/i;
     var PDF_EXTENSION_RE = /\.pdf$/i;
     var IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg)$/i;
@@ -3264,7 +3567,13 @@ import {
     /* ---- history + clear-horizon (agent.vue) ----------------------------- */
     function getClearHistoryStorageKey() {
         if (!S.projectId || S.aiPlatform === "none") return "";
-        return SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+        var key = SK.clearHorizon + ":" + S.projectId + "#" + S.aiPlatform;
+        // An anonymous visitor and a signed-in one share a browser but not a
+        // transcript, so they must not share a horizon either: clearing as a
+        // visitor would otherwise hide the account's history too. The signed-in
+        // key is left exactly as it was, so no existing horizon is orphaned.
+        if (isAnonymousSession()) key += "#" + anonDeviceId();
+        return key;
     }
     function getClearedAt() {
         var key = getClearHistoryStorageKey();
@@ -3495,8 +3804,61 @@ import {
         if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
 
         var bubble;
-        if (msg.isPending) {
+        // THE LIVE-STREAM RENDER CONTRACT, mirrored verbatim in agent.vue's
+        // template: a streaming bubble is STILL a pending bubble (the engine keeps
+        // isPending set because every queue mechanism finds the turn by it), so the
+        // only thing streaming changes here is which half of this branch it takes.
+        // By the time _streaming is set the bubble's `content` already holds a safe
+        // prefix of the answer - liveSafePrefix never leaves it ending inside a
+        // half-arrived link, fence or url - so it renders as ordinary markdown
+        // instead of the dot-trail, and everything else about the bubble is
+        // unchanged.
+        //
+        // _streamPending is the OTHER direction, and it is not a pending turn at
+        // all: the row is terminal, but its answer was streamed and nobody ever
+        // finalized it, so the text is in the chunk store and can be read back
+        // (ChatSession.recoverStreamedAnswer). Empty content there means UNKNOWN,
+        // not "answered nothing". Once it has content (the merge adopted a local
+        // answer onto it) it renders as ordinary text and neither branch is taken.
+        //
+        // WHICH of the two it takes is streamRecoveryPhase's call, and the whole
+        // point of asking is that "the answer is elsewhere" and "somebody is on
+        // their way to get it" are different facts. This used to draw the live
+        // turn's loader for both, so the turns the per-load cap left behind - the
+        // third and later on a page - and every turn whose read had failed spun for
+        // the rest of the session with nothing driving them and no way for the
+        // reader to resolve them. A loader is a promise that something is coming, so
+        // it is now drawn only where something is; the other two phases get the
+        // affordance below. Mirrored in agent.vue's template.
+        //
+        // Both conditions call the shared predicate INLINE rather than through a local
+        // (it is a handful of property reads, so the cost is nothing): the two clients
+        // are diffed on the text of exactly these two expressions, and a local here
+        // would make them un-diffable against a Vue template that cannot declare one.
+        // See tests/stream-client-parity.cjs.
+        if ((msg.isPending && !msg._streaming) || streamRecoveryPhase(msg) === "active") {
             bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+        } else if (streamRecoveryPhase(msg)) {
+            // 'idle' (nobody has been sent for it) and 'failed' (somebody went and
+            // could not read it) differ ONLY in wording, deliberately: both leave the
+            // answer where it is, both are fixed by asking again, and the words come
+            // from the engine so the two clients cannot describe the same state
+            // differently. Nothing here claims the answer is lost - the row is
+            // unfinalized, which is exactly why the chunks are still there to fetch.
+            var labels = streamRecoveryLabels(streamRecoveryPhase(msg));
+            bubble = h("div", { class: "bq-bubble is-stream-recover" + (streamRecoveryPhase(msg) === "failed" ? " is-stream-failed" : "") });
+            bubble.appendChild(h("span", { class: "bq-stream-recover-note", text: labels.note }));
+            var recoverBtn = h("button", { class: "bq-stream-recover-btn", type: "button", text: labels.action });
+            recoverBtn.addEventListener("click", function (e) {
+                e.stopPropagation();
+                // The engine flips the bubble to 'active' synchronously and notifies,
+                // so the click's own feedback is the loader replacing this button. No
+                // local disabled flag: a second click while the read is in flight is
+                // already refused by the engine, and a flag here would be one more
+                // piece of state to leave stuck.
+                session.recoverStreamedAnswer(msg._serverItemId);
+            });
+            bubble.appendChild(recoverBtn);
         } else {
             bubble = h("div", { class: "bq-bubble" });
             if (msg.role === "user" && msg.isPendingQueued) {
@@ -3521,7 +3883,21 @@ import {
             else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
-            var ts = formatChatTimestamp(msg._ts);
+            // NEVER on a bubble that is still running, and streaming is what makes
+            // that worth stating: a live turn now takes this branch WHILE it runs,
+            // and a placeholder mapped from history carries the REQUEST time in _ts,
+            // so it would date the answer before it exists (the settle re-stamps it
+            // with the response time). Before streaming, the spinner branch above
+            // made this implicit. Mirrored in agent.vue's bubbleTime.
+            var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
+            // How long an indexing pass took, appended to its own end time.
+            // `_tsStart` is stamped only on an indexing pass's reply, so this needs
+            // no second test to stay off ordinary answers. Empty for anything under
+            // a second, which is what a one-sided server timestamp collapses to.
+            if (ts && typeof msg._ts === "number" && typeof msg._tsStart === "number") {
+                var dur = formatDuration(msg._ts - msg._tsStart);
+                if (dur) ts += " (" + dur + ")";
+            }
             if (ts) bubble.appendChild(h("time", { class: "bq-msg-time", text: ts }));
         }
         return h("div", { class: cls.join(" "), dataset: { msgIndex: String(idx) } }, bubble);
@@ -3759,8 +4135,12 @@ import {
         // Stub rows are per-CHAT and this chat belongs to the signed-in end
         // user: another user's runs must not splice rows into it. Ownerless
         // records (pre-owner sweeps) are kept.
+        // An anonymous visitor owns no runs — they cannot upload or index at
+        // all — so they get no stub rows. Stated rather than left to fall out
+        // of an empty owner id, which SKIPS the filter and would splice in every
+        // user's rows the moment an anonymous read of these records succeeds.
         var stubs = undefined;
-        if (fresh) {
+        if (fresh && !isAnonymousSession()) {
             stubs = {};
             var myId = (S.user && S.user.user_id) || "";
             for (var rp in markerSweep.runs) {
@@ -4130,7 +4510,31 @@ import {
      *  sessions get the ask-first line instead. buildSystemPrompt sends this
      *  same text to the model, which never sees the bubble itself. */
     function greetingParts() {
-        return buildChatGreeting({ projectName: S.serviceName, canUpload: !uploadsFrozenForUser() });
+        return buildChatGreeting({
+            projectName: S.serviceName,
+            canUpload: !uploadsFrozenForUser(),
+            // A project can replace the sentence entirely from its settings page.
+            // A SYNC cache read, so it is '' until the settings fetch settles --
+            // refreshGreetingEl below is what picks it up when it lands.
+            custom: projectChatGreeting(S.projectId),
+        });
+    }
+
+    /** Repaint JUST the opening bubble, in place.
+     *
+     *  The greeting is painted on the first render, but a project's custom line
+     *  arrives with the settings fetch, which renderChat deliberately does not
+     *  wait for. Swapping the one node keeps that out of renderMessages(), which
+     *  would rebuild the whole list and move the reader's scroll position for a
+     *  change to a single line. No-ops when the text is unchanged, so the common
+     *  case (no custom line) touches no DOM at all. */
+    function refreshGreetingEl() {
+        if (!CS.messagesBox) return;
+        var cur = CS.messagesBox.querySelector(".bq-empty-greeting");
+        if (!cur) return;
+        var next = buildGreetingEl();
+        if (next.textContent === cur.textContent) return;
+        cur.parentNode.replaceChild(next, cur);
     }
     /** The permanent opening bubble. An ordinary assistant message: same class,
      *  same bubble, so it wears the bunny face chat.css gives every one of them. */
@@ -4156,8 +4560,12 @@ import {
             return h("div", { class: "bq-history-loading is-initial" },
                 bunnyLoader("Fetching history..."));
         }
+        // The outer element takes NO height in flow (see widget.css): it is a
+        // zero-height sticky hook and the inner strip overflows it, so mounting
+        // and unmounting this bar cannot move the list under the reader.
         return h("div", { class: "bq-history-loading" },
-            h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" }));
+            h("span", { class: "bq-history-loading-inner" },
+                h("span", { text: "Fetching history" }), h("span", { class: "bq-loader" })));
     }
     /* ---- scroll anchoring across a full re-render ---------------------------
      * renderMessages rebuilds the whole list, and detaching every child collapses
@@ -4269,7 +4677,8 @@ import {
             // messages here left the box completely blank for that window
             // (agent.vue's bar has no such requirement either).
             CS.messagesBox.appendChild(h("div", { class: "bq-history-loading" },
-                h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" })));
+                h("span", { class: "bq-history-loading-inner" },
+                    h("span", { text: "Loading indexing history" }), h("span", { class: "bq-loader" }))));
         }
         // ALWAYS, and always first. The greeting is the opening line of the
         // conversation, not a placeholder for an empty one: it goes in before any
@@ -4475,6 +4884,22 @@ import {
     }
 
     function renderChat() {
+        // Start the project's settings fetch as the chat opens, and do NOT wait
+        // for it: the composer paints on the default, and the only thing that
+        // actually needs the real value is the first upload, which awaits this
+        // same request through readyProjectSettings. Deduped and cached per
+        // project by the engine store, so re-entering the chat costs nothing.
+        primeProjectSettings(S.projectId);
+        // ...but the OPENING LINE is a setting, and it is on screen before the
+        // first send. Repaint the one bubble when the fetch settles so a project
+        // that set its own greeting is not showing the built-in one until the
+        // next render. Keyed on the project the fetch was started for: the user
+        // can leave and open another project while it is in flight.
+        (function (openedFor) {
+            readyProjectSettings(openedFor).then(function () {
+                if (S.projectId === openedFor) refreshGreetingEl();
+            });
+        })(S.projectId);
         // reset transient chat state on (re)entry
         // Preview urls are keyed by project, and an identity-blind cache is how
         // one project's content has reached another project's chat before.
@@ -4511,11 +4936,22 @@ import {
             CS.settingsBtnEl = settingsBtn;
 
             // Landing-style brand header (brandTitleEl, shared with the
-            // logged-out pages) with the gear (settings) on the right.
+            // logged-out pages). The right slot holds the gear for a signed-in
+            // user; an anonymous visitor gets a Login link instead, because
+            // every row behind the gear (email, name, password, newsletter,
+            // logout) belongs to an account they do not have.
+            var headerRight = isAnonymousSession()
+                ? (S.opts.showLogin === false ? null : h("button", {
+                    class: "bq-link", type: "button", title: "Login",
+                    onclick: function () { renderLogin(); }, text: "Login",
+                }))
+                : settingsBtn;
+            if (isAnonymousSession()) CS.settingsBtnEl = null;
+
             var header = h("div", { class: "bq-section-title" },
                 h("div", { class: "bq-title-row" },
                     brandTitleEl(),
-                    h("div", { class: "bq-title-right" }, settingsBtn)));
+                    h("div", { class: "bq-title-right" }, headerRight)));
 
             var chatArea;
             if (S.aiPlatform === "none") {
@@ -4550,7 +4986,7 @@ import {
             }
             CS.messagesBox = box;
 
-            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: "Ask anything about: " + (S.serviceName || "your project") });
+            var input = h("textarea", { class: "bq-input", rows: "1", placeholder: composerPlaceholder() });
             CS.inputEl = input;
             var composing = false;
             input.addEventListener("compositionstart", function () { composing = true; });
@@ -4657,6 +5093,134 @@ import {
         var r = overwriteState.resolver; overwriteState.resolver = null;
         if (r) r(choice);
     }
+    /* ---- upload access group --------------------------------------------- *
+     * Who can read what is extracted from a file the visitor uploads.
+     *
+     * The project owner sets one value from the project's settings page: a group
+     * to use silently, or "ask" to be prompted per file. It is stored as the
+     * "bq::settings" record in the project's OWN database, and the engine's
+     * project_settings store owns the fetch, the cache and the fallback (the
+     * reader is wired in init(), and primeProjectSettings starts the fetch when
+     * the chat opens). The group list, its labels and its hints are that store's
+     * constants, imported at the top of this file rather than restated here, so
+     * the widget and the console can never offer different choices.
+     *
+     * The value chosen here is applied to the file's "src::" record AND handed to
+     * the engine, which puts it in the indexing prompt so the rows the agent
+     * extracts land in the same group. A record written under a different group
+     * is in a different table and never comes back with the rest of the file.
+     *
+     * "authorized" whenever the project said nothing, which is what every record
+     * written before this setting existed used.
+     */
+
+    var accessGroupState = { resolver: null, sticky: null, handle: null, applyToAll: false, choice: "authorized", perPath: {} };
+    function resetAccessGroupBatch() {
+        accessGroupState.sticky = null;
+        accessGroupState.applyToAll = false;
+        accessGroupState.perPath = {};
+    }
+    function chooseAccessGroup(choice) {
+        var picked = normalizeUploadAccessGroup(choice);
+        // "Apply to all remaining files" carries this answer through the REST OF
+        // THIS BATCH and no further: resetAccessGroupBatch() clears it when the
+        // next send starts.
+        if (accessGroupState.applyToAll) accessGroupState.sticky = picked;
+        if (accessGroupState.handle) { accessGroupState.handle.close(); accessGroupState.handle = null; }
+        var r = accessGroupState.resolver; accessGroupState.resolver = null;
+        if (r) r(picked);
+    }
+
+    // Serialized like the overwrite prompt, and for the same reason: uploads run
+    // concurrently and two files must never fight over the single modal.
+    var accessGroupChain = Promise.resolve();
+    function resolveUploadAccessGroup(storagePath) {
+        // WAIT FOR THE SETTINGS RECORD BEFORE DECIDING. The sync accessors answer
+        // from cache and return the "authorized" default until the fetch settles,
+        // so the FIRST upload after a page load is the one that can be decided on
+        // a value the project never chose: a project set to "public" would index
+        // its first file where an anonymous visitor cannot read it, and one set to
+        // "ask" would never open the chooser. Nothing after the upload can move
+        // those records to another group without re-indexing the file, so this is
+        // worth a wait. It is only ever a real wait once: readyProjectSettings
+        // joins the fetch primeProjectSettings started when the chat opened, and
+        // resolves immediately after it has settled. It never rejects, and a read
+        // that failed settles as "unset", which is the default.
+        return readyProjectSettings(S.projectId).then(function () {
+            return decideUploadAccessGroup(storagePath);
+        });
+    }
+    function decideUploadAccessGroup(storagePath) {
+        var svc = S.projectId;
+        if (!projectAsksUploadAccess(svc)) return Promise.resolve(projectUploadAccessGroup(svc));
+        // Under "ask" the project names no group, so the modal opens on the same
+        // value an unset project would have used.
+        var fallback = projectUploadAccessGroup(svc);
+        if (accessGroupState.sticky) return Promise.resolve(accessGroupState.sticky);
+
+        // ONE answer per file, remembered for the batch. This is asked TWICE per
+        // upload - once when the "src::" record is created, once when the engine
+        // builds the indexing request - and the two must be the same decision, or
+        // the file's own record and the rows extracted from it land in different
+        // access groups and never come back together. Without the memo the
+        // visitor is also asked the same question about the same file twice.
+        var pathKey = String(storagePath || "");
+        if (pathKey && accessGroupState.perPath[pathKey]) {
+            return Promise.resolve(accessGroupState.perPath[pathKey]);
+        }
+
+        var run = accessGroupChain.then(function () {
+            // A file ahead of this one may have answered "apply to all" while this
+            // one waited. Honour it without asking again.
+            if (accessGroupState.sticky) return accessGroupState.sticky;
+            // And this file may have been answered while it waited its turn.
+            if (pathKey && accessGroupState.perPath[pathKey]) {
+                return accessGroupState.perPath[pathKey];
+            }
+            accessGroupState.applyToAll = false;
+            accessGroupState.choice = fallback;
+            var filename = String(storagePath || "").split("/").pop() || "this file";
+            return new Promise(function (resolve) {
+                accessGroupState.resolver = resolve;
+                accessGroupState.handle = openModal(function () {
+                    var radios = [];
+                    var list = h("div", { class: "bq-access-options" });
+                    UPLOAD_ACCESS_GROUPS.forEach(function (g) {
+                        var input = h("input", { type: "radio", name: "bq-access-group", value: g });
+                        input.checked = g === accessGroupState.choice;
+                        input.addEventListener("change", function () {
+                            if (input.checked) accessGroupState.choice = g;
+                        });
+                        radios.push(input);
+                        list.appendChild(h("label", { class: "bq-access-option" }, input,
+                            h("span", { class: "bq-access-option-label", text: UPLOAD_ACCESS_LABELS[g] }),
+                            h("span", { class: "bq-access-option-hint", text: UPLOAD_ACCESS_HINTS[g] })));
+                    });
+                    var applyCb = h("input", { type: "checkbox" });
+                    applyCb.addEventListener("change", function () { accessGroupState.applyToAll = !!applyCb.checked; });
+                    var applyLabel = h("label", { class: "bq-overwrite-applyall" }, applyCb,
+                        h("span", { text: "Apply to all remaining files" }));
+                    return h("div", { class: "bq-modal" },
+                        h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Who can read this file?" })),
+                        h("p", { class: "bq-modal-desc" },
+                            "Choose who can ask questions about \u201C" + filename + "\u201D once it is indexed."),
+                        list,
+                        applyLabel,
+                        h("div", { class: "bq-modal-btns" },
+                            h("button", { class: "btn", type: "button", onclick: function () { chooseAccessGroup(accessGroupState.choice); } }, "Upload"))
+                    );
+                }, { dismissible: false });
+            });
+        });
+        // Keep the chain alive even if a prompt rejects, or every later file hangs.
+        accessGroupChain = run.catch(function () { return undefined; });
+        return run.then(function (picked) {
+            var g = normalizeUploadAccessGroup(picked);
+            if (pathKey) accessGroupState.perPath[pathKey] = g;
+            return g;
+        }).catch(function () { return fallback; });
+    }
+
     function promptOverwrite(filename) {
         // A prior file in this batch chose "apply to all" — honor it silently.
         if (overwriteState.sticky) return Promise.resolve(overwriteState.sticky);
@@ -4757,6 +5321,11 @@ import {
             .catch(function () {})
             .then(function () {
                 S.user = null;
+                // On a project that allows anonymous users there is no login
+                // wall to fall back to; dropping the visitor on one would strand
+                // them on a page the project said it did not want. Re-enter the
+                // chat instead, now as an anonymous device.
+                if (anonymousAllowed()) return enterAfterLogin();
                 renderLogin();
             });
     }
@@ -4772,7 +5341,12 @@ import {
         return Promise.resolve()
             .then(function () { return S.user ? S.user : getProfile().then(function (u) { S.user = u; return u; }); })
             .then(function () { return loadServiceInfo(); })
-            .then(function (conn) { S.service = conn; applyAgentConfig(); })
+            // Keep the copy boot already loaded when this re-load comes back
+            // empty (loadServiceInfo swallows its own errors and resolves null).
+            // Overwriting it with null loses conf.require_login, and an
+            // anonymous visitor would then be drawn as a signed-in one: the chat
+            // header would offer the account gear to someone with no account.
+            .then(function (conn) { if (conn) S.service = conn; applyAgentConfig(); })
             .then(function () { renderChat(); })
             .catch(function (err) {
                 console.error("[bunnyquery] enterAfterLogin failed", err);
@@ -4847,6 +5421,12 @@ import {
         return getProfile().then(function (user) {
             S.user = user;
             if (!user) {
+                // A project that allows anonymous users opens straight into the
+                // chat. enterAfterLogin tolerates a null user and, crucially,
+                // reaches no MCP-grant code: the ladder below would redirect the
+                // whole page away to an authorize endpoint a visitor with no
+                // account can never complete.
+                if (anonymousAllowed()) return enterAfterLogin();
                 renderLogin();
                 return;
             }
@@ -4884,6 +5464,24 @@ import {
         S.skapi = skapi;
         S.opts = Object.assign({
             theme: "light",
+            // Header title. null keeps "BunnyQuery \u00b7 <project name>"; a string
+            // replaces the whole line, "" hides it. See brandTitleText.
+            title: null,
+            // Placeholder in the chat composer. null keeps
+            // "Ask anything about: <project name>".
+            inputPlaceholder: null,
+            // Whether an ANONYMOUS visitor is offered a Login button in the chat
+            // header. Only ever shown to a signed-out visitor in the first place
+            // (a signed-in user gets the settings gear there), so this turns that
+            // one affordance off for an embed that does its own auth, or that
+            // does not want visitors making accounts at all. Signed-in users are
+            // unaffected either way.
+            showLogin: true,
+            // Image for the little face on assistant chat bubbles. Any CSS image
+            // url value (an https url or a data: uri). null keeps the bundled
+            // bunny. Applied as the --bq-bubble-face custom property, which
+            // chat.css reads with the default as its fallback.
+            bubbleFace: null,
             signup: false,        // include signup (and thus delete/recover account)
             dev: false,          // use the MCP dev host (mcp-dev.broadwayinc.computer)
             mcpBaseUrl: null,    // override the MCP OAuth server base entirely
@@ -4892,6 +5490,31 @@ import {
             signupConfirmationUrl: null, // defaults to current host page
             hostDomain: null,            // db-CDN host; null → skapi.app (dev) / skapi.com (prod)
             attachmentParsers: null,     // client-side attachment parsers, e.g. [createHwpParser()]
+            // Open the chat with no login for visitors without an account.
+            // null → follow the project's own "Allow anonymous users" setting
+            // (getConnectionInfo().conf.require_login); true/false pins it.
+            allowAnonymous: null,
+            // Server-driven windowed indexing; read at configureChatEngine time.
+            // Listed here so the defaults object is the full opt surface.
+            windowedIndexing: true,
+            // Live streaming of chat turns; read at configureChatEngine time.
+            // OFF until the region's polling worker relays the response bytes:
+            // see the configureChatEngine call for what goes wrong without it.
+            // A REQUEST, not a switch: it is also refused (with a warning, falling
+            // back to buffered) when the embedder's own skapi-js is too old to
+            // carry skapi's half of the stream flag. See skapiSupportsStreaming.
+            liveStreaming: false,
+            // Socket delivery for the streamed reply. OFF unless the embedder asks,
+            // and separately from liveStreaming, because this widget runs on someone
+            // else's page with someone else's skapi instance: skapi's joinRealtime
+            // REPLACES the connection's group rather than adding to it, so for the
+            // length of a turn this would take the room out from under whatever the
+            // host app uses realtime for, and the host would see its own messages
+            // simply stop. Only an embedder who knows their app does not use realtime
+            // (or does not mind) can answer that, so only they can turn it on. It is
+            // purely an accelerator: with it off the reply still streams, just on the
+            // poll's cadence rather than as the text is relayed.
+            liveStreamingRealtime: false,
         }, opts || {});
         S.mountEl = mountEl;
 
@@ -4900,17 +5523,73 @@ import {
         S.root = h("div", { class: "bq-agent" });
         mountEl.appendChild(S.root);
 
+        // The bubble face is a CSS custom property rather than an option read at
+        // render time: chat.css already draws it as a ::before background, and a
+        // property set once on our own root reaches every bubble, present and
+        // future, without any element having to know about it. Set on S.root, so
+        // two widgets on one page can carry different faces.
+        if (typeof S.opts.bubbleFace === "string" && S.opts.bubbleFace) {
+            S.root.style.setProperty("--bq-bubble-face", 'url("' + S.opts.bubbleFace.replace(/"/g, '\\"') + '")');
+        }
+
         applyTheme(loadTheme());
         S.booted = true;
         console.log("[bunnyquery] v" + BQ_VERSION);
+
+        // The embedder ASKED for streaming; whether they get it depends on the
+        // skapi-js their page pinned. Degrade to BUFFERED rather than to a broken
+        // turn: without skapi's half of the flag the destination still streams SSE
+        // into a buffered row and every answer reads back empty, which is worse than
+        // not streaming in every way. See skapiSupportsStreaming for why the two
+        // methods are the probe, under either family's names. Loud, because an
+        // embedder who set the flag and got nothing has no other way to find out;
+        // once, at init, not per turn.
+        var canStream = skapiSupportsStreaming(S.skapi);
+        var liveStreaming = S.opts.liveStreaming === true;
+        if (liveStreaming && !canStream) {
+            liveStreaming = false;
+            console.warn(
+                "[bunnyquery] liveStreaming was requested but this page's skapi-js has neither " +
+                "forwardRequestStream/forwardRequestFinalize nor the older " +
+                "clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the " +
+                "stream flag would be dropped and every reply would read back empty. " +
+                "Falling back to buffered replies - update skapi-js to enable streaming."
+            );
+        }
+
+        // How the engine's project-settings store reads the "bq::settings"
+        // record. Wired ONCE here; every fetch after this is the store's, deduped
+        // and cached per project. Reads S lazily at call time, like the index
+        // marker hooks below, because S.skapi / S.projectId are not populated yet
+        // when init() runs.
+        //
+        // A SIGNED-OUT VISITOR USUALLY READS NOTHING HERE, AND THAT IS FINE. The
+        // record is public (group 0), but skapi's require_login gate refuses ALL
+        // database reads without a session and DEFAULTS TO TRUE, so on most
+        // projects this rejects with REQUIRE_LOGIN for a visitor who has not
+        // logged in. The store swallows that and falls back to "authorized". An
+        // empty read here is not a bug and needs no handling: the only thing the
+        // value is used for is an upload, and a visitor who cannot read the
+        // record cannot upload either.
+        configureProjectSettings(function (service) {
+            if (!S.skapi || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+            return Promise.resolve(S.skapi.getRecords({ service: service, unique_id: PROJECT_SETTINGS_UNIQUE_ID }))
+                .then(function (res) {
+                    var rec = (res && res.list && res.list[0]) || null;
+                    return (rec && rec.data) || null;
+                });
+        });
 
         // Inject this widget's transport + MCP endpoint into the shared chat
         // engine. poll: 0 — the deployed skapi-js@latest returns the early ack
         // (with id + a manual .poll()) only when poll===0, which queued-send
         // cancel relies on (the agent.vue build omits poll; see chat-engine).
-        configureChatEngine({
-            clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
-            clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
+        //
+        // The transport itself (dispatch, history, finalize and the chunk reader)
+        // comes from skapiEngineTransport, which picks ONE family by the embedder's
+        // skapi-js and is assigned over the rest below. See skapiHasForwardRequest
+        // for why that probe is not forwardRequest's own presence.
+        configureChatEngine(Object.assign({
             // Single-item csr-poll point lookup: how the engine hydrates a
             // compact history stub's real body when an indexing row expands.
             csrHistoryItemLookup: function (fullId, service, owner) {
@@ -4937,7 +5616,30 @@ import {
             windowedIndexing: S.opts.windowedIndexing !== false,
             // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
             attachmentParsers: S.opts.attachmentParsers || undefined,
-        });
+            // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
+            // Off by default, and for the same shipping-order reason
+            // windowedIndexing had one: THE RELAYING POLLING WORKER MUST SHIP
+            // FIRST. With this on against a region whose worker does not relay,
+            // the request either has its `since` cursor rejected or the row keeps
+            // an SSE transcript where the readers expect a parsed document, and
+            // the turn reads back as an empty answer. A streamed row settles with
+            // a STATUS AND NO BODY on purpose, so there is no fallback to read.
+            // Flip it per environment once the worker is deployed there; the
+            // widget takes it as an init opt because an embed picks its own
+            // region, where agent.vue flips one module constant.
+            // It also needs a skapi-js that supports `stream`/`onStream`, and the
+            // page's pin is the EMBEDDER's, so the request is granted above by
+            // skapiSupportsStreaming rather than taken on trust here.
+            liveStreaming: liveStreaming,
+            // Requires liveStreaming, and cannot outlive it: the AND is what stops an
+            // embedder turning on socket delivery for a reply that is not streamed.
+            liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true,
+            // The transport: dispatch and history, plus the finalize hook that stores
+            // a streamed turn's kept version and the chunk reader that is the second
+            // half of the durability guarantee. The two optional hooks are handed
+            // over only when canStream says the SDK has them. skapiEngineTransport
+            // says what each one is for, and picks the family.
+        }, skapiEngineTransport(canStream)));
 
         // Recompute the attachment "...(x) more" overflow when the viewport
         // changes (no-op when the chat/attachments aren't mounted).

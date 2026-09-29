@@ -17,6 +17,18 @@ export type ChatGreetingParams = {
 	/** Project display name. Rendered by the client inside translate="no". */
 	projectName?: string;
 	/**
+	 * The project's own opening line, from the `chat_greeting` key of its
+	 * bq::settings record. When set it REPLACES the built-in sentence outright,
+	 * including the canUpload variants below: the owner wrote the words, so the
+	 * client does not append instructions they chose not to give.
+	 *
+	 * It is returned as `lead` with an empty `name`/`tail`, so both clients draw
+	 * it through the exact code path they already use for the default sentence.
+	 * The project name is NOT interpolated into it -- an owner who wants their
+	 * project named can type the name.
+	 */
+	custom?: string;
+	/**
 	 * Whether this session can attach files at all. False for an anonymous
 	 * widget visitor and for a frozen database seen by a non-admin: telling
 	 * those users to upload is a dead end, so they get the ask-first line.
@@ -36,6 +48,12 @@ export type ChatGreetingParts = {
 };
 
 export function buildChatGreeting(params: ChatGreetingParams): ChatGreetingParts {
+	// A custom line short-circuits everything below. Trimmed because the setting
+	// arrives from a textarea, and a value that is only whitespace means "unset"
+	// rather than "open with a blank bubble".
+	const custom = typeof params.custom === 'string' ? params.custom.trim() : '';
+	if (custom) return { lead: custom, name: '', tail: '', text: custom };
+
 	const name = params.projectName ? '"' + params.projectName + '"' : '';
 	// canUpload is opt-out: a caller that does not know defaults to the
 	// upload-first line, which is the right lead for every ordinary session.

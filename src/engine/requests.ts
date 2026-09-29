@@ -3,7 +3,11 @@
  *
  * Ported from www.skapi.com/src/code/ai_agent.ts. The only changes vs the
  * original are dependency-injection seams:
- *   - `skapi.clientSecretRequest*`  -> chatEngineConfig().clientSecretRequest*
+ *   - `skapi.clientSecretRequest*`  -> resolveForwardRequest*() in config.ts,
+ *                                    which dispatches through the host's
+ *                                    `forwardRequest*` keys, or the deprecated
+ *                                    `clientSecretRequest*` ones a host written
+ *                                    before the rename still injects
  *   - MCP endpoint URL              -> chatEngineConfig().mcpBaseUrl
  *   - `poll` on each request        -> pollOpt() (set per consumer; see config.ts)
  *   - Vue `reactive`/`ref` removed  (bgTaskQueue/agentViewMounted are app-level
@@ -12,10 +16,10 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, pollOpt, windowedIndexingEnabled } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
-import { getMaxOutputTokens } from './budget';
+import { getMaxOutputTokens, getModelContextWindow } from './budget';
 
 export const ANTHROPIC_MESSAGES_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODELS_API_URL = 'https://api.anthropic.com/v1/models';
@@ -38,7 +42,186 @@ export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
 export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
 
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
-const clientSecretRequest = (opts: any) => chatEngineConfig().clientSecretRequest(opts);
+
+/**
+ * The MCP endpoint an INDEXING pass points at.
+ *
+ * Same server, same auth, same tools it can actually call: `?profile=index` only narrows
+ * the tools/list the model is SHOWN. An indexing pass reads one window of one file and
+ * writes records for it, so being told about deleteRecords, exportRecordsToFile,
+ * writeReport, getTemporaryUrl, getProfile and getProjectInfos costs about 2,400 tokens
+ * on every pass of every file and buys nothing: there is no user attached to hand a
+ * download or a report to, and re-index clears old records server-side before the pass
+ * runs. Measured: 30,577 B -> 20,755 B.
+ *
+ * A CHAT turn keeps the full list and always will. It is open ended, a person can ask
+ * for anything, and a tool that is missing from the list is a dead end the model cannot
+ * reason its way out of.
+ *
+ * Degrades in both directions, which is why it is a query param: an MCP server that
+ * predates it ignores the parameter and serves the full list, and a client that predates
+ * it just sends no parameter. Neither needs the other deployed first.
+ */
+/**
+ * Append query parameters to an MCP endpoint, preserving any the base already carries.
+ *
+ * An explicit path before the query. The configured base has no trailing slash
+ * ("https://mcp-dev.broadwayinc.computer"), and appending "?profile=index" straight onto an
+ * authority with no path yields a URL that is legal but that intermediaries and clients
+ * normalise inconsistently. "/?profile=index" is unambiguous everywhere.
+ *
+ * Every parameter here is a HINT the server may ignore, which is what lets the two sides
+ * deploy in either order: a server that predates one ignores it, and a client that predates
+ * it sends nothing. The worker strips the whole query before appending its own /internal
+ * paths (_mcp_endpoint_and_token), so nothing added here reaches those routes.
+ */
+function withMcpParams(base: string, params: Record<string, string | number | undefined>): string {
+	if (!base) return base;
+	const pairs = Object.keys(params)
+		.filter(k => params[k] !== undefined && params[k] !== null && params[k] !== '')
+		.map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k])));
+	if (!pairs.length) return base;
+	const [addr, existing] = base.split('?');
+	// Only supply the missing root path. Appending a slash to a base that ALREADY has a
+	// path would change where the request lands on a server mounted under one.
+	const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
+	const path = hasPath ? addr : addr.replace(/\/+$/, '') + '/';
+	return path + '?' + (existing ? existing + '&' : '') + pairs.join('&');
+}
+
+/**
+ * How large a page of a paginated tool result this model can afford.
+ *
+ * The server slices big results into pages and the model spends one round trip per page, so
+ * the page size sets how long reading a large record set takes: 1000 spreadsheet records is
+ * 74 round trips at the server's floor of 10,000 chars and 13 at 60,000. The server cannot
+ * know which model is on the other end of an MCP connection, so it is told.
+ *
+ * The MODEL's own ceiling, not getContextWindow(): the project's context-window setting
+ * budgets this client's FIRST request, while these pages accumulate in the provider's
+ * server-side tool loop, which runs against what the model can actually hold.
+ */
+const mcpContextParam = (platform: 'claude' | 'openai', model?: string) =>
+	getModelContextWindow(platform, model);
+
+const mcpIndexingUrl = (platform: 'claude' | 'openai' = 'openai', model?: string) =>
+	withMcpParams(mcpUrl(), { profile: 'index', ctx: mcpContextParam(platform, model) });
+
+/**
+ * Where a chat turn's MCP tools point, and what they authenticate with.
+ *
+ * A SIGNED-IN turn uses the server's root endpoint with the literal
+ * '$ACCESS_TOKEN', which the backend substitutes from the caller's
+ * `x-access-token` header before the request leaves for the provider.
+ *
+ * An ANONYMOUS turn has no such header, so that substitution yields an EMPTY
+ * credential: `authorization_token: ""` for Claude, `Bearer ` for OpenAI. That is
+ * worse than sending none. The MCP server cannot identify a project from an empty
+ * token, so every tool call 401s — and a pass whose calls all 401 is exactly what
+ * the polling worker classifies as an auth outage, which STOPS the chain. A
+ * provider that validates the field would reject the whole request before that.
+ *
+ * So an anonymous turn points at the project-scoped endpoint `/p/<project id>`
+ * and sends NO credential. That route is anonymous by construction: read-only,
+ * one project, public records only, and a bearer on it is ignored rather than
+ * honoured.
+ *
+ * The project id is the PUBLIC compound token, matching the route's own pattern
+ * and the form the tools accept; the raw regional code would not match.
+ */
+function mcpEndpointFor(
+	anonymous: boolean | undefined,
+	publicProjectId: string | undefined,
+	service: string,
+): { url: string; token?: string } {
+	if (!anonymous) return { url: mcpUrl(), token: '$ACCESS_TOKEN' };
+	const project = publicProjectId || service;
+	return { url: String(mcpUrl()).replace(/\/+$/, '') + '/p/' + project };
+}
+// Every request below is built with `secretName` and sent through here. Which of
+// the host's two transport families it reaches, and the rename back to
+// `clientSecretName` for a host on the old one, is decided in resolveForwardRequest
+// and nowhere else, so no builder ever spells the old name.
+const forwardRequest = (opts: any) => resolveForwardRequest()(opts);
+
+/**
+ * THE two `stream` flags of a streamed chat turn, produced together or not at all.
+ *
+ * There are two of them and they are NOT the same flag:
+ *
+ *   * `transport.stream` is SKAPI's. It tells the polling worker to read the
+ *     destination's response incrementally and append the raw bytes to the chunk
+ *     table, and it is never sent on to the destination.
+ *   * `body.stream` is the DESTINATION's own field, and BunnyQuery is the party
+ *     that may set it: skapi relays bytes and knows no vendor, so it cannot know
+ *     that Anthropic Messages and OpenAI Responses both happen to spell it
+ *     `stream` at the top level of the body.
+ *
+ * Setting one without the other fails QUIETLY, which is why they are produced by
+ * one function from one boolean and returned as one object:
+ *
+ *   * body streams, skapi buffers -> the row stores an SSE TRANSCRIPT where
+ *     extractClaudeText / extractOpenAIText expect a parsed document, so the turn
+ *     reads back as an empty answer with nothing in the logs to say why.
+ *   * skapi streams, the body never asked -> the destination sends one plain
+ *     document, the relay chops it into chunks, the frame parser finds no framing
+ *     at all, and the row settles with a status and no body.
+ *
+ * Two frozen constants rather than a fresh object per call: the pair is a
+ * CONSTANT, and an object literal built at each call site is exactly the shape
+ * that drifts when someone edits one arm.
+ */
+export type ChatStreamWiring = {
+	/** Spread into the forwardRequest OPTIONS (skapi's relay switch). `realtime`
+	 *  belongs here and never in `body`: it is skapi's, not the destination's. */
+	transport: { stream?: true; realtime?: true };
+	/** Spread into `data` (the destination's own switch). */
+	body: { stream?: true };
+};
+const CHAT_STREAM_ON: ChatStreamWiring = Object.freeze({
+	transport: Object.freeze({ stream: true as true }),
+	body: Object.freeze({ stream: true as true }),
+}) as ChatStreamWiring;
+const CHAT_STREAM_OFF: ChatStreamWiring = Object.freeze({
+	transport: Object.freeze({}),
+	body: Object.freeze({}),
+}) as ChatStreamWiring;
+
+/**
+ * Both stream flags for a CHAT turn, from the one `liveStreaming` opt-in.
+ *
+ * Chat turns only. Deliberately NOT called from:
+ *   * the model LISTING calls (listClaudeModels / listOpenAIModels) - plain GETs
+ *     with no body at all, and a listing has nothing to stream;
+ *   * notifyAgentSaveAttachment (background INDEXING) - see the note there.
+ *
+ * `queue` is asked for because a chat turn sent WITH ATTACHMENTS runs on the
+ * background queue ("<userId>-bg") so it waits behind its own files, and that one
+ * must not stream either. Not for the indexing reasons above: the reason is
+ * RECOVERY. A streamed row keeps no body, so its only recovery after a reload is a
+ * poll re-attached with a reader, and the re-attach loop classifies everything on
+ * the bg queue as a background poll (flat cadence, no reader, that is what the
+ * MAX_CONCURRENT_BG_POLLS budget is for). Such a turn would therefore settle on an
+ * empty envelope and the answer would be gone. Losing the live rendering on the
+ * one kind of turn that already waited minutes for its files is the cheaper half of
+ * that trade.
+ */
+const CHAT_STREAM_ON_REALTIME: ChatStreamWiring = Object.freeze({
+	// `realtime` rides on the TRANSPORT arm only. It is a skapi option, not a field
+	// the destination understands, so it must never reach `data`: the body arm stays
+	// exactly what it is with the socket off.
+	transport: Object.freeze({ stream: true as true, realtime: true as true }),
+	body: Object.freeze({ stream: true as true }),
+}) as ChatStreamWiring;
+
+export function chatStreamWiring(queue?: string): ChatStreamWiring {
+	if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
+	if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
+	// Socket delivery is a separate opt-in from streaming itself: see
+	// liveStreamingRealtime for why a host that does not own its skapi instance
+	// should leave it off.
+	return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+}
 
 // Resolve the per-image `detail` for OpenAI. The version match tolerates a
 // trailing variant/date suffix (`gpt-5.4-nano`, `-mini`, `-2026-01-01`, …):
@@ -423,6 +606,17 @@ export type CallClaudeWithMcpParams = {
 // engine's own poll sites and imported by agent.vue; the widget carries its own
 // copy in src/index.js that must be kept in step.
 export const POLL_INTERVAL = 3000;
+// Poll cadence while a turn is STREAMING, i.e. while the poll is also reading the
+// relayed chunks. Faster than POLL_INTERVAL because on a streaming poll the tick is
+// not just "is it done yet", it is the delivery of the answer: at 3s the reader
+// watches the text arrive in three-second steps.
+//
+// 1s and not less, because the relay coalesces its writes to about one per second
+// (the worker's byte budget, see the polling worker's _STREAM_FLUSH_INTERVAL_S), so
+// a faster poll reads the same rows again and buys nothing but requests. It is also
+// what makes "roughly one paint per second" fall out of the transport rather than
+// out of a timer the paint path has to guess at.
+export const STREAM_POLL_INTERVAL = 1000;
 // Ceiling on how many BACKGROUND indexing polls may be attached at once, across
 // every poll site (the engine's drain, the engine's history load, and each
 // client's own fallback poller).
@@ -468,12 +662,20 @@ export async function callClaudeWithMcp({
 		mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
 	}
 
-	return clientSecretRequest({
-		clientSecretName: 'claude',
+	// ONE decision, spread in TWO places. See chatStreamWiring: the transport half
+	// is skapi's relay switch and the body half is Anthropic's own, and a turn that
+	// carries one without the other fails silently rather than loudly. The queue is
+	// the same expression the request uses below, so an attachment turn (which runs
+	// on the bg queue) is recognised and left buffered.
+	const stream = chatStreamWiring(userId || service);
+
+	return forwardRequest({
+		secretName: 'claude',
 		queue: userId || service,
 		service,
 		owner,
 		...pollOpt(),
+		...stream.transport,
 		url: ANTHROPIC_MESSAGES_API_URL,
 		method: 'POST',
 		headers: {
@@ -485,6 +687,9 @@ export async function callClaudeWithMcp({
 		data: {
 			model,
 			max_tokens: maxTokens,
+			// Top level beside model/messages/mcp_servers, which is where the
+			// Messages API takes it.
+			...stream.body,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
 				: {}),
@@ -548,7 +753,9 @@ export async function callClaudeWithPublicMcp(
 	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
+	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
 ) {
+	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	return callClaudeWithMcp({
 		prompt,
 		messages,
@@ -562,8 +769,12 @@ export async function callClaudeWithPublicMcp(
 		fileUrls,
 		mcpServer: {
 			name: MCP_NAME,
-			url: mcpUrl(),
-			authorizationToken: '$ACCESS_TOKEN',
+			url: withMcpParams(endpoint.url, {
+				ctx: mcpContextParam('claude', model || DEFAULT_CLAUDE_MODEL),
+			}),
+			// Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
+			// guard below drops the key rather than sending an empty one.
+			authorizationToken: endpoint.token,
 		},
 		onResponse,
 		onError,
@@ -582,7 +793,9 @@ export async function callOpenAIWithPublicMcp(
 	fileUrls?: FileUrlDirective[],
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
+	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
 ) {
+	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	const resolvedModel = model || DEFAULT_OPENAI_MODEL;
 	const imageDetail = getOpenAIImageDetail(resolvedModel);
 	const messageList =
@@ -610,12 +823,16 @@ export async function callOpenAIWithPublicMcp(
 		})),
 	];
 
-	return clientSecretRequest({
-		clientSecretName: 'openai',
+	// ONE decision, spread in TWO places - see chatStreamWiring.
+	const stream = chatStreamWiring(userId || service);
+
+	return forwardRequest({
+		secretName: 'openai',
 		queue: userId || service,
 		service,
 		owner,
 		...pollOpt(),
+		...stream.transport,
 		url: OPENAI_RESPONSES_API_URL,
 		method: 'POST',
 		headers: {
@@ -625,6 +842,9 @@ export async function callOpenAIWithPublicMcp(
 		data: {
 			model: resolvedModel,
 			max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
+			// Top level beside model/input/tools, which is where the Responses API
+			// takes it.
+			...stream.body,
 			...(extractContent && extractContent.length
 				? { _skapi_extract: extractContent }
 				: {}),
@@ -636,11 +856,14 @@ export async function callOpenAIWithPublicMcp(
 				{
 					type: 'mcp',
 					server_label: MCP_NAME,
-					server_url: mcpUrl(),
+					server_url: withMcpParams(endpoint.url, { ctx: mcpContextParam('openai', resolvedModel) }),
 					require_approval: 'never',
-					headers: {
-						Authorization: 'Bearer $ACCESS_TOKEN',
-					},
+					// No `headers` at all for an anonymous turn: `Bearer ` with an
+					// empty token is a credential the MCP server rejects, and the
+					// project-scoped endpoint needs none.
+					...(endpoint.token
+						? { headers: { Authorization: 'Bearer ' + endpoint.token } }
+						: {}),
 				},
 				...(OPENAI_WEB_SEARCH_ENABLED
 					? [
@@ -681,6 +904,13 @@ export type AttachmentSaveInfo = {
 		mime?: string;
 		size?: number;
 		url: string;
+		/**
+		 * Access group this file's records are written at (the uploader's choice,
+		 * already applied to the "src::" record). Threaded into the indexing
+		 * prompts so the agent's own records land in the same group; omitted
+		 * means "authorized", the group everything used before the setting existed.
+		 */
+		accessGroup?: 'public' | 'authorized' | 'private';
 	};
 	/**
 	 * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
@@ -892,13 +1122,32 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		projectId: info.publicProjectId || service,
 		serviceName: info.serviceName,
 		serviceDescription: info.serviceDescription,
+		// Per-FILE, not per-project: one project holds public and private files at
+		// once, so this travels on the attachment rather than the identity.
+		accessGroup: attachment.accessGroup,
 	});
 
+	// INDEXING NEVER STREAMS, on either platform, whatever `liveStreaming` says.
+	// chatStreamWiring is deliberately not called below, and neither `stream` flag
+	// appears in either branch. Three reasons, any one of which is sufficient:
+	//
+	//   1. Nobody is watching. A pass runs on the background queue behind a chain
+	//      that can span days; there is no bubble to paint it into, so the only
+	//      thing streaming would buy is a chunk table to clean up.
+	//   2. The worker has to READ this response. `auto_continue` (render and window
+	//      passes) decides whether to enqueue the next window from the reply, and
+	//      the truncation and auth-outage checks that stop a chain read it too.
+	//      Those need a real JSON body, and a streamed row settles with a status and
+	//      no body at all.
+	//   3. The worker degrades such a pass anyway (it clears `strm` before the call
+	//      fires), so asking would be a request the backend is guaranteed to refuse
+	//      to honour - and one that leaves the row briefly marked as streaming,
+	//      which is exactly the state csr-finalize gates on.
 	if (platform === 'openai') {
 		const resolvedModel = info.model || DEFAULT_OPENAI_MODEL;
 		const imageDetail = getOpenAIImageDetail(resolvedModel);
-		return tapDispatchFailure(clientSecretRequest({
-			clientSecretName: 'openai',
+		return tapDispatchFailure(forwardRequest({
+			secretName: 'openai',
 			queue: bgIndexingQueueName(info.userId, service),
 			service,
 			owner,
@@ -911,7 +1160,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			},
 			data: {
 				model: resolvedModel,
-				max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
+				max_output_tokens: getMaxOutputTokens('openai', resolvedModel, 'indexing'),
 				// Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
 				...variantIndexingOptions(resolvedModel),
 				...skapiExtract,
@@ -929,7 +1178,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					{
 						type: 'mcp',
 						server_label: MCP_NAME,
-						server_url: mcpUrl(),
+						server_url: mcpIndexingUrl('openai', resolvedModel),
 						require_approval: 'never',
 						headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
 					},
@@ -947,8 +1196,8 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	}
 
 	const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-	return tapDispatchFailure(clientSecretRequest({
-		clientSecretName: 'claude',
+	return tapDispatchFailure(forwardRequest({
+		secretName: 'claude',
 		queue: bgIndexingQueueName(info.userId, service),
 		service,
 		owner,
@@ -963,7 +1212,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		},
 		data: {
 			model: resolvedModel,
-			max_tokens: getMaxOutputTokens('claude', resolvedModel),
+			max_tokens: getMaxOutputTokens('claude', resolvedModel, 'indexing'),
 			...skapiExtract,
 			...skapiRender,
 			...skapiWindow,
@@ -985,7 +1234,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 				{
 					type: 'url',
 					name: MCP_NAME,
-					url: mcpUrl(),
+					url: mcpIndexingUrl('claude', resolvedModel),
 					authorization_token: '$ACCESS_TOKEN',
 				},
 			],
@@ -1061,9 +1310,14 @@ export function extractOpenAIText(response: any) {
 	return '';
 }
 
+// MODEL LISTINGS NEVER STREAM. Both are plain GETs with no body: there is no
+// destination-side `stream` field to pair skapi's with, and a listing is one small
+// document that a caller reads whole. Neither carries `poll` either, so there is
+// not even a reader to hand chunks to. chatStreamWiring is deliberately not called
+// here - the pair is chat-turn-only.
 export async function listClaudeModels(service: string, owner: string) {
-	return clientSecretRequest({
-		clientSecretName: 'claude',
+	return forwardRequest({
+		secretName: 'claude',
 		service,
 		owner,
 		url: ANTHROPIC_MODELS_API_URL,
@@ -1076,8 +1330,8 @@ export async function listClaudeModels(service: string, owner: string) {
 }
 
 export async function listOpenAIModels(service: string, owner: string) {
-	return clientSecretRequest({
-		clientSecretName: 'openai',
+	return forwardRequest({
+		secretName: 'openai',
 		service,
 		owner,
 		url: OPENAI_MODELS_API_URL,
@@ -1206,7 +1460,11 @@ export type BgTaskEntry = {
 	mime?: string;
 	size?: number;
 	status: 'running' | 'pending';
-	poll: ((opts: { latency: number }) => Promise<any>) | undefined;
+	// `onResponse` receives the settled value plus a `meta` of facts about the
+	// REQUEST rather than the response: `executed` is when the worker began
+	// running it, which rides on a running poll tick's status envelope and is
+	// therefore free to a caller already polling.
+	poll: ((opts: { latency: number; onResponse?: (res: any, meta?: { executed?: number }) => void }) => Promise<any>) | undefined;
 	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
 	resumePass?: number;
 	/** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
@@ -1294,7 +1552,7 @@ export async function getChatHistory(
 		params.queue_exclude ? { queue_exclude: params.queue_exclude } : {},
 	);
 
-	return chatEngineConfig().clientSecretRequestHistory(
+	return resolveForwardRequestHistory()(
 		p as { url: string; method: 'POST'; queue?: string; status?: string },
 		Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions),
 	);

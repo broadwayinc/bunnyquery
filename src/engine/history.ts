@@ -6,6 +6,7 @@
  */
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
 import { isErrorResponseBody, getErrorMessage } from './errors';
+import { streamRecoveryEnabled } from './config';
 import { sanitizeAttachmentLinksForHistory } from './links';
 import type { ChatMessage } from './host';
 
@@ -323,7 +324,34 @@ export type SplitHistoryResult = {
 };
 
 export async function getSplitChatHistory(
-	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
+	params: {
+		service: string;
+		owner: string;
+		platform: 'claude' | 'openai';
+		userId?: string;
+		/**
+		 * Scope the SURFACE fetch to this chat's own queue instead of "everything
+		 * that is not the bg queue".
+		 *
+		 * Set for an ANONYMOUS visitor, and only for one. The backend identifies an
+		 * unauthenticated caller as `ip + "(" + user_agent + ")"`, and the default
+		 * surface fetch (queue_exclude, no queue) is scoped by exactly that string
+		 * server side - so two anonymous visitors behind one NAT on the same browser
+		 * build read each other's transcript, which is the thing per-device history
+		 * exists to prevent. Reading the device's own queue instead scopes it by a
+		 * value the client controls and the other device does not share.
+		 *
+		 * NOT used for a signed-in caller. Their turns are already scoped by their
+		 * `sub`, and queue_exact would additionally hide any history sent under a
+		 * different queue name than the current userId (an older fallback, a
+		 * pre-rename row), which queue_exclude still returns.
+		 *
+		 * The queue name is unguessable but NOT secret: it travels on every request
+		 * and queue listings are not user-scoped server side. Anonymous transcripts
+		 * are non-confidential by construction.
+		 */
+		scopeSurfaceToQueue?: boolean;
+	},
 	fetchOptions: Record<string, any>,
 	/** Test seam: replaces getChatHistory. Not for production callers. */
 	_fetchImpl?: typeof getChatHistory,
@@ -345,7 +373,34 @@ export async function getSplitChatHistory(
 
 async function _getSplitChatHistoryLocked(
 	key: string,
-	params: { service: string; owner: string; platform: 'claude' | 'openai'; userId?: string },
+	params: {
+		service: string;
+		owner: string;
+		platform: 'claude' | 'openai';
+		userId?: string;
+		/**
+		 * Scope the SURFACE fetch to this chat's own queue instead of "everything
+		 * that is not the bg queue".
+		 *
+		 * Set for an ANONYMOUS visitor, and only for one. The backend identifies an
+		 * unauthenticated caller as `ip + "(" + user_agent + ")"`, and the default
+		 * surface fetch (queue_exclude, no queue) is scoped by exactly that string
+		 * server side - so two anonymous visitors behind one NAT on the same browser
+		 * build read each other's transcript, which is the thing per-device history
+		 * exists to prevent. Reading the device's own queue instead scopes it by a
+		 * value the client controls and the other device does not share.
+		 *
+		 * NOT used for a signed-in caller. Their turns are already scoped by their
+		 * `sub`, and queue_exact would additionally hide any history sent under a
+		 * different queue name than the current userId (an older fallback, a
+		 * pre-rename row), which queue_exclude still returns.
+		 *
+		 * The queue name is unguessable but NOT secret: it travels on every request
+		 * and queue listings are not user-scoped server side. Anonymous transcripts
+		 * are non-confidential by construction.
+		 */
+		scopeSurfaceToQueue?: boolean;
+	},
 	fetchOptions: Record<string, any>,
 	releaseLock: () => void,
 	_fetchImpl?: typeof getChatHistory,
@@ -353,6 +408,14 @@ async function _getSplitChatHistoryLocked(
 	const fetch = _fetchImpl || getChatHistory;
 	const bgQueue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform };
+	// What the SURFACE (non-background) fetch filters on. `queue_exclude` is the
+	// default and returns every row that is not on the bg chain; the anonymous
+	// path narrows to this chat's OWN queue instead. Same queue name the chat
+	// turns are dispatched under (requests.ts `queue: userId || service`), so the
+	// two cannot drift.
+	const surfaceScope: Record<string, any> = params.scopeSurfaceToQueue && params.userId
+		? { queue: params.userId, queue_exact: true }
+		: { queue_exclude: bgQueue };
 	const fetchMore = !!(fetchOptions && fetchOptions.fetchMore);
 	const limit = fetchOptions && fetchOptions.limit;
 
@@ -404,14 +467,14 @@ async function _getSplitChatHistoryLocked(
 		} else {
 			const sOpts: any = { fetchMore };
 			if (limit) sOpts.limit = limit;
-			let s = await fetch({ ...base, queue_exclude: bgQueue }, sOpts);
+			let s = await fetch({ ...base, ...surfaceScope }, sOpts);
 			// Loop past empty-but-not-end pages (see SURFACE_EMPTY_MAX_PAGES).
 			let hops = 0;
 			while (s && !s.endOfList && !((s.list || []).length) && hops < SURFACE_EMPTY_MAX_PAGES) {
 				hops++;
 				const nOpts: any = { fetchMore: true };
 				if (limit) nOpts.limit = limit;
-				s = await fetch({ ...base, queue_exclude: bgQueue }, nOpts);
+				s = await fetch({ ...base, ...surfaceScope }, nOpts);
 			}
 			state.pendingSurface = {
 				list: (s && Array.isArray(s.list)) ? s.list : [],
@@ -588,16 +651,63 @@ async function _getSplitChatHistoryLocked(
 }
 
 
+/**
+ * THE chat key. Every cache, every ownership stamp and every "is this turn for
+ * the chat on screen?" comparison is built here and nowhere else.
+ *
+ * It used to be written out by hand in four places. When a third segment was
+ * added for the chat identity - a browser can hold an anonymous conversation and
+ * a signed-in one on the SAME project, and the two must not share a cache - only
+ * one of those four was updated. The rest kept producing the two-segment form,
+ * so `key !== getHistoryCacheKey()` became permanently true: every send was
+ * treated as belonging to another project, the optimistic bubble and the
+ * "Thinking..." placeholder were never pushed, and nothing appeared until the
+ * server history caught up. One function, so a twin cannot drift again.
+ */
+export function chatCacheKey(
+	projectId: string | undefined,
+	platform: string | undefined,
+	userId?: string,
+): string {
+	if (!projectId || platform === 'none') return '';
+	return projectId + '#' + platform + '#' + (userId || '');
+}
+
+/**
+ * The INDEXING scope key: project + platform, deliberately WITHOUT the identity.
+ *
+ * Claiming, stopping and cancelling a file's indexing are scoped per project and
+ * platform because a storage path is project-relative and one ChatSession serves
+ * every project. They are NOT per user: an anonymous visitor cannot upload or
+ * index at all, so there is no second identity to separate, and folding the
+ * identity in here would only have to be threaded through BgTaskEntry to no end.
+ *
+ * Kept separate from chatCacheKey ON PURPOSE. These two were the same string
+ * once, which is exactly how adding a segment to one silently broke the other.
+ */
+export function indexScopeKey(
+	projectId: string | undefined,
+	platform: string | undefined,
+): string {
+	if (!projectId || platform === 'none') return '';
+	return projectId + '#' + platform;
+}
+
 export type MapHistoryOptions = {
 	clearedAt: number;
 	projectId: string;
+	/** Chat identity, so the `_ownerKey` stamp matches chatCacheKey(). */
+	userId?: string;
 	/** View-side display formatter for "Indexing:/Reindexing: …" bubbles. */
 	formatIndexingLabel: (name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean) => string;
 };
 
 export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'openai', opts: MapHistoryOptions) {
-	var mapped: any[] = [], runningItemIds: string[] = [];
+	var mapped: any[] = [], runningItemIds: string[] = [], streamPendingItemIds: string[] = [];
 	var extractAssistantText = platform === 'openai' ? extractOpenAIText : extractClaudeText;
+	// See the `isStreamPending` block below. Read ONCE per call rather than per
+	// item: it is a config lookup, and the answer cannot change mid-list.
+	var canRecoverStreams = streamRecoveryEnabled();
 	var filtered = filterListByClearHorizon(list, opts.clearedAt);
 	filtered.slice().reverse().forEach(function (item) {
 		var requestBody = item && item.request_body;
@@ -621,6 +731,45 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			? ((typeof item.response_text === 'string' ? item.response_text : '').trim())
 			: ((extractAssistantText(response) || '').trim() || ''));
 		var isErrorResponse = !isPending && (isFailed || (!isCompact && isErrorResponseBody(response)));
+		// AN ANSWER THAT IS UNKNOWN, NOT EMPTY.
+		//
+		// A STREAMED turn stores nothing on its row: the relay appends the
+		// destination's bytes to the chunk table and settles the row with a status
+		// and no body, and only csr-finalize ever copies an answer onto the row. So a
+		// row that is terminal, carries no body and carries no error is not a turn
+		// that answered nothing: it is a turn nobody finalized. That happens for one
+		// ordinary reason: the row settled while no poll was attached (the tab was
+		// closed, a mobile browser discarded it, the device slept and the interval
+		// stopped), so the client that would have finalized it was not there.
+		//
+		// Read as "empty" (which is what the `assistantText` guard further down did),
+		// such a row produces NO assistant bubble at all and the answer is simply gone
+		// from the conversation, with every byte of it still sitting in the chunk
+		// table, reachable through forwardRequestStream. So it is marked instead,
+		// and the two things that act on the mark are the merge (an unknown answer
+		// never overwrites a known one) and the recovery (an unknown answer is
+		// resolved by reading the chunks back). See ChatMessage._streamPending.
+		//
+		// Deliberately narrow, so nothing that is genuinely an empty turn is caught:
+		//   - only when this host streams AND can read chunks back (see
+		//     streamRecoveryEnabled); a host that does neither behaves exactly as it
+		//     does today, and one that cannot read them back would only trade a
+		//     missing bubble for a permanently empty one;
+		//   - never on the background queue. chatStreamWiring turns streaming OFF for
+		//     every bg-queue turn (an indexing pass must not stream, and an attachment
+		//     turn is left buffered on purpose), so a bg row with no body really did
+		//     answer nothing;
+		//   - never on a compact stub, whose body was withheld by the server rather
+		//     than never stored;
+		//   - 'resolved' only. A FAILED row already renders its error, which is the
+		//     authoritative account of the turn (and, once csrEnvelopeError is in
+		//     play, a truthful one). Its chunks are deliberately kept but not
+		//     rendered. See _finalizeStreamedTurn.
+		var isStreamPending = canRecoverStreams && !isCompact && !isPending && !isCancelledItem
+			&& !isErrorResponse && !item._isBgTask && !item._isOnBgQueue
+			&& item.status === 'resolved'
+			&& (item.response_body == null) && (item.error == null)
+			&& !assistantText;
 		// Record the completion marker, then STRIP it — both, and in that order.
 		// Recording gives the display layer a structured signal instead of a substring
 		// search over model prose. Stripping matches the live resolution path: without
@@ -643,6 +792,12 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		// if one is missing (older records only carried `updated`).
 		var createdTs = Number(item && item.created);
 		var updatedTs = Number(item && item.updated);
+		// When the WORKER began executing this pass, not when it was enqueued. The
+		// SDK normalises it to ms (the worker stamps it in seconds). Absent on a row
+		// that never ran, and on rows written before the SDK projected it -- in both
+		// cases the pass simply shows no duration, which is right: the honest answer
+		// to "how long did it take" is nothing, not the queue wait dressed up as it.
+		var executedTs = Number(item && item.executed);
 		var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : (isFinite(updatedTs) && updatedTs > 0 ? updatedTs : undefined);
 		var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : (isFinite(createdTs) && createdTs > 0 ? createdTs : undefined);
 
@@ -703,7 +858,22 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (item._isBgTask) em.isBackgroundTask = true;
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;
 			if (replyTs !== undefined) em._ts = replyTs;
+			// A pass that FAILED still ran, and how long it ran before failing is worth
+			// as much as a successful pass's duration -- often more, since that is where
+			// a timeout shows itself. `att` is stamped before the upstream call fires,
+			// so a failed row carries it exactly as a resolved one does. (Same stamp as
+			// the success branch below; the stream-pending branch deliberately has none,
+			// having no end time yet.)
+			if (indexFile && isFinite(executedTs) && executedTs > 0) em._tsStart = executedTs;
 			mapped.push(em);
+		} else if (isStreamPending) {
+			// The bubble stands for the turn so the merge has something to key on and
+			// the recovery has somewhere to write. Its content is UNKNOWN: empty here
+			// is the absence of an answer on the row, not the absence of an answer.
+			var sp: any = { role: 'assistant', content: '', _streamPending: true };
+			if (serverItemId !== undefined) { sp._serverItemId = serverItemId; streamPendingItemIds.push(serverItemId); }
+			if (replyTs !== undefined) sp._ts = replyTs;
+			mapped.push(sp);
 		// `|| reportedComplete`: a pass whose ENTIRE answer was the completion token
 		// strips down to an empty string, and the plain `assistantText` guard then
 		// emitted no bubble at all — while the live path emitted one. The run read as
@@ -717,6 +887,17 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (isCompact) okm._compact = true;
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
+			// How long THIS pass took: from the moment the worker began EXECUTING it to
+			// the moment it resolved. Carried on the reply so the bubble can show it
+			// without its request bubble (a continuation's request is hidden from the
+			// expanded row). Only for an indexing pass: `_tsStart`'s presence is what
+			// scopes the duration to indexing responses in both views.
+			//
+			// Deliberately NOT `created`: that is the enqueue time, so a pass that sat
+			// in the queue for an hour before running would have reported the wait as
+			// though it were the read. No fallback to it either, for the same reason --
+			// a missing `executed` means no duration is shown at all.
+			if (indexFile && isFinite(executedTs) && executedTs > 0) okm._tsStart = executedTs;
 			if (reportedComplete) okm._indexComplete = true;
 			mapped.push(okm);
 		}
@@ -728,10 +909,57 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 	// unchallenged. That is what let one project's transcript survive on screen
 	// into another project and be persisted under its key.
 	if (opts.projectId) {
-		var ownerKey = opts.projectId + '#' + platform;
+		var ownerKey = chatCacheKey(opts.projectId, platform, opts.userId);
 		for (var oi = 0; oi < mapped.length; oi++) mapped[oi]._ownerKey = ownerKey;
 	}
-	return { messages: mapped, runningItemIds: runningItemIds };
+	// `streamPendingItemIds` is additive: a consumer that only destructures
+	// { messages, runningItemIds } (agent.vue's own call site does) is unaffected.
+	// The engine drives recovery off the BUBBLES rather than this list (the merge
+	// runs between the two and can adopt a local answer onto one of them), so this
+	// is reporting, not the mechanism.
+	return { messages: mapped, runningItemIds: runningItemIds, streamPendingItemIds: streamPendingItemIds };
+}
+
+/**
+ * Let a LOCAL copy of a turn survive a page whose copy of it is
+ * AUTHORITATIVE-BUT-EMPTY. Mutates `incoming`; returns true when it took anything.
+ *
+ * THE FAILURE THIS PREVENTS. A streamed turn's row goes 'resolved' the moment the
+ * relay finishes, and its answer reaches the row only when csr-finalize stores it,
+ * one poll interval plus a round trip later. A first-page history refetch landing
+ * inside that window maps the row to a `_streamPending` bubble with no content, and
+ * the merge, which believes the server, throws away the local bubble holding the
+ * answer the reader is looking at. The window opens on EVERY streamed turn, and a
+ * refetch fires from visibilitychange, so it is not a corner case.
+ *
+ * The rule is the same one the recovery reads: an UNKNOWN answer never overwrites a
+ * KNOWN one. Where the local copy is still live (pending, or being painted into),
+ * its live-ness is adopted too: without it the merge would hand back a settled
+ * bubble the painter can no longer find (_liveTargetIndex wants isPending or
+ * _streaming) and that _turnAlreadyRendered would then read as already answered, so
+ * the settle would drop the real answer on the floor.
+ */
+export function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessage): boolean {
+	if (!incoming || !local || !incoming._streamPending) return false;
+	if (incoming.role !== 'assistant' || local.role !== 'assistant') return false;
+	var hasText = typeof local.content === 'string' && local.content.length > 0;
+	var isLive = !!(local.isPending || local._streaming);
+	if (!hasText && !isLive) return false;
+	if (hasText) {
+		incoming.content = local.content;
+		// The answer is on screen, so nothing has to be read back. Whether the row
+		// itself ever gets a stored body is the live path's business (its finalize is
+		// in flight); if that fails, the NEXT load meets an empty row again and
+		// recovers it then.
+		incoming._streamPending = false;
+	}
+	// Carried whatever the text says: these are what keep a still-running turn
+	// reachable by the painter and by the settle.
+	if (local._localId !== undefined) incoming._localId = local._localId;
+	if (local.isPending) incoming.isPending = true;
+	if (local.isPendingInProcess) incoming.isPendingInProcess = true;
+	if (local._streaming) incoming._streaming = true;
+	return true;
 }
 
 /* ---- rescuing in-flight bubbles across a first-page refetch ---------------
@@ -780,6 +1008,19 @@ export function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecisionC
 	// it. Unconditional: applying the pending-assistant test here would delete the
 	// user's message mid-upload whenever some other turn happened to be in flight.
 	if (m._stageId) return true;
+	// A bubble being painted from a LIVE stream, before its dispatch has reported a
+	// server id. Same shape of reason as the staged bubble above: the page identifies
+	// turns by id, so nothing in it can stand for this one, and dropping it would
+	// leave the stream with no bubble to paint into (the painter finds its target by
+	// _serverItemId, and this bubble has none to be found by) - the turn would sit on
+	// "Thinking..." until it settled, with every relayed byte already spent.
+	//
+	// Gated on the missing id rather than on _streaming alone, and deliberately: once
+	// the id IS on the bubble, the tests below are right and the local copy really is
+	// redundant. The page carries the same turn as a pending placeholder with that id,
+	// the painter finds THAT one on its next paint (about a second later), and rescuing
+	// as well would put the same turn on screen twice.
+	if (m._streaming && !m._serverItemId) return true;
 	if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
 	// In flight by its own flags, id or no id. The immediate-send pair is stamped
 	// with its server id as soon as the dispatch reports one, and that id is there
