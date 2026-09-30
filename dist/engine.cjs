@@ -6314,6 +6314,7 @@ var ChatSession = class {
       }
     }
     this._adoptWorkerIndexingPasses(0);
+    this._sweepCancelledIndexing();
     var ids = group.cancellableIds || [];
     if (!ids.length) {
       this.host.notify();

@@ -3679,6 +3679,16 @@ export class ChatSession {
 		// server-cancelled by _applyIndexCancellations on the next drain, which is
 		// also what makes the worker stop enqueueing windows.
 		this._adoptWorkerIndexingPasses(0);
+		// And every pass of this file the client ALREADY knows to be live, now, not on
+		// the next drain. `cancellableIds` below is the row's own list, and it leaves
+		// out an in-flight pass that a later pass has already outlived - a rule written
+		// for one pass at a time, which a PDF no longer is: the worker runs several
+		// windows of one file at once and they settle out of order, so the row's list
+		// can be empty while eight passes are running. The sweep reads the key just
+		// recorded above and cancels each known pending pass once (it skips one already
+		// being cancelled, so the loop below cannot cancel a bubble twice). Server-side,
+		// one cancelled window stops the whole document.
+		this._sweepCancelledIndexing();
 		var ids = group.cancellableIds || [];
 		if (!ids.length) { this.host.notify(); return; }
 		ids.forEach(function (serverId) {

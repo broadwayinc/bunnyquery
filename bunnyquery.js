@@ -6170,6 +6170,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       this._adoptWorkerIndexingPasses(0);
+      this._sweepCancelledIndexing();
       var ids = group.cancellableIds || [];
       if (!ids.length) {
         this.host.notify();
