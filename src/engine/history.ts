@@ -5,7 +5,7 @@
  * view-specific display formatting. projectId is passed for link sanitization.
  */
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
-import { isErrorResponseBody, getErrorMessage } from './errors';
+import { isErrorResponseBody, getErrorMessage, isRetriedFailure } from './errors';
 import { streamRecoveryEnabled } from './config';
 import { sanitizeAttachmentLinksForHistory } from './links';
 import type { ChatMessage } from './host';
@@ -854,6 +854,10 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		} else if (isQueued) { /* no assistant placeholder */ }
 		else if (isErrorResponse) {
 			var em: any = { role: 'assistant', content: getErrorMessage(response), isError: true };
+			// A failure the worker has since sent again is not this file's outcome
+			// (see isRetriedFailure): the group reader skips it when it settles the
+			// file's status, and the view draws it muted.
+			if (isRetriedFailure(response)) em.isRetried = true;
 			if (item._fromBgChain) em._fromBgChain = true;
 			if (item._isBgTask) em.isBackgroundTask = true;
 			if (serverItemId !== undefined) em._serverItemId = serverItemId;

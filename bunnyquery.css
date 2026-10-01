@@ -1209,6 +1209,14 @@
     color: var(--bq-danger);
     opacity: 0.65;
 }
+/* A failed pass the worker has already sent again: real, but not the file's
+   outcome (the replacement pass is), so it is told in the muted voice of a
+   note rather than the red of a dead end. */
+.bq-message.is-error.is-retried .bq-bubble {
+    background: var(--bq-paper);
+    border-color: var(--bq-line);
+    color: var(--bq-muted);
+}
 .bq-message.is-pending-older .bq-bubble {
     background: var(--bq-warning-bg);
     border-color: var(--bq-warning-border);

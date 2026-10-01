@@ -619,6 +619,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     return "Something went wrong.";
   }
+  function isRetriedFailure(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
+    return !!input && typeof input === "object" && input.retried === true;
+  }
   function isErrorResponseBody(response) {
     var envErr = csrEnvelopeError(response);
     if (envErr !== void 0) response = envErr;
@@ -3154,6 +3159,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         mapped.push(ph);
       } else if (isQueued) ; else if (isErrorResponse) {
         var em = { role: "assistant", content: getErrorMessage(response), isError: true };
+        if (isRetriedFailure(response)) em.isRetried = true;
         if (item._fromBgChain) em._fromBgChain = true;
         if (item._isBgTask) em.isBackgroundTask = true;
         if (serverItemId !== void 0) em._serverItemId = serverItemId;
@@ -8289,8 +8295,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (stopped) {
         grp.status = "cancelled";
       } else {
-        var last = grp.members[grp.members.length - 1].msg;
-        grp.status = last.isError ? "error" : "done";
+        var retriedIds = {};
+        for (var ri = 0; ri < grp.members.length; ri++) {
+          var rm = grp.members[ri].msg;
+          if (rm.isRetried && rm._serverItemId) retriedIds[rm._serverItemId] = true;
+        }
+        var li = grp.members.length - 1;
+        while (li >= 0 && (grp.members[li].msg.isRetried || grp.members[li].msg._serverItemId && retriedIds[grp.members[li].msg._serverItemId])) li--;
+        if (li < 0) {
+          grp.status = "active";
+        } else {
+          var last = grp.members[li].msg;
+          grp.status = last.isError ? "error" : "done";
+        }
       }
       var sawFirstPass = false;
       for (var pi = 0; pi < grp.members.length; pi++) {
@@ -11863,6 +11880,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var cls = ["bq-message"];
       cls.push(msg.role === "user" ? "is-user" : "is-assistant");
       if (msg.isError) cls.push("is-error");
+      if (msg.isRetried) cls.push("is-retried");
       if (msg.isCancelled) cls.push("is-cancelled");
       if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
       if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");

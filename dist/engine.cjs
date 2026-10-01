@@ -627,6 +627,11 @@ function getErrorMessage(input) {
   }
   return "Something went wrong.";
 }
+function isRetriedFailure(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  return !!input && typeof input === "object" && input.retried === true;
+}
 function isErrorResponseBody(response) {
   var envErr = csrEnvelopeError(response);
   if (envErr !== void 0) response = envErr;
@@ -3298,6 +3303,7 @@ function mapHistoryListToMessages(list, platform, opts) {
       mapped.push(ph);
     } else if (isQueued) ; else if (isErrorResponse) {
       var em = { role: "assistant", content: getErrorMessage(response), isError: true };
+      if (isRetriedFailure(response)) em.isRetried = true;
       if (item._fromBgChain) em._fromBgChain = true;
       if (item._isBgTask) em.isBackgroundTask = true;
       if (serverItemId !== void 0) em._serverItemId = serverItemId;
@@ -8433,8 +8439,19 @@ function buildChatDisplayList(messages, opts) {
     } else if (stopped) {
       grp.status = "cancelled";
     } else {
-      var last = grp.members[grp.members.length - 1].msg;
-      grp.status = last.isError ? "error" : "done";
+      var retriedIds = {};
+      for (var ri = 0; ri < grp.members.length; ri++) {
+        var rm = grp.members[ri].msg;
+        if (rm.isRetried && rm._serverItemId) retriedIds[rm._serverItemId] = true;
+      }
+      var li = grp.members.length - 1;
+      while (li >= 0 && (grp.members[li].msg.isRetried || grp.members[li].msg._serverItemId && retriedIds[grp.members[li].msg._serverItemId])) li--;
+      if (li < 0) {
+        grp.status = "active";
+      } else {
+        var last = grp.members[li].msg;
+        grp.status = last.isError ? "error" : "done";
+      }
     }
     var sawFirstPass = false;
     for (var pi = 0; pi < grp.members.length; pi++) {
@@ -8899,6 +8916,7 @@ exports.isOfficeFile = isOfficeFile;
 exports.isPagedReadFile = isPagedReadFile;
 exports.isPreviewableImagePath = isPreviewableImagePath;
 exports.isProviderApiKeyError = isProviderApiKeyError;
+exports.isRetriedFailure = isRetriedFailure;
 exports.isServerExtractable = isServerExtractable;
 exports.isServiceDbAttachmentHref = isServiceDbAttachmentHref;
 exports.isWindowedReadFile = isWindowedReadFile;

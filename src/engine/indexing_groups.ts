@@ -728,9 +728,30 @@ export function buildChatDisplayList(
 			grp.status = 'cancelled';
 		} else {
 			// The newest loaded outcome is the file's state: an early pass may have
-			// errored and a later one succeeded.
-			var last = grp.members[grp.members.length - 1].msg;
-			grp.status = last.isError ? 'error' : 'done';
+			// errored and a later one succeeded. A failure the worker has already
+			// SENT AGAIN is not an outcome (its replacement pass is; see
+			// isRetriedFailure), so it is passed over. A run whose loaded passes are
+			// all such failures has no settled outcome yet: the replacement is on
+			// the queue by construction (the mark is written after its message went
+			// out), so the row stays live until it is adopted, rather than telling
+			// the user the file died on a page the worker is reading again.
+			// Both bubbles of the sent-again pass are passed over, the request as
+			// well as the failure: they share the row's id, and a request bubble
+			// is never an error, so stopping on it would read the pass as settled.
+			var retriedIds: { [id: string]: boolean } = {};
+			for (var ri = 0; ri < grp.members.length; ri++) {
+				var rm = grp.members[ri].msg;
+				if (rm.isRetried && rm._serverItemId) retriedIds[rm._serverItemId] = true;
+			}
+			var li = grp.members.length - 1;
+			while (li >= 0 && (grp.members[li].msg.isRetried ||
+				(grp.members[li].msg._serverItemId && retriedIds[grp.members[li].msg._serverItemId]))) li--;
+			if (li < 0) {
+				grp.status = 'active';
+			} else {
+				var last = grp.members[li].msg;
+				grp.status = last.isError ? 'error' : 'done';
+			}
 		}
 		// A group whose passes are ALL continuations began before the loaded
 		// window; its earlier passes arrive when older history is paged in.

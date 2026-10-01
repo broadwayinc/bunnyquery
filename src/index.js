@@ -3796,6 +3796,9 @@ import {
         var cls = ["bq-message"];
         cls.push(msg.role === "user" ? "is-user" : "is-assistant");
         if (msg.isError) cls.push("is-error");
+        // A failed pass the worker has since sent again (engine isRetriedFailure):
+        // told quietly, not as the file's dead end.
+        if (msg.isRetried) cls.push("is-retried");
         if (msg.isCancelled) cls.push("is-cancelled");
         if (msg.isPendingQueued || msg.isPendingOlder) cls.push("is-pending-older");
         // The DIM reads _dimSending, not isSendingToServer: an attachment turn is

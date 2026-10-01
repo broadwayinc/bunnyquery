@@ -95,6 +95,10 @@ export interface ChatMessage {
 	_dimSending?: boolean;
 	isCancelled?: boolean;
 	isError?: boolean;
+	/** With isError: the worker has already sent this pass's window again, so the
+	 *  failure is not the file's outcome. Set from the row's error payload
+	 *  (`retried`, see errors.ts isRetriedFailure); never set locally. */
+	isRetried?: boolean;
 	isBackgroundTask?: boolean;
 	/** Set on background-indexing REQUEST bubbles only (see IndexingFileRef). */
 	_indexFile?: IndexingFileRef;

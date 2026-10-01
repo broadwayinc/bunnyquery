@@ -69,6 +69,7 @@ export { buildChatGreeting, type ChatGreetingParams, type ChatGreetingParts } fr
 // normalization, and history mapping — shared so both consumers stay identical.
 export {
 	getErrorMessage, isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, isProviderApiKeyError,
+	isRetriedFailure,
 	// The csr-poll STATUS ENVELOPE, and the provider error nested one level inside a
 	// failed one. Exported because "is this an envelope or a body" is asked in two
 	// places that must agree (the streamed settle, and every error reader), and it

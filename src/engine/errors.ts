@@ -113,6 +113,21 @@ export function getErrorMessage(input: any): string {
 	return 'Something went wrong.';
 }
 
+/**
+ * True when the worker has already sent this pass's window again. Its stored
+ * error then carries `retried` (the worker's _mark_pass_retried writes it only
+ * AFTER the replacement pass was queued, so the flag never promises a retry that
+ * does not exist). The failure is real but it is not the file's outcome: the
+ * replacement pass is. The file's row must not go red over it, and the bubble is
+ * drawn muted rather than as a dead end. Same one-level unwrap as every reader
+ * here, so a streamed turn's failure answers the same way as a buffered one.
+ */
+export function isRetriedFailure(input: any): boolean {
+	var envErr = csrEnvelopeError(input);
+	if (envErr !== undefined) input = envErr;
+	return !!input && typeof input === 'object' && input.retried === true;
+}
+
 export function isErrorResponseBody(response: any): boolean {
 	// A FAILED streamed row is an error however empty its payload turned out to
 	// be: the status is the fact. See csrEnvelopeError.
