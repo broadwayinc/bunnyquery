@@ -22,6 +22,11 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+// The dashboard checkout was renamed (www.bunnyquery.com -> bunnyquery.com); the
+// first of these that exists is the one used, so a stale name only skips.
+const DASHBOARD_DIR = ['bunnyquery.com', 'www.bunnyquery.com']
+    .map((d) => path.resolve(__dirname, '..', '..', d))
+    .find((d) => fs.existsSync(d)) || path.resolve(__dirname, '..', '..', 'bunnyquery.com');
 const { ChatSession, formatDuration } = require('../dist/engine.cjs');
 
 const IDENT = { projectId: 'svc-1', owner: 'own-1', platform: 'claude', userId: 'user-abc' };
@@ -231,7 +236,7 @@ test('every engine poll that settles a turn hands the execution start over', () 
     }
 });
 
-const AGENT = path.resolve(__dirname, '../../www.bunnyquery.com/src/views/service/agent.vue');
+const AGENT = path.join(DASHBOARD_DIR, 'src/views/service/agent.vue');
 if (!fs.existsSync(AGENT)) {
     results.push([true, "and agent.vue's forked poll forwards it too (SKIPPED: www.bunnyquery.com is not checked out beside this package)"]);
 } else {
@@ -259,7 +264,7 @@ if (!fs.existsSync(AGENT)) {
     // chatSession.historyItemPolls, so both engine pollers skip it from then on.
     // Once it attaches it is the only poll that pass will ever get, so dropping the
     // meta argument here costs the duration outright.
-    const MAIN = path.resolve(__dirname, '../../www.bunnyquery.com/src/views/service/main.vue');
+    const MAIN = path.join(DASHBOARD_DIR, 'src/views/service/main.vue');
     if (!fs.existsSync(MAIN)) {
         results.push([true, "and main.vue's fallback bg poller forwards it too (SKIPPED: www.bunnyquery.com is not checked out beside this package)"]);
     } else {

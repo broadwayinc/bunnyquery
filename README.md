@@ -34,6 +34,11 @@ you can build your own chat UI on top of it. See
   across as many passes as it takes. A file's passes collapse into a single
   status row in the chat that can be expanded, and stopped: "Stop" cancels every
   queued and running pass at once and ends the continuation chain.
+- **Stop waiting**: a reply that is taking too long can be given up on. The
+  "Thinking" bubble carries a small x that cancels the running request on the
+  server, marks the question as cancelled, and lets the next message go out
+  at once instead of queueing behind it. A message still waiting in the queue
+  has the same control on its own bubble.
 - **Attachment parser plugins**: register a client-side parser so the widget
   extracts text in the browser from formats the model can't otherwise read, and
   indexes it directly. See [Attachment parser plugins](#attachment-parser-plugins).

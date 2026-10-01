@@ -1106,8 +1106,11 @@ export class ChatSession {
 			timers = [];
 		};
 		var stopBase = base && typeof base.stop === 'function' ? base.stop.bind(base) : null;
+		// The wrapper's own resolve, kept so that stop() below can SETTLE it.
+		var resolveRaced: ((v: any) => void) | null = null;
 
 		var raced: any = new Promise(function (resolve, reject) {
+			resolveRaced = resolve;
 			base.then(function (res: any) {
 				if (settled) return;
 				settled = true; clearProbes(); resolve(res);
@@ -1140,10 +1143,21 @@ export class ChatSession {
 		});
 
 		// _trackPoll and the cancel path both reach for .stop, so the wrapper has to carry it.
+		//
+		// A stop SETTLES the wrapper, with the {status:'stopped'} shape the SDK's own
+		// stop resolves with. It used to mark itself settled and then ignore the base
+		// poll's stopped result in the handler above, so the wrapper never resolved at
+		// all. Harmless for a queued turn (nothing awaits that chain to the end), but a
+		// dispatch chain awaits THIS promise to clear state.sending and
+		// pendingAgentRequests, so stopping a running turn's poll wedged every later
+		// send onto the queued path for good. Resolving here, rather than waiting on
+		// the base poll, also covers an older skapi-js whose poll cannot be stopped.
 		raced.stop = function () {
+			if (settled) return;
 			settled = true;
 			clearProbes();
-			if (stopBase) stopBase();
+			if (stopBase) { try { stopBase(); } catch (e) { /* already gone */ } }
+			if (resolveRaced) resolveRaced({ id: itemId, status: 'stopped' });
 		};
 		return raced;
 	}
@@ -2559,6 +2573,13 @@ export class ChatSession {
 				return response;
 			})
 			.then(function (response: any) {
+				// Neither of these is an answer. A STOPPED poll is this client giving up
+				// on the turn (cancelPendingReply), a CANCELLED envelope is the server
+				// saying the row was cancelled from elsewhere (another tab or device).
+				// Read as a provider body, both extract to nothing, and the turn was
+				// stamped "No text response received from AI provider." and the cache
+				// kept that as the answer to a question the user had stopped waiting on.
+				if (isPollStopped(response) || self._isCancelledPollResult(response)) return { content: '', isError: false, cancelled: true };
 				if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
 				var answer = (params.aiPlatform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response));
 				answer = (answer || '').trim();
@@ -2571,6 +2592,14 @@ export class ChatSession {
 				// if the chatbox unmounted mid-request.
 				delete self.pendingAgentRequests[params.key];
 				if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
+				if (result.cancelled) {
+					// Settle the turn as cancelled and write NO reply. When this client made
+					// the cancel the bubbles are already settled (cancelPendingReply does it
+					// before the stop resolves this chain) and this finds nothing to do; when
+					// the cancel came from elsewhere, this is what settles them.
+					if (dispatchItemId) self._settleCancelledTurn(dispatchItemId, params.key);
+					return result;
+				}
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
 				if (dispatchItemId) reply._serverItemId = dispatchItemId;
 
@@ -3165,7 +3194,7 @@ export class ChatSession {
 		// When it ISN'T (unmounted / another project), dispatchAgentRequest has
 		// already replaced the pending bubble with the answer IN THE CACHE, so a
 		// later loadChatHistory renders it.
-		Promise.resolve(run).catch(function () { }).then(function () {
+		Promise.resolve(run).catch(function () { }).then(function (result: any) {
 			// Clear `sending` UNCONDITIONALLY. It is session-global (it gates
 			// isQueuedSend above, plus the platform/model pickers in the view), so
 			// leaving it set when the user navigated to another project wedged
@@ -3175,6 +3204,12 @@ export class ChatSession {
 			// dispatchAgentRequest has already written the answer into the cache
 			// under `key`, so a later loadChatHistory renders it.
 			self.state.sending = false;
+			// A cancelled turn has NO reply to type. typewriteLatestReply reads the
+			// latest settled assistant bubble out of the cache and types it into the
+			// first pending placeholder on screen, and after a cancel that placeholder
+			// belongs to the NEXT turn (the cancel promotes it), so running it here
+			// would paint the previous answer under a question nobody has answered.
+			if (result && result.cancelled) return;
 			if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
 			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottomIfSticky(true); });
 		});
@@ -3385,6 +3420,14 @@ export class ChatSession {
 
 	onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void {
 		if (serverId) this.historyItemPolls.delete(serverId);
+		// The row was cancelled while this poll was still running (from another tab,
+		// or under an SDK whose poll could not be stopped): settle the turn as
+		// cancelled and write no answer. Read as a reply, the envelope below became
+		// "No text response received from AI provider."
+		if (this._isCancelledPollResult(response)) {
+			if (serverId) this._settleCancelledTurn(serverId, ownerKey);
+			return;
+		}
 		// This turn resolved while a DIFFERENT chat is on screen (the user moved to
 		// another project mid-flight). state.messages now belongs to that chat, and
 		// resolveQueuedUserBubble's positional fallbacks would happily hijack ITS
@@ -3577,6 +3620,186 @@ export class ChatSession {
 			var ci = self.state.messages.findIndex(function (m) { return m._serverItemId === serverId && m.role === 'user'; });
 			if (ci !== -1) { self.state.messages[ci] = Object.assign({}, self.state.messages[ci], { _cancelling: false, _cancelError: errMsg }); self.host.notify(); }
 		});
+	}
+
+	/**
+	 * Stop waiting for the reply to the chat turn that is running now, and move on.
+	 *
+	 * `msg` is the turn's pending ASSISTANT bubble (the dot-trail "Thinking"
+	 * placeholder), which is where both views draw the control. A turn's two bubbles
+	 * carry the same _serverItemId, so it is also how the request is found.
+	 * cancelQueuedMessage is the sibling for a turn still waiting in the queue and
+	 * takes the USER bubble; the two differ in what they are handed and in what has
+	 * to be unwound afterwards, not in what the server is asked.
+	 *
+	 * What ends the wait:
+	 *   1. csr-cancel marks the running row cancelled. The worker stops relaying and
+	 *      never stores an answer for it, so the reply cannot turn up later on this
+	 *      device or another, and history replays the turn as cancelled;
+	 *   2. the poll on it is stopped, which settles whichever chain was awaiting it
+	 *      with a stopped result: dispatchAgentRequest's for an immediate send, the
+	 *      queued chain for a promoted turn, the history poll after a reload. Each
+	 *      reads a stopped or cancelled result as "no reply" and releases what it
+	 *      holds (state.sending, pendingAgentRequests, historyItemPolls), which is
+	 *      what lets the next send go out immediately instead of queueing;
+	 *   3. the bubbles settle at once, without waiting for that chain: the user
+	 *      bubble takes its cancelled form, the placeholder goes, and the next queued
+	 *      turn, if there is one, is promoted so its own "Thinking" appears.
+	 *
+	 * What it does NOT do: the provider call already in flight on the worker runs
+	 * to its end (a streamed one stops within about a second). A message sent
+	 * behind it on the same queue starts once the worker acks the cancelled row.
+	 *
+	 * Refused without a server id (the ack has not come back yet; the views disable
+	 * the control until it has) and while a cancel is already out. Indexing passes
+	 * are not this method's business: their Stop is cancelIndexingGroup, which ends
+	 * the file's whole chain.
+	 */
+	cancelPendingReply(msg: ChatMessage, idx: number): void {
+		var self = this;
+		var id = this.host.getIdentity();
+		var serverId = msg._serverItemId;
+		if (!serverId || msg._cancelling) return;
+		if (msg.role !== 'assistant' || !msg.isPending || msg.isBackgroundTask) return;
+		var platform = id.platform;
+		if (platform !== 'claude' && platform !== 'openai') return;
+		var url = platform === 'claude' ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+		var queueBase = id.userId || id.projectId;
+		var queue = msg._useBgQueue ? bgIndexingQueueName(queueBase) : queueBase;
+		var findPlaceholder = function () {
+			return self.state.messages.findIndex(function (m) { return m._serverItemId === serverId && m.role === 'assistant' && !!m.isPending; });
+		};
+		// Same rule as cancelQueuedMessage: the rendered index is a hint, the server
+		// id is the identity, and the role test keeps this off the user bubble that
+		// shares the id.
+		var at = (this.state.messages[idx] && this.state.messages[idx]._serverItemId === serverId && this.state.messages[idx].role === 'assistant')
+			? idx
+			: findPlaceholder();
+		if (at !== -1) {
+			this.state.messages[at] = Object.assign({}, this.state.messages[at], { _cancelling: true, _cancelError: undefined });
+		}
+		this.host.notify();
+		var unmark = function (errMsg?: string) {
+			var ci = findPlaceholder();
+			if (ci === -1) return;
+			self.state.messages[ci] = Object.assign({}, self.state.messages[ci], { _cancelling: false, _cancelError: errMsg });
+			self.host.notify();
+		};
+		Promise.resolve(this.host.cancelRequest({
+			url: url, method: 'POST', id: serverId, queue: queue, service: id.projectId, owner: id.owner,
+		})).then(function (result: any) {
+			if (result && result.removed) {
+				// Stop asking about a row that will never answer, THEN settle the
+				// bubbles. The stop resolves the awaiting chain with a stopped result,
+				// and that chain's own settle then finds nothing left to do.
+				self._stopPoll(serverId as string);
+				self._settleCancelledTurn(serverId as string);
+				return;
+			}
+			// Not removed: the row had already finished (or was already gone), so the
+			// answer is on its way through the poll that is still attached. Nothing to
+			// unwind and nothing to report: the user gets the reply they were waiting
+			// for, a moment late.
+			unmark(undefined);
+		}).catch(function (err: any) {
+			unmark(err && typeof err.message === 'string' && err.message ? err.message : 'Could not stop this request.');
+		});
+	}
+
+	/** The cancelled form of a request bubble, with everything that keeps it in
+	 *  place carried over: the file markers that hold an indexing pass in its
+	 *  collapsed row, the chat it belongs to, its send time and its render key. */
+	private _cancelledCopyOf(m: ChatMessage, itemId?: string): ChatMessage {
+		var cancelled: ChatMessage = { role: 'user', content: m.content, isCancelled: true };
+		if (itemId !== undefined) cancelled._serverItemId = itemId;
+		else if (m._serverItemId !== undefined) cancelled._serverItemId = m._serverItemId;
+		if (m.isBackgroundTask) cancelled.isBackgroundTask = true;
+		if (m._indexFile) cancelled._indexFile = m._indexFile;
+		if (m._useBgQueue) cancelled._useBgQueue = true;
+		if (m._ownerKey !== undefined) cancelled._ownerKey = m._ownerKey;
+		if (m._ts !== undefined) cancelled._ts = m._ts;
+		if (m._localId !== undefined) cancelled._localId = m._localId;
+		return cancelled;
+	}
+
+	/**
+	 * Settle a turn as cancelled wherever it lives, and let the queue move on.
+	 *
+	 * On the chat on screen: every pending placeholder carrying the id goes (a
+	 * history refetch can have re-mapped the running turn into a second one), the
+	 * request bubble takes its cancelled form, and the next queued turn is promoted
+	 * so the conversation does not sit on an "(In queue)" bubble with nothing
+	 * running. For a chat that is NOT on screen (the user moved on while the turn
+	 * ran, and it was cancelled from elsewhere) the same edit is made in that chat's
+	 * history cache, which is what the next visit renders.
+	 *
+	 * Idempotent on purpose: a cancel this client made settles the bubbles at once,
+	 * and the chain that was awaiting the poll settles again a moment later when the
+	 * stop resolves it. The second pass finds nothing to do. Deliberately NOT
+	 * _removeStrayPendingAssistants: by then the placeholder on screen is the freshly
+	 * promoted turn's, whose user bubble is pending, and the sweep would take it.
+	 */
+	private _settleCancelledTurn(itemId: string, ownerKey?: string): void {
+		if (!itemId) return;
+		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
+			this._applyCancelToCache(ownerKey, itemId);
+			return;
+		}
+		var changed = false, wasBg = false;
+		for (var i = this.state.messages.length - 1; i >= 0; i--) {
+			var m = this.state.messages[i];
+			if (!m || m._serverItemId !== itemId) continue;
+			if (m.role === 'assistant' && m.isPending) { this.state.messages.splice(i, 1); changed = true; continue; }
+			if (m.role === 'user' && !m.isCancelled) {
+				if (m.isBackgroundTask) wasBg = true;
+				this.state.messages[i] = this._cancelledCopyOf(m, itemId);
+				changed = true;
+			}
+		}
+		this.cancelledServerIds.delete(itemId);
+		if (!changed) return;
+		if (wasBg) this.promoteNextBgQueuedToRunning(); else this.promoteNextQueuedToRunning();
+		this.updateHistoryCache();
+		this.host.notify();
+	}
+
+	/**
+	 * _settleCancelledTurn for a chat that is not on screen: the same edit, made in
+	 * its history cache. Matched by id where the cached bubbles carry one; an
+	 * off-chat send caches its pair before the ack (see dispatchComposedMessage), so
+	 * the fallback is positional, exactly as _applyReplyToCache's is: the trailing
+	 * pending placeholder, and the last request bubble still marked in flight.
+	 */
+	private _applyCancelToCache(key: string, itemId: string): void {
+		var existing = key ? this.aiChatHistoryCache[key] : undefined;
+		if (!existing) return;
+		var msgs = existing.messages.slice();
+		var changed = false;
+		var pIdx = -1, uIdx = -1;
+		for (var i = msgs.length - 1; i >= 0; i--) {
+			var m = msgs[i];
+			if (!m || m._serverItemId !== itemId) continue;
+			if (m.role === 'assistant' && m.isPending) { msgs.splice(i, 1); changed = true; pIdx = i; }
+			else if (m.role === 'user' && !m.isCancelled && uIdx === -1) uIdx = i;
+		}
+		if (pIdx === -1) {
+			for (var p = msgs.length - 1; p >= 0; p--) {
+				var pm = msgs[p];
+				if (!pm || !pm.isPending || pm.role !== 'assistant' || pm.isBackgroundTask || pm._serverItemId !== undefined) continue;
+				msgs.splice(p, 1); changed = true; break;
+			}
+		}
+		if (uIdx === -1) {
+			for (var u = msgs.length - 1; u >= 0; u--) {
+				var um = msgs[u];
+				if (!um || um.role !== 'user' || um.isBackgroundTask || um._serverItemId !== undefined || um._stageId) continue;
+				if (!(um.isPendingQueued || um.isPendingInProcess || um.isSendingToServer)) continue;
+				uIdx = u; break;
+			}
+		}
+		if (uIdx !== -1) { msgs[uIdx] = this._cancelledCopyOf(msgs[uIdx], itemId); changed = true; }
+		if (!changed) return;
+		this.aiChatHistoryCache[key] = { messages: msgs, endOfList: existing.endOfList, startKeyHistory: existing.startKeyHistory };
 	}
 
 	/**
@@ -4026,9 +4249,12 @@ export class ChatSession {
 		if (this.state.messages.some(function (m) { return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue; })) return Promise.resolve();
 		this.state.sending = true;
 		this.host.scrollToBottomIfSticky(true);
-		return Promise.resolve(pending).catch(function () { }).then(function () {
+		return Promise.resolve(pending).catch(function () { }).then(function (result: any) {
 			if (token !== self.state.gateRefreshToken) return;
 			self.state.sending = false;
+			// Same guard as the immediate-send settle: a cancelled turn has no reply
+			// to type, and the placeholder on screen may be the next turn's by now.
+			if (result && result.cancelled) return;
 			return Promise.resolve(self.typewriteLatestReply(key)).then(function () { self.host.scrollToBottomIfSticky(true); });
 		});
 	}

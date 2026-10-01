@@ -20,6 +20,11 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+// The dashboard checkout was renamed (www.bunnyquery.com -> bunnyquery.com); the
+// first of these that exists is the one used, so a stale name only skips.
+const DASHBOARD_DIR = ['bunnyquery.com', 'www.bunnyquery.com']
+    .map((d) => path.resolve(__dirname, '..', '..', d))
+    .find((d) => fs.existsSync(d)) || path.resolve(__dirname, '..', '..', 'bunnyquery.com');
 const {
     getModelContextWindow,
     getContextWindow,
@@ -101,7 +106,7 @@ ok('a name the table cannot place still gets the platform default', () => {
 
 // The guard against the next time. It reads the dashboard's model lists from the sibling
 // checkout, so it is skipped where that checkout is not present.
-const MODELS_DIR = path.join(__dirname, '..', '..', 'www.bunnyquery.com', 'public', 'models');
+const MODELS_DIR = path.join(DASHBOARD_DIR, 'public', 'models');
 const LISTS = [['claude', 'claude.json'], ['openai', 'openai.json']];
 
 if (!fs.existsSync(MODELS_DIR)) {

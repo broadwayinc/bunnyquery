@@ -99,6 +99,11 @@ test('the indexing system prompt carries the email rule', () => {
 
 const fs = require('fs');
 const path = require('path');
+// The dashboard checkout was renamed (www.bunnyquery.com -> bunnyquery.com); the
+// first of these that exists is the one used, so a stale name only skips.
+const DASHBOARD_DIR = ['bunnyquery.com', 'www.bunnyquery.com']
+    .map((d) => path.resolve(__dirname, '..', '..', d))
+    .find((d) => fs.existsSync(d)) || path.resolve(__dirname, '..', '..', 'bunnyquery.com');
 
 function textlikeRegexOf(file) {
     // The estimator regexes are hand-mirrored between the widget and the console;
@@ -114,7 +119,7 @@ test('the token estimators do not count an .eml as text', () => {
     // charging size/3 tokens estimated a 380 KB mail with one photo at 127k
     // tokens and disabled Send under the OpenAI default budget.
     const widget = textlikeRegexOf(path.join(__dirname, '..', 'src', 'index.js'));
-    const console_ = textlikeRegexOf(path.join(__dirname, '..', '..', 'www.bunnyquery.com', 'src', 'views', 'service', 'agent.vue'));
+    const console_ = textlikeRegexOf(path.join(DASHBOARD_DIR, 'src', 'views', 'service', 'agent.vue'));
     assert.strictEqual(widget, console_, 'widget and console TEXTLIKE_EXTENSION_RE differ');
     const re = new Function('return ' + widget)();
     assert.strictEqual(re.test('mail.eml'), false, '.eml is still counted as text');

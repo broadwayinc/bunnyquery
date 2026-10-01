@@ -3838,6 +3838,22 @@ import {
         // See tests/stream-client-parity.cjs.
         if ((msg.isPending && !msg._streaming) || streamRecoveryPhase(msg) === "active") {
             bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+            // Stop waiting for this reply. Only on a chat turn's own "Thinking"
+            // bubble: an indexing pass is stopped from its collapsed row
+            // (cancelIndexingGroup, the whole chain at once), and a recovery read
+            // is not a turn anyone is waiting on the provider for. Disabled until
+            // the ack has stamped the server id, exactly like the queued ×: with
+            // no id there is nothing to cancel yet. Mirrored in agent.vue.
+            if (msg.role === "assistant" && !msg.isBackgroundTask && !streamRecoveryPhase(msg)) {
+                var waitDisabled = !msg._serverItemId || msg._cancelling;
+                var stopWaitBtn = h("button", {
+                    class: "bq-cancel-wait-btn" + (waitDisabled ? " is-disabled" : ""),
+                    type: "button", title: "Stop waiting for this reply", "aria-label": "Stop waiting for this reply", html: "&times;",
+                });
+                if (!waitDisabled) stopWaitBtn.addEventListener("click", function (e) { e.stopPropagation(); session.cancelPendingReply(msg, idx); });
+                bubble.appendChild(stopWaitBtn);
+                if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
+            }
         } else if (streamRecoveryPhase(msg)) {
             // 'idle' (nobody has been sent for it) and 'failed' (somebody went and
             // could not read it) differ ONLY in wording, deliberately: both leave the

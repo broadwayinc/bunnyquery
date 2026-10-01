@@ -24,6 +24,38 @@ A few notes on how to read this:
 
 ---
 
+## Unreleased (2026-09-30)
+
+The reply a user is waiting on can be cancelled, in both chatboxes.
+
+### Stop waiting for a reply
+
+- The running turn's "Thinking" bubble carries a small x ("Stop waiting for this reply").
+  It cancels the request on the server (csr-cancel marks the running row cancelled, so
+  the worker stops relaying and no answer is ever stored for it), stops the poll,
+  marks the question "(cancelled)" the same way a cancelled queued message is, and
+  promotes the next queued message so its own "Thinking" appears. The composer is
+  free immediately: the next send goes out as an ordinary send rather than queueing
+  behind the cancelled turn. Disabled until the server has acknowledged the request,
+  exactly like the queued-message x. Indexing passes keep their own Stop on the
+  collapsed row.
+- Engine: `ChatSession.cancelPendingReply(msg, idx)`, handed the pending ASSISTANT
+  bubble. Both clients call it.
+- Engine fix underneath it: stopping a foreground poll now SETTLES it. The early-probe
+  wrapper used to mark itself settled inside `stop()` and then ignore the base poll's
+  stopped result, so the promise never resolved; a dispatch chain awaits that promise
+  to clear `sending`, so stopping a running turn's poll would have wedged every later
+  send onto the queued path.
+- Engine fix: a stopped poll result, or a `cancelled` envelope from a row cancelled
+  elsewhere (another tab or device), is no longer read as an empty answer. It used to
+  become "No text response received from AI provider." on the immediate-send and
+  queued-send paths and was written into the history cache under that name.
+- Styles: `.bq-cancel-wait-btn` in the shared `styles/chat.css`.
+- Styles: the dot-trail inside a bubble now reserves the width of its widest frame, so
+  the bubble no longer changes width three times per cycle and the stop-waiting control
+  holds still. Applies to the "Thinking" bubble and the drafting bubble in both
+  chatboxes; loaders that trail a label are unchanged.
+
 ## Unreleased (2026-09-18)
 
 The engine and the widget move to skapi-js's `forwardRequest` family, which replaces the

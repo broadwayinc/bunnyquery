@@ -83,6 +83,28 @@
 .bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass) .bq-bubble:has(> .bq-loader) > .bq-loader {
     vertical-align: middle;
 }
+/* The dot-trail cycles '.', '..', '...', so left to itself it is a box that
+   changes width three times every 1.2s: the bubble pulsed with it, and the
+   stop-waiting control that follows the dots moved each time, which made it hard
+   to hit. Inside a bubble the loader therefore RESERVES the width of its widest
+   frame: a hidden '...' sets the box and the animated dots are laid over it from
+   the left. Sized by the text itself rather than by a length, so it is right in
+   any font and at any letter-spacing. Scoped to bubbles on purpose: a loader that
+   trails a label ("Saving...") has to keep hugging its text. */
+.bq-bubble > .bq-loader {
+    position: relative;
+    display: inline-block;
+    white-space: nowrap;
+}
+.bq-bubble > .bq-loader::before {
+    content: '...';
+    visibility: hidden;
+}
+.bq-bubble > .bq-loader::after {
+    position: absolute;
+    left: 0;
+    top: 0;
+}
 
 .bq-message.is-error .bq-bubble {
     background: var(--bq-danger-bg);
@@ -153,6 +175,35 @@
 }
 .bq-cancel-queue-btn:hover:not(.is-disabled) { background: var(--bq-warning-bg); color: var(--bq-warning); }
 .bq-cancel-queue-btn.is-disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
+/* Stop waiting for a reply: sits INLINE after the dot-trail in a chat turn's own
+   "Thinking" bubble, where the bunny is inline too (:has(> .bq-loader) above).
+   Same face as the queued-message × but placed differently: that one floats to
+   its bubble's corner, this one simply follows the dots. Muted at rest so the
+   dots stay the thing the eye lands on; hover changes opacity only, never its
+   colour. Shared by both chatboxes. */
+.bq-cancel-wait-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    margin-left: 0.55rem;
+    width: 1.1rem;
+    height: 1.1rem;
+    min-height: 0;
+    padding: 0;
+    border: 1px solid var(--bq-line);
+    background: transparent;
+    color: var(--bq-muted);
+    font-size: 0.85rem;
+    line-height: 1;
+    cursor: pointer;
+    box-shadow: none;
+    border-radius: 0;
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+.bq-cancel-wait-btn:hover:not(.is-disabled) { opacity: 1; }
+.bq-cancel-wait-btn.is-disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
 
 /* ---- unfinalized streamed answer (ask for it) ----------------------------
    A turn whose answer was streamed and never finalized keeps its bytes in the

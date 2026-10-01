@@ -29,6 +29,11 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+// The dashboard checkout was renamed (www.bunnyquery.com -> bunnyquery.com); the
+// first of these that exists is the one used, so a stale name only skips.
+const DASHBOARD_DIR = ['bunnyquery.com', 'www.bunnyquery.com']
+    .map((d) => path.resolve(__dirname, '..', '..', d))
+    .find((d) => fs.existsSync(d)) || path.resolve(__dirname, '..', '..', 'bunnyquery.com');
 const engine = require('../dist/engine.cjs');
 const { configureChatEngine, listClaudeModels, getChatHistory, skapiSupportsStreaming, streamRecoveryEnabled } = engine;
 
@@ -223,7 +228,7 @@ await test('END TO END, new SDK: a chat request reaches forwardRequest(null, {se
 // SKIPS rather than fails when a checkout is absent, because this package is also
 // published and tested on its own.
 const REAL_SDKS = [
-    ['skapi-js 2.2.2, as www.bunnyquery.com installs it', '../../www.bunnyquery.com/node_modules/skapi-js/dist/skapi.cjs', true],
+    ['skapi-js 2.2.2, as the dashboard installs it', path.join(DASHBOARD_DIR, 'node_modules/skapi-js/dist/skapi.cjs'), true],
     ['skapi-js 2.0.2, as www.skapi.com installs it', '../../www.skapi.com/node_modules/skapi-js/dist/skapi.cjs', false],
     ['the local skapi-js build carrying the rename', '../../skapi-js/dist/skapi.cjs', true],
 ];

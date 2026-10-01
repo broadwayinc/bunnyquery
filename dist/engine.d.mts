@@ -4373,6 +4373,70 @@ declare class ChatSession {
     onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
     /**
+     * Stop waiting for the reply to the chat turn that is running now, and move on.
+     *
+     * `msg` is the turn's pending ASSISTANT bubble (the dot-trail "Thinking"
+     * placeholder), which is where both views draw the control. A turn's two bubbles
+     * carry the same _serverItemId, so it is also how the request is found.
+     * cancelQueuedMessage is the sibling for a turn still waiting in the queue and
+     * takes the USER bubble; the two differ in what they are handed and in what has
+     * to be unwound afterwards, not in what the server is asked.
+     *
+     * What ends the wait:
+     *   1. csr-cancel marks the running row cancelled. The worker stops relaying and
+     *      never stores an answer for it, so the reply cannot turn up later on this
+     *      device or another, and history replays the turn as cancelled;
+     *   2. the poll on it is stopped, which settles whichever chain was awaiting it
+     *      with a stopped result: dispatchAgentRequest's for an immediate send, the
+     *      queued chain for a promoted turn, the history poll after a reload. Each
+     *      reads a stopped or cancelled result as "no reply" and releases what it
+     *      holds (state.sending, pendingAgentRequests, historyItemPolls), which is
+     *      what lets the next send go out immediately instead of queueing;
+     *   3. the bubbles settle at once, without waiting for that chain: the user
+     *      bubble takes its cancelled form, the placeholder goes, and the next queued
+     *      turn, if there is one, is promoted so its own "Thinking" appears.
+     *
+     * What it does NOT do: the provider call already in flight on the worker runs
+     * to its end (a streamed one stops within about a second). A message sent
+     * behind it on the same queue starts once the worker acks the cancelled row.
+     *
+     * Refused without a server id (the ack has not come back yet; the views disable
+     * the control until it has) and while a cancel is already out. Indexing passes
+     * are not this method's business: their Stop is cancelIndexingGroup, which ends
+     * the file's whole chain.
+     */
+    cancelPendingReply(msg: ChatMessage, idx: number): void;
+    /** The cancelled form of a request bubble, with everything that keeps it in
+     *  place carried over: the file markers that hold an indexing pass in its
+     *  collapsed row, the chat it belongs to, its send time and its render key. */
+    private _cancelledCopyOf;
+    /**
+     * Settle a turn as cancelled wherever it lives, and let the queue move on.
+     *
+     * On the chat on screen: every pending placeholder carrying the id goes (a
+     * history refetch can have re-mapped the running turn into a second one), the
+     * request bubble takes its cancelled form, and the next queued turn is promoted
+     * so the conversation does not sit on an "(In queue)" bubble with nothing
+     * running. For a chat that is NOT on screen (the user moved on while the turn
+     * ran, and it was cancelled from elsewhere) the same edit is made in that chat's
+     * history cache, which is what the next visit renders.
+     *
+     * Idempotent on purpose: a cancel this client made settles the bubbles at once,
+     * and the chain that was awaiting the poll settles again a moment later when the
+     * stop resolves it. The second pass finds nothing to do. Deliberately NOT
+     * _removeStrayPendingAssistants: by then the placeholder on screen is the freshly
+     * promoted turn's, whose user bubble is pending, and the sweep would take it.
+     */
+    private _settleCancelledTurn;
+    /**
+     * _settleCancelledTurn for a chat that is not on screen: the same edit, made in
+     * its history cache. Matched by id where the cached bubbles carry one; an
+     * off-chat send caches its pair before the ack (see dispatchComposedMessage), so
+     * the fallback is positional, exactly as _applyReplyToCache's is: the trailing
+     * pending placeholder, and the last request bubble still marked in flight.
+     */
+    private _applyCancelToCache;
+    /**
      * Stop indexing a file, from its collapsed row — every pass at once, not just
      * the bubble the user happens to see.
      *

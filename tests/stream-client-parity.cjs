@@ -30,6 +30,11 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+// The dashboard checkout was renamed (www.bunnyquery.com -> bunnyquery.com); the
+// first of these that exists is the one used, so a stale name only skips.
+const DASHBOARD_DIR = ['bunnyquery.com', 'www.bunnyquery.com']
+    .map((d) => path.resolve(__dirname, '..', '..', d))
+    .find((d) => fs.existsSync(d)) || path.resolve(__dirname, '..', '..', 'bunnyquery.com');
 const engine = require('../dist/engine.cjs');
 const {
     ChatSession, configureChatEngine,
@@ -86,8 +91,8 @@ const RESOLVED_ENVELOPE = { id: 'r1', status: 'resolved', queue_name: 'u1', in_q
 /* ---- reading the two clients --------------------------------------------- */
 
 const WIDGET_PATH = path.resolve(__dirname, '../src/index.js');
-const AGENT_PATH = path.resolve(__dirname, '../../www.bunnyquery.com/src/views/service/agent.vue');
-const AI_AGENT_PATH = path.resolve(__dirname, '../../www.bunnyquery.com/src/code/ai_agent.ts');
+const AGENT_PATH = path.join(DASHBOARD_DIR, 'src/views/service/agent.vue');
+const AI_AGENT_PATH = path.join(DASHBOARD_DIR, 'src/code/ai_agent.ts');
 const read = (p) => fs.readFileSync(p, 'utf8');
 const hasAgent = fs.existsSync(AGENT_PATH) && fs.existsSync(AI_AGENT_PATH);
 
