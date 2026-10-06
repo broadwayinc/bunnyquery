@@ -4251,6 +4251,64 @@ import {
         return byFile;
     }
 
+    /* ---- "also stop the other files" --------------------------------------
+     * The dialog is opened from ONE file's row, and a user who has a batch being
+     * indexed usually wants the whole batch stopped, which used to mean opening and
+     * confirming this dialog once per file. So when other files are being indexed
+     * too, the dialog offers a checkbox to stop them in the same confirm.
+     *
+     * "Other" is every row that currently offers its own Stop (the same
+     * indexGroupStoppable the button is drawn from), minus the file this dialog is
+     * about. Compared by FILE key, not run key: stopping a file stops every run of
+     * it, so a second live run of the same file is not another file.
+     *
+     * Unchecked every time the dialog opens, so the default confirm does exactly
+     * what it always did. agent.vue offers the same checkbox with the same wording. */
+    var stopIndexOthers = { checked: false, row: null, text: null, box: null };
+
+    function otherStoppableIndexGroups(target) {
+        if (!target) return [];
+        var list = buildChatDisplayList(CS.messages, displayListOptions());
+        var others = [];
+        for (var i = 0; i < list.length; i++) {
+            var row = list[i];
+            if (row.kind !== "indexing") continue;
+            if (!indexGroupStoppable(row.group) || row.group.key === target.key) continue;
+            others.push(row.group);
+        }
+        return others;
+    }
+
+    // How many other FILES that is: two live runs of one file are one file.
+    function countIndexFiles(groups) {
+        var seen = {}, n = 0;
+        for (var i = 0; i < groups.length; i++) {
+            if (seen[groups[i].key]) continue;
+            seen[groups[i].key] = true;
+            n++;
+        }
+        return n;
+    }
+
+    function stopOthersLabel(n) {
+        return n === 1 ? "Also stop the other file being indexed" : "Also stop the " + n + " other files being indexed";
+    }
+
+    // Files finish (and new ones start) while the dialog sits open, so the count is
+    // re-read on every render. With nothing else left to stop the checkbox goes away
+    // and its tick with it, rather than promising to stop files that are done.
+    function refreshStopIndexOthers() {
+        if (!stopIndexOthers.row) return;
+        var n = countIndexFiles(otherStoppableIndexGroups(findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)));
+        if (!n) {
+            stopIndexOthers.checked = false;
+            if (stopIndexOthers.box) stopIndexOthers.box.checked = false;
+        } else if (stopIndexOthers.text) {
+            stopIndexOthers.text.textContent = stopOthersLabel(n);
+        }
+        stopIndexOthers.row.style.display = n ? "" : "none";
+    }
+
     // openModal's own dismissals (backdrop click, ×) just detach the root, so a
     // dismissed dialog is detected here rather than through a callback.
     function stopIndexModalIsOpen() {
@@ -4278,6 +4336,7 @@ import {
     function syncStopIndexModal() {
         if (!stopIndexModalIsOpen()) return;
         if (!findCancellableIndexGroup(stopIndexState.runKey, stopIndexState.fileKey)) closeStopIndexModal();
+        else refreshStopIndexOthers();
     }
 
     function openStopIndexModal(group) {
@@ -4291,11 +4350,25 @@ import {
             stopBtn.addEventListener("click", function () {
                 var runKey = stopIndexState.runKey;
                 var fileKey = stopIndexState.fileKey;
+                var alsoOthers = stopIndexOthers.checked;
                 closeStopIndexModal();
                 // Re-resolve: the row this was opened from is several renders old.
                 var live = findCancellableIndexGroup(runKey, fileKey);
+                // The others are re-resolved too, and BEFORE anything is cancelled:
+                // a stop rewrites the message list these rows are built from.
+                var others = alsoOthers ? otherStoppableIndexGroups(live) : [];
                 if (live) session.cancelIndexingGroup(live);
+                for (var oi = 0; oi < others.length; oi++) session.cancelIndexingGroup(others[oi]);
             });
+            var othersBox = h("input", { type: "checkbox" });
+            othersBox.addEventListener("change", function () { stopIndexOthers.checked = !!othersBox.checked; });
+            var othersText = h("span");
+            var othersRow = h("label", { class: "bq-overwrite-applyall" }, othersBox, othersText);
+            stopIndexOthers.checked = false;
+            stopIndexOthers.box = othersBox;
+            stopIndexOthers.text = othersText;
+            stopIndexOthers.row = othersRow;
+            refreshStopIndexOthers();
             return h("div", { class: "bq-modal" },
                 h("button", { class: "bq-modal-close", type: "button", html: "&times;", onclick: close }),
                 h("div", { class: "bq-modal-delete-header" }, h("span", { text: "Stop indexing" })),
@@ -4306,6 +4379,7 @@ import {
                 h("p", { class: "bq-modal-desc bq-modal-delete-warn" },
                     "Whatever has been indexed so far stays searchable, and the pass already running finishes on the server. " +
                     "The remaining passes are dropped, not paused, so the file stays partly indexed until you reindex it."),
+                othersRow,
                 h("div", { class: "bq-modal-btns" },
                     h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Keep indexing"),
                     stopBtn));

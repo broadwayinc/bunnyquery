@@ -357,10 +357,15 @@ function buildChatSystemPrompt(params) {
   const { projectId, serviceName, serviceDescription, greeting, canUpload, client } = params;
   const g = params.indexAccessGroup;
   const indexGroupLiteral = typeof g === "number" ? String(g) : g === "public" || g === "private" || g === "authorized" || g === "admin" ? `"${g}"` : '"authorized"';
+  const groundingRules = `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
+WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
+KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
+These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
   let systemPrompt = `
 You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
+${groundingRules}
 NUMBERS FROM A SPREADSHEET: use queryGrid, never mental arithmetic over records. A total, a count, an average, a "how many mention X", a "which one is biggest" - all of those are computed server-side over EVERY row of the file and come back with the sheet, the row count and the row numbers they were made from. Records are a SAMPLE, and a sample added up is a confident wrong number. Quote the row count and the sheet alongside the figure so the reader can check it.
 CALL queryGrid describe FIRST, before any figure. Workbooks routinely state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that each re-total it, plus a summary sheet whose bottom row is the file total. Those look like four different answers and are one. describe names which sheets restate which, and which rows are totals. Pick ONE sheet, say which you picked, and never add figures across a sheet and its summary. If the reply carries a warning about restatement, repeat it to the user.
 A FILE TOTAL IS NOT A ROW'S TOTAL. The biggest number on a summary sheet is the whole file, not the thing that was asked about. Before quoting any figure, check it is scoped to what the question named: filter by the column that identifies it and report how many rows matched.
@@ -3253,8 +3258,9 @@ function mapHistoryListToMessages(list, platform, opts) {
     var createdTs = Number(item && item.created);
     var updatedTs = Number(item && item.updated);
     var executedTs = Number(item && item.executed);
+    var respondedTs = Number(item && item.responded);
     var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : isFinite(updatedTs) && updatedTs > 0 ? updatedTs : void 0;
-    var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : isFinite(createdTs) && createdTs > 0 ? createdTs : void 0;
+    var replyTs = isFinite(respondedTs) && respondedTs > 0 ? respondedTs : isFinite(updatedTs) && updatedTs > 0 ? updatedTs : isFinite(createdTs) && createdTs > 0 ? createdTs : void 0;
     if (userText) {
       var displayContent;
       var indexFile = void 0;
@@ -3881,6 +3887,13 @@ var ChatSession = class {
     // the request budget MAX_CONCURRENT_BG_POLLS exists to protect.
     /** Live streams by server item id. One per in-flight streamed turn. */
     this.liveStreams = {};
+    /** When skapi recorded a turn's response as having finished arriving, by server
+     *  item id. Read off the terminal envelope of a STREAMED turn (the only settle
+     *  that carries it, see _settleLiveStream) and used as the answer bubble's time
+     *  in place of this browser's clock. Entries are never removed: a settle reaches
+     *  here twice (the poll's onResponse, then the promise), and the value for an id
+     *  cannot change. */
+    this._respondedAt = {};
     // ─── compact-stub hydration ─────────────────────────────────────────────
     // Split-fetch bg pages arrive as label stubs (no bodies). When the user
     // expands a row, the real reply text is fetched per item (csr-poll point
@@ -4406,6 +4419,23 @@ var ChatSession = class {
     });
     return n;
   }
+  _noteRespondedAt(itemId, response) {
+    if (!itemId || !isCsrStatusEnvelope(response)) return;
+    var at = Number(response.responded);
+    if (!isFinite(at) || at <= 0) return;
+    if (!this._respondedAt) this._respondedAt = {};
+    this._respondedAt[itemId] = at;
+  }
+  /** The time a live answer bubble is stamped with: when skapi received the
+   *  response, if the settle told us, else now. "Now" is what every bubble got
+   *  before, and it is still right for a buffered turn, whose settle hands back the
+   *  destination's body and nothing of skapi's; a history load then replaces it
+   *  with the server's value. */
+  _replyStampFor(msg) {
+    var id = msg ? msg._serverItemId : void 0;
+    var at = typeof id === "string" && id && this._respondedAt ? this._respondedAt[id] : void 0;
+    return typeof at === "number" ? at : wallClockNow();
+  }
   /**
    * Open (or re-open) the live stream for `itemId`, or null when this poll must
    * not carry one.
@@ -4595,6 +4625,7 @@ var ChatSession = class {
   _settleLiveStream(st, response) {
     this._closeLiveStream(st, true);
     if (!isCsrStatusEnvelope(response)) return response;
+    this._noteRespondedAt(st.id, response);
     if (response.status !== "resolved") return response;
     if (!this._mayFinalize(st)) this._rec().incomplete[st.id] = true;
     if (st.finalBody == null) return response;
@@ -6036,7 +6067,7 @@ var ChatSession = class {
     return thinkingIdx !== -1 ? thinkingIdx : userIdx >= 0 ? userIdx + 1 : -1;
   }
   insertAtTarget(msg, targetIdx) {
-    if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = wallClockNow();
+    if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = this._replyStampFor(msg);
     var tgt = targetIdx >= 0 ? this.state.messages[targetIdx] : void 0;
     var replaceable = !!tgt && !!tgt.isPending && !tgt.isBackgroundTask && this._isOwnPlaceholderOf(targetIdx, this._owningUserIndex(targetIdx));
     if (replaceable) this.state.messages[targetIdx] = msg;
@@ -6659,7 +6690,7 @@ var ChatSession = class {
   enqueueTypewrite(idx, fullText, localId, paintedText) {
     var self = this;
     var target = this.state.messages[idx];
-    if (target && target._ts === void 0) target._ts = wallClockNow();
+    if (target && target._ts === void 0) target._ts = this._replyStampFor(target);
     if (!this.typewriterQueue) this.typewriterQueue = Promise.resolve();
     this.typewriterQueue = this.typewriterQueue.then(function() {
       return self.typewriteIntoIndex(idx, fullText, localId, paintedText);

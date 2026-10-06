@@ -1220,6 +1220,35 @@ export class ChatSession {
 	/** Live streams by server item id. One per in-flight streamed turn. */
 	private liveStreams: { [itemId: string]: LiveStreamState } = {};
 
+	/** When skapi recorded a turn's response as having finished arriving, by server
+	 *  item id. Read off the terminal envelope of a STREAMED turn (the only settle
+	 *  that carries it, see _settleLiveStream) and used as the answer bubble's time
+	 *  in place of this browser's clock. Entries are never removed: a settle reaches
+	 *  here twice (the poll's onResponse, then the promise), and the value for an id
+	 *  cannot change. */
+	private _respondedAt: { [itemId: string]: number } = {};
+
+	private _noteRespondedAt(itemId: string, response: any): void {
+		if (!itemId || !isCsrStatusEnvelope(response)) return;
+		var at = Number(response.responded);
+		if (!isFinite(at) || at <= 0) return;
+		// Self-healing for a session built without the constructor (the engine tests
+		// drive Object.create(ChatSession.prototype)), like typewriterQueue below.
+		if (!this._respondedAt) this._respondedAt = {};
+		this._respondedAt[itemId] = at;
+	}
+
+	/** The time a live answer bubble is stamped with: when skapi received the
+	 *  response, if the settle told us, else now. "Now" is what every bubble got
+	 *  before, and it is still right for a buffered turn, whose settle hands back the
+	 *  destination's body and nothing of skapi's; a history load then replaces it
+	 *  with the server's value. */
+	private _replyStampFor(msg: ChatMessage | undefined): number {
+		var id = msg ? msg._serverItemId : undefined;
+		var at = (typeof id === 'string' && id && this._respondedAt) ? this._respondedAt[id] : undefined;
+		return typeof at === 'number' ? at : wallClockNow();
+	}
+
 	/**
 	 * Open (or re-open) the live stream for `itemId`, or null when this poll must
 	 * not carry one.
@@ -1472,6 +1501,10 @@ export class ChatSession {
 	private _settleLiveStream(st: LiveStreamState, response: any): any {
 		this._closeLiveStream(st, true);
 		if (!isCsrStatusEnvelope(response)) return response;
+		// Before any return below, and for every terminal status: the bubble that
+		// settles this turn is stamped from it whether it ends as an answer, an error
+		// or a truncation.
+		this._noteRespondedAt(st.id, response);
 		// RESOLVED only, and this is not caution, it is correctness. 'cancelled' is the
 		// envelope the user's own Stop produces, and _isCancelledPollResult downstream
 		// is what settles the turn as stopped: hand it an assembled body instead and a
@@ -3377,7 +3410,7 @@ export class ChatSession {
 	insertAtTarget(msg: ChatMessage, targetIdx: number): void {
 		// Error/direct replies land here rather than through the typewriter, so this
 		// is where they pick up their display time.
-		if (msg && msg.role === 'assistant' && msg._ts === undefined) msg._ts = wallClockNow();
+		if (msg && msg.role === 'assistant' && msg._ts === undefined) msg._ts = this._replyStampFor(msg);
 		// Overwrite only a placeholder that genuinely belongs to the turn above it.
 		// Two things now sit at this index that must never be replaced by a chat
 		// answer: a background "Indexing:" placeholder (a file's rows are inserted
@@ -4069,9 +4102,11 @@ export class ChatSession {
 		// Stamp the reply bubble's display time as it starts revealing. This is the
 		// single chokepoint every typed reply (immediate, queued, and bg-resolution)
 		// passes through, so it is where a live reply gets its "when it arrived"
-		// timestamp; a history reload later replaces it with the server `updated`.
+		// timestamp; a history reload later replaces it with the server's own.
+		// _replyStampFor prefers the time skapi received the response when the settle
+		// reported one (a streamed turn), over this browser's clock.
 		var target = this.state.messages[idx];
-		if (target && target._ts === undefined) target._ts = wallClockNow();
+		if (target && target._ts === undefined) target._ts = this._replyStampFor(target);
 		// SELF-HEALING, because this is now reached from the live paint path too. The
 		// queue is a class field, so it is only initialised by the constructor; any
 		// caller holding a ChatSession built another way (the engine tests drive

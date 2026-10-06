@@ -3859,6 +3859,20 @@ declare class ChatSession {
     private _countBgPolls;
     /** Live streams by server item id. One per in-flight streamed turn. */
     private liveStreams;
+    /** When skapi recorded a turn's response as having finished arriving, by server
+     *  item id. Read off the terminal envelope of a STREAMED turn (the only settle
+     *  that carries it, see _settleLiveStream) and used as the answer bubble's time
+     *  in place of this browser's clock. Entries are never removed: a settle reaches
+     *  here twice (the poll's onResponse, then the promise), and the value for an id
+     *  cannot change. */
+    private _respondedAt;
+    private _noteRespondedAt;
+    /** The time a live answer bubble is stamped with: when skapi received the
+     *  response, if the settle told us, else now. "Now" is what every bubble got
+     *  before, and it is still right for a buffered turn, whose settle hands back the
+     *  destination's body and nothing of skapi's; a history load then replaces it
+     *  with the server's value. */
+    private _replyStampFor;
     /**
      * Open (or re-open) the live stream for `itemId`, or null when this poll must
      * not carry one.

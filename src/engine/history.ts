@@ -798,8 +798,17 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 		// cases the pass simply shows no duration, which is right: the honest answer
 		// to "how long did it take" is nothing, not the queue wait dressed up as it.
 		var executedTs = Number(item && item.executed);
+		// When skapi recorded the destination's response as having finished arriving.
+		// It is the answer's time whenever the row carries it, because `updated` is
+		// not that for a STREAMED turn: finalizing the turn stores its answer a few
+		// seconds later and moves `updated` to that moment. Absent on rows settled
+		// before the worker recorded it, on a turn that failed with no response, and
+		// under an SDK that does not project it. All three fall back to `updated`,
+		// which is exactly what this showed before.
+		var respondedTs = Number(item && item.responded);
 		var userTs = isFinite(createdTs) && createdTs > 0 ? createdTs : (isFinite(updatedTs) && updatedTs > 0 ? updatedTs : undefined);
-		var replyTs = isFinite(updatedTs) && updatedTs > 0 ? updatedTs : (isFinite(createdTs) && createdTs > 0 ? createdTs : undefined);
+		var replyTs = isFinite(respondedTs) && respondedTs > 0 ? respondedTs
+			: (isFinite(updatedTs) && updatedTs > 0 ? updatedTs : (isFinite(createdTs) && createdTs > 0 ? createdTs : undefined));
 
 		if (userText) {
 			var displayContent;
