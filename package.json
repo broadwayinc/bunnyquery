@@ -36,7 +36,8 @@
     "test": "for f in ./tests/*.cjs; do echo \"--- $f\"; node \"$f\" || exit 1; done"
   },
   "dependencies": {
-    "basic-node-server": "^1.1.1"
+    "basic-node-server": "^1.1.1",
+    "skapi-js": "^2.2.3"
   },
   "devDependencies": {
     "tsup": "^8.5.1",
