@@ -149,6 +149,37 @@
     font-style: italic;
     clear: both;
 }
+/* ---- citations + the no-source mark -------------------------------------*/
+/* Under an answer that read something: one chip per cited file (and page, in
+   the label only). The chips are the ordinary stored-file link chips
+   (.bq-link-button, emitted by renderInlineLinkHtml), so they inherit the
+   expired / refreshing / unavailable states and the hover rule; this only lays
+   them out as a row under a hairline. Absent entirely when there is nothing to
+   cite, so a plain bubble is laid out exactly as before. */
+.bq-citations {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 0.6rem;
+    margin-top: 0.45rem;
+    padding-top: 0.35rem;
+    border-top: 1px solid var(--bq-line);
+    font-size: 0.72rem;
+    line-height: 1.35;
+    white-space: normal;
+    clear: both;
+}
+.bq-citations .bq-link-button { max-width: 16rem; }
+/* The answer used no data tool: a small muted line, never a colour that reads
+   as an error (the answer may still be right; what it was not is READ). */
+.bq-no-source-note {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.68rem;
+    font-style: italic;
+    color: var(--bq-muted);
+    clear: both;
+}
 /* Timestamp under a settled bubble (created for a user turn, response time for an
    assistant turn). Muted and small so it never competes with the message. */
 .bq-msg-time {

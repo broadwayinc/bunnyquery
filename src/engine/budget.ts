@@ -5,6 +5,10 @@
  * to sanitizeAttachmentLinksForHistory (which used to read a global).
  */
 import { sanitizeAttachmentLinksForHistory } from './links';
+import {
+	formatRetrievalNote, isRetrievalNote, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET,
+	type RetrievalNote,
+} from './retrieval_memory';
 
 export var CONTEXT_WINDOW_DEFAULT: Record<string, number> = { claude: 200000, openai: 128000 };
 // Exact model ids first, then family keys (see getModelContextWindow: a suffixed
@@ -328,10 +332,44 @@ export type BoundedChatOptions = {
 	platform: string;
 	model?: string;
 	systemPrompt: string;
-	history: Array<{ role: string; content: string }>;
+	/**
+	 * The turns, oldest first, the one being sent LAST. An assistant turn may
+	 * carry `_retrieval` (see retrieval_memory.ts): the note is appended to that
+	 * turn's LLM copy for the newest RETRIEVAL_NOTES_MAX such turns, within
+	 * RETRIEVAL_NOTES_TOKEN_BUDGET. Turns without it are sent as they always were.
+	 */
+	history: Array<{ role: string; content: string; _retrieval?: RetrievalNote | null }>;
 	/** Used to strip/rewrite expired attachment links in older user turns. */
 	projectId: string;
+	/** Set false to leave every `_retrieval` note out of the request. Default on. */
+	retrievalNotes?: boolean;
 };
+
+/**
+ * Append each carried retrieval note to its assistant turn, newest first, until
+ * RETRIEVAL_NOTES_MAX notes or RETRIEVAL_NOTES_TOKEN_BUDGET estimated tokens are
+ * used. Returns new message objects for the turns it changed and the originals
+ * for the rest; the turn at `latestIndex` (the one being sent) is never touched.
+ * Pure, and exported so the bound can be tested without a session.
+ */
+export function applyRetrievalNotes<T extends { role: string; content: string; _retrieval?: RetrievalNote | null }>(
+	messages: T[], latestIndex: number,
+): { messages: T[]; notesUsed: number; noteTokens: number } {
+	var out = messages.slice();
+	var used = 0, tokens = 0;
+	for (var i = messages.length - 1; i >= 0; i--) {
+		if (used >= RETRIEVAL_NOTES_MAX) break;
+		var m = messages[i];
+		if (i === latestIndex || !m || m.role !== 'assistant' || !isRetrievalNote(m._retrieval)) continue;
+		var line = formatRetrievalNote(m._retrieval);
+		if (!line) continue;
+		var cost = estimateTextTokens(line) + 2;
+		if (tokens + cost > RETRIEVAL_NOTES_TOKEN_BUDGET) break;
+		tokens += cost; used++;
+		out[i] = Object.assign({}, m, { content: (m.content || '') + '\n\n' + line });
+	}
+	return { messages: out, notesUsed: used, noteTokens: tokens };
+}
 
 export function buildBoundedChatMessages(options: BoundedChatOptions) {
 	var contextBasedBudget = contextBasedBudgetFor(options.platform, options.model, options.projectId);
@@ -354,6 +392,10 @@ export function buildBoundedChatMessages(options: BoundedChatOptions) {
 		Math.round(MAX_HISTORY_MESSAGES * (budgetForHistory / HISTORY_TOKEN_BUDGET)));
 	var windowed = options.history.slice(-maxHistoryMessages);
 	var latestIndex = windowed.length - 1;
+	// Retrieval memory rides on the turn it belongs to, BEFORE the token loop
+	// below, so a note is paid for out of the same history budget as the words
+	// around it and the request can never exceed the budget by the notes' size.
+	if (options.retrievalNotes !== false) windowed = applyRetrievalNotes(windowed, latestIndex).messages;
 	var trimmed = windowed.map(function (m, i) {
 		if (i === latestIndex) return m;
 		var stripped = stripFileBlocksFromHistory(m.content);

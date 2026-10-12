@@ -28,6 +28,12 @@ export {
 	// says no: an SDK too old to know the key drops it silently, leaving the
 	// destination streaming SSE into a buffered row that reads back empty.
 	skapiSupportsStreaming,
+	// The chat's web switch, resolved the one way both clients and the request
+	// builders agree on: the host's `webAccess` option, then the project's
+	// `web_access` setting, then off. The sync form is for a prompt builder or a
+	// template; the awaiting form is what the request builders use.
+	webAccessEnabled,
+	resolveWebAccess,
 } from './config';
 
 export {
@@ -78,6 +84,12 @@ export {
 	isCsrStatusEnvelope, csrEnvelopeError,
 } from './errors';
 export * from './budget';
+// Retrieval memory: the per-turn note of what a chat turn read, queried or
+// linked, and the bounds under which buildBoundedChatMessages carries it.
+export * from './retrieval_memory';
+// Citations and the no-source mark: what each client draws under an answer
+// out of that note, and the one gate deciding which bubbles get them.
+export * from './citations';
 // Per-format UTF-8 declaration for files offered as a download. Shared so a fenced
 // block and a server-published file open identically in Excel, Word and a browser.
 export * from './download_encoding';
@@ -269,6 +281,11 @@ export {
 	normalizeChatGreeting,
 	chatGreetingFrom,
 	projectChatGreeting,
+	// web access for chat answers (same record, its own key, off by default)
+	DEFAULT_WEB_ACCESS,
+	normalizeWebAccess,
+	webAccessFrom,
+	projectWebAccess,
 	// pure readers over a settings `data` object
 	normalizeUploadAccessGroup,
 	normalizeProjectAccessSetting,

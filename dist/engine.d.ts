@@ -287,6 +287,23 @@ interface ChatEngineConfig {
      */
     liveStreamingRealtime?: boolean;
     /**
+     * Whether a CHAT answer may reach the open web: Claude's `web_fetch` and
+     * OpenAI's `web_search` are attached to a chat request only when this
+     * resolves to true.
+     *
+     * OPTIONAL, AND UNSET IS NOT FALSE. When the host leaves it out, the engine
+     * reads the project's own setting (`web_access` in the `bq::settings`
+     * record, see project_settings.ts) and falls back to OFF, so the project
+     * owner's switch on the Project Settings page decides for every client that
+     * does not override it. A host that sets a boolean here overrides the
+     * project for its own page, both ways. Resolution: this option, then the
+     * project setting, then false.
+     *
+     * Chat turns only. An indexing pass keeps the tools it has today, since the
+     * worker hands it rendered pages and extracted text and not a URL to fetch.
+     */
+    webAccess?: boolean;
+    /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
      * sends the ASSEMBLED provider body, so history reads it exactly as it reads
@@ -381,6 +398,21 @@ interface ChatEngineConfig {
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
+/**
+ * The web switch for a chat turn, SYNCHRONOUSLY: the host's `webAccess` option
+ * when it is a boolean, else the project's cached `web_access` setting, else
+ * false. For a template or a prompt builder, which have nowhere to await. Reads
+ * the cache as it stands, so before the settings fetch settles it answers the
+ * default; request builders use resolveWebAccess below instead.
+ */
+declare function webAccessEnabled(service?: string): boolean;
+/**
+ * The same switch, awaiting the project's settings record when the host did not
+ * decide. Never rejects: a failed or impossible read (no reader injected, a
+ * signed-out visitor on a require_login project) settles as "unset", which is
+ * off. Cheap after the first call per project: the store dedupes and caches.
+ */
+declare function resolveWebAccess(service?: string): Promise<boolean>;
 /**
  * True when a streamed turn whose answer never reached its row can be READ BACK.
  *
@@ -652,6 +684,15 @@ type ChatSystemPromptParams = {
      * ones.
      */
     indexAccessGroup?: string;
+    /**
+     * Whether THIS chat may reach the open web. The engine attaches Claude's
+     * web_fetch and OpenAI's web_search to a chat request only when the project's
+     * web switch is on (the host's `webAccess` option, else the project's
+     * `web_access` setting, else off: config.ts webAccessEnabled), and the prompt
+     * follows the tool list, so the model is never told to fetch with a tool it
+     * does not have. Omitted means off, which is also the engine's default.
+     */
+    webAccess?: boolean;
 };
 declare function buildChatSystemPrompt(params: ChatSystemPromptParams): string;
 
@@ -926,6 +967,102 @@ declare function isAuthExpiredError(input: any): boolean;
  */
 declare function isProviderApiKeyError(input: any): boolean;
 
+/**
+ * Retrieval memory: a compact note of what a chat turn RETRIEVED, kept with the
+ * turn so a follow-up question skips discovery.
+ *
+ * THE PROBLEM. The provider runs the tool loop on its side and history keeps
+ * only the answer text (budget.ts), so on "and what does page 3 say?" the model
+ * starts from nothing: it looks the file up again, guesses a table and an access
+ * group again, and routinely lands somewhere else, which is how an answer flips
+ * between two turns about the same document.
+ *
+ * WHAT THE ENGINE CAN SEE. The provider's final body carries the tool loop:
+ *   - Anthropic Messages: content[] blocks `mcp_tool_use` (name, input) and
+ *     `mcp_tool_result` (content), plus `server_tool_use` / `web_*_tool_result`
+ *     for the built-in web tools;
+ *   - OpenAI Responses: output[] items `mcp_call` (name, arguments as a JSON
+ *     string, output as a string) and `web_search_call`.
+ * The polling worker stores that body on the row (spilling to S3 past 300 KB,
+ * never truncating), and a streamed turn's assembled body keeps the same blocks
+ * (sse.ts copies each block's skeleton and its JSON input verbatim), so the
+ * same reader works live, after a stream and after a reload. When a body has no
+ * tool blocks at all (a host that strips them, a provider shape this does not
+ * know), the note falls back to what the ANSWER names: db: file links and src::
+ * paths. Nothing is ever invented: an empty note is null, not a guess.
+ *
+ * WHAT IS KEPT, per turn: files (storage paths), tables, access groups,
+ * searchText hits as path + page, the tool names, and whether a web tool ran.
+ * Arguments are read by KEY, never by position, and only the keys the
+ * BunnyQuery tools use for those four things; a query's filter values, a
+ * record's data and a tool result's text are never copied, so the note cannot
+ * leak a page of a document into every later turn.
+ *
+ * HOW IT REACHES THE MODEL. buildBoundedChatMessages appends the formatted note
+ * to the LLM copy of the assistant turn it belongs to (never the displayed
+ * bubble), for the newest RETRIEVAL_NOTES_MAX turns and within
+ * RETRIEVAL_NOTES_TOKEN_BUDGET tokens, so the memory is bounded however long
+ * the chat gets. A host that never attaches `_retrieval` sees byte-identical
+ * requests to today.
+ */
+type RetrievalHit = {
+    path: string;
+    page: number;
+};
+type RetrievalNote = {
+    /** Storage paths (the part after "src::") the turn read, queried or linked. */
+    files: string[];
+    /** Table names the turn queried. */
+    tables: string[];
+    /** Access groups the turn queried at, as written in the call. */
+    accessGroups: string[];
+    /** searchText hits: the page a term was found on, per file. */
+    hits: RetrievalHit[];
+    /** Tool names, in order of first use. */
+    tools: string[];
+    /** A web tool ran in this turn (web_search / web_fetch). */
+    web: boolean;
+    /** 'tools' when read off the body's tool blocks; 'answer' when only the
+     *  answer text was available to read. */
+    source: 'tools' | 'answer' | 'body';
+};
+/** How many of the newest turns carry their note into the request. */
+declare const RETRIEVAL_NOTES_MAX = 6;
+/** Ceiling on the estimated tokens all carried notes may add to one request. */
+declare const RETRIEVAL_NOTES_TOKEN_BUDGET = 1200;
+/** Per-list cap inside one note (files, tables, groups, hits, tools). */
+declare const RETRIEVAL_NOTE_MAX_ITEMS = 8;
+/** Hard cap on one formatted note. */
+declare const RETRIEVAL_NOTE_MAX_CHARS = 600;
+/** The marker a carried note opens with; also what keeps it out of the model's own voice. */
+declare const RETRIEVAL_NOTE_PREFIX = "[Retrieval note, not shown to the user";
+/**
+ * What an ANSWER names: db: file links ("[name](db:path)") and src:: ids. The
+ * fallback for a body with no tool blocks, and merged into a tool note too so a
+ * file the model linked but never queried (it knew the path from history) is
+ * still remembered.
+ */
+declare function retrievalNoteFromText(text: string | null | undefined): RetrievalNote | null;
+/**
+ * The note for one assistant turn: the body's tool loop when it has one, else
+ * what the answer names, else null. `answerText` is the extracted answer, read
+ * for file links in both cases.
+ */
+declare function extractRetrievalNote(body: any, answerText?: string | null): RetrievalNote | null;
+/**
+ * True when `body` is a provider response this module can read: an Anthropic
+ * Messages body (`content` array) or an OpenAI Responses body (`output` array).
+ */
+declare function providerBodyWasRead(body: any): boolean;
+/** True when the value is a note this module produced (or an equivalent shape). */
+declare function isRetrievalNote(value: any): value is RetrievalNote;
+/**
+ * One line the model reads. Sections are omitted when empty, the whole thing is
+ * capped at RETRIEVAL_NOTE_MAX_CHARS, and it opens with RETRIEVAL_NOTE_PREFIX so
+ * the model can tell it from its own earlier words. Returns '' for an empty note.
+ */
+declare function formatRetrievalNote(note: RetrievalNote | null | undefined): string;
+
 declare var CONTEXT_WINDOW_DEFAULT: Record<string, number>;
 declare var CONTEXT_WINDOW_BY_MODEL: Record<string, number>;
 declare var MAX_OUTPUT_BY_MODEL: Record<string, number>;
@@ -1021,12 +1158,37 @@ type BoundedChatOptions = {
     platform: string;
     model?: string;
     systemPrompt: string;
+    /**
+     * The turns, oldest first, the one being sent LAST. An assistant turn may
+     * carry `_retrieval` (see retrieval_memory.ts): the note is appended to that
+     * turn's LLM copy for the newest RETRIEVAL_NOTES_MAX such turns, within
+     * RETRIEVAL_NOTES_TOKEN_BUDGET. Turns without it are sent as they always were.
+     */
     history: Array<{
         role: string;
         content: string;
+        _retrieval?: RetrievalNote | null;
     }>;
     /** Used to strip/rewrite expired attachment links in older user turns. */
     projectId: string;
+    /** Set false to leave every `_retrieval` note out of the request. Default on. */
+    retrievalNotes?: boolean;
+};
+/**
+ * Append each carried retrieval note to its assistant turn, newest first, until
+ * RETRIEVAL_NOTES_MAX notes or RETRIEVAL_NOTES_TOKEN_BUDGET estimated tokens are
+ * used. Returns new message objects for the turns it changed and the originals
+ * for the rest; the turn at `latestIndex` (the one being sent) is never touched.
+ * Pure, and exported so the bound can be tested without a session.
+ */
+declare function applyRetrievalNotes<T extends {
+    role: string;
+    content: string;
+    _retrieval?: RetrievalNote | null;
+}>(messages: T[], latestIndex: number): {
+    messages: T[];
+    notesUsed: number;
+    noteTokens: number;
 };
 declare function buildBoundedChatMessages(options: BoundedChatOptions): {
     messages: {
@@ -1037,6 +1199,95 @@ declare function buildBoundedChatMessages(options: BoundedChatOptions): {
     estimatedInputTokens: number;
     estimatedBudget: number;
 };
+
+/**
+ * Citations and the no-source mark (reliability plan 3.5).
+ *
+ * The retrieval note (retrieval_memory.ts) already records what a turn READ:
+ * the files it queried or linked and the pages searchText found a term on.
+ * This module turns that note into what the two clients DRAW under an answer:
+ *
+ *   - a row of file chips, one per cited file (and page, when a page is
+ *     known), each opening the file the way every other stored-file chip does
+ *     (the `_expired_.url` placeholder that the client's click handler mints a
+ *     fresh url for; the page is in the label only, there is no deep link);
+ *   - a small mark when the answer used NO data tool at all, so an answer the
+ *     model wrote from its own head is visibly different from one it read.
+ *
+ * Pure data in, pure data out: no DOM, nothing reactive. Each client renders the
+ * parts with the same emitter it already uses for inline links, so a citation
+ * chip is byte for byte the chip the model would have written inline, and the
+ * same delegated click handler, the same unavailable state and the same minted
+ * url cache serve it.
+ */
+
+interface Citation {
+    /** Storage path, exactly as the note carries it. */
+    path: string;
+    /** 1-based page, when a searchText hit named one. */
+    page?: number;
+    /** What the chip says: the file name (last path segment) plus " p.N" when a page is known. */
+    label: string;
+}
+/**
+ * The tools that READ project data. An answer whose turn called none of these
+ * (and no web tool) was written without looking at anything, which is what the
+ * no-source mark says. Names are the MCP tool names as the body carries them.
+ */
+declare var DATA_TOOL_NAMES: string[];
+/** The mark's text, single-sourced so the two clients cannot word it differently. */
+declare var NO_DATA_TOOL_MARK: string;
+/** The file name of a storage path: its last non-empty segment. */
+declare function citationFileName(path: string): string;
+/**
+ * The citations of one note, deduplicated and ordered: searchText hits first
+ * (files in the order they were first hit, pages ascending within a file), then
+ * the files the turn read or linked without a page, in the note's order. A file
+ * that has a page hit is not repeated as a page-less chip. Empty for a null note.
+ */
+declare function citationsFor(note: RetrievalNote | null | undefined): Citation[];
+/** True when `name` is one of the data-reading tools. */
+declare function isDataToolName(name: string): boolean;
+/**
+ * True when the turn has a note and that note shows no data tool and no web
+ * tool: the answer was written without reading anything. A null note is
+ * UNKNOWN (no body to read, a greeting, an indexing pass), never "no source".
+ */
+declare function answerUsedNoDataTool(note: RetrievalNote | null | undefined): boolean;
+/**
+ * The retrieval note of a SETTLED CHAT ANSWER, or null: the one place both
+ * clients decide which bubbles get chips and the mark. Not a user turn, not an
+ * indexing pass (a collapsed row, never a bubble), not an error, not a bubble
+ * still waiting for its answer. The greeting is client chrome with no note.
+ */
+declare function retrievalNoteOfAnswer(msg: {
+    role?: string;
+    isError?: boolean;
+    isPending?: boolean;
+    isBackgroundTask?: boolean;
+    _streamPending?: boolean;
+    _retrieval?: RetrievalNote | null;
+} | null | undefined): RetrievalNote | null;
+/** The shape both clients' link emitters accept (a RenderableInlineLink with the view's part tag). */
+interface CitationLinkPart {
+    type: 'link';
+    label: string;
+    fullLabel: string;
+    href: string;
+    expired: boolean;
+    expiredHref: string;
+    remotePath: string;
+}
+/**
+ * One citation as the link part the clients already know how to draw and click:
+ * the `_expired_.url` placeholder for the file's storage path (or the fresh url
+ * the view has cached for it), the storage path as `remotePath` so the click
+ * handler and the unavailable map find it, and NO image, so a cited picture is
+ * a chip under the answer rather than a second preview of it. The display label
+ * is truncated from the front (truncateLabelForDisplay keeps the tail), so the
+ * " p.N" suffix survives a long file name.
+ */
+declare function citationLinkPart(citation: Citation, resolveFreshHref?: (expiredHref: string) => string | undefined): CitationLinkPart;
 
 /**
  * How a text file the chat offers as a download is encoded and labelled, so that
@@ -2037,11 +2288,17 @@ type CallClaudeWithMcpParams = {
     fileUrls?: FileUrlDirective[];
     onResponse?: (res: any) => void;
     onError?: (err: any) => void;
+    /**
+     * Attach Claude's `web_fetch` to this turn. Omitted means "ask the engine":
+     * the host's `webAccess` config option, then the project's `web_access`
+     * setting, then off. See config.ts resolveWebAccess.
+     */
+    webAccess?: boolean;
 };
 declare const POLL_INTERVAL = 3000;
 declare const STREAM_POLL_INTERVAL = 1000;
 declare const MAX_CONCURRENT_BG_POLLS = 6;
-declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, }: CallClaudeWithMcpParams): Promise<any>;
+declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, webAccess, }: CallClaudeWithMcpParams): Promise<any>;
 declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
     anonymous?: boolean;
     publicProjectId?: string;
@@ -2250,6 +2507,7 @@ declare function buildHistoryItemFullId(platform: 'claude' | 'openai', service: 
  * and the skapi cancel/refresh surface. Everything the session needs that would
  * otherwise touch the DOM or a framework goes through a host hook.
  */
+
 interface ChatIdentity {
     projectId: string;
     /**
@@ -2318,6 +2576,11 @@ interface IndexingFileRef {
 interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
+    /** Retrieval memory (retrieval_memory.ts): what this assistant turn read,
+     *  queried or linked, taken off the provider body's tool blocks or, failing
+     *  that, the answer's file links. Never rendered. buildBoundedChatMessages
+     *  appends it to the turn's LLM copy so a follow-up skips discovery. */
+    _retrieval?: RetrievalNote;
     isPending?: boolean;
     isPendingInProcess?: boolean;
     isPendingQueued?: boolean;
@@ -4758,8 +5021,31 @@ declare const UPLOAD_ACCESS_OPTIONS: {
 type ProjectSettingsData = {
     upload_access_group?: unknown;
     chat_greeting?: unknown;
+    web_access?: unknown;
     [key: string]: unknown;
 };
+/**
+ * Whether a CHAT answer may reach the open web (Claude `web_fetch`, OpenAI
+ * `web_search`). Same record, its own `web_access` key.
+ *
+ * OFF BY DEFAULT, and the default is the point: customers reported answers that
+ * were not in their data, and an open web tool is one of the ways such an answer
+ * gets out. A project that never opens the setting answers from its files and
+ * database alone. Only the literal `true` turns it on: this record is public and
+ * a client must never read a value it did not write as permission.
+ *
+ * Resolution order, applied by the engine where the chat request is built:
+ *   1. the host's `webAccess` init/config option, when it is a boolean;
+ *   2. this setting, when the project has set it;
+ *   3. off.
+ * Indexing requests are not governed by this: an indexing pass keeps the tools
+ * it has today (see requests.ts notifyAgentSaveAttachment).
+ */
+declare const DEFAULT_WEB_ACCESS = false;
+/** Narrow a stored value to the switch: only `true` is on. */
+declare function normalizeWebAccess(value: any): boolean;
+/** The switch held in a settings-record `data`, false when unset. */
+declare function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
 /**
  * Longest custom opening line the dashboard will store.
  *
@@ -4856,6 +5142,13 @@ declare function projectAsksUploadAccess(service: string): boolean;
  */
 declare function projectChatGreeting(service: string): string;
 /**
+ * Sync convenience: the project's web-access setting, false until the fetch
+ * settles or when the project never set it. The request builders prefer the
+ * awaiting form (config.ts resolveWebAccess) so the first turn after a page load
+ * reads the stored value rather than the cold-cache default.
+ */
+declare function projectWebAccess(service: string): boolean;
+/**
  * Adopt a value the caller just WROTE, so the settings page reflects its own
  * save without a re-fetch.
  *
@@ -4875,4 +5168,4 @@ declare function patchProjectSettings(service: string, patch: ProjectSettingsDat
  */
 declare function clearProjectSettings(service?: string): void;
 
-export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_UPLOAD_ACCESS_GROUP, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, applyEncodingDeclaration, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, formatDuration, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectUploadAccessGroup, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow };
+export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

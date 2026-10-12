@@ -52,6 +52,10 @@ import {
     configureProjectSettings,
     primeProjectSettings,
     readyProjectSettings,
+    // The chat's web switch as the engine resolves it (init option, then the
+    // project's `web_access` setting, then off), so the prompt tells the model
+    // exactly the tool list the request carries.
+    webAccessEnabled,
     normalizeUploadAccessGroup,
     projectAsksUploadAccess,
     projectUploadAccessGroup,
@@ -93,6 +97,14 @@ import {
     IMAGE_PREVIEWS_PER_MESSAGE,
     hydrateImagePreviews,
     clearImagePreviewCache,
+    // Citations and the no-source mark under an answer: the engine decides which
+    // bubbles qualify, what the chips are and what the mark says; this view only
+    // draws them with the same chip emitter and click handler as an inline link.
+    citationsFor,
+    answerUsedNoDataTool,
+    retrievalNoteOfAnswer,
+    citationLinkPart,
+    NO_DATA_TOOL_MARK,
     // Per-format UTF-8 declaration for downloadable files, single-sourced in
     // engine/download_encoding.ts and mirrored in skapi-mcp.
     prepareDownloadText,
@@ -2086,6 +2098,11 @@ import {
             // readyProjectSettings on the text-only branch, and the attachment
             // branch resolves the upload group before it dispatches.
             indexAccessGroup: projectUploadAccessGroup(S.projectId),
+            // Whether this chat may reach the open web. The request builders
+            // attach web_fetch / web_search on the same switch, so the prompt
+            // follows the tool list. Same sync cache read as the group above,
+            // settled by the same readyProjectSettings before a send.
+            webAccess: webAccessEnabled(S.projectId),
             client: "widget",
         });
     }
@@ -2444,6 +2461,19 @@ import {
             allowImagePreview: allowImagePreview,
             unavailable: isLinkUnavailable(link, unavailableLinkMap),
         });
+    }
+    // The citation chips of one answer's retrieval note, as the SAME markup an
+    // inline stored-file link gets (so onBubbleLinkClick mints the url on click,
+    // the unavailable map greys it, the minted-url cache serves it). Never a
+    // preview: a cited picture is a chip under the answer, not a second image.
+    function citationChipsHtml(note) {
+        var cites = citationsFor(note);
+        var html = "";
+        for (var i = 0; i < cites.length; i++) {
+            var part = citationLinkPart(cites[i], function (expiredHref) { return refreshedExpiredLinkMap[expiredHref]; });
+            html += linkToAnchorHtml(part, false);
+        }
+        return html;
     }
     // Classification is the ENGINE's (classifyInlineLink): what a link IS must
     // not be decided twice, once here and once in agent.vue. This view supplies
@@ -3895,6 +3925,21 @@ import {
             var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
             md.addEventListener("click", onBubbleLinkClick);
             bubble.appendChild(md);
+            // Citations and the no-source mark (engine citations.ts). Only a settled
+            // chat answer with a retrieval note qualifies (retrievalNoteOfAnswer); a
+            // bubble with nothing to show is laid out exactly as before. The chip
+            // row takes the same delegated click handler as the markdown block, so a
+            // chip opens the file the way an inline link does. Mirrored in agent.vue.
+            var citeNote = retrievalNoteOfAnswer(msg);
+            if (citeNote) {
+                var citeHtml = citationChipsHtml(citeNote);
+                if (citeHtml) {
+                    var citeRow = h("div", { class: "bq-citations", translate: "no", html: citeHtml });
+                    citeRow.addEventListener("click", onBubbleLinkClick);
+                    bubble.appendChild(citeRow);
+                }
+                if (answerUsedNoDataTool(citeNote)) bubble.appendChild(h("span", { class: "bq-no-source-note", text: NO_DATA_TOOL_MARK }));
+            }
             // Order matters: a staged turn carries isPendingQueued the whole way
             // through, so the two attachment phases have to be tested first.
             if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
@@ -5587,16 +5632,24 @@ import {
             // null → follow the project's own "Allow anonymous users" setting
             // (getConnectionInfo().conf.require_login); true/false pins it.
             allowAnonymous: null,
+            // Whether the chat's answers may reach the open web (Claude web_fetch,
+            // OpenAI web_search). null = follow the project's own "Web access for
+            // answers" setting on its Project Settings page (`web_access` in the
+            // bq::settings record), which is off unless the owner turned it on;
+            // true/false pins it for this page, both ways. Read at
+            // configureChatEngine time and when each chat request is built.
+            webAccess: null,
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
             windowedIndexing: true,
             // Live streaming of chat turns; read at configureChatEngine time.
-            // OFF until the region's polling worker relays the response bytes:
-            // see the configureChatEngine call for what goes wrong without it.
-            // A REQUEST, not a switch: it is also refused (with a warning, falling
+            // ON by default: every region's polling worker relays the response
+            // bytes now, so the answer paints as it arrives instead of up to one
+            // poll tick after it finished. Pass false for buffered replies.
+            // Still a REQUEST, not a switch: it is refused (with a warning, falling
             // back to buffered) when the embedder's own skapi-js is too old to
             // carry skapi's half of the stream flag. See skapiSupportsStreaming.
-            liveStreaming: false,
+            liveStreaming: true,
             // Socket delivery for the streamed reply. OFF unless the embedder asks,
             // and separately from liveStreaming, because this widget runs on someone
             // else's page with someone else's skapi instance: skapi's joinRealtime
@@ -5638,7 +5691,9 @@ import {
         // embedder who set the flag and got nothing has no other way to find out;
         // once, at init, not per turn.
         var canStream = skapiSupportsStreaming(S.skapi);
-        var liveStreaming = S.opts.liveStreaming === true;
+        // On unless the embedder said false (an explicit undefined or null means
+        // "the default", which is on).
+        var liveStreaming = S.opts.liveStreaming == null ? true : S.opts.liveStreaming === true;
         if (liveStreaming && !canStream) {
             liveStreaming = false;
             console.warn(
@@ -5709,17 +5764,22 @@ import {
             windowedIndexing: S.opts.windowedIndexing !== false,
             // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
             attachmentParsers: S.opts.attachmentParsers || undefined,
+            // Web access for chat answers. Handed over ONLY when the embedder
+            // pinned it: an undefined here means "ask the project", and the engine
+            // then reads the project's `web_access` setting when it builds each
+            // chat request (off unless the owner turned it on). Passing the null
+            // default through would read as a decision.
+            webAccess: typeof S.opts.webAccess === "boolean" ? S.opts.webAccess : undefined,
             // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
-            // Off by default, and for the same shipping-order reason
-            // windowedIndexing had one: THE RELAYING POLLING WORKER MUST SHIP
-            // FIRST. With this on against a region whose worker does not relay,
-            // the request either has its `since` cursor rejected or the row keeps
-            // an SSE transcript where the readers expect a parsed document, and
-            // the turn reads back as an empty answer. A streamed row settles with
-            // a STATUS AND NO BODY on purpose, so there is no fallback to read.
-            // Flip it per environment once the worker is deployed there; the
-            // widget takes it as an init opt because an embed picks its own
-            // region, where agent.vue flips one module constant.
+            // On by default since every region's polling worker relays the
+            // response bytes. It used to be off for the shipping-order reason
+            // windowedIndexing had: against a worker that does not relay, the
+            // request has its `since` cursor rejected or the row keeps an SSE
+            // transcript where the readers expect a parsed document, and the turn
+            // reads back as an empty answer (a streamed row settles with a STATUS
+            // AND NO BODY on purpose). An embed against such a worker passes
+            // liveStreaming: false. The widget takes it as an init opt because an
+            // embed picks its own region, where agent.vue flips one module constant.
             // It also needs a skapi-js that supports `stream`/`onStream`, and the
             // page's pin is the EMBEDDER's, so the request is granted above by
             // skapiSupportsStreaming rather than taken on trust here.

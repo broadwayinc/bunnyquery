@@ -95,8 +95,38 @@ export const UPLOAD_ACCESS_OPTIONS = UPLOAD_ACCESS_GROUPS.map((value) => ({
 export type ProjectSettingsData = {
 	upload_access_group?: unknown;
 	chat_greeting?: unknown;
+	web_access?: unknown;
 	[key: string]: unknown;
 };
+
+/**
+ * Whether a CHAT answer may reach the open web (Claude `web_fetch`, OpenAI
+ * `web_search`). Same record, its own `web_access` key.
+ *
+ * OFF BY DEFAULT, and the default is the point: customers reported answers that
+ * were not in their data, and an open web tool is one of the ways such an answer
+ * gets out. A project that never opens the setting answers from its files and
+ * database alone. Only the literal `true` turns it on: this record is public and
+ * a client must never read a value it did not write as permission.
+ *
+ * Resolution order, applied by the engine where the chat request is built:
+ *   1. the host's `webAccess` init/config option, when it is a boolean;
+ *   2. this setting, when the project has set it;
+ *   3. off.
+ * Indexing requests are not governed by this: an indexing pass keeps the tools
+ * it has today (see requests.ts notifyAgentSaveAttachment).
+ */
+export const DEFAULT_WEB_ACCESS = false;
+
+/** Narrow a stored value to the switch: only `true` is on. */
+export function normalizeWebAccess(value: any): boolean {
+	return value === true;
+}
+
+/** The switch held in a settings-record `data`, false when unset. */
+export function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean {
+	return data ? normalizeWebAccess(data.web_access) : DEFAULT_WEB_ACCESS;
+}
 
 /**
  * Longest custom opening line the dashboard will store.
@@ -312,6 +342,16 @@ export function projectAsksUploadAccess(service: string): boolean {
  */
 export function projectChatGreeting(service: string): string {
 	return chatGreetingFrom(cachedProjectSettings(service));
+}
+
+/**
+ * Sync convenience: the project's web-access setting, false until the fetch
+ * settles or when the project never set it. The request builders prefer the
+ * awaiting form (config.ts resolveWebAccess) so the first turn after a page load
+ * reads the stored value rather than the cold-cache default.
+ */
+export function projectWebAccess(service: string): boolean {
+	return webAccessFrom(cachedProjectSettings(service));
 }
 
 /**

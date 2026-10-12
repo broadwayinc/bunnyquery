@@ -40,6 +40,104 @@
     return text;
   }
 
+  // src/engine/project_settings.ts
+  var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
+  var DEFAULT_UPLOAD_ACCESS_GROUP = "authorized";
+  var PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
+  var UPLOAD_ACCESS_LABELS = {
+    public: "Public",
+    authorized: "Signed in users",
+    private: "Only me"
+  };
+  var UPLOAD_ACCESS_HINTS = {
+    public: "Anyone can ask about this file, including visitors who are not logged in.",
+    authorized: "Only users signed in to this project can ask about this file.",
+    private: "Only you can ask about this file."
+  };
+  var DEFAULT_WEB_ACCESS = false;
+  function normalizeWebAccess(value) {
+    return value === true;
+  }
+  function webAccessFrom(data) {
+    return data ? normalizeWebAccess(data.web_access) : DEFAULT_WEB_ACCESS;
+  }
+  var CHAT_GREETING_MAX_LENGTH = 400;
+  function normalizeChatGreeting(value) {
+    if (typeof value !== "string") return "";
+    const trimmed = value.replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    return trimmed.slice(0, CHAT_GREETING_MAX_LENGTH);
+  }
+  function chatGreetingFrom(data) {
+    return normalizeChatGreeting(data?.chat_greeting);
+  }
+  function normalizeUploadAccessGroup(value) {
+    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? DEFAULT_UPLOAD_ACCESS_GROUP : value;
+  }
+  function normalizeProjectAccessSetting(value) {
+    if (value === "ask") return "ask";
+    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? null : value;
+  }
+  function accessSettingFrom(data) {
+    return normalizeProjectAccessSetting(data?.upload_access_group);
+  }
+  function uploadAccessGroupFrom(data) {
+    const v = accessSettingFrom(data);
+    return v && v !== "ask" ? v : DEFAULT_UPLOAD_ACCESS_GROUP;
+  }
+  function asksUploadAccessFrom(data) {
+    return accessSettingFrom(data) === "ask";
+  }
+  var reader = null;
+  var cache = /* @__PURE__ */ new Map();
+  function configureProjectSettings(fn) {
+    reader = fn;
+  }
+  function entry(service) {
+    let e = cache.get(service);
+    if (!e) {
+      e = { data: null, settled: false, inflight: null };
+      cache.set(service, e);
+    }
+    return e;
+  }
+  function loadProjectSettings(service) {
+    if (!service) return Promise.resolve(null);
+    const e = entry(service);
+    if (e.settled) return Promise.resolve(e.data);
+    if (e.inflight) return e.inflight;
+    if (!reader) return Promise.resolve(null);
+    const run = reader(service).then((data) => data && typeof data === "object" ? data : null).catch(() => null).then((data) => {
+      const cur = entry(service);
+      if (cur.inflight === run) {
+        cur.data = data;
+        cur.settled = true;
+        cur.inflight = null;
+      }
+      return data;
+    });
+    e.inflight = run;
+    return run;
+  }
+  function primeProjectSettings(service) {
+    void loadProjectSettings(service);
+  }
+  function readyProjectSettings(service) {
+    return loadProjectSettings(service);
+  }
+  function cachedProjectSettings(service) {
+    const e = cache.get(service);
+    return e && e.settled ? e.data : null;
+  }
+  function projectUploadAccessGroup(service) {
+    return uploadAccessGroupFrom(cachedProjectSettings(service));
+  }
+  function projectAsksUploadAccess(service) {
+    return asksUploadAccessFrom(cachedProjectSettings(service));
+  }
+  function projectChatGreeting(service) {
+    return chatGreetingFrom(cachedProjectSettings(service));
+  }
+
   // src/engine/config.ts
   var _config = null;
   function configureChatEngine(config) {
@@ -104,6 +202,17 @@
   }
   function liveStreamingEnabled() {
     return _config?.liveStreaming === true;
+  }
+  function webAccessEnabled(service) {
+    const opt = _config ? _config.webAccess : void 0;
+    if (typeof opt === "boolean") return opt;
+    return webAccessFrom(service ? cachedProjectSettings(service) : null);
+  }
+  function resolveWebAccess(service) {
+    const opt = _config ? _config.webAccess : void 0;
+    if (typeof opt === "boolean") return Promise.resolve(opt);
+    if (!service) return Promise.resolve(false);
+    return loadProjectSettings(service).then(webAccessFrom, () => false);
   }
   function streamRecoveryEnabled() {
     if (!_config) return false;
@@ -350,12 +459,14 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
   // src/engine/prompts/chat_system_prompt.ts
   function buildChatSystemPrompt(params) {
     const { projectId, serviceName, serviceDescription, greeting, canUpload} = params;
+    const webAccess = params.webAccess === true;
     const g = params.indexAccessGroup;
     const indexGroupLiteral = typeof g === "number" ? String(g) : g === "public" || g === "private" || g === "authorized" || g === "admin" ? `"${g}"` : '"authorized"';
     const groundingRules = `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
+    const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise with getUniqueId using unique_id "src::" and condition "gte" (narrow it by the name the user used). THEN FIND THE PAGE: call searchText with the file's path and the words the user asked about; it returns the file, the page and the matching excerpt. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. If searchText answers no_page_text, the file was indexed before page text existed: read it with readFileContent instead, paging with the cursor until END OF FILE, and cite the file. When searchText and the file's records come back empty over files that HAVE page text, say that the data does not have it and name the files and the terms you searched. Never fill the gap from your general knowledge, and never from the web${webAccess ? ` without saying so. WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content. This is the one exception to the four sources named above.` : `: this chat has no web tool.`}`;
     let systemPrompt = `
 You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
@@ -364,13 +475,14 @@ ${groundingRules}
 NUMBERS FROM A SPREADSHEET: use queryGrid, never mental arithmetic over records. A total, a count, an average, a "how many mention X", a "which one is biggest" - all of those are computed server-side over EVERY row of the file and come back with the sheet, the row count and the row numbers they were made from. Records are a SAMPLE, and a sample added up is a confident wrong number. Quote the row count and the sheet alongside the figure so the reader can check it.
 CALL queryGrid describe FIRST, before any figure. Workbooks routinely state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that each re-total it, plus a summary sheet whose bottom row is the file total. Those look like four different answers and are one. describe names which sheets restate which, and which rows are totals. Pick ONE sheet, say which you picked, and never add figures across a sheet and its summary. If the reply carries a warning about restatement, repeat it to the user.
 A FILE TOTAL IS NOT A ROW'S TOTAL. The biggest number on a summary sheet is the whole file, not the thing that was asked about. Before quoting any figure, check it is scoped to what the question named: filter by the column that identifies it and report how many rows matched.
+${documentRules}
 Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized", but THIS project indexes at access_group ${indexGroupLiteral}, so pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name here, index or tag or plain - the auto-fill would search a group this project's data is not in and come back empty, and leaving access_group off a plain table query does NOT mean "all groups": unless you are the project's owner the server reads a table with no group as access_group 0 (public only), so a table indexed at ${indexGroupLiteral} comes back empty with its records sitting right there. Files uploaded before the project's setting changed may sit at another group, so when a scoped query comes back empty, retry it across the other groups (0, 1, "private") before concluding there is nothing, while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups ONLY for the project's owner, and only its access_group 0 records for any other user, so name the group whenever you name a table. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
 Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
 Embedded values: a search term is often stored inside a larger string. A merchant "BAKSA" appears as "DNH*BAKSA#4070277042", and a card as "5860****5173". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
 - Other attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, email messages (.eml), and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) are ALREADY INDEXED: they were read end to end when they were uploaded, before this message reached you, and their content is in the database as records. Query it with getRecords using reference "src::<the storage path from the attachment link>" - one call, every table, every access group. Do NOT call web_fetch on their URLs. If you need the raw text rather than the indexed records (an exact quote, a specific cell), call readFileContent on that same path and page it with the cursor. Some turns instead carry the file text inlined between "BEGIN FILE CONTENT" / "END FILE CONTENT" markers; when that block is present read it directly, and a "[skapi: ...]" note inside it means that file could not be extracted.
-- For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.
+${webAccess ? `- For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.` : `- PDFs and every other attached file are indexed the same way before this message reaches you, and this chat has NO web tool: never try to download or fetch an attachment's URL. Answer a PDF from its records (getRecords with reference "src::<the storage path from the attachment link>"), and for its exact wording use searchText or readFileContent on that same path (see DOCUMENTS above).`}
 Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files; it returns ONE window per call, so keep paging with the cursor from the previous window until it says END OF FILE before you conclude anything is absent. Be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
 File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix - do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand - so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
 File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records; every file extracted out of a document has one too, in table "__MEDIA__" (access_group "authorized"). Present each result as a markdown link as described above. Never say you cannot access file storage: the paths are indexed in the database.
@@ -1030,6 +1142,224 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return "\u2026" + label.slice(label.length - (LINK_LABEL_MAX_DISPLAY_CHARS - 1));
   }
 
+  // src/engine/retrieval_memory.ts
+  var RETRIEVAL_NOTES_MAX = 6;
+  var RETRIEVAL_NOTES_TOKEN_BUDGET = 1200;
+  var RETRIEVAL_NOTE_MAX_ITEMS = 8;
+  var RETRIEVAL_NOTE_MAX_CHARS = 600;
+  var RETRIEVAL_NOTE_PREFIX = "[Retrieval note, not shown to the user";
+  var FILE_KEYS = ["path", "storage_path", "storagePath", "file", "file_path", "filePath"];
+  var TABLE_KEYS = ["table_name", "tableName"];
+  var GROUP_KEYS = ["access_group", "accessGroup"];
+  var SRC_PREFIX = "src::";
+  var RESULT_WALK_MAX_NODES = 400;
+  var RESULT_WALK_MAX_DEPTH = 5;
+  function isWebToolName(name) {
+    return typeof name === "string" && /^web_(search|fetch)/.test(name);
+  }
+  function pushUnique(list, value) {
+    if (typeof value !== "string") return;
+    var v = value.trim();
+    if (!v || list.indexOf(v) !== -1 || list.length >= RETRIEVAL_NOTE_MAX_ITEMS) return;
+    list.push(v);
+  }
+  function pushGroup(list, value) {
+    if (typeof value === "number" && isFinite(value)) pushUnique(list, String(value));
+    else pushUnique(list, value);
+  }
+  function pushHit(list, path, page) {
+    if (typeof path !== "string" || !path.trim()) return;
+    var n = typeof page === "number" ? page : Number(page);
+    if (!isFinite(n) || n <= 0) return;
+    n = Math.floor(n);
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].path === path && list[i].page === n) return;
+    }
+    if (list.length >= RETRIEVAL_NOTE_MAX_ITEMS) return;
+    list.push({ path: path.trim(), page: n });
+  }
+  function pathFromSrcId(value) {
+    if (typeof value !== "string") return null;
+    if (value.indexOf(SRC_PREFIX) !== 0) return null;
+    var rest = value.slice(SRC_PREFIX.length).trim();
+    return rest ? rest : null;
+  }
+  function parseJsonLoose(value) {
+    if (typeof value !== "string") return value;
+    var t = value.trim();
+    if (!t || t[0] !== "{" && t[0] !== "[") return null;
+    try {
+      return JSON.parse(t);
+    } catch (e) {
+      return null;
+    }
+  }
+  function readArguments(note, args) {
+    if (!args || typeof args !== "object") return;
+    var i;
+    for (i = 0; i < FILE_KEYS.length; i++) pushUnique(note.files, args[FILE_KEYS[i]]);
+    for (i = 0; i < TABLE_KEYS.length; i++) pushUnique(note.tables, args[TABLE_KEYS[i]]);
+    for (i = 0; i < GROUP_KEYS.length; i++) pushGroup(note.accessGroups, args[GROUP_KEYS[i]]);
+    if (typeof args.table === "string") pushUnique(note.tables, args.table);
+    else if (args.table && typeof args.table === "object") {
+      pushUnique(note.tables, args.table.name);
+      pushGroup(note.accessGroups, args.table.access_group);
+    }
+    var ref = pathFromSrcId(args.reference);
+    if (ref) pushUnique(note.files, ref);
+    var uid = pathFromSrcId(args.unique_id);
+    if (uid) pushUnique(note.files, uid);
+  }
+  function readHits(note, result) {
+    var parsed = parseJsonLoose(result);
+    if (!parsed || typeof parsed !== "object") return;
+    var visited = 0;
+    var walk = function(node, depth) {
+      if (!node || typeof node !== "object" || depth > RESULT_WALK_MAX_DEPTH) return;
+      if (++visited > RESULT_WALK_MAX_NODES) return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length && visited <= RESULT_WALK_MAX_NODES; i++) walk(node[i], depth + 1);
+        return;
+      }
+      if (typeof node.path === "string" && node.page !== void 0) {
+        pushHit(note.hits, node.path, node.page);
+      }
+      for (var k in node) {
+        if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
+        var v = node[k];
+        if (v && typeof v === "object") walk(v, depth + 1);
+      }
+    };
+    walk(parsed, 0);
+  }
+  function claudeResultText(block) {
+    var c = block && block.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      return c.map(function(part) {
+        return part && typeof part.text === "string" ? part.text : "";
+      }).join("\n");
+    }
+    return "";
+  }
+  function emptyNote(source) {
+    return { files: [], tables: [], accessGroups: [], hits: [], tools: [], web: false, source };
+  }
+  function noteHasContent(note) {
+    return note.files.length > 0 || note.tables.length > 0 || note.accessGroups.length > 0 || note.hits.length > 0 || note.tools.length > 0 || note.web;
+  }
+  function noteFromToolBlocks(body) {
+    if (!body || typeof body !== "object") return null;
+    var note = emptyNote("tools");
+    var sawTool = false;
+    var i;
+    var content = body.content;
+    if (Array.isArray(content)) {
+      var callNames = {};
+      for (i = 0; i < content.length; i++) {
+        var block = content[i];
+        if (!block || typeof block !== "object") continue;
+        var type = block.type;
+        if (type === "mcp_tool_use" || type === "tool_use") {
+          sawTool = true;
+          pushUnique(note.tools, block.name);
+          if (typeof block.id === "string" && typeof block.name === "string") callNames[block.id] = block.name;
+          readArguments(note, block.input);
+        } else if (type === "server_tool_use" || type === "web_search_tool_use") {
+          sawTool = true;
+          if (isWebToolName(block.name) || type === "web_search_tool_use") note.web = true;
+          pushUnique(note.tools, block.name || type);
+        } else if (type === "mcp_tool_result" || type === "tool_result") {
+          sawTool = true;
+          var name = typeof block.tool_use_id === "string" ? callNames[block.tool_use_id] : void 0;
+          if (!block.is_error && (name === void 0 || name === "searchText")) readHits(note, claudeResultText(block));
+        } else if (type === "web_search_tool_result" || type === "web_fetch_tool_result") {
+          sawTool = true;
+          note.web = true;
+        }
+      }
+    }
+    var output = body.output;
+    if (Array.isArray(output)) {
+      for (i = 0; i < output.length; i++) {
+        var item = output[i];
+        if (!item || typeof item !== "object") continue;
+        var kind = typeof item.type === "string" ? item.type : "";
+        if (kind === "mcp_call" || kind === "function_call") {
+          sawTool = true;
+          pushUnique(note.tools, item.name);
+          readArguments(note, parseJsonLoose(item.arguments) || item.arguments);
+          if (!item.error && item.name === "searchText") readHits(note, item.output);
+        } else if (kind.indexOf("web_search") === 0 || kind.indexOf("web_fetch") === 0) {
+          sawTool = true;
+          note.web = true;
+          pushUnique(note.tools, kind);
+        }
+      }
+    }
+    return sawTool ? note : null;
+  }
+  function retrievalNoteFromText(text) {
+    if (typeof text !== "string" || !text) return null;
+    var note = emptyNote("answer");
+    var link = /\]\(db:([^)\s"]+)/g;
+    var m;
+    while ((m = link.exec(text)) !== null) pushUnique(note.files, m[1]);
+    var src = /src::([^\s"'`<>)\]]+)/g;
+    while ((m = src.exec(text)) !== null) {
+      pushUnique(note.files, m[1].replace(/[.,;:!?]+$/, ""));
+    }
+    return noteHasContent(note) ? note : null;
+  }
+  function extractRetrievalNote(body, answerText) {
+    var fromTools = noteFromToolBlocks(body);
+    var fromText = retrievalNoteFromText(answerText);
+    if (!fromTools) {
+      if (fromText) return fromText;
+      return providerBodyWasRead(body) ? emptyNote("body") : null;
+    }
+    if (fromText) {
+      for (var i = 0; i < fromText.files.length; i++) pushUnique(fromTools.files, fromText.files[i]);
+    }
+    return noteHasContent(fromTools) ? fromTools : emptyNote("body");
+  }
+  function providerBodyWasRead(body) {
+    if (!body || typeof body !== "object") return false;
+    return Array.isArray(body.content) || Array.isArray(body.output);
+  }
+  function isRetrievalNote(value) {
+    return !!value && typeof value === "object" && Array.isArray(value.files) && Array.isArray(value.tables) && Array.isArray(value.accessGroups) && Array.isArray(value.hits) && Array.isArray(value.tools);
+  }
+  function formatRetrievalNote(note) {
+    if (!note || !noteHasContent(note)) return "";
+    var parts = [];
+    if (note.files.length) parts.push("files " + note.files.join(", "));
+    if (note.tables.length) parts.push("tables " + note.tables.join(", "));
+    if (note.accessGroups.length) parts.push("access_group " + note.accessGroups.join(", "));
+    if (note.hits.length) {
+      var byFile = {};
+      var order = [];
+      for (var i = 0; i < note.hits.length; i++) {
+        var h = note.hits[i];
+        if (!byFile[h.path]) {
+          byFile[h.path] = [];
+          order.push(h.path);
+        }
+        byFile[h.path].push(h.page);
+      }
+      parts.push("searchText hits " + order.map(function(p) {
+        return p + " p" + byFile[p].join(", p");
+      }).join("; "));
+    }
+    if (note.tools.length) parts.push("tools " + note.tools.join(", "));
+    if (note.web) parts.push("web tool used");
+    var line = RETRIEVAL_NOTE_PREFIX + ": this turn used " + parts.join(" | ") + "]";
+    if (line.length > RETRIEVAL_NOTE_MAX_CHARS) {
+      line = line.slice(0, RETRIEVAL_NOTE_MAX_CHARS - 4) + "...]";
+    }
+    return line;
+  }
+
   // src/engine/budget.ts
   var CONTEXT_WINDOW_DEFAULT = { claude: 2e5, openai: 128e3 };
   var CONTEXT_WINDOW_BY_MODEL = {
@@ -1182,6 +1512,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (!content) return content;
     return content.replace(/```([^\n`]+?\.[^\s.`]+)\n[\s\S]*?```/g, "[file previously attached: $1]");
   }
+  function applyRetrievalNotes(messages, latestIndex) {
+    var out = messages.slice();
+    var used = 0, tokens = 0;
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if (used >= RETRIEVAL_NOTES_MAX) break;
+      var m = messages[i];
+      if (i === latestIndex || !m || m.role !== "assistant" || !isRetrievalNote(m._retrieval)) continue;
+      var line = formatRetrievalNote(m._retrieval);
+      if (!line) continue;
+      var cost = estimateTextTokens(line) + 2;
+      if (tokens + cost > RETRIEVAL_NOTES_TOKEN_BUDGET) break;
+      tokens += cost;
+      used++;
+      out[i] = Object.assign({}, m, { content: (m.content || "") + "\n\n" + line });
+    }
+    return { messages: out, notesUsed: used, noteTokens: tokens };
+  }
   function buildBoundedChatMessages(options) {
     var contextBasedBudget = contextBasedBudgetFor(options.platform, options.model, options.projectId);
     var availableInputBudget = getInputTokenBudget(options.platform, options.model, options.projectId);
@@ -1197,6 +1544,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     );
     var windowed = options.history.slice(-maxHistoryMessages);
     var latestIndex = windowed.length - 1;
+    if (options.retrievalNotes !== false) windowed = applyRetrievalNotes(windowed, latestIndex).messages;
     var trimmed = windowed.map(function(m, i2) {
       if (i2 === latestIndex) return m;
       var stripped = stripFileBlocksFromHistory(m.content);
@@ -1217,6 +1565,105 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       droppedCount: Math.max(0, options.history.length - bounded.length),
       estimatedInputTokens: used + systemCost,
       estimatedBudget: availableInputBudget
+    };
+  }
+
+  // src/engine/citations.ts
+  var DATA_TOOL_NAMES = [
+    "getRecords",
+    "queryGrid",
+    "readFileContent",
+    "searchText",
+    "getFileOutline",
+    "getUniqueId",
+    "getTables",
+    "getTags",
+    "getIndexes"
+  ];
+  var NO_DATA_TOOL_MARK = "No project data was read for this answer";
+  function citationFileName(path) {
+    var segs = String(path || "").split("/");
+    for (var i = segs.length - 1; i >= 0; i--) {
+      if (segs[i]) return segs[i];
+    }
+    return String(path || "");
+  }
+  function citationLabel(path, page) {
+    return citationFileName(path) + (typeof page === "number" && page > 0 ? " p." + page : "");
+  }
+  function isMintablePath(path) {
+    return !!path && !isHttpUrlLike(path);
+  }
+  function citationsFor(note) {
+    if (!isRetrievalNote(note)) return [];
+    var out = [];
+    var hitPaths = [];
+    var byPath = {};
+    var i;
+    for (i = 0; i < note.hits.length; i++) {
+      var h = note.hits[i];
+      if (!h || typeof h.path !== "string" || !isMintablePath(h.path)) continue;
+      var page = typeof h.page === "number" ? h.page : Number(h.page);
+      if (!isFinite(page) || page <= 0) continue;
+      page = Math.floor(page);
+      if (!byPath[h.path]) {
+        byPath[h.path] = [];
+        hitPaths.push(h.path);
+      }
+      if (byPath[h.path].indexOf(page) === -1) byPath[h.path].push(page);
+    }
+    for (i = 0; i < hitPaths.length; i++) {
+      var p = hitPaths[i];
+      var pages = byPath[p].slice().sort(function(a, b) {
+        return a - b;
+      });
+      for (var j = 0; j < pages.length; j++) {
+        out.push({ path: p, page: pages[j], label: citationLabel(p, pages[j]) });
+      }
+    }
+    for (i = 0; i < note.files.length; i++) {
+      var f = note.files[i];
+      if (typeof f !== "string" || !isMintablePath(f)) continue;
+      if (byPath[f]) continue;
+      var dup = false;
+      for (var k = 0; k < out.length; k++) {
+        if (out[k].path === f && out[k].page === void 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      out.push({ path: f, label: citationLabel(f) });
+    }
+    return out;
+  }
+  function isDataToolName(name) {
+    return DATA_TOOL_NAMES.indexOf(name) !== -1;
+  }
+  function answerUsedNoDataTool(note) {
+    if (!isRetrievalNote(note)) return false;
+    if (note.web) return false;
+    for (var i = 0; i < note.tools.length; i++) {
+      if (isDataToolName(note.tools[i])) return false;
+    }
+    return true;
+  }
+  function retrievalNoteOfAnswer(msg) {
+    if (!msg || msg.role !== "assistant") return null;
+    if (msg.isError || msg.isPending || msg.isBackgroundTask || msg._streamPending) return null;
+    return isRetrievalNote(msg._retrieval) ? msg._retrieval : null;
+  }
+  function citationLinkPart(citation, resolveFreshHref) {
+    var expiredHref = buildDisplayExpiredAttachmentHref(citation.path, citation.label);
+    var cached = resolveFreshHref ? resolveFreshHref(expiredHref) : void 0;
+    return {
+      type: "link",
+      label: truncateLabelForDisplay(citation.label),
+      fullLabel: citation.label,
+      href: cached || expiredHref,
+      expired: !cached,
+      expiredHref,
+      remotePath: citation.path
     };
   }
 
@@ -2135,9 +2582,25 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var ANTHROPIC_BETA_HEADER = `${ANTHROPIC_MCP_BETA},${ANTHROPIC_WEB_FETCH_BETA},${ANTHROPIC_PROMPT_CACHING_BETA}`;
   var WEB_FETCH_MAX_USES = 40;
   var WEB_FETCH_MAX_CONTENT_TOKENS = 2e5;
+  var claudeWebFetchTool = () => ({
+    type: "web_fetch_20250910",
+    name: "web_fetch",
+    max_uses: WEB_FETCH_MAX_USES,
+    citations: { enabled: true },
+    max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS
+  });
   var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
   var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
   var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
+  var openaiWebSearchTool = () => ({
+    type: "web_search",
+    external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS
+  });
+  var webToolsForChat = (platform, webAccess) => {
+    if (webAccess !== true) return [];
+    if (platform === "claude") return [claudeWebFetchTool()];
+    return [openaiWebSearchTool()] ;
+  };
   var MCP_NAME = "BunnyQuery";
   var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
   var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
@@ -2153,6 +2616,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var mcpContextParam = (platform, model) => getModelContextWindow(platform, model);
   var mcpIndexingUrl = (platform = "openai", model) => withMcpParams(mcpUrl(), { profile: "index", ctx: mcpContextParam(platform, model) });
+  var mcpChatUrl = (endpointUrl, platform, model) => withMcpParams(endpointUrl, { profile: "chat", ctx: mcpContextParam(platform, model) });
   function mcpEndpointFor(anonymous, publicProjectId, service) {
     if (!anonymous) return { url: mcpUrl(), token: "$ACCESS_TOKEN" };
     const project = publicProjectId || service;
@@ -2338,8 +2802,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     system,
     mcpServer,
     extractContent,
-    fileUrls
+    fileUrls,
+    webAccess
   }) {
+    const web = typeof webAccess === "boolean" ? webAccess : await resolveWebAccess(service);
     const mcpServerDefinition = {
       type: "url",
       name: mcpServer.name,
@@ -2398,13 +2864,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             ...mcpServer.defaultConfig ? { default_config: mcpServer.defaultConfig } : {},
             ...mcpServer.configs ? { configs: mcpServer.configs } : {}
           },
-          {
-            type: "web_fetch_20250910",
-            name: "web_fetch",
-            max_uses: WEB_FETCH_MAX_USES,
-            citations: { enabled: true },
-            max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS
-          }
+          // `web_fetch` rides here only when the project's web switch is on. The
+          // beta header above is left as it is: it only makes the tool TYPE
+          // available, and a request that does not list the tool cannot use it.
+          ...webToolsForChat("claude", web)
         ]
       }
     });
@@ -2424,9 +2887,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       fileUrls,
       mcpServer: {
         name: MCP_NAME,
-        url: withMcpParams(endpoint.url, {
-          ctx: mcpContextParam("claude", model || DEFAULT_CLAUDE_MODEL)
-        }),
+        url: mcpChatUrl(endpoint.url, "claude", model || DEFAULT_CLAUDE_MODEL),
         // Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
         // guard below drops the key rather than sending an empty one.
         authorizationToken: endpoint.token
@@ -2436,6 +2897,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
     const resolvedModel = model || DEFAULT_OPENAI_MODEL;
     const imageDetail = getOpenAIImageDetail(resolvedModel);
+    const web = await resolveWebAccess(service);
     const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
       {
         role: "user",
@@ -2481,19 +2943,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           {
             type: "mcp",
             server_label: MCP_NAME,
-            server_url: withMcpParams(endpoint.url, { ctx: mcpContextParam("openai", resolvedModel) }),
+            server_url: mcpChatUrl(endpoint.url, "openai", resolvedModel),
             require_approval: "never",
             // No `headers` at all for an anonymous turn: `Bearer ` with an
             // empty token is a credential the MCP server rejects, and the
             // project-scoped endpoint needs none.
             ...endpoint.token ? { headers: { Authorization: "Bearer " + endpoint.token } } : {}
           },
-          ...[
-            {
-              type: "web_search",
-              external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS
-            }
-          ] 
+          // `web_search` rides here only when the project's web switch is on.
+          ...webToolsForChat("openai", web)
         ]
       }
     });
@@ -2641,12 +3099,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               require_approval: "never",
               headers: { Authorization: "Bearer $ACCESS_TOKEN" }
             },
-            ...[
-              {
-                type: "web_search",
-                external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS
-              }
-            ] 
+            // UNCONDITIONAL, unlike a chat turn: the project's web switch
+            // governs answers, not indexing. Kept exactly as it was.
+            ...[openaiWebSearchTool()] 
           ]
         }
       }));
@@ -2699,13 +3154,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             type: "mcp_toolset",
             mcp_server_name: MCP_NAME
           },
-          {
-            type: "web_fetch_20250910",
-            name: "web_fetch",
-            max_uses: WEB_FETCH_MAX_USES,
-            citations: { enabled: true },
-            max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS
-          }
+          // UNCONDITIONAL, unlike a chat turn: the project's web switch governs
+          // answers, not indexing. Kept exactly as it was.
+          claudeWebFetchTool()
         ]
       }
     }));
@@ -3185,6 +3636,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (item._fromBgChain) okm._fromBgChain = true;
         if (item._isBgTask) okm.isBackgroundTask = true;
         if (isCompact) okm._compact = true;
+        if (!item._isBgTask && !isCompact) {
+          var note = extractRetrievalNote(response, assistantText);
+          if (note) okm._retrieval = note;
+        }
         if (serverItemId !== void 0) okm._serverItemId = serverItemId;
         if (replyTs !== void 0) okm._ts = replyTs;
         if (indexFile && isFinite(executedTs) && executedTs > 0) okm._tsStart = executedTs;
@@ -4880,6 +5335,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return;
       }
       var reply = isErr ? { role: "assistant", content: getErrorMessage(body), isError: true, _serverItemId: itemId } : { role: "assistant", content: text, _serverItemId: itemId };
+      if (!isErr) {
+        var rNote = extractRetrievalNote(body, text);
+        if (rNote) reply._retrieval = rNote;
+      }
       if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
         this._applyReplyToCache(ownerKey, reply, itemId);
       } else {
@@ -5288,7 +5747,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
         var answer = params.aiPlatform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
         answer = (answer || "").trim();
-        return { content: answer || "No text response received from AI provider.", isError: false };
+        return { content: answer || "No text response received from AI provider.", isError: false, retrieval: extractRetrievalNote(response, answer) };
       }).catch(function(err) {
         return { content: getErrorMessage(err), isError: true };
       }).then(function(result) {
@@ -5300,6 +5759,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
         var reply = { role: "assistant", content: result.content, isError: result.isError };
         if (dispatchItemId) reply._serverItemId = dispatchItemId;
+        if (result.retrieval) reply._retrieval = result.retrieval;
         self._applyReplyToCache(params.key, reply, dispatchItemId);
         return result;
       });
@@ -5963,6 +6423,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
         var offReply = isErrorResponseBody(response) ? { role: "assistant", content: getErrorMessage(response), isError: true } : { role: "assistant", content: ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim() || "No text response received from AI provider." };
+        if (!offReply.isError) {
+          var offNote = extractRetrievalNote(response, offReply.content);
+          if (offNote) offReply._retrieval = offNote;
+        }
         this._applyReplyToCache(ownerKey, offReply, serverId);
         if (serverId) this.cancelledServerIds.delete(serverId);
         return;
@@ -5984,6 +6448,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else {
         var answer = platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
         answer = (answer || "").trim() || "No text response received from AI provider.";
+        var qNote = extractRetrievalNote(response, answer);
         var lid = this._newLocalId();
         if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
           var qPainted = this._paintedTextAt(targetIdx);
@@ -5991,16 +6456,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var qSettled = { role: "assistant", content: qPainted, _localId: lid };
           if (prevQ._serverItemId) qSettled._serverItemId = prevQ._serverItemId;
           if (prevQ._ownerKey) qSettled._ownerKey = prevQ._ownerKey;
+          if (qNote) qSettled._retrieval = qNote;
           this.state.messages[targetIdx] = qSettled;
           this.host.notify();
           this.enqueueTypewrite(targetIdx, answer, lid, qPainted);
         } else if (targetIdx >= 0) {
-          this.state.messages.splice(targetIdx, 0, { role: "assistant", content: "", _localId: lid });
+          var qInsert = { role: "assistant", content: "", _localId: lid };
+          if (qNote) qInsert._retrieval = qNote;
+          this.state.messages.splice(targetIdx, 0, qInsert);
           this.host.notify();
           this.enqueueTypewrite(targetIdx, answer, lid);
         } else {
           var aiIdx = this.state.messages.length;
-          this.state.messages.push({ role: "assistant", content: "", _localId: lid });
+          var qAppend = { role: "assistant", content: "", _localId: lid };
+          if (qNote) qAppend._retrieval = qNote;
+          this.state.messages.push(qAppend);
           this.host.notify();
           this.enqueueTypewrite(aiIdx, answer, lid);
         }
@@ -6590,6 +7060,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var settled = { role: "assistant", content: painted, isPending: false, _localId: lid };
       if (prevSettled._serverItemId) settled._serverItemId = prevSettled._serverItemId;
       if (prevSettled._ownerKey) settled._ownerKey = prevSettled._ownerKey;
+      if (latest._retrieval) settled._retrieval = latest._retrieval;
       this.state.messages[pendingIdx] = settled;
       this._removeStrayPendingAssistants();
       this.host.notify();
@@ -6810,6 +7281,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var isErr = isErrorResponseBody(response);
       var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
       var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+      var hNote = isErr ? null : extractRetrievalNote(response, answer);
       var stripMarker = function(t) {
         return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join("").trim() : t;
       };
@@ -6835,7 +7307,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
         var hPainted = this._paintedTextAt(idx);
         var lid = this._newLocalId();
-        this.state.messages[idx] = { role: "assistant", content: hPainted, _localId: lid, _serverItemId: itemId };
+        var hReply = { role: "assistant", content: hPainted, _localId: lid, _serverItemId: itemId };
+        if (hNote) hReply._retrieval = hNote;
+        this.state.messages[idx] = hReply;
         this.host.notify();
         this.enqueueTypewrite(idx, text, lid, hPainted);
         this.updateHistoryCache();
@@ -6869,6 +7343,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       var lid2 = this._newLocalId();
       var reply = { role: "assistant", content: "", _localId: lid2, _serverItemId: itemId };
+      if (hNote) reply._retrieval = hNote;
       this.state.messages.splice(userIdx + 1, 0, reply);
       this.host.notify();
       this.enqueueTypewrite(userIdx + 1, text2, lid2);
@@ -8533,102 +9008,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return out;
   }
 
-  // src/engine/project_settings.ts
-  var UPLOAD_ACCESS_GROUPS = ["public", "authorized", "private"];
-  var DEFAULT_UPLOAD_ACCESS_GROUP = "authorized";
-  var PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
-  var UPLOAD_ACCESS_LABELS = {
-    public: "Public",
-    authorized: "Signed in users",
-    private: "Only me"
-  };
-  var UPLOAD_ACCESS_HINTS = {
-    public: "Anyone can ask about this file, including visitors who are not logged in.",
-    authorized: "Only users signed in to this project can ask about this file.",
-    private: "Only you can ask about this file."
-  };
-  var CHAT_GREETING_MAX_LENGTH = 400;
-  function normalizeChatGreeting(value) {
-    if (typeof value !== "string") return "";
-    const trimmed = value.replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    return trimmed.slice(0, CHAT_GREETING_MAX_LENGTH);
-  }
-  function chatGreetingFrom(data) {
-    return normalizeChatGreeting(data?.chat_greeting);
-  }
-  function normalizeUploadAccessGroup(value) {
-    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? DEFAULT_UPLOAD_ACCESS_GROUP : value;
-  }
-  function normalizeProjectAccessSetting(value) {
-    if (value === "ask") return "ask";
-    return UPLOAD_ACCESS_GROUPS.indexOf(value) === -1 ? null : value;
-  }
-  function accessSettingFrom(data) {
-    return normalizeProjectAccessSetting(data?.upload_access_group);
-  }
-  function uploadAccessGroupFrom(data) {
-    const v = accessSettingFrom(data);
-    return v && v !== "ask" ? v : DEFAULT_UPLOAD_ACCESS_GROUP;
-  }
-  function asksUploadAccessFrom(data) {
-    return accessSettingFrom(data) === "ask";
-  }
-  var reader = null;
-  var cache = /* @__PURE__ */ new Map();
-  function configureProjectSettings(fn) {
-    reader = fn;
-  }
-  function entry(service) {
-    let e = cache.get(service);
-    if (!e) {
-      e = { data: null, settled: false, inflight: null };
-      cache.set(service, e);
-    }
-    return e;
-  }
-  function loadProjectSettings(service) {
-    if (!service) return Promise.resolve(null);
-    const e = entry(service);
-    if (e.settled) return Promise.resolve(e.data);
-    if (e.inflight) return e.inflight;
-    if (!reader) return Promise.resolve(null);
-    const run = reader(service).then((data) => data && typeof data === "object" ? data : null).catch(() => null).then((data) => {
-      const cur = entry(service);
-      if (cur.inflight === run) {
-        cur.data = data;
-        cur.settled = true;
-        cur.inflight = null;
-      }
-      return data;
-    });
-    e.inflight = run;
-    return run;
-  }
-  function primeProjectSettings(service) {
-    void loadProjectSettings(service);
-  }
-  function readyProjectSettings(service) {
-    return loadProjectSettings(service);
-  }
-  function cachedProjectSettings(service) {
-    const e = cache.get(service);
-    return e && e.settled ? e.data : null;
-  }
-  function projectUploadAccessGroup(service) {
-    return uploadAccessGroupFrom(cachedProjectSettings(service));
-  }
-  function projectAsksUploadAccess(service) {
-    return asksUploadAccessFrom(cachedProjectSettings(service));
-  }
-  function projectChatGreeting(service) {
-    return chatGreetingFrom(cachedProjectSettings(service));
-  }
-
   // src/index.js
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.13.0" ;
+    var BQ_VERSION = "1.14.0-beta.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -10600,7 +10984,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // reaches it has settled the fetch first: sendMessage awaits
         // readyProjectSettings on the text-only branch, and the attachment
         // branch resolves the upload group before it dispatches.
-        indexAccessGroup: projectUploadAccessGroup(S.projectId)});
+        indexAccessGroup: projectUploadAccessGroup(S.projectId),
+        // Whether this chat may reach the open web. The request builders
+        // attach web_fetch / web_search on the same switch, so the prompt
+        // follows the tool list. Same sync cache read as the group above,
+        // settled by the same readyProjectSettings before a send.
+        webAccess: webAccessEnabled(S.projectId)});
     }
     function refreshSkapiSession() {
       return S.skapi.getProfile({ refreshToken: true }).then(function() {
@@ -10782,6 +11171,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         allowImagePreview,
         unavailable: isLinkUnavailable(link, unavailableLinkMap)
       });
+    }
+    function citationChipsHtml(note) {
+      var cites = citationsFor(note);
+      var html = "";
+      for (var i = 0; i < cites.length; i++) {
+        var part = citationLinkPart(cites[i], function(expiredHref) {
+          return refreshedExpiredLinkMap[expiredHref];
+        });
+        html += linkToAnchorHtml(part, false);
+      }
+      return html;
     }
     function buildLinkPartFromGroups(full, g1, g2, g3, g4, g5, g6) {
       return classifyInlineLink(full, [g1, g2, g3, g4, g5, g6], {
@@ -11963,6 +12363,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var md = h("div", { class: "bq-md", translate: "no", html: parseMsgPartsHtml(msg.content) });
         md.addEventListener("click", onBubbleLinkClick);
         bubble.appendChild(md);
+        var citeNote = retrievalNoteOfAnswer(msg);
+        if (citeNote) {
+          var citeHtml = citationChipsHtml(citeNote);
+          if (citeHtml) {
+            var citeRow = h("div", { class: "bq-citations", translate: "no", html: citeHtml });
+            citeRow.addEventListener("click", onBubbleLinkClick);
+            bubble.appendChild(citeRow);
+          }
+          if (answerUsedNoDataTool(citeNote)) bubble.appendChild(h("span", { class: "bq-no-source-note", text: NO_DATA_TOOL_MARK }));
+        }
         if (msg.isUploadingAttachments) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Uploading files...)" }));
         else if (msg.isAwaitingIndexing) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(Indexing files...)" }));
         else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
@@ -13240,16 +13650,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // null → follow the project's own "Allow anonymous users" setting
         // (getConnectionInfo().conf.require_login); true/false pins it.
         allowAnonymous: null,
+        // Whether the chat's answers may reach the open web (Claude web_fetch,
+        // OpenAI web_search). null = follow the project's own "Web access for
+        // answers" setting on its Project Settings page (`web_access` in the
+        // bq::settings record), which is off unless the owner turned it on;
+        // true/false pins it for this page, both ways. Read at
+        // configureChatEngine time and when each chat request is built.
+        webAccess: null,
         // Server-driven windowed indexing; read at configureChatEngine time.
         // Listed here so the defaults object is the full opt surface.
         windowedIndexing: true,
         // Live streaming of chat turns; read at configureChatEngine time.
-        // OFF until the region's polling worker relays the response bytes:
-        // see the configureChatEngine call for what goes wrong without it.
-        // A REQUEST, not a switch: it is also refused (with a warning, falling
+        // ON by default: every region's polling worker relays the response
+        // bytes now, so the answer paints as it arrives instead of up to one
+        // poll tick after it finished. Pass false for buffered replies.
+        // Still a REQUEST, not a switch: it is refused (with a warning, falling
         // back to buffered) when the embedder's own skapi-js is too old to
         // carry skapi's half of the stream flag. See skapiSupportsStreaming.
-        liveStreaming: false,
+        liveStreaming: true,
         // Socket delivery for the streamed reply. OFF unless the embedder asks,
         // and separately from liveStreaming, because this widget runs on someone
         // else's page with someone else's skapi instance: skapi's joinRealtime
@@ -13273,7 +13691,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       S.booted = true;
       console.log("[bunnyquery] v" + BQ_VERSION);
       var canStream = skapiSupportsStreaming(S.skapi);
-      var liveStreaming = S.opts.liveStreaming === true;
+      var liveStreaming = S.opts.liveStreaming == null ? true : S.opts.liveStreaming === true;
       if (liveStreaming && !canStream) {
         liveStreaming = false;
         console.warn(
@@ -13314,17 +13732,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         windowedIndexing: S.opts.windowedIndexing !== false,
         // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
         attachmentParsers: S.opts.attachmentParsers || void 0,
+        // Web access for chat answers. Handed over ONLY when the embedder
+        // pinned it: an undefined here means "ask the project", and the engine
+        // then reads the project's `web_access` setting when it builds each
+        // chat request (off unless the owner turned it on). Passing the null
+        // default through would read as a decision.
+        webAccess: typeof S.opts.webAccess === "boolean" ? S.opts.webAccess : void 0,
         // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
-        // Off by default, and for the same shipping-order reason
-        // windowedIndexing had one: THE RELAYING POLLING WORKER MUST SHIP
-        // FIRST. With this on against a region whose worker does not relay,
-        // the request either has its `since` cursor rejected or the row keeps
-        // an SSE transcript where the readers expect a parsed document, and
-        // the turn reads back as an empty answer. A streamed row settles with
-        // a STATUS AND NO BODY on purpose, so there is no fallback to read.
-        // Flip it per environment once the worker is deployed there; the
-        // widget takes it as an init opt because an embed picks its own
-        // region, where agent.vue flips one module constant.
+        // On by default since every region's polling worker relays the
+        // response bytes. It used to be off for the shipping-order reason
+        // windowedIndexing had: against a worker that does not relay, the
+        // request has its `since` cursor rejected or the row keeps an SSE
+        // transcript where the readers expect a parsed document, and the turn
+        // reads back as an empty answer (a streamed row settles with a STATUS
+        // AND NO BODY on purpose). An embed against such a worker passes
+        // liveStreaming: false. The widget takes it as an init opt because an
+        // embed picks its own region, where agent.vue flips one module constant.
         // It also needs a skapi-js that supports `stream`/`onStream`, and the
         // page's pin is the EMBEDDER's, so the request is granted above by
         // skapiSupportsStreaming rather than taken on trust here.

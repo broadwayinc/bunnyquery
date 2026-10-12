@@ -7,6 +7,8 @@
  * otherwise touch the DOM or a framework goes through a host hook.
  */
 
+import type { RetrievalNote } from './retrieval_memory';
+
 export interface ChatIdentity {
 	projectId: string;
 	/**
@@ -78,6 +80,11 @@ export interface IndexingFileRef {
 export interface ChatMessage {
 	role: 'user' | 'assistant';
 	content: string; // raw markdown — never HTML (the view parses for display)
+	/** Retrieval memory (retrieval_memory.ts): what this assistant turn read,
+	 *  queried or linked, taken off the provider body's tool blocks or, failing
+	 *  that, the answer's file links. Never rendered. buildBoundedChatMessages
+	 *  appends it to the turn's LLM copy so a follow-up skips discovery. */
+	_retrieval?: RetrievalNote;
 	isPending?: boolean;
 	isPendingInProcess?: boolean;
 	isPendingQueued?: boolean;

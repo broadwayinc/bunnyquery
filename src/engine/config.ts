@@ -23,6 +23,7 @@
  */
 
 import { type AttachmentParser, registerAttachmentParser } from './attachment_parsers';
+import { cachedProjectSettings, loadProjectSettings, webAccessFrom } from './project_settings';
 
 /**
  * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
@@ -237,6 +238,23 @@ export interface ChatEngineConfig {
      * unless the embedder turns it on.
      */
     liveStreamingRealtime?: boolean;
+    /**
+     * Whether a CHAT answer may reach the open web: Claude's `web_fetch` and
+     * OpenAI's `web_search` are attached to a chat request only when this
+     * resolves to true.
+     *
+     * OPTIONAL, AND UNSET IS NOT FALSE. When the host leaves it out, the engine
+     * reads the project's own setting (`web_access` in the `bq::settings`
+     * record, see project_settings.ts) and falls back to OFF, so the project
+     * owner's switch on the Project Settings page decides for every client that
+     * does not override it. A host that sets a boolean here overrides the
+     * project for its own page, both ways. Resolution: this option, then the
+     * project setting, then false.
+     *
+     * Chat turns only. An indexing pass keeps the tools it has today, since the
+     * worker hands it rendered pages and extracted text and not a URL to fetch.
+     */
+    webAccess?: boolean;
     /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
@@ -463,6 +481,32 @@ export function liveStreamingRealtimeEnabled(): boolean {
 
 export function liveStreamingEnabled(): boolean {
     return _config?.liveStreaming === true;
+}
+
+/**
+ * The web switch for a chat turn, SYNCHRONOUSLY: the host's `webAccess` option
+ * when it is a boolean, else the project's cached `web_access` setting, else
+ * false. For a template or a prompt builder, which have nowhere to await. Reads
+ * the cache as it stands, so before the settings fetch settles it answers the
+ * default; request builders use resolveWebAccess below instead.
+ */
+export function webAccessEnabled(service?: string): boolean {
+    const opt = _config ? _config.webAccess : undefined;
+    if (typeof opt === 'boolean') return opt;
+    return webAccessFrom(service ? cachedProjectSettings(service) : null);
+}
+
+/**
+ * The same switch, awaiting the project's settings record when the host did not
+ * decide. Never rejects: a failed or impossible read (no reader injected, a
+ * signed-out visitor on a require_login project) settles as "unset", which is
+ * off. Cheap after the first call per project: the store dedupes and caches.
+ */
+export function resolveWebAccess(service?: string): Promise<boolean> {
+    const opt = _config ? _config.webAccess : undefined;
+    if (typeof opt === 'boolean') return Promise.resolve(opt);
+    if (!service) return Promise.resolve(false);
+    return loadProjectSettings(service).then(webAccessFrom, () => false);
 }
 
 /**

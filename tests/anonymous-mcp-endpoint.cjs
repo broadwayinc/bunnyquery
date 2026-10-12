@@ -71,6 +71,7 @@ const openaiMcp = () => lastRequest.data.tools.find((t) => t.type === 'mcp');
  */
 const routeOf = (url) => String(url).split('?')[0].replace(/\/$/, '');
 const ctxOf = (url) => new URL(String(url)).searchParams.get('ctx');
+const profileOf = (url) => new URL(url).searchParams.get('profile');
 
 (async () => {
 
@@ -137,8 +138,10 @@ await test('THE CONTEXT-WINDOW HINT RIDES ON EVERY MCP URL', async () => {
     // is why this is a hint on the url rather than a required field.
     await claude(undefined);
     assert.strictEqual(ctxOf(claudeMcp().url), '1000000', 'claude-sonnet-5 window');
+    assert.strictEqual(profileOf(claudeMcp().url), 'chat', 'a chat turn asks for the chat profile');
     await openai(undefined);
     assert.strictEqual(ctxOf(openaiMcp().server_url), '1050000', 'gpt-5.6-luna window');
+    assert.strictEqual(profileOf(openaiMcp().server_url), 'chat', 'a chat turn asks for the chat profile');
 });
 
 await test('the hint is the window of the model on THAT call, not a constant', async () => {

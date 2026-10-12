@@ -16,7 +16,7 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled, resolveWebAccess } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens, getModelContextWindow } from './budget';
@@ -30,12 +30,40 @@ const ANTHROPIC_PROMPT_CACHING_BETA = 'prompt-caching-2024-07-31';
 const ANTHROPIC_BETA_HEADER = `${ANTHROPIC_MCP_BETA},${ANTHROPIC_WEB_FETCH_BETA},${ANTHROPIC_PROMPT_CACHING_BETA}`;
 const WEB_FETCH_MAX_USES = 40;
 const WEB_FETCH_MAX_CONTENT_TOKENS = 200000;
+// The two web tools, built in one place so a chat turn and an indexing pass
+// cannot drift in how they spell them. A CHAT turn carries them only when the
+// project's web switch is on (see webToolsForChat); an INDEXING pass keeps them
+// unconditionally, as it always has.
+const claudeWebFetchTool = () => ({
+	type: 'web_fetch_20250910',
+	name: 'web_fetch',
+	max_uses: WEB_FETCH_MAX_USES,
+	citations: { enabled: true },
+	max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS,
+});
 
 export const OPENAI_RESPONSES_API_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_MODELS_API_URL = 'https://api.openai.com/v1/models';
 const DEFAULT_OPENAI_IMAGE_DETAIL = 'auto';
 const OPENAI_WEB_SEARCH_ENABLED = true;
 const OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
+const openaiWebSearchTool = () => ({
+	type: 'web_search',
+	external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS,
+});
+/**
+ * The web tool list of a CHAT turn: the provider's tool when the switch is on,
+ * nothing when it is off. Off is the default (project_settings.ts
+ * DEFAULT_WEB_ACCESS): the answer then comes from the project's files and
+ * database alone, which is what the grounding rules promise. The switch is
+ * resolved by the caller (resolveWebAccess: host option, then the project's
+ * `web_access` setting, then false) so this stays a pure function of it.
+ */
+const webToolsForChat = (platform: 'claude' | 'openai', webAccess: boolean | undefined): any[] => {
+	if (webAccess !== true) return [];
+	if (platform === 'claude') return [claudeWebFetchTool()];
+	return OPENAI_WEB_SEARCH_ENABLED ? [openaiWebSearchTool()] : [];
+};
 export const MCP_NAME = 'BunnyQuery';
 
 export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
@@ -106,6 +134,13 @@ const mcpContextParam = (platform: 'claude' | 'openai', model?: string) =>
 
 const mcpIndexingUrl = (platform: 'claude' | 'openai' = 'openai', model?: string) =>
 	withMcpParams(mcpUrl(), { profile: 'index', ctx: mcpContextParam(platform, model) });
+// A CHAT turn asks the server for its `chat` profile: the data tools only (reads and the
+// record writes a user may ask for), with readFileContent worded for reading rather than
+// indexing, and none of the owner, hosting, ticket, secret-key or user-management tools. The
+// server treats a profile as a narrowing of what the caller may see, so it is safe on the
+// anonymous /p/ route too. Reliability plan 4.2 (2026-10-12).
+const mcpChatUrl = (endpointUrl: string, platform: 'claude' | 'openai', model?: string) =>
+	withMcpParams(endpointUrl, { profile: 'chat', ctx: mcpContextParam(platform, model) });
 
 /**
  * Where a chat turn's MCP tools point, and what they authenticate with.
@@ -601,6 +636,12 @@ export type CallClaudeWithMcpParams = {
 	fileUrls?: FileUrlDirective[];
 	onResponse?: (res: any) => void;
 	onError?: (err: any) => void;
+	/**
+	 * Attach Claude's `web_fetch` to this turn. Omitted means "ask the engine":
+	 * the host's `webAccess` config option, then the project's `web_access`
+	 * setting, then off. See config.ts resolveWebAccess.
+	 */
+	webAccess?: boolean;
 };
 // Poll cadence for every client-secret request the chat waits on. Shared by the
 // engine's own poll sites and imported by agent.vue; the widget carries its own
@@ -651,7 +692,12 @@ export async function callClaudeWithMcp({
 	mcpServer,
 	extractContent,
 	fileUrls,
+	webAccess,
 }: CallClaudeWithMcpParams) {
+	// Resolved HERE and not only in callClaudeWithPublicMcp, so a host calling this
+	// builder directly gets the same switch: an explicit boolean wins, otherwise
+	// the project's setting, otherwise off.
+	const web = typeof webAccess === 'boolean' ? webAccess : await resolveWebAccess(service);
 	const mcpServerDefinition: Record<string, any> = {
 		type: 'url',
 		name: mcpServer.name,
@@ -729,13 +775,10 @@ export async function callClaudeWithMcp({
 						: {}),
 					...(mcpServer.configs ? { configs: mcpServer.configs } : {}),
 				},
-				{
-					type: 'web_fetch_20250910',
-					name: 'web_fetch',
-					max_uses: WEB_FETCH_MAX_USES,
-					citations: { enabled: true },
-					max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS,
-				},
+				// `web_fetch` rides here only when the project's web switch is on. The
+				// beta header above is left as it is: it only makes the tool TYPE
+				// available, and a request that does not list the tool cannot use it.
+				...webToolsForChat('claude', web),
 			],
 		},
 	});
@@ -769,9 +812,7 @@ export async function callClaudeWithPublicMcp(
 		fileUrls,
 		mcpServer: {
 			name: MCP_NAME,
-			url: withMcpParams(endpoint.url, {
-				ctx: mcpContextParam('claude', model || DEFAULT_CLAUDE_MODEL),
-			}),
+			url: mcpChatUrl(endpoint.url, 'claude', model || DEFAULT_CLAUDE_MODEL),
 			// Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
 			// guard below drops the key rather than sending an empty one.
 			authorizationToken: endpoint.token,
@@ -798,6 +839,9 @@ export async function callOpenAIWithPublicMcp(
 	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	const resolvedModel = model || DEFAULT_OPENAI_MODEL;
 	const imageDetail = getOpenAIImageDetail(resolvedModel);
+	// The project's web switch: host option, then the `web_access` setting, then
+	// off. Awaited so the first turn after a page load reads the stored value.
+	const web = await resolveWebAccess(service);
 	const messageList =
 		messages && messages.length
 			? prepareOpenAIMessages(messages, imageDetail)
@@ -856,7 +900,7 @@ export async function callOpenAIWithPublicMcp(
 				{
 					type: 'mcp',
 					server_label: MCP_NAME,
-					server_url: withMcpParams(endpoint.url, { ctx: mcpContextParam('openai', resolvedModel) }),
+					server_url: mcpChatUrl(endpoint.url, 'openai', resolvedModel),
 					require_approval: 'never',
 					// No `headers` at all for an anonymous turn: `Bearer ` with an
 					// empty token is a credential the MCP server rejects, and the
@@ -865,14 +909,8 @@ export async function callOpenAIWithPublicMcp(
 						? { headers: { Authorization: 'Bearer ' + endpoint.token } }
 						: {}),
 				},
-				...(OPENAI_WEB_SEARCH_ENABLED
-					? [
-						{
-							type: 'web_search',
-							external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS,
-						},
-					]
-					: []),
+				// `web_search` rides here only when the project's web switch is on.
+				...webToolsForChat('openai', web),
 			],
 		},
 	});
@@ -1182,14 +1220,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 						require_approval: 'never',
 						headers: { Authorization: 'Bearer $ACCESS_TOKEN' },
 					},
-					...(OPENAI_WEB_SEARCH_ENABLED
-						? [
-								{
-									type: 'web_search',
-									external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS,
-								},
-							]
-						: []),
+					// UNCONDITIONAL, unlike a chat turn: the project's web switch
+					// governs answers, not indexing. Kept exactly as it was.
+					...(OPENAI_WEB_SEARCH_ENABLED ? [openaiWebSearchTool()] : []),
 				],
 			},
 		}));
@@ -1243,13 +1276,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 					type: 'mcp_toolset',
 					mcp_server_name: MCP_NAME,
 				},
-				{
-					type: 'web_fetch_20250910',
-					name: 'web_fetch',
-					max_uses: WEB_FETCH_MAX_USES,
-					citations: { enabled: true },
-					max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS,
-				},
+				// UNCONDITIONAL, unlike a chat turn: the project's web switch governs
+				// answers, not indexing. Kept exactly as it was.
+				claudeWebFetchTool(),
 			],
 		},
 	}));

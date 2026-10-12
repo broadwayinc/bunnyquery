@@ -48,6 +48,7 @@ import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, c
 import { createSseParser, type SseParser } from './sse';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage, isCsrStatusEnvelope } from './errors';
 import { buildBoundedChatMessages } from './budget';
+import { extractRetrievalNote } from './retrieval_memory';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
 import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage } from './history';
@@ -2109,6 +2110,10 @@ export class ChatSession {
 		var reply: ChatMessage = isErr
 			? { role: 'assistant', content: getErrorMessage(body), isError: true, _serverItemId: itemId }
 			: { role: 'assistant', content: text, _serverItemId: itemId };
+		if (!isErr) {
+			var rNote = extractRetrievalNote(body, text);
+			if (rNote) reply._retrieval = rNote;
+		}
 		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
 			// The reader is in another chat. Settle it where it belongs and touch
 			// nothing on screen - state.messages is a different conversation's list.
@@ -2616,7 +2621,9 @@ export class ChatSession {
 				if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
 				var answer = (params.aiPlatform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response));
 				answer = (answer || '').trim();
-				return { content: answer || 'No text response received from AI provider.', isError: false };
+				// Retrieval memory: what this turn read, off the body's tool blocks (a
+				// streamed turn's `response` is already the assembled body here).
+				return { content: answer || 'No text response received from AI provider.', isError: false, retrieval: extractRetrievalNote(response, answer) };
 			})
 			.catch(function (err: any) { return { content: getErrorMessage(err), isError: true }; })
 			.then(function (result: any) {
@@ -2635,6 +2642,7 @@ export class ChatSession {
 				}
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
 				if (dispatchItemId) reply._serverItemId = dispatchItemId;
+				if (result.retrieval) reply._retrieval = result.retrieval;
 
 				// REPLACE the trailing pending "Thinking..." bubble in the cache with
 				// the answer, regardless of whether this chat is the currently-visible
@@ -3470,6 +3478,10 @@ export class ChatSession {
 			var offReply: ChatMessage = isErrorResponseBody(response)
 				? { role: 'assistant', content: getErrorMessage(response), isError: true }
 				: { role: 'assistant', content: ((platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response)) || '').trim() || 'No text response received from AI provider.' };
+			if (!offReply.isError) {
+				var offNote = extractRetrievalNote(response, offReply.content);
+				if (offNote) offReply._retrieval = offNote;
+			}
 			this._applyReplyToCache(ownerKey, offReply, serverId);
 			if (serverId) this.cancelledServerIds.delete(serverId);
 			return;
@@ -3485,6 +3497,9 @@ export class ChatSession {
 		} else {
 			var answer = (platform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response));
 			answer = (answer || '').trim() || 'No text response received from AI provider.';
+			// Retrieval memory for this turn, attached to whichever bubble below ends up
+			// holding the answer.
+			var qNote = extractRetrievalNote(response, answer);
 			var lid = this._newLocalId();
 			if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
 				// Same resume as the immediate-send path: keep what the stream painted
@@ -3498,14 +3513,19 @@ export class ChatSession {
 				var qSettled: any = { role: 'assistant', content: qPainted, _localId: lid };
 				if (prevQ._serverItemId) qSettled._serverItemId = prevQ._serverItemId;
 				if (prevQ._ownerKey) qSettled._ownerKey = prevQ._ownerKey;
+				if (qNote) qSettled._retrieval = qNote;
 				this.state.messages[targetIdx] = qSettled;
 				this.host.notify(); this.enqueueTypewrite(targetIdx, answer, lid, qPainted);
 			} else if (targetIdx >= 0) {
-				this.state.messages.splice(targetIdx, 0, { role: 'assistant', content: '', _localId: lid });
+				var qInsert: ChatMessage = { role: 'assistant', content: '', _localId: lid };
+				if (qNote) qInsert._retrieval = qNote;
+				this.state.messages.splice(targetIdx, 0, qInsert);
 				this.host.notify(); this.enqueueTypewrite(targetIdx, answer, lid);
 			} else {
 				var aiIdx = this.state.messages.length;
-				this.state.messages.push({ role: 'assistant', content: '', _localId: lid });
+				var qAppend: ChatMessage = { role: 'assistant', content: '', _localId: lid };
+				if (qNote) qAppend._retrieval = qNote;
+				this.state.messages.push(qAppend);
 				this.host.notify(); this.enqueueTypewrite(aiIdx, answer, lid);
 			}
 		}
@@ -4165,6 +4185,9 @@ export class ChatSession {
 		var settled: any = { role: 'assistant', content: painted, isPending: false, _localId: lid };
 		if (prevSettled._serverItemId) settled._serverItemId = prevSettled._serverItemId;
 		if (prevSettled._ownerKey) settled._ownerKey = prevSettled._ownerKey;
+		// The retrieval note rides with the cached reply; the typewriter only
+		// writes `content`, so it survives the reveal.
+		if (latest._retrieval) settled._retrieval = latest._retrieval;
 		this.state.messages[pendingIdx] = settled;
 		this._removeStrayPendingAssistants();
 		this.host.notify();
@@ -4458,6 +4481,9 @@ export class ChatSession {
 		// before and after a reload. Only an INDEXING pass has a protocol token to
 		// hide.
 		var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+		// Retrieval memory for a CHAT turn that settled through a re-attached poll.
+		// Read once here; the background branches below never use it.
+		var hNote = isErr ? null : extractRetrievalNote(response, answer);
 		var stripMarker = function (t: string): string {
 			return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join('').trim() : t;
 		};
@@ -4499,7 +4525,9 @@ export class ChatSession {
 			// the reader watched arrive.
 			var hPainted = this._paintedTextAt(idx);
 			var lid = this._newLocalId();
-			this.state.messages[idx] = { role: 'assistant', content: hPainted, _localId: lid, _serverItemId: itemId };
+			var hReply: ChatMessage = { role: 'assistant', content: hPainted, _localId: lid, _serverItemId: itemId };
+			if (hNote) hReply._retrieval = hNote;
+			this.state.messages[idx] = hReply;
 			this.host.notify(); this.enqueueTypewrite(idx, text, lid, hPainted);
 			this.updateHistoryCache(); return;
 		}
@@ -4532,6 +4560,7 @@ export class ChatSession {
 		}
 		var lid2 = this._newLocalId();
 		var reply: ChatMessage = { role: 'assistant', content: '', _localId: lid2, _serverItemId: itemId };
+		if (hNote) reply._retrieval = hNote;
 		this.state.messages.splice(userIdx + 1, 0, reply);
 		this.host.notify(); this.enqueueTypewrite(userIdx + 1, text2, lid2);
 		this.updateHistoryCache();

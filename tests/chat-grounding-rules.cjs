@@ -19,6 +19,12 @@
  *     greeting, text the user asks for);
  *   - a visitor who cannot upload is never told to upload, here either.
  *
+ * The DOCUMENTS block (reliability plan 3.4) is pinned below the three rules: one
+ * method for a question about a file's content (find the file, searchText the
+ * page, quote the exact text, cite file and page, readFileContent for a file with
+ * no page text, say so when nothing matches), and its last sentence follows the
+ * web switch: no web tool when the web is off, web facts marked as such when on.
+ *
  * Run: node ./tests/chat-grounding-rules.cjs
  */
 
@@ -125,6 +131,80 @@ test('the rules are the same for both clients and with or without a description'
     assert.strictEqual(block(prompt({ client: 'widget' })), base);
     assert.strictEqual(block(prompt({ serviceName: 'Acme', serviceDescription: 'We sell parts.', greeting: 'Hello' })), base);
     assert.strictEqual(block(prompt({ indexAccessGroup: 'public' })), base);
+});
+
+/* ---- the DOCUMENTS block (plan 3.4) ------------------------------------------------- */
+
+const DOC = 'DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of):';
+
+test('DOCUMENTS: find the file, then the page with searchText, quote the exact text, cite file and page', () => {
+    const r = rule(P, DOC);
+    assert.ok(/FIRST FIND THE FILE, with getFileOutline/.test(r));
+    assert.ok(/getUniqueId using unique_id "src::" and condition "gte"/.test(r));
+    assert.ok(/THEN FIND THE PAGE: call searchText with the file's path/.test(r));
+    assert.ok(/QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE/.test(r));
+    assert.ok(/never present a paraphrase as a quote/.test(r));
+});
+
+test('DOCUMENTS: a file with no page text is read with readFileContent, to END OF FILE', () => {
+    const r = rule(P, DOC);
+    assert.ok(/If searchText answers no_page_text/.test(r));
+    assert.ok(/read it with readFileContent instead, paging with the cursor until END OF FILE/.test(r));
+});
+
+test('DOCUMENTS: nothing found over files WITH page text is said as such, naming files and terms', () => {
+    const r = rule(P, DOC);
+    assert.ok(/come back empty over files that HAVE page text, say that the data does not have it/.test(r));
+    assert.ok(/name the files and the terms you searched/.test(r));
+});
+
+test('DOCUMENTS: the gap is never filled from general knowledge or the web; with the web OFF the chat has no web tool', () => {
+    const r = rule(P, DOC);
+    assert.ok(/Never fill the gap from your general knowledge, and never from the web: this chat has no web tool\./.test(r));
+    assert.ok(!/WEB ACCESS IS ON/.test(r));
+});
+
+test('DOCUMENTS with the web ON: a web fact is allowed only when marked as from the web, kept apart, never used to fill a document', () => {
+    const r = rule(prompt({ webAccess: true }), DOC);
+    assert.ok(/never from the web without saying so\. WEB ACCESS IS ON for this project/.test(r));
+    assert.ok(/marked as coming from the web \(name the site\)/.test(r));
+    assert.ok(/kept apart from what the project's data says/.test(r));
+    assert.ok(/never used to fill in or complete a document's content/.test(r));
+    assert.ok(/the one exception to the four sources named above/.test(r));
+});
+
+test('DOCUMENTS sits with the spreadsheet rules, before the completeness rules', () => {
+    const fileTotal = P.indexOf("A FILE TOTAL IS NOT A ROW'S TOTAL.");
+    const doc = P.indexOf(DOC);
+    const complete = P.indexOf('Complete answers over stored data:');
+    assert.ok(fileTotal !== -1 && doc !== -1 && complete !== -1);
+    assert.ok(fileTotal < doc && doc < complete);
+    // one line each: the spreadsheet rule ends, DOCUMENTS begins
+    assert.ok(!P.slice(fileTotal, doc).slice(0, -1).includes('\n'));
+});
+
+test('DOCUMENTS is additive: the grounding block is byte-identical with the web on or off', () => {
+    const block = (text) => text.slice(text.indexOf('ANSWER ONLY FROM THE DATA.'), text.indexOf('NUMBERS FROM A SPREADSHEET:'));
+    assert.strictEqual(block(prompt({ webAccess: true })), block(P));
+    assert.strictEqual(block(prompt({ webAccess: false })), block(P));
+    // and the DOCUMENTS line is the same for both clients and every access group
+    assert.strictEqual(rule(prompt({ client: 'widget' }), DOC), rule(P, DOC));
+    assert.strictEqual(rule(prompt({ indexAccessGroup: 'public' }), DOC), rule(P, DOC));
+});
+
+test('the attachment bullet follows the switch: OFF never says to fetch a URL, ON keeps web_fetch for URL files', () => {
+    assert.ok(!/use your web_fetch tool to download and read each URL/.test(P));
+    assert.ok(/this chat has NO web tool: never try to download or fetch an attachment's URL/.test(P));
+    assert.ok(/use searchText or readFileContent on that same path \(see DOCUMENTS above\)/.test(P));
+    const on = prompt({ webAccess: true });
+    assert.ok(/use your web_fetch tool to download and read each URL before answering/.test(on));
+    assert.ok(!/this chat has NO web tool/.test(on));
+});
+
+test('no em dash anywhere in the prompt, with the web on or off', () => {
+    for (const p of [P, prompt({ webAccess: true }), prompt({ canUpload: false, client: 'widget' })]) {
+        assert.ok(p.indexOf('\u2014') === -1, 'an em dash crept into the prompt');
+    }
 });
 
 const failed = results.filter(r => !r[0]);

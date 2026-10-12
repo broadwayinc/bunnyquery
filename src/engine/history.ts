@@ -5,6 +5,7 @@
  * view-specific display formatting. projectId is passed for link sanitization.
  */
 import { extractClaudeText, extractOpenAIText, INDEXING_COMPLETE_MARKER, EMPTY_INDEXING_REPLY, getChatHistory, bgIndexingQueueName } from './requests';
+import { extractRetrievalNote } from './retrieval_memory';
 import { isErrorResponseBody, getErrorMessage, isRetriedFailure } from './errors';
 import { streamRecoveryEnabled } from './config';
 import { sanitizeAttachmentLinksForHistory } from './links';
@@ -898,6 +899,14 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 			if (item._fromBgChain) okm._fromBgChain = true;
 			if (item._isBgTask) okm.isBackgroundTask = true;
 			if (isCompact) okm._compact = true;
+			// Retrieval memory, re-derived from the stored body on every load so a
+			// reload reads the same note the live settle attached. Chat turns only:
+			// an indexing pass never enters the LLM history, and a compact stub has
+			// no body to read.
+			if (!item._isBgTask && !isCompact) {
+				var note = extractRetrievalNote(response, assistantText);
+				if (note) okm._retrieval = note;
+			}
 			if (serverItemId !== undefined) okm._serverItemId = serverItemId;
 			if (replyTs !== undefined) okm._ts = replyTs;
 			// How long THIS pass took: from the moment the worker began EXECUTING it to
