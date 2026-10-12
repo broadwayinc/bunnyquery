@@ -66,8 +66,11 @@ const webToolsForChat = (platform: 'claude' | 'openai', webAccess: boolean | und
 };
 export const MCP_NAME = 'BunnyQuery';
 
-export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';
-export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
+// The model a project uses when it never picked one (the settings page shows the same
+// constants). Owner's choice 2026-10-12: Sonnet 5.5 on Claude, GPT-6.1 Sol on OpenAI (both
+// have rows in budget.ts: 1,000,000 / 1,050,000 context, 128,000 output).
+export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5-5';
+export const DEFAULT_OPENAI_MODEL = 'gpt-6.1-sol';
 
 const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 

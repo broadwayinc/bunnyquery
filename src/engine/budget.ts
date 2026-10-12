@@ -32,6 +32,9 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 	'claude-sonnet-4-5': 1000000, 'claude-sonnet-4': 200000,
 	'claude-haiku-4-5': 200000, 'claude-3-5-sonnet': 200000,
 	// openai, exact ids
+	// gpt-6.1: OpenAI's listing carries no window; taken as the gpt-6 family's until a
+	// published figure says otherwise (2026-10-12, the default model).
+	'gpt-6.1-sol': 1050000,
 	'gpt-6-astra': 1050000, 'gpt-6-sol': 1050000, 'gpt-6-luna': 1050000,
 	'gpt-5.6-sol': 1050000, 'gpt-5.6-terra': 1050000, 'gpt-5.6-luna': 1050000,
 	'gpt-5.5': 1000000, 'gpt-5.4': 1050000,
@@ -39,7 +42,7 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 	'gpt-4.1': 1040000, 'gpt-4o': 128000, 'o1': 200000, 'o1-pro': 200000,
 	// family keys
 	'claude-fable': 1000000, 'claude-opus': 1000000, 'claude-sonnet': 1000000,
-	'claude-haiku': 200000, 'gpt-6': 1050000, 'gpt-5.6': 1050000, 'gpt-5': 128000,
+	'claude-haiku': 200000, 'gpt-6.1': 1050000, 'gpt-6': 1050000, 'gpt-5.6': 1050000, 'gpt-5': 128000,
 };
 // Two rows above are load-bearing rather than redundant, both because the family
 // walk drops trailing segments:
@@ -76,6 +79,7 @@ export var MAX_OUTPUT_BY_MODEL: Record<string, number> = {
 	'claude-sonnet-4-6': 64000, 'claude-haiku-4-5': 64000,
 	'claude-3-5-sonnet': 8000,
 	// openai
+	'gpt-6.1-sol': 128000,
 	'gpt-6-astra': 128000, 'gpt-6-sol': 128000, 'gpt-6-luna': 128000,
 	'gpt-5.6-sol': 128000, 'gpt-5.6-terra': 128000, 'gpt-5.6-luna': 128000,
 	'gpt-5.5': 128000, 'gpt-5.4': 128000,
@@ -83,7 +87,7 @@ export var MAX_OUTPUT_BY_MODEL: Record<string, number> = {
 	'gpt-4.1': 16000, 'gpt-4o': 4000, 'o1': 100000, 'o1-pro': 100000,
 	// family keys
 	'claude-fable': 128000, 'claude-opus': 128000, 'claude-sonnet': 64000,
-	'claude-haiku': 64000, 'gpt-6': 128000, 'gpt-5.6': 128000, 'gpt-5': 128000,
+	'claude-haiku': 64000, 'gpt-6.1': 128000, 'gpt-6': 128000, 'gpt-5.6': 128000, 'gpt-5': 128000,
 };
 
 // The window a project runs at when nobody has touched the setting, clamped per

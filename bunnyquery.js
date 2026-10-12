@@ -1380,6 +1380,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-haiku-4-5": 2e5,
     "claude-3-5-sonnet": 2e5,
     // openai, exact ids
+    // gpt-6.1: OpenAI's listing carries no window; taken as the gpt-6 family's until a
+    // published figure says otherwise (2026-10-12, the default model).
+    "gpt-6.1-sol": 105e4,
     "gpt-6-astra": 105e4,
     "gpt-6-sol": 105e4,
     "gpt-6-luna": 105e4,
@@ -1399,6 +1402,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-opus": 1e6,
     "claude-sonnet": 1e6,
     "claude-haiku": 2e5,
+    "gpt-6.1": 105e4,
     "gpt-6": 105e4,
     "gpt-5.6": 105e4,
     "gpt-5": 128e3
@@ -1416,6 +1420,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-haiku-4-5": 64e3,
     "claude-3-5-sonnet": 8e3,
     // openai
+    "gpt-6.1-sol": 128e3,
     "gpt-6-astra": 128e3,
     "gpt-6-sol": 128e3,
     "gpt-6-luna": 128e3,
@@ -1435,6 +1440,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     "claude-opus": 128e3,
     "claude-sonnet": 64e3,
     "claude-haiku": 64e3,
+    "gpt-6.1": 128e3,
     "gpt-6": 128e3,
     "gpt-5.6": 128e3,
     "gpt-5": 128e3
@@ -2602,8 +2608,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return [openaiWebSearchTool()] ;
   };
   var MCP_NAME = "BunnyQuery";
-  var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
-  var DEFAULT_OPENAI_MODEL = "gpt-5.6-luna";
+  var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5";
+  var DEFAULT_OPENAI_MODEL = "gpt-6.1-sol";
   var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
   function withMcpParams(base, params) {
     if (!base) return base;
