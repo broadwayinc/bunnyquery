@@ -4055,6 +4055,17 @@ declare class ChatSession {
     /** Files this client has an index dispatch in flight for, by scoped path ->
      *  wall clock. See claimIndexRun. */
     private _indexClaims;
+    /** bgTaskQueue by the SAME scoped path the claims use -> how many entries
+     *  name that file. Derived from the array, never written to directly: see
+     *  _bgQueueIndex for when it is rebuilt and why that is exact. */
+    private _bgQueueByFile;
+    /** What _bgQueueByFile was built from: the array itself, its length and its
+     *  first and last entries. Equal stamp = equal contents (see _bgQueueIndex). */
+    private _bgQueueStamp;
+    /** How many times the index was rebuilt. Diagnostics and tests only: a
+     *  3,000-file batch should build it a few thousand times at most (once per
+     *  push or settle), never once per claim. */
+    _bgQueueIndexRebuilds: number;
     constructor(host: ChatHost);
     /** What the display layer needs to decide whether a run is finished. `keys` holds
      *  every file the server still has indexing work for; `checked` is false until the
@@ -4096,6 +4107,27 @@ declare class ChatSession {
     /** Storage paths are project-relative, and one ChatSession serves every
      *  project, so a claim has to be scoped the way a stop is (_indexKeyOf). */
     private _indexClaimKey;
+    /**
+     * bgTaskQueue as a map: scoped path (indexScopeKey(projectId, platform) +
+     * '|' + storagePath, the key the claims and the stops use) -> entries.
+     *
+     * The array stays the source of truth because the engine does not own every
+     * write to it: both hosts hand in their own array (the dashboard a Vue
+     * reactive one it pushes to from the Files page and splices from its
+     * fallback poller), and tests push to it directly. So the map is DERIVED, and
+     * rebuilt when a cheap stamp says the array changed: its identity, its length,
+     * its first and its last entry.
+     *
+     * Why that stamp is exact for this array: every write to bgTaskQueue is either
+     * a push of a NEW entry object or a splice that removes one (nothing inserts
+     * in the middle, replaces in place or re-pushes a removed entry). Under those
+     * two operations, same length plus same last entry means the same contents:
+     * a push changes the last entry unless that same push is removed again, and a
+     * removal changes the length unless a push restores it, which changes the
+     * last entry. The first entry is in the stamp as margin. A rebuild is one
+     * pass over the array, paid once per change instead of once per claim.
+     */
+    private _bgQueueIndex;
     /**
      * Take this file's indexing slot, or report that someone already has it.
      *

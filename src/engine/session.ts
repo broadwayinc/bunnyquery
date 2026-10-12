@@ -611,6 +611,17 @@ export class ChatSession {
 	/** Files this client has an index dispatch in flight for, by scoped path ->
 	 *  wall clock. See claimIndexRun. */
 	private _indexClaims: { [scopedPath: string]: number };
+	/** bgTaskQueue by the SAME scoped path the claims use -> how many entries
+	 *  name that file. Derived from the array, never written to directly: see
+	 *  _bgQueueIndex for when it is rebuilt and why that is exact. */
+	private _bgQueueByFile: { [scopedPath: string]: number } | null;
+	/** What _bgQueueByFile was built from: the array itself, its length and its
+	 *  first and last entries. Equal stamp = equal contents (see _bgQueueIndex). */
+	private _bgQueueStamp: { arr: BgTaskEntry[] | null; length: number; first: any; last: any };
+	/** How many times the index was rebuilt. Diagnostics and tests only: a
+	 *  3,000-file batch should build it a few thousand times at most (once per
+	 *  push or settle), never once per claim. */
+	_bgQueueIndexRebuilds: number;
 
 	constructor(host: ChatHost) {
 		this.host = host;
@@ -651,6 +662,9 @@ export class ChatSession {
 		this._liveIndexKey = '';
 		this._liveIndexAt = 0;
 		this._indexClaims = {};
+		this._bgQueueByFile = null;
+		this._bgQueueStamp = { arr: null, length: 0, first: undefined, last: undefined };
+		this._bgQueueIndexRebuilds = 0;
 	}
 
 	/** What the display layer needs to decide whether a run is finished. `keys` holds
@@ -699,13 +713,14 @@ export class ChatSession {
 		// of truth says "not indexing", and a second dispatch in that window is
 		// exactly the duplicate this guard exists to stop. Observed live: two first
 		// passes four seconds apart, two collapsed rows.
-		var claimed = this._indexClaims[this._indexClaimKey(storagePath)];
+		var scoped = this._indexClaimKey(storagePath);
+		var claimed = this._indexClaims[scoped];
 		if (claimed && nowMs() - claimed < INDEX_DISPATCH_CLAIM_MS) return true;
-		var id = this.host.getIdentity();
-		for (var i = 0; i < this.bgTaskQueue.length; i++) {
-			var e = this.bgTaskQueue[i];
-			if (e && e.storagePath === storagePath && e.projectId === id.projectId && e.platform === id.platform) return true;
-		}
+		// The queue, looked up by the same scoped path instead of scanned. A batch
+		// claims once per file, and the queue holds one entry per file already
+		// dispatched, so the scan was O(n) per claim and O(n^2) over a 3,000-file
+		// batch. The index is rebuilt only when the array changes (_bgQueueIndex).
+		if (this._bgQueueIndex()[scoped] > 0) return true;
 		return this.state.messages.some(function (m) {
 			if (!m.isBackgroundTask || m.role !== 'user' || m.isCancelled) return false;
 			if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
@@ -718,6 +733,48 @@ export class ChatSession {
 	private _indexClaimKey(storagePath: string): string {
 		var id = this.host.getIdentity();
 		return indexScopeKey(id.projectId, id.platform) + '|' + storagePath;
+	}
+
+	/**
+	 * bgTaskQueue as a map: scoped path (indexScopeKey(projectId, platform) +
+	 * '|' + storagePath, the key the claims and the stops use) -> entries.
+	 *
+	 * The array stays the source of truth because the engine does not own every
+	 * write to it: both hosts hand in their own array (the dashboard a Vue
+	 * reactive one it pushes to from the Files page and splices from its
+	 * fallback poller), and tests push to it directly. So the map is DERIVED, and
+	 * rebuilt when a cheap stamp says the array changed: its identity, its length,
+	 * its first and its last entry.
+	 *
+	 * Why that stamp is exact for this array: every write to bgTaskQueue is either
+	 * a push of a NEW entry object or a splice that removes one (nothing inserts
+	 * in the middle, replaces in place or re-pushes a removed entry). Under those
+	 * two operations, same length plus same last entry means the same contents:
+	 * a push changes the last entry unless that same push is removed again, and a
+	 * removal changes the length unless a push restores it, which changes the
+	 * last entry. The first entry is in the stamp as margin. A rebuild is one
+	 * pass over the array, paid once per change instead of once per claim.
+	 */
+	private _bgQueueIndex(): { [scopedPath: string]: number } {
+		var q = this.bgTaskQueue;
+		var n = q ? q.length : 0;
+		var first = n ? q[0] : undefined;
+		var last = n ? q[n - 1] : undefined;
+		var st = this._bgQueueStamp;
+		if (this._bgQueueByFile && st.arr === q && st.length === n && st.first === first && st.last === last) {
+			return this._bgQueueByFile;
+		}
+		var idx: { [scopedPath: string]: number } = {};
+		for (var i = 0; i < n; i++) {
+			var e = q[i];
+			if (!e || !e.storagePath) continue;
+			var k = indexScopeKey(e.projectId, e.platform) + '|' + e.storagePath;
+			idx[k] = (idx[k] || 0) + 1;
+		}
+		this._bgQueueByFile = idx;
+		this._bgQueueStamp = { arr: q, length: n, first: first, last: last };
+		this._bgQueueIndexRebuilds++;
+		return idx;
 	}
 
 	/**

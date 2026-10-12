@@ -4536,6 +4536,9 @@ var ChatSession = class {
     this._liveIndexKey = "";
     this._liveIndexAt = 0;
     this._indexClaims = {};
+    this._bgQueueByFile = null;
+    this._bgQueueStamp = { arr: null, length: 0, first: void 0, last: void 0 };
+    this._bgQueueIndexRebuilds = 0;
   }
   /** What the display layer needs to decide whether a run is finished. `keys` holds
    *  every file the server still has indexing work for; `checked` is false until the
@@ -4572,13 +4575,10 @@ var ChatSession = class {
    */
   hasLiveIndexRun(storagePath) {
     if (!storagePath) return false;
-    var claimed = this._indexClaims[this._indexClaimKey(storagePath)];
+    var scoped = this._indexClaimKey(storagePath);
+    var claimed = this._indexClaims[scoped];
     if (claimed && nowMs() - claimed < INDEX_DISPATCH_CLAIM_MS) return true;
-    var id = this.host.getIdentity();
-    for (var i = 0; i < this.bgTaskQueue.length; i++) {
-      var e = this.bgTaskQueue[i];
-      if (e && e.storagePath === storagePath && e.projectId === id.projectId && e.platform === id.platform) return true;
-    }
+    if (this._bgQueueIndex()[scoped] > 0) return true;
     return this.state.messages.some(function(m) {
       if (!m.isBackgroundTask || m.role !== "user" || m.isCancelled) return false;
       if (!(m.isPendingQueued || m.isPendingInProcess || m.isSendingToServer)) return false;
@@ -4590,6 +4590,47 @@ var ChatSession = class {
   _indexClaimKey(storagePath) {
     var id = this.host.getIdentity();
     return indexScopeKey(id.projectId, id.platform) + "|" + storagePath;
+  }
+  /**
+   * bgTaskQueue as a map: scoped path (indexScopeKey(projectId, platform) +
+   * '|' + storagePath, the key the claims and the stops use) -> entries.
+   *
+   * The array stays the source of truth because the engine does not own every
+   * write to it: both hosts hand in their own array (the dashboard a Vue
+   * reactive one it pushes to from the Files page and splices from its
+   * fallback poller), and tests push to it directly. So the map is DERIVED, and
+   * rebuilt when a cheap stamp says the array changed: its identity, its length,
+   * its first and its last entry.
+   *
+   * Why that stamp is exact for this array: every write to bgTaskQueue is either
+   * a push of a NEW entry object or a splice that removes one (nothing inserts
+   * in the middle, replaces in place or re-pushes a removed entry). Under those
+   * two operations, same length plus same last entry means the same contents:
+   * a push changes the last entry unless that same push is removed again, and a
+   * removal changes the length unless a push restores it, which changes the
+   * last entry. The first entry is in the stamp as margin. A rebuild is one
+   * pass over the array, paid once per change instead of once per claim.
+   */
+  _bgQueueIndex() {
+    var q = this.bgTaskQueue;
+    var n = q ? q.length : 0;
+    var first = n ? q[0] : void 0;
+    var last = n ? q[n - 1] : void 0;
+    var st = this._bgQueueStamp;
+    if (this._bgQueueByFile && st.arr === q && st.length === n && st.first === first && st.last === last) {
+      return this._bgQueueByFile;
+    }
+    var idx = {};
+    for (var i = 0; i < n; i++) {
+      var e = q[i];
+      if (!e || !e.storagePath) continue;
+      var k = indexScopeKey(e.projectId, e.platform) + "|" + e.storagePath;
+      idx[k] = (idx[k] || 0) + 1;
+    }
+    this._bgQueueByFile = idx;
+    this._bgQueueStamp = { arr: q, length: n, first, last };
+    this._bgQueueIndexRebuilds++;
+    return idx;
   }
   /**
    * Take this file's indexing slot, or report that someone already has it.
