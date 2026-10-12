@@ -385,6 +385,18 @@ export interface ChatHost {
 	 * setting existed.
 	 */
 	uploadAccessGroup?(storagePath: string): 'public' | 'authorized' | 'private' | undefined | Promise<'public' | 'authorized' | 'private' | undefined>;
+	/**
+	 * "Has the signed-in user already uploaded this file to this project?" Asked
+	 * BEFORE a member's bytes go up, only while the skip-duplicates switch resolves
+	 * on (config.ts resolveSkipDuplicateFiles: the project's `skip_duplicate_files`
+	 * setting, on by default, restricted by the host's `skipDuplicateFiles: false`).
+	 * `file.name` is the name as STORED (the last segment of the storage path the
+	 * host itself produced), `file.size` the byte count. A match means the member
+	 * is neither uploaded nor indexed: the turn takes the stored copy's url and
+	 * the chip says so. Null, a rejection or a missing hook all mean "upload as
+	 * usual"; the engine's findDuplicateUpload is the ready-made implementation.
+	 */
+	findDuplicateUpload?(file: { name: string; size: number }): Promise<{ storagePath: string } | null> | { storagePath: string } | null;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;

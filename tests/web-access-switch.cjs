@@ -8,9 +8,11 @@
  *
  * What this pins:
  *   - the switch is OFF by default: no option, no record, no web tool;
- *   - resolution order: the host's `webAccess` option, then the project's
- *     `web_access` setting (bq::settings), then off, and only the literal true
- *     turns it on;
+ *   - resolution: the project's `web_access` setting (bq::settings) is the
+ *     CEILING and the host's `webAccess` option may only restrict below it,
+ *     effective = projectSetting && hostOption !== false; only the literal true
+ *     in the record turns it on, and a host's true on a project that is off has
+ *     no effect (changed 2026-10-12 from "host option wins both ways");
  *   - the request builders await the settings record on the first turn and treat
  *     a failed read as off;
  *   - an INDEXING pass is untouched: it keeps web_fetch / web_search as it always
@@ -152,10 +154,23 @@ await test('the setting is read per project: one project on does not switch anot
     assert.strictEqual(hasWebFetch(tools()), false);
 });
 
-/* ---- the host option wins both ways --------------------------------------------- */
+/* ---- the project setting is the ceiling; the host may only restrict ---------------- */
 
-await test('the host option true wins over an unset or false setting', async () => {
+await test('the host option true does NOT raise a project that is unset or off', async () => {
     records = { svc_1: { web_access: false } };
+    configure(true);
+    await claude();
+    assert.strictEqual(hasWebFetch(tools()), false, 'host true over setting false');
+    await openai();
+    assert.strictEqual(hasWebSearch(tools()), false);
+    records = {};
+    configure(true);
+    await claude();
+    assert.strictEqual(hasWebFetch(tools()), false, 'host true over no record');
+});
+
+await test('the host option true follows a project that is on', async () => {
+    records = { svc_1: { web_access: true } };
     configure(true);
     await claude();
     assert.ok(hasWebFetch(tools()));
@@ -163,7 +178,7 @@ await test('the host option true wins over an unset or false setting', async () 
     assert.ok(hasWebSearch(tools()));
 });
 
-await test('the host option false wins over a setting that is on', async () => {
+await test('the host option false restricts a setting that is on', async () => {
     records = { svc_1: { web_access: true } };
     configure(false);
     await claude();
@@ -172,7 +187,7 @@ await test('the host option false wins over a setting that is on', async () => {
     assert.strictEqual(hasWebSearch(tools()), false);
 });
 
-await test('a host option that is not a boolean (null) is "ask the project"', async () => {
+await test('a host option that is not a boolean (null) is "follow the project"', async () => {
     records = { svc_1: { web_access: true } };
     configure(null);
     await claude();
@@ -201,19 +216,26 @@ await test('a read that fails (REQUIRE_LOGIN for a signed-out visitor) settles a
     assert.strictEqual(await resolveWebAccess('svc_locked'), false);
 });
 
-await test('resolveWebAccess: option, then setting, then false; never rejects', async () => {
+await test('resolveWebAccess: setting && option !== false; never rejects', async () => {
     records = { svc_1: { web_access: true } };
     configure(undefined);
     assert.strictEqual(await resolveWebAccess('svc_1'), true);
     assert.strictEqual(await resolveWebAccess('svc_none'), false);
     assert.strictEqual(await resolveWebAccess(''), false);
     configure(false);
-    assert.strictEqual(await resolveWebAccess('svc_1'), false);
+    assert.strictEqual(await resolveWebAccess('svc_1'), false, 'host false restricts');
     configure(true);
-    assert.strictEqual(await resolveWebAccess('svc_none'), true);
+    assert.strictEqual(await resolveWebAccess('svc_none'), false, 'host true cannot raise an unset project');
+    assert.strictEqual(await resolveWebAccess('svc_1'), true, 'host true follows a project that is on');
+    assert.strictEqual(await resolveWebAccess(''), false, 'no service is the default, whatever the host says');
+    // The per-call override (a direct caller's `webAccess`) restricts the same way.
+    configure(undefined);
+    assert.strictEqual(await resolveWebAccess('svc_1', false), false);
+    assert.strictEqual(await resolveWebAccess('svc_1', true), true);
+    assert.strictEqual(await resolveWebAccess('svc_none', true), false);
 });
 
-await test('webAccessEnabled (sync): option, then the CACHED setting, then false', async () => {
+await test('webAccessEnabled (sync): the CACHED setting && option !== false', async () => {
     records = {};
     configure(undefined);
     assert.strictEqual(webAccessEnabled('svc_1'), false);
@@ -225,12 +247,14 @@ await test('webAccessEnabled (sync): option, then the CACHED setting, then false
     setProjectSettings('svc_1', { web_access: true });
     assert.strictEqual(webAccessEnabled('svc_1'), false);
     configure(true);
-    assert.strictEqual(webAccessEnabled('svc_none'), true);
+    assert.strictEqual(webAccessEnabled('svc_none'), false, 'host true cannot raise an unset project');
+    setProjectSettings('svc_1', { web_access: true });
+    assert.strictEqual(webAccessEnabled('svc_1'), true);
 });
 
 /* ---- a direct caller of callClaudeWithMcp ------------------------------------------ */
 
-await test('callClaudeWithMcp: an explicit `webAccess` wins; omitted asks the engine', async () => {
+await test('callClaudeWithMcp: an explicit `webAccess` restricts under the same ceiling; omitted asks the engine', async () => {
     records = { svc_1: { web_access: true } };
     configure(undefined);
     const base = { prompt: 'hi', service: 'svc_1', owner: 'own_1', userId: 'usr_1', mcpServer: { name: MCP_NAME, url: 'https://mcp.example.com' } };
@@ -238,10 +262,12 @@ await test('callClaudeWithMcp: an explicit `webAccess` wins; omitted asks the en
     assert.strictEqual(hasWebFetch(tools()), false, 'explicit false with the setting on');
     await callClaudeWithMcp(base);
     assert.ok(hasWebFetch(tools()), 'omitted follows the setting');
+    await callClaudeWithMcp(Object.assign({}, base, { webAccess: true }));
+    assert.ok(hasWebFetch(tools()), 'explicit true with the setting on');
     records = {};
     configure(undefined);
     await callClaudeWithMcp(Object.assign({}, base, { webAccess: true }));
-    assert.ok(hasWebFetch(tools()), 'explicit true with no record');
+    assert.strictEqual(hasWebFetch(tools()), false, 'explicit true cannot raise a project with no record');
 });
 
 /* ---- indexing is untouched -------------------------------------------------------- */

@@ -34,7 +34,22 @@ export {
 	// template; the awaiting form is what the request builders use.
 	webAccessEnabled,
 	resolveWebAccess,
+	// Same ceiling rule for the upload path's skip-duplicates switch: the project's
+	// `skip_duplicate_files` setting (on by default), restricted by a host's
+	// `skipDuplicateFiles: false`.
+	skipDuplicateFilesEnabled,
+	resolveSkipDuplicateFiles,
 } from './config';
+
+// "Has this user already uploaded this file here?", answered from the `src::` file
+// records. The widget wires it as the host's findDuplicateUpload hook; it never throws.
+export {
+	findDuplicateUpload,
+	isDuplicateCandidateId,
+	DUPLICATE_LOOKUP_MAX_CANDIDATES,
+	type DuplicateUploadMatch,
+	type DuplicateUploadFile,
+} from './duplicates';
 
 export {
 	isServerExtractable,
@@ -286,6 +301,11 @@ export {
 	normalizeWebAccess,
 	webAccessFrom,
 	projectWebAccess,
+	// skip duplicate uploads (same record, its own key, on by default)
+	DEFAULT_SKIP_DUPLICATE_FILES,
+	normalizeSkipDuplicateFiles,
+	skipDuplicateFilesFrom,
+	projectSkipDuplicateFiles,
 	// pure readers over a settings `data` object
 	normalizeUploadAccessGroup,
 	normalizeProjectAccessSetting,

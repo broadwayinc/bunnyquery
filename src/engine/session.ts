@@ -42,7 +42,7 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream } from './config';
+import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream, resolveSkipDuplicateFiles } from './config';
 // The wire-format knowledge. skapi relays the provider's bytes without reading them,
 // so the session hands them straight to this parser and never inspects a frame itself.
 import { createSseParser, type SseParser } from './sse';
@@ -5955,11 +5955,35 @@ export class ChatSession {
 		if (!total) return Promise.reject(new Error('Empty attachment'));
 		var urls: Array<{ name: string; url: string; storagePath: string }> = [];
 		var anyIndexFailed = false;
+		// Members answered by a file the user already has here (see findDuplicate
+		// below). Counted so a folder chip can say how many it reused.
+		var reusedCount = 0;
+		att.reused = false;
 		var chain: Promise<any> = Promise.resolve();
+		// "Already uploaded by this user, same name and size" -> the stored copy's
+		// storage path, else null. Asked only while the skip-duplicates switch
+		// resolves ON (the project's setting is the ceiling, the host may only
+		// restrict), and only of a host that wired the hook. Every failure is null,
+		// so this can save an upload and an indexing run but never block one.
+		var findDuplicate = function (member: any): Promise<string | null> {
+			if (typeof self.host.findDuplicateUpload !== 'function') return Promise.resolve(null);
+			var storedName = String(member.storagePath || '').split('/').filter(Boolean).pop() || member.file.name;
+			return resolveSkipDuplicateFiles(id.projectId).then(function (on) {
+				if (!on) return null;
+				return Promise.resolve(self.host.findDuplicateUpload!({ name: storedName, size: member.file.size }))
+					.then(function (hit: any) {
+						return hit && typeof hit.storagePath === 'string' && hit.storagePath ? hit.storagePath : null;
+					});
+			}).catch(function () { return null; });
+		};
 		members.forEach(function (member: any, idx: number) {
 			chain = chain.then(function () {
 				var hadExists = false;
 				var skipped = false;
+				// The storage path of the file this member DUPLICATES, when the user
+				// already has it here: nothing is uploaded or indexed for it, and the
+				// turn takes the stored copy's url instead.
+				var duplicateOf: string | null = null;
 				// True when the file already existed and we are re-indexing over it
 				// (user chose Reindex, OR Overwrite replaced the bytes). Drives the
 				// delete-then-repost of the stale "src::" record below. Kept separate
@@ -5978,7 +6002,14 @@ export class ChatSession {
 						onProgress: onProg, setAbort: function (abort) { att._abort = abort; },
 					});
 				};
-				return doMemberUpload(true).catch(function (err: any) {
+				return findDuplicate(member).then(function (dup) {
+					if (dup) {
+						duplicateOf = dup;
+						console.log('[chat-engine] skipping an upload the user already has:', member.storagePath, '->', dup);
+						return;
+					}
+					return doMemberUpload(true);
+				}).catch(function (err: any) {
 					var code = err && (err.code || (err.body && err.body.code));
 					var msg = err && (err.message || (err.body && err.body.message) || (typeof err === 'string' ? err : ''));
 					var isExists = code === 'EXISTS' || (msg && /exist/i.test(msg));
@@ -5999,9 +6030,20 @@ export class ChatSession {
 					});
 				}).then(function () {
 					if (skipped) return; // user skipped this member — no url, no index request
-					return self.host.getTemporaryUrl(member.storagePath);
+					// A duplicate takes the STORED copy's url: the same reuse an EXISTS
+					// answer gets when the user keeps the file, minus the prompt and
+					// minus the re-index.
+					return self.host.getTemporaryUrl(duplicateOf || member.storagePath);
 				}).then(function (url: string) {
 					if (skipped) return; // guard the indexing branch for a skipped member
+					if (duplicateOf) {
+						urls.push({ name: member.relPath, url: url, storagePath: duplicateOf });
+						reusedCount += 1;
+						if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = duplicateOf; att.reused = true; }
+						else att.reusedCount = reusedCount;
+						self.host.renderAttachmentChips();
+						return; // not indexed: the stored copy already is
+					}
 					urls.push({ name: member.relPath, url: url, storagePath: member.storagePath });
 					if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = member.storagePath; }
 					var mime = member.file.type || self.host.getMimeType(member.file.name);

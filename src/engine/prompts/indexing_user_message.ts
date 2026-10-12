@@ -231,6 +231,28 @@ function buildRenderMeta(attachment: IndexingAttachmentInfo): string {
 	);
 }
 
+/**
+ * Verbatim page text for SCANNED pages (reliability plan 3.1, owner's yes 2026-10-12).
+ *
+ * The worker writes a `__PAGES__` record per page. A page WITH a text layer is written
+ * server-side before the model call; a page WITHOUT one (a scan) can only come from the
+ * model, and the worker's `_fill_vision_pages` fills it from a posted record that names
+ * the page (`page`) and carries `page_text`. The signal the model has is the label the
+ * worker puts before each image: "Embedded text layer for this page" appears under the
+ * label exactly when the page has one (the layer ships the text with the first strip of
+ * a page), so "no such block" is "no text layer", and that is the whole rule. Fixed table
+ * name, as the system prompt demands for every content kind. Kept short: the owner pays
+ * output tokens for the transcription itself, not for the instruction.
+ */
+export const PAGE_TEXT_TABLE = 'page_texts';
+const PAGE_TEXT_RULE =
+	`PAGE TEXT for pages WITHOUT a text layer: for EVERY page whose label (its first label, when the page is split ` +
+	`into strips) carries NO "Embedded text layer" block, ALSO post exactly ONE record in table "${PAGE_TEXT_TABLE}" ` +
+	`with data {"page": <its document page number from the label, 1-based>, "page_text": "<the page's complete text ` +
+	`exactly as printed, verbatim, in reading order, nothing summarised or left out>"}, reference "src::" + the storage ` +
+	`path above, in addition to the records above. A page WITH an embedded text layer gets NO such record: its text ` +
+	`is already stored.\n\n`;
+
 // Shared datafy guidance. The placeholder is where the worker splices the note + rendered
 // page images; instructions reference "the page images in this message" so they read
 // correctly whether the images land before or after this text.
@@ -255,6 +277,7 @@ function buildRenderDatafy(placeholder: string): string {
 		`summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the ` +
 		`exact text and should be preferred over reading the pixels, with the image used for layout, tables, ` +
 		`stamps and handwriting.\n\n` +
+		PAGE_TEXT_RULE +
 		`Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read ` +
 		`the rest of the file and do NOT worry about the pages after this window: if any remain, the next window ` +
 		`is rendered and sent to you automatically. Report only the pages you were actually shown - never imply ` +

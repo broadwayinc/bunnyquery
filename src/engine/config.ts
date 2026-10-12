@@ -23,7 +23,7 @@
  */
 
 import { type AttachmentParser, registerAttachmentParser } from './attachment_parsers';
-import { cachedProjectSettings, loadProjectSettings, webAccessFrom } from './project_settings';
+import { cachedProjectSettings, loadProjectSettings, webAccessFrom, skipDuplicateFilesFrom } from './project_settings';
 
 /**
  * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
@@ -243,18 +243,29 @@ export interface ChatEngineConfig {
      * OpenAI's `web_search` are attached to a chat request only when this
      * resolves to true.
      *
-     * OPTIONAL, AND UNSET IS NOT FALSE. When the host leaves it out, the engine
-     * reads the project's own setting (`web_access` in the `bq::settings`
-     * record, see project_settings.ts) and falls back to OFF, so the project
-     * owner's switch on the Project Settings page decides for every client that
-     * does not override it. A host that sets a boolean here overrides the
-     * project for its own page, both ways. Resolution: this option, then the
-     * project setting, then false.
+     * OPTIONAL. The project's own setting (`web_access` in the `bq::settings`
+     * record, see project_settings.ts; off unless the owner turned it on) is the
+     * CEILING, and this option may only restrict below it:
+     *     effective = projectSetting && webAccess !== false
+     * So `false` here turns the web off for this page whatever the project says,
+     * and `true` or unset follows the project. A value above the project setting
+     * has no effect: the owner's switch is what lets an answer out onto the web.
      *
      * Chat turns only. An indexing pass keeps the tools it has today, since the
      * worker hands it rendered pages and extracted text and not a URL to fetch.
      */
     webAccess?: boolean;
+    /**
+     * Whether a chat attachment that the signed-in user already uploaded to this
+     * project (same file name, same size, same uploader) is SKIPPED: not uploaded
+     * again, not indexed again, the turn using the stored copy's url. Same
+     * ceiling rule as `webAccess`, against the project's `skip_duplicate_files`
+     * setting, which is ON unless the owner turned it off:
+     *     effective = projectSetting && skipDuplicateFiles !== false
+     * `false` here lets this page re-upload duplicates on a project that skips
+     * them; `true` or unset follows the project. See duplicates.ts for the check.
+     */
+    skipDuplicateFiles?: boolean;
     /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
@@ -484,29 +495,71 @@ export function liveStreamingEnabled(): boolean {
 }
 
 /**
- * The web switch for a chat turn, SYNCHRONOUSLY: the host's `webAccess` option
- * when it is a boolean, else the project's cached `web_access` setting, else
- * false. For a template or a prompt builder, which have nowhere to await. Reads
- * the cache as it stands, so before the settings fetch settles it answers the
- * default; request builders use resolveWebAccess below instead.
+ * THE CEILING RULE, shared by every project switch a host may also set:
+ *     effective = projectSetting && hostOption !== false
+ * The project owner's setting is the most a page can have; a host option can
+ * only take it lower. `override` is a per-call host value (a direct caller of
+ * callClaudeWithMcp passing `webAccess`), which restricts exactly like the config
+ * option: either one being `false` is off.
  */
-export function webAccessEnabled(service?: string): boolean {
-    const opt = _config ? _config.webAccess : undefined;
-    if (typeof opt === 'boolean') return opt;
-    return webAccessFrom(service ? cachedProjectSettings(service) : null);
+function underCeiling(projectSetting: boolean, option: boolean | undefined, override?: boolean): boolean {
+    if (!projectSetting) return false;
+    if (option === false) return false;
+    if (override === false) return false;
+    return true;
 }
 
 /**
- * The same switch, awaiting the project's settings record when the host did not
- * decide. Never rejects: a failed or impossible read (no reader injected, a
- * signed-out visitor on a require_login project) settles as "unset", which is
- * off. Cheap after the first call per project: the store dedupes and caches.
+ * The web switch for a chat turn, SYNCHRONOUSLY: the project's cached
+ * `web_access` setting (off unless the owner turned it on), restricted by the
+ * host's `webAccess` option when that is `false`. For a template or a prompt
+ * builder, which have nowhere to await. Reads the cache as it stands, so before
+ * the settings fetch settles it answers the default; request builders use
+ * resolveWebAccess below instead.
  */
-export function resolveWebAccess(service?: string): Promise<boolean> {
+export function webAccessEnabled(service?: string): boolean {
     const opt = _config ? _config.webAccess : undefined;
-    if (typeof opt === 'boolean') return Promise.resolve(opt);
-    if (!service) return Promise.resolve(false);
-    return loadProjectSettings(service).then(webAccessFrom, () => false);
+    return underCeiling(webAccessFrom(service ? cachedProjectSettings(service) : null), opt);
+}
+
+/**
+ * The same switch, awaiting the project's settings record. Never rejects: a
+ * failed or impossible read (no reader injected, a signed-out visitor on a
+ * require_login project) settles as "unset", which is off. Cheap after the first
+ * call per project: the store dedupes and caches. `override` is a per-call host
+ * value that may only restrict (see underCeiling).
+ */
+export function resolveWebAccess(service?: string, override?: boolean): Promise<boolean> {
+    const opt = _config ? _config.webAccess : undefined;
+    if (!service) return Promise.resolve(underCeiling(webAccessFrom(null), opt, override));
+    return loadProjectSettings(service)
+        .then(webAccessFrom, () => false)
+        .then((setting) => underCeiling(setting, opt, override));
+}
+
+/**
+ * The skip-duplicates switch for an upload, SYNCHRONOUSLY: the project's cached
+ * `skip_duplicate_files` setting (on unless the owner turned it off), restricted
+ * by the host's `skipDuplicateFiles` option when that is `false`. Answers the
+ * default before the settings fetch settles; the upload path uses
+ * resolveSkipDuplicateFiles below.
+ */
+export function skipDuplicateFilesEnabled(service?: string): boolean {
+    const opt = _config ? _config.skipDuplicateFiles : undefined;
+    return underCeiling(skipDuplicateFilesFrom(service ? cachedProjectSettings(service) : null), opt);
+}
+
+/**
+ * The same switch, awaiting the project's settings record. Never rejects: a
+ * failed read settles as "unset", which for this switch is ON (the default), so
+ * a project that cannot be read still skips duplicates unless the host said no.
+ */
+export function resolveSkipDuplicateFiles(service?: string): Promise<boolean> {
+    const opt = _config ? _config.skipDuplicateFiles : undefined;
+    if (!service) return Promise.resolve(underCeiling(skipDuplicateFilesFrom(null), opt));
+    return loadProjectSettings(service)
+        .then(skipDuplicateFilesFrom, () => skipDuplicateFilesFrom(null))
+        .then((setting) => underCeiling(setting, opt));
 }
 
 /**

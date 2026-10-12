@@ -56,8 +56,9 @@ const openaiWebSearchTool = () => ({
  * nothing when it is off. Off is the default (project_settings.ts
  * DEFAULT_WEB_ACCESS): the answer then comes from the project's files and
  * database alone, which is what the grounding rules promise. The switch is
- * resolved by the caller (resolveWebAccess: host option, then the project's
- * `web_access` setting, then false) so this stays a pure function of it.
+ * resolved by the caller (resolveWebAccess: the project's `web_access` setting
+ * is the ceiling, a host option may only restrict) so this stays a pure
+ * function of it.
  */
 const webToolsForChat = (platform: 'claude' | 'openai', webAccess: boolean | undefined): any[] => {
 	if (webAccess !== true) return [];
@@ -640,9 +641,11 @@ export type CallClaudeWithMcpParams = {
 	onResponse?: (res: any) => void;
 	onError?: (err: any) => void;
 	/**
-	 * Attach Claude's `web_fetch` to this turn. Omitted means "ask the engine":
-	 * the host's `webAccess` config option, then the project's `web_access`
-	 * setting, then off. See config.ts resolveWebAccess.
+	 * Attach Claude's `web_fetch` to this turn. A per-call host value under the
+	 * same ceiling rule as the config option: the project's `web_access` setting
+	 * is the most a turn can have, and `false` here (or in the config) takes it
+	 * off. Omitted follows the config option and the project. See config.ts
+	 * resolveWebAccess.
 	 */
 	webAccess?: boolean;
 };
@@ -698,9 +701,9 @@ export async function callClaudeWithMcp({
 	webAccess,
 }: CallClaudeWithMcpParams) {
 	// Resolved HERE and not only in callClaudeWithPublicMcp, so a host calling this
-	// builder directly gets the same switch: an explicit boolean wins, otherwise
-	// the project's setting, otherwise off.
-	const web = typeof webAccess === 'boolean' ? webAccess : await resolveWebAccess(service);
+	// builder directly gets the same switch: the project's setting is the ceiling,
+	// and an explicit `false` (here or in the config) restricts below it.
+	const web = await resolveWebAccess(service, typeof webAccess === 'boolean' ? webAccess : undefined);
 	const mcpServerDefinition: Record<string, any> = {
 		type: 'url',
 		name: mcpServer.name,

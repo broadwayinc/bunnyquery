@@ -291,18 +291,29 @@ interface ChatEngineConfig {
      * OpenAI's `web_search` are attached to a chat request only when this
      * resolves to true.
      *
-     * OPTIONAL, AND UNSET IS NOT FALSE. When the host leaves it out, the engine
-     * reads the project's own setting (`web_access` in the `bq::settings`
-     * record, see project_settings.ts) and falls back to OFF, so the project
-     * owner's switch on the Project Settings page decides for every client that
-     * does not override it. A host that sets a boolean here overrides the
-     * project for its own page, both ways. Resolution: this option, then the
-     * project setting, then false.
+     * OPTIONAL. The project's own setting (`web_access` in the `bq::settings`
+     * record, see project_settings.ts; off unless the owner turned it on) is the
+     * CEILING, and this option may only restrict below it:
+     *     effective = projectSetting && webAccess !== false
+     * So `false` here turns the web off for this page whatever the project says,
+     * and `true` or unset follows the project. A value above the project setting
+     * has no effect: the owner's switch is what lets an answer out onto the web.
      *
      * Chat turns only. An indexing pass keeps the tools it has today, since the
      * worker hands it rendered pages and extracted text and not a URL to fetch.
      */
     webAccess?: boolean;
+    /**
+     * Whether a chat attachment that the signed-in user already uploaded to this
+     * project (same file name, same size, same uploader) is SKIPPED: not uploaded
+     * again, not indexed again, the turn using the stored copy's url. Same
+     * ceiling rule as `webAccess`, against the project's `skip_duplicate_files`
+     * setting, which is ON unless the owner turned it off:
+     *     effective = projectSetting && skipDuplicateFiles !== false
+     * `false` here lets this page re-upload duplicates on a project that skips
+     * them; `true` or unset follows the project. See duplicates.ts for the check.
+     */
+    skipDuplicateFiles?: boolean;
     /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
@@ -399,20 +410,36 @@ interface ChatEngineConfig {
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
 /**
- * The web switch for a chat turn, SYNCHRONOUSLY: the host's `webAccess` option
- * when it is a boolean, else the project's cached `web_access` setting, else
- * false. For a template or a prompt builder, which have nowhere to await. Reads
- * the cache as it stands, so before the settings fetch settles it answers the
- * default; request builders use resolveWebAccess below instead.
+ * The web switch for a chat turn, SYNCHRONOUSLY: the project's cached
+ * `web_access` setting (off unless the owner turned it on), restricted by the
+ * host's `webAccess` option when that is `false`. For a template or a prompt
+ * builder, which have nowhere to await. Reads the cache as it stands, so before
+ * the settings fetch settles it answers the default; request builders use
+ * resolveWebAccess below instead.
  */
 declare function webAccessEnabled(service?: string): boolean;
 /**
- * The same switch, awaiting the project's settings record when the host did not
- * decide. Never rejects: a failed or impossible read (no reader injected, a
- * signed-out visitor on a require_login project) settles as "unset", which is
- * off. Cheap after the first call per project: the store dedupes and caches.
+ * The same switch, awaiting the project's settings record. Never rejects: a
+ * failed or impossible read (no reader injected, a signed-out visitor on a
+ * require_login project) settles as "unset", which is off. Cheap after the first
+ * call per project: the store dedupes and caches. `override` is a per-call host
+ * value that may only restrict (see underCeiling).
  */
-declare function resolveWebAccess(service?: string): Promise<boolean>;
+declare function resolveWebAccess(service?: string, override?: boolean): Promise<boolean>;
+/**
+ * The skip-duplicates switch for an upload, SYNCHRONOUSLY: the project's cached
+ * `skip_duplicate_files` setting (on unless the owner turned it off), restricted
+ * by the host's `skipDuplicateFiles` option when that is `false`. Answers the
+ * default before the settings fetch settles; the upload path uses
+ * resolveSkipDuplicateFiles below.
+ */
+declare function skipDuplicateFilesEnabled(service?: string): boolean;
+/**
+ * The same switch, awaiting the project's settings record. Never rejects: a
+ * failed read settles as "unset", which for this switch is ON (the default), so
+ * a project that cannot be read still skips duplicates unless the host said no.
+ */
+declare function resolveSkipDuplicateFiles(service?: string): Promise<boolean>;
 /**
  * True when a streamed turn whose answer never reached its row can be READ BACK.
  *
@@ -508,6 +535,65 @@ declare function streamRecoveryEnabled(): boolean;
  * forwardRequestHistory instead.
  */
 declare function skapiSupportsStreaming(sk: any): boolean;
+
+/**
+ * Duplicate-upload detection for chat attachments (reliability plan, owner's
+ * yes 2026-10-12): "has the signed-in user already uploaded THIS file to this
+ * project?", answered from the file records the upload path already writes.
+ *
+ * WHAT COUNTS AS THE SAME FILE. Same name, same size in bytes, same uploader.
+ * Every upload creates a `src::<storagePath>` record (table `file_summaries`)
+ * whose `data.size_bytes` is the byte count and whose `user_id` is the
+ * uploader, so a lookup by name narrowed by those two fields finds a file
+ * without reading its bytes. A different user's identical file is NOT a
+ * duplicate: that user's copy sits at a different access group and path and
+ * may be invisible to this one.
+ *
+ * HOW THE NAME IS FOUND. `getUniqueId` with `condition: '<='` is an ENDS-WITH
+ * match on the record id (served from the reversed proxy rows), and a file
+ * record's id ends with the file's name: `src::<name>` for a file at the
+ * root, `src::<folders>/<name>` otherwise. The match is then narrowed to
+ * exactly those two shapes, so `src::report.pdf` is not found by "port.pdf",
+ * and to the `src::` prefix, because the `run::` and `done::` index markers
+ * end with the same path and are not files.
+ *
+ * NEVER THROWS. A failed or refused lookup (a signed-out visitor on a
+ * require_login project, a region without the proxy rows yet, a network
+ * error) answers null, and null means "upload as usual": the check exists to
+ * save an indexing run, and must never be able to cost one.
+ *
+ * TRANSPORT-FREE like the rest of the engine: the caller hands in the skapi
+ * instance it owns. The widget passes its own; a host with no instance simply
+ * does not wire the hook and uploads as before.
+ */
+/** The record found, with the storage path the stored file lives at. */
+type DuplicateUploadMatch = {
+    /** The stored file's db storage path (the record id without `src::`). */
+    storagePath: string;
+    /** The matching `src::` record id. */
+    uniqueId: string;
+    /** The file record as read. */
+    record: any;
+};
+type DuplicateUploadFile = {
+    /** The file name as it is STORED: the last segment of the storage path. */
+    name: string;
+    /** Size in bytes. */
+    size: number;
+};
+/** The `src::` records to read before giving up; a name is rarely shared this widely. */
+declare const DUPLICATE_LOOKUP_MAX_CANDIDATES = 25;
+/** Narrow an ends-with listing to real file records for exactly this name. */
+declare function isDuplicateCandidateId(uniqueId: unknown, name: string): boolean;
+/**
+ * The first `src::` record for `file.name` whose `data.size_bytes` equals
+ * `file.size` and whose `user_id` is `userId`, or null. `opts.service` is passed
+ * through to both skapi calls when given (the widget names the project on every
+ * call); otherwise the instance's own project is queried.
+ */
+declare function findDuplicateUpload(skapi: any, file: DuplicateUploadFile, userId: string, opts?: {
+    service?: string;
+}): Promise<DuplicateUploadMatch | null>;
 
 /**
  * Office-file server-side extraction helpers.
@@ -815,6 +901,20 @@ declare function buildIndexingRenderMessage(attachment: IndexingAttachmentInfo, 
  * of the window it is rendering; passing an explicit label produces a ready-to-send message.
  */
 declare function buildIndexingRenderContinueTemplate(attachment: IndexingAttachmentInfo, placeholder: string, pageLabel?: string): string;
+/**
+ * Verbatim page text for SCANNED pages (reliability plan 3.1, owner's yes 2026-10-12).
+ *
+ * The worker writes a `__PAGES__` record per page. A page WITH a text layer is written
+ * server-side before the model call; a page WITHOUT one (a scan) can only come from the
+ * model, and the worker's `_fill_vision_pages` fills it from a posted record that names
+ * the page (`page`) and carries `page_text`. The signal the model has is the label the
+ * worker puts before each image: "Embedded text layer for this page" appears under the
+ * label exactly when the page has one (the layer ships the text with the first strip of
+ * a page), so "no such block" is "no text layer", and that is the whole rule. Fixed table
+ * name, as the system prompt demands for every content kind. Kept short: the owner pays
+ * output tokens for the transcription itself, not for the instruction.
+ */
+declare const PAGE_TEXT_TABLE = "page_texts";
 /**
  * User message for a WINDOWED file: the worker splices ONE window of the file's rows or
  * text into this message at `placeholder`, then continues from the reader's own cursor
@@ -2289,9 +2389,11 @@ type CallClaudeWithMcpParams = {
     onResponse?: (res: any) => void;
     onError?: (err: any) => void;
     /**
-     * Attach Claude's `web_fetch` to this turn. Omitted means "ask the engine":
-     * the host's `webAccess` config option, then the project's `web_access`
-     * setting, then off. See config.ts resolveWebAccess.
+     * Attach Claude's `web_fetch` to this turn. A per-call host value under the
+     * same ceiling rule as the config option: the project's `web_access` setting
+     * is the most a turn can have, and `false` here (or in the config) takes it
+     * off. Omitted follows the config option and the project. See config.ts
+     * resolveWebAccess.
      */
     webAccess?: boolean;
 };
@@ -2877,6 +2979,25 @@ interface ChatHost {
      * setting existed.
      */
     uploadAccessGroup?(storagePath: string): 'public' | 'authorized' | 'private' | undefined | Promise<'public' | 'authorized' | 'private' | undefined>;
+    /**
+     * "Has the signed-in user already uploaded this file to this project?" Asked
+     * BEFORE a member's bytes go up, only while the skip-duplicates switch resolves
+     * on (config.ts resolveSkipDuplicateFiles: the project's `skip_duplicate_files`
+     * setting, on by default, restricted by the host's `skipDuplicateFiles: false`).
+     * `file.name` is the name as STORED (the last segment of the storage path the
+     * host itself produced), `file.size` the byte count. A match means the member
+     * is neither uploaded nor indexed: the turn takes the stored copy's url and
+     * the chip says so. Null, a rejection or a missing hook all mean "upload as
+     * usual"; the engine's findDuplicateUpload is the ready-made implementation.
+     */
+    findDuplicateUpload?(file: {
+        name: string;
+        size: number;
+    }): Promise<{
+        storagePath: string;
+    } | null> | {
+        storagePath: string;
+    } | null;
     /** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
     storagePathFor(relPath: string): string;
     getMimeType(name: string): string | null;
@@ -5022,6 +5143,7 @@ type ProjectSettingsData = {
     upload_access_group?: unknown;
     chat_greeting?: unknown;
     web_access?: unknown;
+    skip_duplicate_files?: unknown;
     [key: string]: unknown;
 };
 /**
@@ -5034,18 +5156,42 @@ type ProjectSettingsData = {
  * database alone. Only the literal `true` turns it on: this record is public and
  * a client must never read a value it did not write as permission.
  *
- * Resolution order, applied by the engine where the chat request is built:
- *   1. the host's `webAccess` init/config option, when it is a boolean;
- *   2. this setting, when the project has set it;
- *   3. off.
- * Indexing requests are not governed by this: an indexing pass keeps the tools
- * it has today (see requests.ts notifyAgentSaveAttachment).
+ * Resolution, applied by the engine where the chat request is built (config.ts
+ * resolveWebAccess): THIS SETTING IS THE CEILING and the host may only restrict.
+ *   effective = projectSetting && hostOption !== false
+ * A host's `webAccess: false` turns a project that is on off for its own page;
+ * a host's `true` on a project that is off has no effect, because the owner's
+ * switch is the one that lets an answer out onto the web. Indexing requests are
+ * not governed by this: an indexing pass keeps the tools it has today (see
+ * requests.ts notifyAgentSaveAttachment).
  */
 declare const DEFAULT_WEB_ACCESS = false;
 /** Narrow a stored value to the switch: only `true` is on. */
 declare function normalizeWebAccess(value: any): boolean;
 /** The switch held in a settings-record `data`, false when unset. */
 declare function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * Whether an upload that is byte-for-byte the SAME FILE the signed-in user
+ * already has in this project (same name, same size, same uploader) is skipped:
+ * not uploaded again and not indexed again, with the chat turn using the stored
+ * copy. Same record, its own `skip_duplicate_files` key.
+ *
+ * ON BY DEFAULT: a second copy of a file costs a second indexing run, which is
+ * the single most expensive thing a project does, and answers from two copies
+ * of one document double every row. Only the literal `false` turns it off: this
+ * record is public and a client must never read a value it did not write.
+ *
+ * Resolution is the same ceiling rule as `web_access` (config.ts
+ * resolveSkipDuplicateFiles): effective = projectSetting && hostOption !== false.
+ * The host's `skipDuplicateFiles: false` lets its page re-upload duplicates on
+ * a project that skips them; a host's `true` on a project that turned it off has
+ * no effect.
+ */
+declare const DEFAULT_SKIP_DUPLICATE_FILES = true;
+/** Narrow a stored value to the switch: only the literal `false` is off. */
+declare function normalizeSkipDuplicateFiles(value: any): boolean;
+/** The switch held in a settings-record `data`, true when unset. */
+declare function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean;
 /**
  * Longest custom opening line the dashboard will store.
  *
@@ -5149,6 +5295,12 @@ declare function projectChatGreeting(service: string): string;
  */
 declare function projectWebAccess(service: string): boolean;
 /**
+ * Sync convenience: the project's skip-duplicates setting, true until the fetch
+ * settles or when the project never set it. The upload path prefers the
+ * awaiting form (config.ts resolveSkipDuplicateFiles).
+ */
+declare function projectSkipDuplicateFiles(service: string): boolean;
+/**
  * Adopt a value the caller just WROTE, so the settings page reflects its own
  * save without a re-fetch.
  *
@@ -5168,4 +5320,4 @@ declare function patchProjectSettings(service: string, patch: ProjectSettingsDat
  */
 declare function clearProjectSettings(service?: string): void;
 
-export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, type DisplayEntry, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_MAX_CANDIDATES, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

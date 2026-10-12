@@ -73,6 +73,13 @@ function normalizeWebAccess(value) {
 function webAccessFrom(data) {
   return data ? normalizeWebAccess(data.web_access) : DEFAULT_WEB_ACCESS;
 }
+var DEFAULT_SKIP_DUPLICATE_FILES = true;
+function normalizeSkipDuplicateFiles(value) {
+  return value !== false;
+}
+function skipDuplicateFilesFrom(data) {
+  return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
+}
 var CHAT_GREETING_MAX_LENGTH = 400;
 function normalizeChatGreeting(value) {
   if (typeof value !== "string") return "";
@@ -159,6 +166,9 @@ function projectChatGreeting(service) {
 function projectWebAccess(service) {
   return webAccessFrom(cachedProjectSettings(service));
 }
+function projectSkipDuplicateFiles(service) {
+  return skipDuplicateFilesFrom(cachedProjectSettings(service));
+}
 function setProjectSettings(service, data) {
   if (!service) return;
   cache.set(service, { data: data || null, settled: true, inflight: null });
@@ -238,16 +248,29 @@ function liveStreamingRealtimeEnabled() {
 function liveStreamingEnabled() {
   return _config?.liveStreaming === true;
 }
+function underCeiling(projectSetting, option, override) {
+  if (!projectSetting) return false;
+  if (option === false) return false;
+  if (override === false) return false;
+  return true;
+}
 function webAccessEnabled(service) {
   const opt = _config ? _config.webAccess : void 0;
-  if (typeof opt === "boolean") return opt;
-  return webAccessFrom(service ? cachedProjectSettings(service) : null);
+  return underCeiling(webAccessFrom(service ? cachedProjectSettings(service) : null), opt);
 }
-function resolveWebAccess(service) {
+function resolveWebAccess(service, override) {
   const opt = _config ? _config.webAccess : void 0;
-  if (typeof opt === "boolean") return Promise.resolve(opt);
-  if (!service) return Promise.resolve(false);
-  return loadProjectSettings(service).then(webAccessFrom, () => false);
+  if (!service) return Promise.resolve(underCeiling(webAccessFrom(null), opt, override));
+  return loadProjectSettings(service).then(webAccessFrom, () => false).then((setting) => underCeiling(setting, opt, override));
+}
+function skipDuplicateFilesEnabled(service) {
+  const opt = _config ? _config.skipDuplicateFiles : void 0;
+  return underCeiling(skipDuplicateFilesFrom(service ? cachedProjectSettings(service) : null), opt);
+}
+function resolveSkipDuplicateFiles(service) {
+  const opt = _config ? _config.skipDuplicateFiles : void 0;
+  if (!service) return Promise.resolve(underCeiling(skipDuplicateFilesFrom(null), opt));
+  return loadProjectSettings(service).then(skipDuplicateFilesFrom, () => skipDuplicateFilesFrom(null)).then((setting) => underCeiling(setting, opt));
 }
 function streamRecoveryEnabled() {
   if (!_config) return false;
@@ -261,6 +284,54 @@ function skapiSupportsStreaming(sk) {
 function pollOpt() {
   const p = _config?.poll;
   return p === void 0 ? {} : { poll: p };
+}
+
+// src/engine/duplicates.ts
+var DUPLICATE_LOOKUP_MAX_CANDIDATES = 25;
+var SRC_PREFIX = "src::";
+function isDuplicateCandidateId(uniqueId, name) {
+  if (typeof uniqueId !== "string" || !name) return false;
+  if (uniqueId.indexOf(SRC_PREFIX) !== 0) return false;
+  if (uniqueId === SRC_PREFIX + name) return true;
+  const tail = "/" + name;
+  return uniqueId.length > SRC_PREFIX.length + tail.length && uniqueId.slice(-tail.length) === tail;
+}
+function listOf(res) {
+  if (!res) return [];
+  if (Array.isArray(res)) return res;
+  return Array.isArray(res.list) ? res.list : [];
+}
+async function findDuplicateUpload(skapi, file, userId, opts) {
+  try {
+    if (!skapi || typeof skapi.getUniqueId !== "function" || typeof skapi.getRecords !== "function") return null;
+    const name = file && typeof file.name === "string" ? file.name : "";
+    const size = file && typeof file.size === "number" ? file.size : NaN;
+    if (!name || !(size >= 0) || !userId) return null;
+    const service = opts && opts.service ? { service: opts.service } : {};
+    const found = listOf(await skapi.getUniqueId(Object.assign({ unique_id: name, condition: "<=" }, service)));
+    const ids = [];
+    for (const item of found) {
+      const id = item && typeof item === "object" ? item.unique_id : item;
+      if (isDuplicateCandidateId(id, name) && ids.indexOf(id) === -1) ids.push(id);
+      if (ids.length >= DUPLICATE_LOOKUP_MAX_CANDIDATES) break;
+    }
+    for (const uniqueId of ids) {
+      let record = null;
+      try {
+        record = listOf(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
+      } catch {
+        continue;
+      }
+      if (!record || typeof record !== "object") continue;
+      const data = record.data && typeof record.data === "object" ? record.data : null;
+      if (!data || data.size_bytes !== size) continue;
+      if (record.user_id !== userId) continue;
+      return { storagePath: uniqueId.slice(SRC_PREFIX.length), uniqueId, record };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // src/engine/office.ts
@@ -675,6 +746,10 @@ function buildRenderMeta(attachment) {
 ` : "") + `- access group (use this for EVERY record you write for this file): ${indexingAccessGroup(attachment)}
 `;
 }
+var PAGE_TEXT_TABLE = "page_texts";
+var PAGE_TEXT_RULE = `PAGE TEXT for pages WITHOUT a text layer: for EVERY page whose label (its first label, when the page is split into strips) carries NO "Embedded text layer" block, ALSO post exactly ONE record in table "${PAGE_TEXT_TABLE}" with data {"page": <its document page number from the label, 1-based>, "page_text": "<the page's complete text exactly as printed, verbatim, in reading order, nothing summarised or left out>"}, reference "src::" + the storage path above, in addition to the records above. A page WITH an embedded text layer gets NO such record: its text is already stored.
+
+`;
 function buildRenderDatafy(placeholder) {
   return `
 ${placeholder}
@@ -685,7 +760,7 @@ Each image is preceded by a label giving its DOCUMENT PAGE number. That label is
 
 Transcribe COMPLETELY, not representatively. A table with twenty rows gets twenty records, not a sample of the first few - if a page has more rows than you can save comfortably, still save them all rather than summarising. Where a page carries an embedded text layer it is quoted above that page's image: it is the exact text and should be preferred over reading the pixels, with the image used for layout, tables, stamps and handwriting.
 
-Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
+` + PAGE_TEXT_RULE + `Save records for THIS window of pages only, then stop and report what you saved. Do NOT try to read the rest of the file and do NOT worry about the pages after this window: if any remain, the next window is rendered and sent to you automatically. Report only the pages you were actually shown - never imply you have seen the whole document.`;
 }
 function buildIndexingWindowMessage(attachment, placeholder, isContinuation, positionLabel) {
   const src = `src::${attachment.storagePath}`;
@@ -1227,7 +1302,7 @@ var RETRIEVAL_NOTE_PREFIX = "[Retrieval note, not shown to the user";
 var FILE_KEYS = ["path", "storage_path", "storagePath", "file", "file_path", "filePath"];
 var TABLE_KEYS = ["table_name", "tableName"];
 var GROUP_KEYS = ["access_group", "accessGroup"];
-var SRC_PREFIX = "src::";
+var SRC_PREFIX2 = "src::";
 var RESULT_WALK_MAX_NODES = 400;
 var RESULT_WALK_MAX_DEPTH = 5;
 function isWebToolName(name) {
@@ -1256,8 +1331,8 @@ function pushHit(list, path, page) {
 }
 function pathFromSrcId(value) {
   if (typeof value !== "string") return null;
-  if (value.indexOf(SRC_PREFIX) !== 0) return null;
-  var rest = value.slice(SRC_PREFIX.length).trim();
+  if (value.indexOf(SRC_PREFIX2) !== 0) return null;
+  var rest = value.slice(SRC_PREFIX2.length).trim();
   return rest ? rest : null;
 }
 function parseJsonLoose(value) {
@@ -2926,7 +3001,7 @@ async function callClaudeWithMcp({
   fileUrls,
   webAccess
 }) {
-  const web = typeof webAccess === "boolean" ? webAccess : await resolveWebAccess(service);
+  const web = await resolveWebAccess(service, typeof webAccess === "boolean" ? webAccess : void 0);
   const mcpServerDefinition = {
     type: "url",
     name: mcpServer.name,
@@ -8515,11 +8590,26 @@ var ChatSession = class {
     if (!total) return Promise.reject(new Error("Empty attachment"));
     var urls = [];
     var anyIndexFailed = false;
+    var reusedCount = 0;
+    att.reused = false;
     var chain = Promise.resolve();
+    var findDuplicate = function(member) {
+      if (typeof self.host.findDuplicateUpload !== "function") return Promise.resolve(null);
+      var storedName = String(member.storagePath || "").split("/").filter(Boolean).pop() || member.file.name;
+      return resolveSkipDuplicateFiles(id.projectId).then(function(on) {
+        if (!on) return null;
+        return Promise.resolve(self.host.findDuplicateUpload({ name: storedName, size: member.file.size })).then(function(hit) {
+          return hit && typeof hit.storagePath === "string" && hit.storagePath ? hit.storagePath : null;
+        });
+      }).catch(function() {
+        return null;
+      });
+    };
     members.forEach(function(member, idx) {
       chain = chain.then(function() {
         var hadExists = false;
         var skipped = false;
+        var duplicateOf = null;
         var existedBefore = false;
         var onProg = function(p) {
           if (p && p.total) {
@@ -8538,7 +8628,14 @@ var ChatSession = class {
             }
           });
         };
-        return doMemberUpload(true).catch(function(err) {
+        return findDuplicate(member).then(function(dup) {
+          if (dup) {
+            duplicateOf = dup;
+            console.log("[chat-engine] skipping an upload the user already has:", member.storagePath, "->", dup);
+            return;
+          }
+          return doMemberUpload(true);
+        }).catch(function(err) {
           var code = err && (err.code || err.body && err.body.code);
           var msg = err && (err.message || err.body && err.body.message || (typeof err === "string" ? err : ""));
           var isExists = code === "EXISTS" || msg && /exist/i.test(msg);
@@ -8558,9 +8655,20 @@ var ChatSession = class {
           });
         }).then(function() {
           if (skipped) return;
-          return self.host.getTemporaryUrl(member.storagePath);
+          return self.host.getTemporaryUrl(duplicateOf || member.storagePath);
         }).then(function(url) {
           if (skipped) return;
+          if (duplicateOf) {
+            urls.push({ name: member.relPath, url, storagePath: duplicateOf });
+            reusedCount += 1;
+            if (att.kind !== "folder") {
+              att.uploadedUrl = url;
+              att.storagePath = duplicateOf;
+              att.reused = true;
+            } else att.reusedCount = reusedCount;
+            self.host.renderAttachmentChips();
+            return;
+          }
           urls.push({ name: member.relPath, url, storagePath: member.storagePath });
           if (att.kind !== "folder") {
             att.uploadedUrl = url;
@@ -9201,8 +9309,10 @@ exports.DATA_TOOL_NAMES = DATA_TOOL_NAMES;
 exports.DEFAULT_CLAUDE_MODEL = DEFAULT_CLAUDE_MODEL;
 exports.DEFAULT_CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW;
 exports.DEFAULT_OPENAI_MODEL = DEFAULT_OPENAI_MODEL;
+exports.DEFAULT_SKIP_DUPLICATE_FILES = DEFAULT_SKIP_DUPLICATE_FILES;
 exports.DEFAULT_UPLOAD_ACCESS_GROUP = DEFAULT_UPLOAD_ACCESS_GROUP;
 exports.DEFAULT_WEB_ACCESS = DEFAULT_WEB_ACCESS;
+exports.DUPLICATE_LOOKUP_MAX_CANDIDATES = DUPLICATE_LOOKUP_MAX_CANDIDATES;
 exports.EMPTY_INDEXING_REPLY = EMPTY_INDEXING_REPLY;
 exports.EXPIRED_ATTACHMENT_URL_HOST = EXPIRED_ATTACHMENT_URL_HOST;
 exports.EXPIRED_ATTACHMENT_URL_ORIGIN = EXPIRED_ATTACHMENT_URL_ORIGIN;
@@ -9234,6 +9344,7 @@ exports.MIN_INPUT_TOKEN_BUDGET = MIN_INPUT_TOKEN_BUDGET;
 exports.MIN_PER_REQUEST_INPUT_CAP = MIN_PER_REQUEST_INPUT_CAP;
 exports.NO_DATA_TOOL_MARK = NO_DATA_TOOL_MARK;
 exports.OUTPUT_TOKEN_RESERVE = OUTPUT_TOKEN_RESERVE;
+exports.PAGE_TEXT_TABLE = PAGE_TEXT_TABLE;
 exports.POLL_INTERVAL = POLL_INTERVAL;
 exports.PRESIGN_SAFETY_MARGIN_MS = PRESIGN_SAFETY_MARGIN_MS;
 exports.PREVIEWABLE_IMAGE_CONTENT_TYPES = PREVIEWABLE_IMAGE_CONTENT_TYPES;
@@ -9322,6 +9433,7 @@ exports.fetchLiveIndexingKeys = fetchLiveIndexingKeys;
 exports.fillHistoryViewport = fillHistoryViewport;
 exports.filterListByClearHorizon = filterListByClearHorizon;
 exports.findAttachmentParser = findAttachmentParser;
+exports.findDuplicateUpload = findDuplicateUpload;
 exports.formatChatTimestamp = formatChatTimestamp;
 exports.formatDuration = formatDuration;
 exports.formatRetrievalNote = formatRetrievalNote;
@@ -9346,6 +9458,7 @@ exports.isAuthExpiredError = isAuthExpiredError;
 exports.isBgIndexingQueue = isBgIndexingQueue;
 exports.isCsrStatusEnvelope = isCsrStatusEnvelope;
 exports.isDataToolName = isDataToolName;
+exports.isDuplicateCandidateId = isDuplicateCandidateId;
 exports.isErrorResponseBody = isErrorResponseBody;
 exports.isHttpUrlLike = isHttpUrlLike;
 exports.isImageVisionFile = isImageVisionFile;
@@ -9379,6 +9492,7 @@ exports.normalizeAttachmentPathCandidate = normalizeAttachmentPathCandidate;
 exports.normalizeChatGreeting = normalizeChatGreeting;
 exports.normalizeExt = normalizeExt;
 exports.normalizeProjectAccessSetting = normalizeProjectAccessSetting;
+exports.normalizeSkipDuplicateFiles = normalizeSkipDuplicateFiles;
 exports.normalizeTextContent = normalizeTextContent;
 exports.normalizeTrailingInlineToken = normalizeTrailingInlineToken;
 exports.normalizeUploadAccessGroup = normalizeUploadAccessGroup;
@@ -9401,6 +9515,7 @@ exports.projectAccessSetting = projectAccessSetting;
 exports.projectAsksUploadAccess = projectAsksUploadAccess;
 exports.projectChatGreeting = projectChatGreeting;
 exports.projectSettingsSettled = projectSettingsSettled;
+exports.projectSkipDuplicateFiles = projectSkipDuplicateFiles;
 exports.projectUploadAccessGroup = projectUploadAccessGroup;
 exports.projectWebAccess = projectWebAccess;
 exports.providerBodyWasRead = providerBodyWasRead;
@@ -9412,6 +9527,7 @@ exports.renderInlineLinkHtml = renderInlineLinkHtml;
 exports.repairUrlEntities = repairUrlEntities;
 exports.repairUrlWhitespace = repairUrlWhitespace;
 exports.resolveImagePreviewUrl = resolveImagePreviewUrl;
+exports.resolveSkipDuplicateFiles = resolveSkipDuplicateFiles;
 exports.resolveWebAccess = resolveWebAccess;
 exports.retrievalNoteFromText = retrievalNoteFromText;
 exports.retrievalNoteOfAnswer = retrievalNoteOfAnswer;
@@ -9422,6 +9538,8 @@ exports.setProjectContextWindow = setProjectContextWindow;
 exports.setProjectSettings = setProjectSettings;
 exports.shouldRescueInFlightMessage = shouldRescueInFlightMessage;
 exports.skapiSupportsStreaming = skapiSupportsStreaming;
+exports.skipDuplicateFilesEnabled = skipDuplicateFilesEnabled;
+exports.skipDuplicateFilesFrom = skipDuplicateFilesFrom;
 exports.streamRecoveryEnabled = streamRecoveryEnabled;
 exports.streamRecoveryLabels = streamRecoveryLabels;
 exports.streamRecoveryPhase = streamRecoveryPhase;

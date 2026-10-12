@@ -15,6 +15,7 @@ export {
 	buildIndexingRenderContinueTemplate,
 	buildIndexingWindowMessage,
 	RENDER_FROM_TOKEN,
+	PAGE_TEXT_TABLE,
 	type IndexingAttachmentInfo,
 	type BuildIndexingUserMessageOptions,
 } from './indexing_user_message';

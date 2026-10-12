@@ -52,10 +52,13 @@ import {
     configureProjectSettings,
     primeProjectSettings,
     readyProjectSettings,
-    // The chat's web switch as the engine resolves it (init option, then the
-    // project's `web_access` setting, then off), so the prompt tells the model
-    // exactly the tool list the request carries.
+    // The chat's web switch as the engine resolves it (the project's `web_access`
+    // setting is the ceiling, the init option may only restrict), so the prompt
+    // tells the model exactly the tool list the request carries.
     webAccessEnabled,
+    // "Already uploaded by this user?" for the skip-duplicates switch: the engine
+    // asks the host, and this is the ready-made answer over the src:: records.
+    findDuplicateUpload,
     normalizeUploadAccessGroup,
     projectAsksUploadAccess,
     projectUploadAccessGroup,
@@ -2002,6 +2005,13 @@ import {
             });
         },
         uploadAccessGroup: function (path) { return resolveUploadAccessGroup(path); },
+        // "Already uploaded by this user?" from the src:: file records. The engine
+        // asks only while the skip-duplicates switch is on; null means upload.
+        findDuplicateUpload: function (file) {
+            var uid = S.user && S.user.user_id;
+            if (!uid) return Promise.resolve(null);
+            return findDuplicateUpload(S.skapi, file, uid, { service: S.projectId });
+        },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
         promptOverwrite: function (filename) { return promptOverwrite(filename); },
@@ -3260,6 +3270,9 @@ import {
                 : finalizing ? "Finalizing"
                 : att.status === "uploading" ? att.progress + "%"
                 : isFolder ? "(" + (att.files ? att.files.length : 0) + ")"
+                // A file the user already had here: nothing was uploaded or
+                // indexed, the message uses the stored copy (skipDuplicateFiles).
+                : att.reused ? "already uploaded"
                 : formatBytes(att.file ? att.file.size : att.size);
             chip.appendChild(h("span", { class: "bq-attachment-meta", text: meta }));
             if (clickable) chip.appendChild(h("span", { class: "bq-attachment-arrow", text: "↗" }));
@@ -5640,6 +5653,15 @@ import {
             // true/false pins it for this page, both ways. Read at
             // configureChatEngine time and when each chat request is built.
             webAccess: null,
+            // Whether a chat attachment the signed-in user ALREADY uploaded to this
+            // project (same file name, same size, same uploader) is skipped: not
+            // uploaded again, not indexed again, the message using the stored
+            // copy. null = follow the project's own "Skip duplicate files" setting
+            // (`skip_duplicate_files` in the bq::settings record), which is ON
+            // unless the owner turned it off. The project setting is the ceiling:
+            // false here restricts below it for this page, true has no effect on
+            // a project that turned it off.
+            skipDuplicateFiles: null,
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
             windowedIndexing: true,
@@ -5771,6 +5793,9 @@ import {
             // chat request (off unless the owner turned it on). Passing the null
             // default through would read as a decision.
             webAccess: typeof S.opts.webAccess === "boolean" ? S.opts.webAccess : undefined,
+            // Skip duplicate uploads. Same hand-over rule: only a pinned boolean is
+            // passed, and the project's setting is the ceiling the engine applies.
+            skipDuplicateFiles: typeof S.opts.skipDuplicateFiles === "boolean" ? S.opts.skipDuplicateFiles : undefined,
             // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
             // On by default since every region's polling worker relays the
             // response bytes. It used to be off for the shipping-order reason

@@ -96,6 +96,7 @@ export type ProjectSettingsData = {
 	upload_access_group?: unknown;
 	chat_greeting?: unknown;
 	web_access?: unknown;
+	skip_duplicate_files?: unknown;
 	[key: string]: unknown;
 };
 
@@ -109,12 +110,14 @@ export type ProjectSettingsData = {
  * database alone. Only the literal `true` turns it on: this record is public and
  * a client must never read a value it did not write as permission.
  *
- * Resolution order, applied by the engine where the chat request is built:
- *   1. the host's `webAccess` init/config option, when it is a boolean;
- *   2. this setting, when the project has set it;
- *   3. off.
- * Indexing requests are not governed by this: an indexing pass keeps the tools
- * it has today (see requests.ts notifyAgentSaveAttachment).
+ * Resolution, applied by the engine where the chat request is built (config.ts
+ * resolveWebAccess): THIS SETTING IS THE CEILING and the host may only restrict.
+ *   effective = projectSetting && hostOption !== false
+ * A host's `webAccess: false` turns a project that is on off for its own page;
+ * a host's `true` on a project that is off has no effect, because the owner's
+ * switch is the one that lets an answer out onto the web. Indexing requests are
+ * not governed by this: an indexing pass keeps the tools it has today (see
+ * requests.ts notifyAgentSaveAttachment).
  */
 export const DEFAULT_WEB_ACCESS = false;
 
@@ -126,6 +129,35 @@ export function normalizeWebAccess(value: any): boolean {
 /** The switch held in a settings-record `data`, false when unset. */
 export function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean {
 	return data ? normalizeWebAccess(data.web_access) : DEFAULT_WEB_ACCESS;
+}
+
+/**
+ * Whether an upload that is byte-for-byte the SAME FILE the signed-in user
+ * already has in this project (same name, same size, same uploader) is skipped:
+ * not uploaded again and not indexed again, with the chat turn using the stored
+ * copy. Same record, its own `skip_duplicate_files` key.
+ *
+ * ON BY DEFAULT: a second copy of a file costs a second indexing run, which is
+ * the single most expensive thing a project does, and answers from two copies
+ * of one document double every row. Only the literal `false` turns it off: this
+ * record is public and a client must never read a value it did not write.
+ *
+ * Resolution is the same ceiling rule as `web_access` (config.ts
+ * resolveSkipDuplicateFiles): effective = projectSetting && hostOption !== false.
+ * The host's `skipDuplicateFiles: false` lets its page re-upload duplicates on
+ * a project that skips them; a host's `true` on a project that turned it off has
+ * no effect.
+ */
+export const DEFAULT_SKIP_DUPLICATE_FILES = true;
+
+/** Narrow a stored value to the switch: only the literal `false` is off. */
+export function normalizeSkipDuplicateFiles(value: any): boolean {
+	return value !== false;
+}
+
+/** The switch held in a settings-record `data`, true when unset. */
+export function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean {
+	return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
 }
 
 /**
@@ -352,6 +384,15 @@ export function projectChatGreeting(service: string): string {
  */
 export function projectWebAccess(service: string): boolean {
 	return webAccessFrom(cachedProjectSettings(service));
+}
+
+/**
+ * Sync convenience: the project's skip-duplicates setting, true until the fetch
+ * settles or when the project never set it. The upload path prefers the
+ * awaiting form (config.ts resolveSkipDuplicateFiles).
+ */
+export function projectSkipDuplicateFiles(service: string): boolean {
+	return skipDuplicateFilesFrom(cachedProjectSettings(service));
 }
 
 /**
