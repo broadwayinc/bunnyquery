@@ -24,6 +24,20 @@ A few notes on how to read this:
 
 ---
 
+## Unreleased (2026-10-19)
+
+New default models.
+
+### Engine
+
+- A project that never picked a model now uses **Claude Haiku 5.5** on Claude and
+  **GPT-6 Luna** on OpenAI (`DEFAULT_CLAUDE_MODEL` / `DEFAULT_OPENAI_MODEL`; the widget
+  carries the same two values). Until now the defaults were Claude Sonnet 5.5 and
+  GPT-6.1 Sol. A model a project saved is kept.
+- `budget.ts` gains an exact row for `claude-haiku-5-5` (1,000,000 context, 128,000
+  output, the catalogue's numbers), so a widget host that never loads the model
+  catalogue does not fall to the 200,000 / 64,000 `claude-haiku` family row.
+
 ## Unreleased (2026-09-30)
 
 The reply a user is waiting on can be cancelled, in both chatboxes.

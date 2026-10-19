@@ -2283,8 +2283,8 @@ interface SseParser {
 declare function createSseParser(): SseParser;
 
 declare const MCP_NAME = "BunnyQuery";
-declare const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5";
-declare const DEFAULT_OPENAI_MODEL = "gpt-6.1-sol";
+declare const DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+declare const DEFAULT_OPENAI_MODEL = "gpt-6-luna";
 /**
  * THE two `stream` flags of a streamed chat turn, produced together or not at all.
  *

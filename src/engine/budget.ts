@@ -24,7 +24,7 @@ export var CONTEXT_WINDOW_DEFAULT: Record<string, number> = { claude: 200000, op
 export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 	// claude, exact ids
 	'claude-fable-5-1': 1000000, 'claude-opus-5-5': 1000000,
-	'claude-sonnet-5-5': 1000000,
+	'claude-sonnet-5-5': 1000000, 'claude-haiku-5-5': 1000000,
 	'claude-fable-5': 1000000, 'claude-opus-5': 1000000,
 	'claude-opus-4-8': 1000000, 'claude-opus-4-7': 1000000,
 	'claude-opus-4-6': 1000000, 'claude-opus-4-5': 200000,
@@ -73,7 +73,7 @@ export var CONTEXT_WINDOW_BY_MODEL: Record<string, number> = {
 export var MAX_OUTPUT_BY_MODEL: Record<string, number> = {
 	// claude
 	'claude-fable-5-1': 128000, 'claude-opus-5-5': 128000,
-	'claude-sonnet-5-5': 128000,
+	'claude-sonnet-5-5': 128000, 'claude-haiku-5-5': 128000,
 	'claude-fable-5': 128000, 'claude-opus-5': 128000,
 	'claude-opus-4-8': 128000, 'claude-sonnet-5': 128000,
 	'claude-sonnet-4-6': 64000, 'claude-haiku-4-5': 64000,

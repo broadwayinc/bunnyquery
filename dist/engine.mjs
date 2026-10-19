@@ -1516,6 +1516,7 @@ var CONTEXT_WINDOW_BY_MODEL = {
   "claude-fable-5-1": 1e6,
   "claude-opus-5-5": 1e6,
   "claude-sonnet-5-5": 1e6,
+  "claude-haiku-5-5": 1e6,
   "claude-fable-5": 1e6,
   "claude-opus-5": 1e6,
   "claude-opus-4-8": 1e6,
@@ -1561,6 +1562,7 @@ var MAX_OUTPUT_BY_MODEL = {
   "claude-fable-5-1": 128e3,
   "claude-opus-5-5": 128e3,
   "claude-sonnet-5-5": 128e3,
+  "claude-haiku-5-5": 128e3,
   "claude-fable-5": 128e3,
   "claude-opus-5": 128e3,
   "claude-opus-4-8": 128e3,
@@ -2796,8 +2798,8 @@ var webToolsForChat = (platform, webAccess) => {
   return [openaiWebSearchTool()] ;
 };
 var MCP_NAME = "BunnyQuery";
-var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5";
-var DEFAULT_OPENAI_MODEL = "gpt-6.1-sol";
+var DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+var DEFAULT_OPENAI_MODEL = "gpt-6-luna";
 var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
 function withMcpParams(base, params) {
   if (!base) return base;

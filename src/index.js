@@ -177,9 +177,9 @@ import {
     var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
 
     var MAX_TOKENS = 25000;
-    // Same defaults as the engine (requests.ts), owner's choice 2026-10-12.
-    var DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5";
-    var DEFAULT_OPENAI_MODEL = "gpt-6.1-sol";
+    // Same defaults as the engine (requests.ts), owner's choice 2026-10-19.
+    var DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+    var DEFAULT_OPENAI_MODEL = "gpt-6-luna";
 
     var BG_INDEXING_QUEUE_SUFFIX = "-bg";
 
