@@ -24,6 +24,15 @@ A few notes on how to read this:
 
 ---
 
+## Unreleased (2026-10-21)
+
+### Widget
+
+- The **"Fetching history..."** strip at the top of the chat is translucent: the band
+  behind the words is the page colour at 78% and fades to clear below, so the newest rows
+  keep showing through while older history loads. The dashboard's chat page got the same
+  change on the same day.
+
 ## Unreleased (2026-10-19)
 
 New default models.

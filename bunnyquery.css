@@ -679,7 +679,9 @@
     padding: 0.5rem 0 1rem;
     font-size: 0.8rem;
     color: var(--bq-muted);
-    background: linear-gradient(to bottom, var(--bq-paper) 70%, transparent);
+    /* a translucent band, not a solid one: the newest rows keep showing through
+       while the strip is up (mirrors agent.vue, 2026-10-21) */
+    background: linear-gradient(to bottom, color-mix(in srgb, var(--bq-paper) 78%, transparent) 70%, transparent);
 }
 /* initial first-page load: center it in the (empty) messages area. A full-box
    overlay rather than a top strip, so it takes its height back - and it replaces
