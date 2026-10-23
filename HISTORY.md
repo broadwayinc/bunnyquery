@@ -5,26 +5,41 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The latest version on npm is **1.9.10**. Version
-  **1.10.0** is built in the source tree but not yet published, and is marked as
-  such. (1.6.3 and 1.6.4 were never published on their own; their changes reached
-  npm inside 1.7.0. 1.8.7, 1.9.2 and 1.9.12 are source bumps that never reached
-  npm either.)
+- **Published vs built.** The source tree is at **1.15.6**, a documentation-only release
+  (this file and the README; no code change). The latest version on npm when this was
+  written is 1.15.5 (2026-10-21). Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+  and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
+  1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
   their own entries here, so their changes are not itemized below. Two features
   landed in that window and are documented only in the README: the widget's
   `allowAnonymous` option, and the expanded extractable-document set.
-- **Missing patch numbers.** A few versions on npm (1.2.1 most notably) are
-  republishes with no distinct source commit behind them, so they have no entry
-  here. Version 1.6.1 is the reverse case: it has commits but was never
-  published on its own, and its changes reached npm inside 1.6.2.
-- Both chat clients (this widget and `agent.vue` on www.bunnyquery.com) consume
-  the same engine, so an engine fix only reaches www.bunnyquery.com once the
-  package is republished.
+- **Republishes.** A few versions on npm are republishes with no source change behind
+  them: 1.2.1, 1.10.5 and 1.10.11. They are listed below with a line saying so.
+- **Moved entries.** Three early entries were filed one version too early when first
+  written and now sit where the work shipped: the office-extraction work of 2026-06-23
+  (shipped inside 1.3.0, not 1.2.3), paged `readFileContent` indexing (1.5.7, not 1.5.6)
+  and vision indexing for PDFs (1.6.0, not 1.5.7). Dates are the npm publish dates, UTC.
+- Both chat clients (this widget and `agent.vue` on bunnyquery.com) consume the same
+  engine, so an engine fix only reaches bunnyquery.com once the package is republished
+  and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
 
-## Unreleased (2026-10-21)
+## 1.15.6 (2026-10-23)
+
+Documentation only; the widget and the engine are byte-for-byte 1.15.5.
+
+- README rewritten for the current code base: the 1.15 init options and their ceiling rule,
+  live replies and websocket delivery, grounded answers with citations, duplicate skipping,
+  text-first PDFs with parallel lanes and stored page text, spreadsheet rows stored by the
+  server, the web-off default for plain links, the engine's citation, stop-waiting and
+  duplicate helpers, and the default models (Claude Haiku 5.5, GPT-6 Luna).
+- HISTORY.md rebuilt from the npm publish dates and the version-bump commits: every
+  "Unreleased" block filed under the version that shipped it, entries added for 1.10.1 to
+  1.15.2, three early entries moved to where their work shipped, two dates corrected.
+
+## 1.15.5 (2026-10-21, published)
 
 ### Widget
 
@@ -33,9 +48,9 @@ A few notes on how to read this:
   keep showing through while older history loads. The dashboard's chat page got the same
   change on the same day.
 
-## Unreleased (2026-10-19)
+## 1.15.4 (2026-10-19, published)
 
-New default models.
+New default models. 1.15.3 was skipped: the source went from 1.15.2 straight to 1.15.4.
 
 ### Engine
 
@@ -47,7 +62,102 @@ New default models.
   output, the catalogue's numbers), so a widget host that never loads the model
   catalogue does not fall to the 200,000 / 64,000 `claude-haiku` family row.
 
-## Unreleased (2026-09-30)
+### Repo
+
+- The `tests/` folder and the `npm test` script were removed from the repository on
+  2026-10-16. The package's `files` list never included them, so nothing published changed.
+
+## 1.15.2 (2026-10-12, published)
+
+### Engine
+
+- `ChatSession` keeps a derived index of the background task queue, so `hasLiveIndexRun`
+  and `claimIndexRun` answer from a map instead of scanning every queued entry. With
+  thousands of files queued at once (a bulk upload) the cost of each dispatch stays flat.
+
+## 1.15.1 (2026-10-12, published)
+
+Duplicate attachments are skipped, and scanned pages get their text stored once.
+
+### Engine
+
+- New `skipDuplicateFiles` config key and `duplicates.ts` (`findDuplicateUpload`,
+  `isDuplicateCandidateId`). A chat attachment the signed-in user already uploaded to the
+  project (same stored name, same size in bytes, same uploader, found from the file's
+  `src::` record) is neither uploaded nor indexed again; the turn uses the stored copy's
+  url. The project's `skip_duplicate_files` setting (`bq::settings`, on unless the owner
+  turned it off) is the ceiling; a host can only restrict below it. A failed lookup never
+  blocks an upload.
+- Indexing user message: the page-text rule for scanned pages. A page without a text layer
+  gets one record from the model's own pass naming the page and carrying its text, which the
+  server stores once as that page's verbatim text; a page with a text layer is stored
+  server-side before the model is called.
+
+### Widget
+
+- `skipDuplicateFiles` init option (`null` follows the project). A reused attachment's chip
+  reads "already uploaded".
+
+## 1.15.0 (2026-10-12, published)
+
+### Engine
+
+- Default models moved to **Claude Sonnet 5.5** and **GPT-6.1 Sol** (`DEFAULT_CLAUDE_MODEL`
+  / `DEFAULT_OPENAI_MODEL`, mirrored in the widget). `budget.ts` gains `gpt-6.1-sol` and a
+  `gpt-6.1` family row at the gpt-6 figures. Superseded by 1.15.4 on 2026-10-19.
+- 1.15.0-beta.0 was a source bump only and never reached npm.
+
+## 1.14.0 (2026-10-12, published)
+
+The accuracy release of the reliability plan: answers grounded in documents and cited, with
+the web off unless a project turns it on.
+
+### Engine
+
+- **Retrieval memory** (`retrieval_memory.ts`): the engine keeps a note of what each answer
+  read (tool names, files, pages) and carries recent notes into the next request under a
+  token budget (`applyRetrievalNotes`), so a follow-up question does not start from zero.
+- **Citations** (`citations.ts`): `citationsFor`, `citationLinkPart`, `retrievalNoteOfAnswer`
+  and `answerUsedNoDataTool` turn a reply's note into file-and-page citations, and tell a
+  reply that read no data apart from one that did.
+- **Web access switch.** New `webAccess` config key, resolved against the project's
+  `web_access` setting (`bq::settings`, off by default). Claude's `web_fetch` and OpenAI's
+  `web_search` are attached to a chat turn only when the resolved value is true, and the
+  system prompt says which case applies. `webAccessEnabled` / `resolveWebAccess` exported.
+- **Document rules** in the chat system prompt: for a question about an uploaded file, find
+  the file first (`getFileOutline`, `searchText`), read it instead of guessing from record
+  summaries, and say so when the data does not hold the answer.
+- A chat turn asks the MCP server for its `chat` tool profile (`?profile=chat`): the data
+  tools only, instead of the full list, on every model step.
+
+### Widget
+
+- `liveStreaming` is **on by default**. New `webAccess` init option (`null` follows the
+  project).
+- Citation chips (`.bq-citations`) under an answer, and the no-source mark when nothing was
+  read.
+- 1.14.0-beta.0 was a source bump only and never reached npm.
+
+## 1.13.0 (2026-10-06, published)
+
+### Engine
+
+- Three **grounding rules** in the chat system prompt, right after "Knowledge lookup": answer
+  only from the data (a tool result in this conversation, an attached file, the project
+  description, what the user said); when the data does not have it, say so and say what was
+  searched; keep what the data says apart from what was worked out from it.
+- A reply's timestamp is the moment skapi received the response (`responded`, the row's
+  `rtmp`), on a history load and on a live settle alike, instead of the browser's poll clock
+  or an `updated` value that csr-finalize rewrites.
+- `skapi-js` is no longer a dependency of the package: the SDK is host-injected through
+  `configureChatEngine` and never bundled. Source maps ship beside `dist/engine.*`.
+
+### Widget
+
+- The Stop dialog of an indexing row offers "Also stop the N other files being indexed", so
+  one confirmation ends every file in flight.
+
+## 1.12.1 (2026-10-01, published)
 
 The reply a user is waiting on can be cancelled, in both chatboxes.
 
@@ -79,7 +189,26 @@ The reply a user is waiting on can be cancelled, in both chatboxes.
   holds still. Applies to the "Thinking" bubble and the drafting bubble in both
   chatboxes; loaders that trail a label are unchanged.
 
-## Unreleased (2026-09-18)
+### Also in 1.12.1
+
+- `isRetriedFailure` (`errors.ts`): an error the worker went on to retry is marked
+  `isRetried` on its bubble, styled apart from a real failure, and skipped when a file's
+  status is read, so a retried pass no longer paints the row red.
+- `cancelIndexingGroup` sweeps the file's worker-queued windows at once
+  (`_sweepCancelledIndexing`), which matters now that a document's windows run in several
+  lanes and settle out of order.
+- 1.12.0 was the source bump of the cancel work and never reached npm; 1.12.1 is what shipped.
+
+## 1.11.1 (2026-09-29, published)
+
+### Engine
+
+- `budget.ts` gains rows for Claude Sonnet 5.5, Opus 5.5 and Fable 5.1, for `gpt-6-astra`,
+  `gpt-6-sol` and `gpt-6-luna`, and a `gpt-6` family key. Without them the three GPT-6
+  models fell to OpenAI's 128,000-token platform default: a 28,000-token chat input budget
+  and 10,000-character MCP pages instead of 136,160 and 60,000.
+
+## 1.11.0 (2026-09-20, published)
 
 The engine and the widget move to skapi-js's `forwardRequest` family, which replaces the
 `clientSecretRequest` family. Nothing an existing host does changes.
@@ -106,7 +235,95 @@ The engine and the widget move to skapi-js's `forwardRequest` family, which repl
 - The chat transport, the queued-send cancel and the Google sign-in code exchange all go through
   that one decision.
 
-## 1.10.0 (2026-09-04, unpublished)
+## 1.10.12 (2026-09-11, published)
+
+### Widget
+
+- A small style cleanup in `styles/chat.css`.
+
+## 1.10.11 (2026-09-10, published)
+
+A republish of 1.10.10 with no source change.
+
+## 1.10.10 (2026-09-10, published)
+
+The bump commit is titled 1.10.9, but the version went from 1.10.8 straight to 1.10.10, so
+1.10.9 does not exist.
+
+### Engine
+
+- A live indexing pass records its duration the moment it settles (`_stampPassDuration`),
+  not only when it is read back from history. `BgTaskEntry.poll` takes an `onResponse`
+  callback that receives the response and its meta.
+
+## 1.10.8 (2026-09-09, published)
+
+### Engine
+
+- A failed pass also reports how long it ran (`_tsStart` is set on failed passes by the
+  history mapper).
+
+## 1.10.7 (2026-09-09, published)
+
+### Engine
+
+- Indexing pass duration: `ChatMessage._tsStart`, `formatDuration` in `time.ts`, and the
+  duration appended to an indexing response bubble.
+
+## 1.10.6 (2026-09-09, published)
+
+### Engine
+
+- `_hasLiveIndexEvidence` counts a pass settled within `RECENT_INDEX_PASS_EVIDENCE_MS` as
+  evidence that indexing is live, so a chat with no local dispatch of its own still sees it.
+
+## 1.10.5 (2026-09-09, published)
+
+A republish of 1.10.4 with no source change.
+
+## 1.10.4 (2026-09-09, published)
+
+### Engine
+
+- Custom chat greeting per project: `greeting.ts` and the `chat_greeting` key of the
+  project's `bq::settings` record (`project_settings.ts`). A custom greeting replaces the
+  default one, project name included; the default is unchanged when none is set.
+
+### Widget
+
+- Shows the project's greeting; small `widget.css` and `chat.css` adjustments.
+
+## 1.10.3 (2026-09-08, published)
+
+### Widget
+
+- Link text-decoration styles in `widget.css`.
+
+## 1.10.2 (2026-09-07, published)
+
+### Engine
+
+- `link_markup.ts` renders a link's glyph and label as separate HTML so each can be styled,
+  with the matching rules in `chat.css`. The widget's file-download anchor uses the same
+  glyph.
+
+## 1.10.1 (2026-09-06, published)
+
+### Engine
+
+- Indexing groups show only the **newest** run of a file once older runs have settled; a
+  superseded run is hidden while an active one stays visible.
+- The `run::` record's terminal verdict is laid over a loaded group
+  (`overlayRunRecordVerdict`). A run the worker ended (three failed retries, a stale grant,
+  a cap-out) used to read "Indexed" off its last settled pass, and the files page painted
+  the badge green over the record's "error"; the record's error, cancelled or done now wins
+  when it describes this run. Visible work and a live queue hit still win over the record.
+- Indexing prompts: the TABULAR rule yields when the message says the server has already
+  saved the spreadsheet rows; every record saved from a window carries the window's `win::`
+  tag, so the worker can remove exactly that window's records before re-sending it; the
+  e-mail rules are tightened.
+
+## 1.10.0 (2026-09-04, published)
 
 Email (`.eml`) is read, windowed and indexed like any other document.
 
@@ -571,13 +788,8 @@ identity already pointed at project B.
 
 ## 1.6.0 (2026-07-16, published)
 
-Version bump only, republishing 1.5.7's engine.
-
----
-
-## 1.5.7 (2026-07-16)
-
-Vision indexing for PDFs, and resume across passes.
+Vision indexing for PDFs, and resume across passes. (Filed under 1.5.7 when first written;
+the work is commit f9a53b9 of 2026-07-16 and shipped as 1.6.0.)
 
 - **`isImageVisionFile`** and the `_skapi_render` directive. PDF content is
   visual and must be delivered as **image blocks in the message**, because
@@ -602,7 +814,7 @@ Vision indexing for PDFs, and resume across passes.
 
 ---
 
-## 1.5.6 (2026-07-13)
+## 1.5.7 (2026-07-13, published)
 
 - **`isPagedReadFile`**: spreadsheets and PDFs are indexed by **paging through
   the `readFileContent` tool** rather than a capped inline dump or a web_fetch
@@ -613,7 +825,15 @@ Vision indexing for PDFs, and resume across passes.
 
 ---
 
-## 1.5.5 (2026-07-13)
+## 1.5.6 (2026-07-13, published)
+
+- Indexing system prompt: the BIG or SCANNED files rule (the inline content may be only
+  the first part of a large file) and the VISION rule (read the images a `readFileContent`
+  window or an inline attachment carries: scanned PDF pages, embedded photos).
+
+---
+
+## 1.5.5 (2026-07-09, published)
 
 - Over-cap attachment adds are **truncated and reported informationally**
   instead of blocking the composer. The notice says how many files were left
@@ -718,7 +938,7 @@ Version bump only.
 
 ---
 
-## 1.4.5 (2026-07-01)
+## 1.4.5 (2026-06-30, published)
 
 The rAF typewriter, and the end of the stranded "Thinking..." bubbles.
 
@@ -937,9 +1157,10 @@ with a tsup build producing two outputs.
 
 ---
 
-## 1.2.3 (2026-06-23)
+## 2026-06-23 (no version bump; shipped inside 1.3.0)
 
-Server-side office extraction, and the overwrite prompt.
+Server-side office extraction, and the overwrite prompt. Commit 7fb6a6b, the day before
+1.3.0; filed under 1.2.3 when first written.
 
 - **`_skapi_extract`**: office documents (`.docx`, `.xlsx`, `.pptx`, `.hwpx`)
   cannot be read by web_fetch because they are binary zips, so the proxy worker
@@ -971,6 +1192,13 @@ Server-side office extraction, and the overwrite prompt.
   await the shared in-flight fetch and then fire `anchor.click()`, opening the
   file in several tabs at once when it resolved. The chip shows a busy cursor
   while it works.
+
+---
+
+## 1.2.3 (2026-06-12, published)
+
+- The "Indexing: <file>" label carries the file's MIME type and size when they are known
+  (commit 395280f, "mime fix", in the single-file widget of the time).
 
 ---
 

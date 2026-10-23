@@ -5,19 +5,30 @@ projects. Drop it into any web page and your users get a full chat experience:
 account login/signup, conversation history, file & folder uploads, and a settings
 panel, all talking to your project's **BunnyQuery** AI agent.
 
-BunnyQuery is a standalone vanilla-JS port of the BunnyQuery (www.bunnyquery.com) agent
-chatbox. The **widget** ships as a single IIFE that exposes `window.BunnyQuery` plus one
+BunnyQuery is a standalone vanilla-JS port of the [bunnyquery.com](https://www.bunnyquery.com)
+dashboard chat. The **widget** ships as a single IIFE that exposes `window.BunnyQuery` plus one
 stylesheet. Drop it in via `<script>`, no build step or framework required.
 
 The package also exports the **framework-agnostic chat engine** that powers it
-(`bunnyquery/engine`), the same DOM-free core the Skapi admin chatbox consumes, so
+(`bunnyquery/engine`), the same DOM-free core the bunnyquery.com dashboard chat consumes, so
 you can build your own chat UI on top of it. See
 [Importing the chat engine](#importing-the-chat-engine).
+
+**Current release: 1.15.6** on [npm](https://www.npmjs.com/package/bunnyquery). The
+release-by-release changelog is [HISTORY.md](HISTORY.md).
 
 ## Features
 
 - **AI chat** against your project's configured agent (Claude or OpenAI under the
-  hood), with animated pending indicators and a background indexing queue.
+  hood), with animated pending indicators and a background indexing queue. A project
+  that never picked a model runs on Claude Haiku 5.5 or GPT-6 Luna.
+- **Live replies**: the answer is painted into its bubble as the model writes it, on
+  by default. A host that owns its skapi instance can also have each piece delivered
+  over skapi's websocket the moment it is relayed (`liveStreamingRealtime`).
+- **Grounded answers**: the agent answers only from the project's data, says so when
+  the data does not have it, and names the file and page an answer came from as
+  citation chips under the reply. The open web is off unless the project's owner
+  turns it on (`webAccess`).
 - **Authentication**: email/password login, optional signup, password change,
   email verification, account recovery, and "Sign in with Google".
 - **Conversation history**: paginated, with "Fetching history…" indicators on
@@ -26,14 +37,18 @@ you can build your own chat UI on top of it. See
   (uploading / failed / indexed), overflow collapsing for large batches, and a
   prompt when an upload hits a file that already exists (skip / reindex only /
   overwrite, with "apply to all remaining"). Images are read with vision/OCR,
-  large documents and spreadsheets are read window by window, PDFs are rendered
-  to page images, emails are read as their headers, body and attachment text,
-  and everything else extractable is inlined as text. See
+  large documents are read window by window in parallel lanes, spreadsheet rows
+  are stored by the server directly, PDF pages are read as text where they have
+  a text layer and rendered to page images where they do not, emails are read as
+  their headers, body and attachment text, and everything else extractable is
+  inlined as text. A file the signed-in user already uploaded (same name, same
+  size) is not uploaded or indexed again (`skipDuplicateFiles`). See
   [Supported file types](#supported-file-types).
 - **Background indexing**: an uploaded file is indexed in the background,
   across as many passes as it takes. A file's passes collapse into a single
   status row in the chat that can be expanded, and stopped: "Stop" cancels every
-  queued and running pass at once and ends the continuation chain.
+  queued and running pass at once and ends the continuation chain, and its confirm
+  dialog can take every other file being indexed down with it.
 - **Stop waiting**: a reply that is taking too long can be given up on. The
   "Thinking" bubble carries a small x that cancels the running request on the
   server, marks the question as cancelled, and lets the next message go out
@@ -185,7 +200,7 @@ BunnyQuery.logout();
 
 > `init()` is idempotent: calling it twice logs a warning and returns the existing
 > instance rather than re-mounting. On a successful mount it logs its version, e.g.
-> `[bunnyquery] v1.8.3`.
+> `[bunnyquery] v1.15.6`.
 
 See [HISTORY.md](HISTORY.md) for the release-by-release changelog.
 
@@ -219,27 +234,32 @@ picture** and **reads any text in it (OCR)**. Works on both Claude and OpenAI.
 Only images referenced in the **most recent** message are inlined (older links
 may have expired).
 
-### 2. PDFs: rendered to page images
+### 2. PDFs: text pages as text, the rest as page images
 
 `.pdf`
 
-PDF text layers are often absent or unreliable, so a PDF is indexed **visually**:
-the proxy worker renders a window of pages to images and injects them as image
-blocks in the indexing message. The window is five pages on Claude and on the
-OpenAI models that accept full-resolution images, and two on OpenAI's
-downsampled and nano tiers. Tool-result images render on neither provider, which
-is why the pages have to be in the message itself. That makes scanned PDFs work
-as well as digital ones.
+A PDF is read two ways, page by page. A run of pages that carries a text layer
+and no pictures or drawings is read **as text**, fifteen pages per window. Every
+other page (a scan, a photo, a page with figures) is indexed **visually**: the
+proxy worker renders a window of pages to images and injects them as image blocks
+in the indexing message. That window is five pages on Claude and on the OpenAI
+models that accept full-resolution images, and two on OpenAI's downsampled and
+nano tiers. Tool-result images render on neither provider, which is why the pages
+have to be in the message itself. Scanned PDFs work as well as digital ones, and a
+born-digital PDF takes about a third of the passes it used to.
 
-The worker advances the window itself, off its renderer's true page count, and
-enqueues the next pass. Indexing a long document therefore does not depend on
-the browser tab staying open, and does not depend on the model correctly
-declaring itself finished.
+The worker advances the windows itself, off its renderer's true page count, and
+reads several windows at once in parallel lanes sized to what the AI platform's
+rate limits allow. Indexing a long document therefore does not depend on the
+browser tab staying open, and does not depend on the model correctly declaring
+itself finished. The verbatim text of every page (the text layer, or the model's
+transcription of a scanned page) is stored with the file, so the agent can later
+search it for an exact phrase or number and cite the page.
 
 ### 3. Large documents, spreadsheets & data: read window by window
 
 ```
-.xls .xlsx .xlsm           grids: sheet-by-sheet row windows, plus embedded photos
+.xls .xlsx .xlsm           grids: rows stored by the server directly, plus embedded photos
 .ods                       OpenDocument sheets: character windows, plus photos
 .csv .tsv .tab             row-bounded windows with absolute row numbers
 .doc .docx .docm           word processor documents
@@ -267,6 +287,11 @@ depends on the tab staying open. Without it the agent pages the file itself with
 the `readFileContent` tool. Pass `windowedIndexing: false` to `init()` to opt
 out; engine consumers opt in via `configureChatEngine` (see
 [Importing the chat engine](#importing-the-chat-engine)).
+
+Spreadsheet rows take a shorter road still: the server reads the sheet and stores
+one record per row itself, with no model call and no tokens spent on the rows.
+Word, text and e-mail windows are read in parallel lanes like PDF pages, and a
+project indexes up to three documents at once.
 
 ### 4. Everything else extractable: inlined as text server-side
 
@@ -318,9 +343,12 @@ chat message.
 
 ### 5. Anything else: a plain link
 
-A file that is none of the above is handed to the model as a temporary link,
-which it opens with its built-in web tool: **Claude** via `web_fetch`, **OpenAI**
-via `web_search` (external web access is enabled).
+A file that is none of the above is handed to the model as a temporary link. The
+model can open it only with its built-in web tool (**Claude** via `web_fetch`,
+**OpenAI** via `web_search`), and those tools are attached only when the project's
+**Web access for answers** switch is on, which it is not by default. With the web
+off, such a file is indexed from its name and metadata alone; register an
+[attachment parser plugin](#attachment-parser-plugins) to read it in the browser.
 
 > A provider's web tool opens document/page-style URLs, but not necessarily a
 > bare *data-file* download (e.g. a raw `.csv`/`.tsv` link). That is why those
@@ -433,8 +461,8 @@ The active theme is saved to `localStorage`, so a returning user keeps their cho
 ## Importing the chat engine
 
 `bunnyquery.js` is the ready-made widget. Under it sits a **framework-agnostic,
-DOM-free chat engine**, the same core that powers both this widget and the Skapi
-admin chatbox. Import it from `bunnyquery/engine` when you want to build your own chat
+DOM-free chat engine**, the same core that powers both this widget and the
+bunnyquery.com dashboard chat. Import it from `bunnyquery/engine` when you want to build your own chat
 UI (React, Vue, Svelte, vanilla…) while reusing the engine's message/queue/typewriter/
 cache state machine, request builders, markdown-message composition, and prompts.
 
@@ -529,6 +557,17 @@ widget rather than approximately:
   state once a page of history collapses into a single indexing row. Implement
   the optional `ChatHost.onHistoryLoaded` hook, measure your own box, and let
   the loop page until the reader genuinely gained reachable content.
+- **`citationsFor` / `citationLinkPart`** turn the retrieval note the engine keeps
+  for a reply (`retrievalNoteOfAnswer`) into the file-and-page citations the
+  widget shows under an answer; `answerUsedNoDataTool` says whether a reply read
+  no data at all.
+- **`ChatSession.cancelPendingReply(msg, idx)`** is the "stop waiting" control:
+  handed the pending assistant bubble, it cancels the running request on the
+  server, marks the question cancelled and promotes the next queued message.
+  `cancelQueuedMessage` does the same for a message still in the queue.
+- **`findDuplicateUpload`** and the `configureProjectSettings` reader back the
+  `skipDuplicateFiles` and `webAccess` switches; see the `configureChatEngine`
+  table above.
 
 Other optional `ChatHost` hooks worth implementing: `deleteExistingFileRecord`
 (so a reindex replaces the file's knowledge instead of duplicating it) and
