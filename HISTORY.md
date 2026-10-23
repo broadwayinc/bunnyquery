@@ -5,9 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.15.6**, a documentation-only release
-  (this file and the README; no code change). The latest version on npm when this was
-  written is 1.15.5 (2026-10-21). Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.16.0**. The latest version on npm
+  when this was written is 1.15.5 (2026-10-21). Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -25,6 +24,34 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.16.0 (2026-10-23)
+
+Streaming is no longer a choice, and the socket takes its name.
+
+### Engine
+
+- `configureChatEngine`'s `liveStreaming` key now means **socket delivery** of the streamed
+  reply, which `liveStreamingRealtime` meant until 1.15.6; `liveStreamingRealtime` is
+  ignored. Streaming itself has no key any more: the engine streams every chat turn whenever
+  the host handed over both `forwardRequestFinalize` and `forwardRequestStream` (under either
+  spelling), and a host that wants buffered replies hands over neither.
+  `liveStreamingEnabled()` derives from the hooks; `liveStreamingSocketEnabled()` is the
+  socket.
+- Why: every deployed region's worker relays the response bytes and every current skapi-js
+  carries the flag, so "stream or buffer" had one right answer, while "push the stream over
+  the host's websocket" is a real choice: `joinRealtime` takes the connection's room for the
+  length of a turn.
+
+### Widget
+
+- The `liveStreaming` init option now means the websocket, **off** by default: `null` or
+  `false` streams on the one-second poll alone, `true` pushes each chunk as it is relayed.
+  `liveStreamingRealtime` is ignored. An embed that passed `liveStreaming: false` to buffer
+  replies now gets them streamed on the poll instead. The widget still buffers, with its one
+  console warning, when the page's skapi-js is too old to carry the stream flag.
+- The hosted chat page (`infra/bq-template.html`) passes `liveStreaming: true`: it owns its
+  skapi instance, so the socket is safe there.
 
 ## 1.15.6 (2026-10-23)
 

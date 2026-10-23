@@ -242,11 +242,11 @@ function resolveForwardRequestStream() {
 function windowedIndexingEnabled() {
   return _config?.windowedIndexing === true;
 }
-function liveStreamingRealtimeEnabled() {
-  return liveStreamingEnabled() && _config?.liveStreamingRealtime === true;
+function liveStreamingSocketEnabled() {
+  return liveStreamingEnabled() && _config?.liveStreaming === true;
 }
 function liveStreamingEnabled() {
-  return _config?.liveStreaming === true;
+  return typeof resolveForwardRequestFinalize() === "function" && typeof resolveForwardRequestStream() === "function";
 }
 function underCeiling(projectSetting, option, override) {
   if (!projectSetting) return false;
@@ -2839,7 +2839,7 @@ var CHAT_STREAM_ON_REALTIME = Object.freeze({
 function chatStreamWiring(queue) {
   if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
   if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
-  return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+  return liveStreamingSocketEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
 }
 var VARIANT_IMAGE_DETAIL = "original";
 var VARIANT_TEXT_VERBOSITY = "high";

@@ -204,11 +204,11 @@
   function windowedIndexingEnabled() {
     return _config?.windowedIndexing === true;
   }
-  function liveStreamingRealtimeEnabled() {
-    return liveStreamingEnabled() && _config?.liveStreamingRealtime === true;
+  function liveStreamingSocketEnabled() {
+    return liveStreamingEnabled() && _config?.liveStreaming === true;
   }
   function liveStreamingEnabled() {
-    return _config?.liveStreaming === true;
+    return typeof resolveForwardRequestFinalize() === "function" && typeof resolveForwardRequestStream() === "function";
   }
   function underCeiling(projectSetting, option, override) {
     if (!projectSetting) return false;
@@ -2717,7 +2717,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function chatStreamWiring(queue) {
     if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
     if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
-    return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+    return liveStreamingSocketEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
   }
   var VARIANT_IMAGE_DETAIL = "original";
   var VARIANT_TEXT_VERBOSITY = "high";
@@ -9162,7 +9162,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.15.6" ;
+    var BQ_VERSION = "1.16.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -13826,25 +13826,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // Server-driven windowed indexing; read at configureChatEngine time.
         // Listed here so the defaults object is the full opt surface.
         windowedIndexing: true,
-        // Live streaming of chat turns; read at configureChatEngine time.
-        // ON by default: every region's polling worker relays the response
-        // bytes now, so the answer paints as it arrives instead of up to one
-        // poll tick after it finished. Pass false for buffered replies.
-        // Still a REQUEST, not a switch: it is refused (with a warning, falling
-        // back to buffered) when the embedder's own skapi-js is too old to
-        // carry skapi's half of the stream flag. See skapiSupportsStreaming.
-        liveStreaming: true,
-        // Socket delivery for the streamed reply. OFF unless the embedder asks,
-        // and separately from liveStreaming, because this widget runs on someone
-        // else's page with someone else's skapi instance: skapi's joinRealtime
-        // REPLACES the connection's group rather than adding to it, so for the
-        // length of a turn this would take the room out from under whatever the
-        // host app uses realtime for, and the host would see its own messages
-        // simply stop. Only an embedder who knows their app does not use realtime
-        // (or does not mind) can answer that, so only they can turn it on. It is
-        // purely an accelerator: with it off the reply still streams, just on the
-        // poll's cadence rather than as the text is relayed.
-        liveStreamingRealtime: false
+        // Deliver the streamed reply over skapi's WEBSOCKET as well as the poll.
+        // OFF unless the embedder asks, because this widget runs on someone else's
+        // page with someone else's skapi instance: skapi's joinRealtime REPLACES
+        // the connection's group rather than adding to it, so for the length of a
+        // turn this would take the room out from under whatever the host app uses
+        // realtime for, and the host would see its own messages simply stop. Only
+        // an embedder who knows their app does not use realtime (or does not mind)
+        // can answer that, so only they can turn it on. Purely an accelerator: with
+        // it off the reply still streams, on the poll's cadence.
+        // Streaming itself is not an option: the widget streams whenever the page's
+        // skapi-js can (see canStream in init) and buffers, with a warning, when it
+        // cannot. Before 1.16.0 this key meant "stream at all" and the socket was
+        // `liveStreamingRealtime`; that name is now ignored.
+        liveStreaming: false
       }, opts || {});
       S.mountEl = mountEl;
       clear(mountEl);
@@ -13857,11 +13852,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       S.booted = true;
       console.log("[bunnyquery] v" + BQ_VERSION);
       var canStream = skapiSupportsStreaming(S.skapi);
-      var liveStreaming = S.opts.liveStreaming == null ? true : S.opts.liveStreaming === true;
-      if (liveStreaming && !canStream) {
-        liveStreaming = false;
+      if (!canStream) {
         console.warn(
-          "[bunnyquery] liveStreaming was requested but this page's skapi-js has neither forwardRequestStream/forwardRequestFinalize nor the older clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Falling back to buffered replies - update skapi-js to enable streaming."
+          "[bunnyquery] this page's skapi-js has neither forwardRequestStream/forwardRequestFinalize nor the older clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Replies are buffered - update skapi-js to stream them."
         );
       }
       configureProjectSettings(function(service) {
@@ -13908,22 +13901,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // passed, and the project's setting is the ceiling the engine applies.
         skipDuplicateFiles: typeof S.opts.skipDuplicateFiles === "boolean" ? S.opts.skipDuplicateFiles : void 0,
         // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
-        // On by default since every region's polling worker relays the
-        // response bytes. It used to be off for the shipping-order reason
-        // windowedIndexing had: against a worker that does not relay, the
-        // request has its `since` cursor rejected or the row keeps an SSE
-        // transcript where the readers expect a parsed document, and the turn
-        // reads back as an empty answer (a streamed row settles with a STATUS
-        // AND NO BODY on purpose). An embed against such a worker passes
-        // liveStreaming: false. The widget takes it as an init opt because an
-        // embed picks its own region, where agent.vue flips one module constant.
-        // It also needs a skapi-js that supports `stream`/`onStream`, and the
-        // page's pin is the EMBEDDER's, so the request is granted above by
-        // skapiSupportsStreaming rather than taken on trust here.
-        liveStreaming,
-        // Requires liveStreaming, and cannot outlive it: the AND is what stops an
-        // embedder turning on socket delivery for a reply that is not streamed.
-        liveStreamingRealtime: liveStreaming && S.opts.liveStreamingRealtime === true
+        // Streaming itself is not passed: the engine streams whenever the two
+        // hooks below are handed over, which skapiEngineTransport does only when
+        // canStream. What the embedder chooses is the socket: `liveStreaming` here
+        // is the engine's socket-delivery key. ANDed with canStream so a page whose
+        // SDK cannot stream never asks for a socket on a buffered reply.
+        liveStreaming: canStream && S.opts.liveStreaming === true
         // The transport: dispatch and history, plus the finalize hook that stores
         // a streamed turn's kept version and the chunk reader that is the second
         // half of the durability guarantee. The two optional hooks are handed

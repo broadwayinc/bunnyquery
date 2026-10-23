@@ -16,7 +16,7 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingRealtimeEnabled, resolveWebAccess } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess } from './config';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens, getModelContextWindow } from './budget';
@@ -228,7 +228,7 @@ const CHAT_STREAM_OFF: ChatStreamWiring = Object.freeze({
 }) as ChatStreamWiring;
 
 /**
- * Both stream flags for a CHAT turn, from the one `liveStreaming` opt-in.
+ * Both stream flags for a CHAT turn, on whenever the host handed over the streaming hooks.
  *
  * Chat turns only. Deliberately NOT called from:
  *   * the model LISTING calls (listClaudeModels / listOpenAIModels) - plain GETs
@@ -258,9 +258,9 @@ export function chatStreamWiring(queue?: string): ChatStreamWiring {
 	if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
 	if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
 	// Socket delivery is a separate opt-in from streaming itself: see
-	// liveStreamingRealtime for why a host that does not own its skapi instance
+	// the `liveStreaming` key in config.ts for why a host that does not own its skapi instance
 	// should leave it off.
-	return liveStreamingRealtimeEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+	return liveStreamingSocketEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
 }
 
 // Resolve the per-image `detail` for OpenAI. The version match tolerates a

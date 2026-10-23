@@ -254,38 +254,29 @@ interface ChatEngineConfig {
         };
     }) => void;
     /**
-     * Opt in to LIVE STREAMING of chat turns.
+     * Deliver each relayed chunk over skapi's WEBSOCKET as well, so text lands as it
+     * is relayed instead of on the next poll tick. Off unless a host asks.
      *
-     * Off by default, and for the same shipping-order reason `windowedIndexing`
-     * is: THE BACKEND MUST SHIP FIRST. When on, every chat turn carries two
-     * `stream` flags (see requests.ts chatStreamWiring) and the polling row
-     * settles with a STATUS AND NO BODY, because the answer was the stream. On a
-     * region whose polling worker does not relay, that same request either has
-     * its unknown `since` cursor rejected or stores an SSE transcript where the
-     * readers expect a parsed document, and the turn reads back as an empty
-     * answer. So it stays off until the worker is deployed, then flips per
-     * environment.
+     * Streaming itself is not a choice any more: the engine streams every chat turn
+     * whenever the host handed over the two streaming hooks below
+     * (`forwardRequestFinalize` and `forwardRequestStream`, or their deprecated
+     * names), and a host that wants buffered replies simply hands over neither. See
+     * liveStreamingEnabled(). This key only decides the TRANSPORT of a stream that is
+     * on anyway, so a host with no streaming hooks gets nothing from setting it.
      *
-     * It also needs `forwardRequestFinalize` below (or its deprecated name,
-     * `clientSecretRequestFinalize`): without it a streamed turn is never
-     * finalized, so its row keeps a status and no body forever and a later
-     * history load shows the question with an empty answer.
-     */
-    liveStreaming?: boolean;
-    /**
-     * Also push each relayed chunk over skapi's websocket, so text lands as it is
-     * relayed instead of on the next poll tick. Requires `liveStreaming`.
-     *
-     * SEPARATE FROM `liveStreaming` ON PURPOSE, and off unless a host asks. It is a
-     * pure accelerator with a safe fallback, so the reason is not risk to the chat, it
-     * is what it does to the HOST'S OWN realtime: skapi's joinRealtime REPLACES the
+     * Off by default on purpose, and the reason is not risk to the chat (the socket
+     * is a pure accelerator with a safe fallback: the poll carries the read), it is
+     * what it does to the HOST'S OWN realtime. skapi's joinRealtime REPLACES the
      * connection's group rather than adding to it, so for the length of a turn this
      * takes the room. The dashboard owns its skapi instance and uses realtime for
      * nothing else, so it opts in. The embeddable widget is handed the EMBEDDER'S
      * instance and cannot know what their app does with it, so it stays off there
      * unless the embedder turns it on.
+     *
+     * Until 1.16.0 this key meant "stream at all" and the socket was
+     * `liveStreamingRealtime`; that name is now ignored.
      */
-    liveStreamingRealtime?: boolean;
+    liveStreaming?: boolean;
     /**
      * Whether a CHAT answer may reach the open web: Claude's `web_fetch` and
      * OpenAI's `web_search` are attached to a chat request only when this
@@ -443,17 +434,17 @@ declare function resolveSkipDuplicateFiles(service?: string): Promise<boolean>;
 /**
  * True when a streamed turn whose answer never reached its row can be READ BACK.
  *
- * IT ASKS FOR THE READER AND NOT FOR `liveStreaming`, AND THAT SPLIT IS THE WHOLE
- * POINT. "Should NEW turns stream?" and "can an ALREADY streamed row be recovered?"
+ * IT ASKS FOR THE READER ALONE, NOT FOR WHETHER NEW TURNS STREAM, AND THAT SPLIT IS
+ * THE WHOLE POINT. "Should NEW turns stream?" and "can an ALREADY streamed row be recovered?"
  * are two different questions about two different sets of rows, and answering both
  * with one flag strands the second set the moment the first answer changes.
  *
  * The failure, and it is not hypothetical - it is what turning the feature off
  * does. A row streamed yesterday holds its answer in the chunk table and a status
- * and no body on the row; only csr-finalize ever copies one onto it. Flip
- * `liveStreaming` off today (an embedder drops the option, a dev rolls the flag
- * back after a bad deploy, a client's skapiSupportsStreaming probe degrades the
- * instance to buffered) and every one of those rows instantly becomes unmarked,
+ * and no body on the row; only csr-finalize ever copies one onto it. Take
+ * streaming away today (a host stops handing over the finalize hook, a client's
+ * skapiSupportsStreaming probe degrades the instance to buffered) and every one of
+ * those rows instantly becomes unmarked,
  * unrecoverable and unreadable: the mapper emits no bubble for it, the recovery
  * never looks at it, and its answer is unreachable with every byte of it still
  * stored. Rolling a rendering flag back must not delete anybody's history.
@@ -478,8 +469,8 @@ declare function resolveSkipDuplicateFiles(service?: string): Promise<boolean>;
 declare function streamRecoveryEnabled(): boolean;
 /**
  * Does a given skapi INSTANCE support the streaming half of the protocol? Ask this
- * before honouring a `liveStreaming: true` opt-in, and degrade to buffered when the
- * answer is no.
+ * before handing the engine the two streaming hooks, and hand over neither (buffered
+ * replies) when the answer is no.
  *
  * THE FAILURE THIS PREVENTS, and it is the one the SDK's own docs call quiet. A
  * streamed turn carries TWO `stream` flags: skapi's (relay the destination's bytes
@@ -498,8 +489,8 @@ declare function streamRecoveryEnabled(): boolean;
  * It lives in the ENGINE rather than in each client because the two clients are
  * diffed against each other and this is precisely the kind of predicate that forks:
  * the widget must ask it (init() takes the EMBEDDER's instance, and an embed page
- * pins its own skapi-js version, so `liveStreaming: true` is a REQUEST and this is
- * what grants it) and agent.vue must ask it too (its instance is the repo's own, so
+ * pins its own skapi-js version, so streaming is granted by this probe and never
+ * assumed) and agent.vue must ask it too (its instance is the repo's own, so
  * only a stale node_modules or an unbuilt skapi-js can fail it - which is exactly
  * the state a dev flipping the constant is most likely to be in, and a silently
  * empty chat is the worst possible way to find out).

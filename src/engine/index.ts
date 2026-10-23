@@ -24,7 +24,7 @@ export {
 	// empty bubble where it used to get none, which is strictly worse than the bug.
 	streamRecoveryEnabled,
 	// Whether a given skapi INSTANCE can carry skapi's half of the stream flag. Both
-	// clients gate their liveStreaming opt-in on it and degrade to buffered when it
+	// clients gate the streaming hooks they hand over on it and degrade to buffered when it
 	// says no: an SDK too old to know the key drops it silently, leaving the
 	// destination streaming SSE into a buffered row that reads back empty.
 	skapiSupportsStreaming,
