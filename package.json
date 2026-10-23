@@ -35,7 +35,8 @@
     "dev": "npx bns port=3333"
   },
   "dependencies": {
-    "basic-node-server": "^1.1.1"
+    "basic-node-server": "^1.1.1",
+    "skapi-js": "^2.2.17"
   },
   "devDependencies": {
     "tsup": "^8.5.1",
