@@ -4,3 +4,4 @@
 deploy.sh
 # Claude Code agent worktrees (nested checkouts, never commit)
 .claude/worktrees/
+_bunnyquery_widget_update.py
