@@ -313,22 +313,17 @@ export function composeUserMessage(
 				sections.join('\n\n');
 		}
 		// Files the model fetches by url (NOT server-extractable: PDFs, images)
-		// CAN be flagged for the worker to re-mint just before the upstream call,
-		// so a request that waited in the queue never hands over a stale link.
-		//
-		// It is off, and must stay off until the worker mints a url that answers
-		// HEAD. What it mints today is an S3 SigV4 query presign, and a presign is
-		// bound to the ONE method it was signed for: `get_object`. HEAD the same
-		// url and S3 rejects the signature with 403 — measured, and the CDN url it
-		// replaces answers both. OpenAI probes a file url before downloading it,
-		// so from the day this went live EVERY chat carrying an image or PDF came
-		// back "Error while downloading file. Upstream status code: 403." — 100%
-		// of the requests that carried the directive, none of the ones that did
-		// not. Sending no directive leaves the CDN url in place, which is what
-		// worked before and answers HEAD; the drain gate (awaitIndexingDrained)
-		// covers the staleness this was meant to solve, since the turn is now
-		// dispatched only once the queue is empty rather than sitting in it.
-		const WORKER_URL_REMINT_ENABLED = false;
+		// are flagged for the worker to mint a fresh link just before the
+		// upstream call, so a request that waited in the queue never hands over
+		// a stale link. A store file link now lives 10 minutes for anything but
+		// a public file (dev/CDN_FILE_PLAN.md 4.2), so this is what keeps a
+		// queued request working. The worker mints the CDN link (never an S3
+		// presign: a presign is bound to the one method it was signed for and
+		// a provider's HEAD probe got 403 from it, which is why this was off
+		// from 2026-07-27 to 2026-10-24); the CDN link answers HEAD and GET.
+		// The worker also checks that the user who asked may read each path
+		// before it mints or extracts anything.
+		const WORKER_URL_REMINT_ENABLED = true;
 		const urlFiles = WORKER_URL_REMINT_ENABLED
 			? attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name))
 			: [];

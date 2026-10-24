@@ -2837,11 +2837,12 @@ import {
     // Mint a temporary CDN url for a db file (request:'get-db'), matching
     // Service.getTemporaryUrl: backend returns { url:<path> }, client prepends
     // https://db.<hostDomain>/.
-    // `cdn` picks the branch DELIBERATELY. A generate_temporary_cdn_url url
-    // ignores `expires` entirely and lives until the end of the next UTC day
-    // (24-48h); a plain get-db presign honours `expires` to the second. Passing
-    // the flag while also passing a short `expires` is the trap: it reads as a
-    // 10 minute url and behaves as a two day one.
+    // `cdn` picks the branch DELIBERATELY. A generate_temporary_cdn_url url is
+    // a store file link: it lives 24 hours for a public file and `expires`
+    // (10 minutes by default, 1 hour at most) for any other, carries the file's
+    // ETag as ?v= so a changed file is a new address, and is minted only for a
+    // caller who may read the file (dev/CDN_FILE_PLAN.md 4). A plain get-db
+    // presign honours `expires` to the second, within the same ceiling.
     // `contentType` overrides the extension guess. It is what decides whether a
     // new tab DISPLAYS the file or downloads it: get_signed_url only sets
     // ResponseContentType when we pass one, and application/octet-stream always
