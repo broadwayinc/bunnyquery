@@ -490,7 +490,7 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 
 ` + sections.join("\n\n");
       }
-      const urlFiles = [];
+      const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name)) ;
       if (urlFiles.length > 0) {
         fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
       }
@@ -9162,7 +9162,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.broadwayinc.computer";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.16.0" ;
+    var BQ_VERSION = "1.16.1" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

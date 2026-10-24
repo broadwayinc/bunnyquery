@@ -5,8 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.16.0**. The latest version on npm
-  when this was written is 1.15.5 (2026-10-21). Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.16.1**. The latest version on npm
+  when this was written is 1.16.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -24,6 +24,26 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.16.1 (2026-10-24)
+
+Store file links follow skapi's new rule for them.
+
+### Engine
+
+- `composeUserMessage` sends the `file_urls` directive again (`WORKER_URL_REMINT_ENABLED`
+  is true): a link to a store file now lives 10 minutes unless the file is public (skapi's
+  `get-signed-url`), so the indexing worker mints a fresh CDN link right before each provider
+  call and a request that waited in the queue never hands over a stale one. The directive was
+  off since 2026-07-27 because the worker then minted an S3 presign, which refuses a provider's
+  HEAD probe; the worker mints the CDN link now, which answers HEAD and GET.
+
+### Widget
+
+- `getTemporaryUrlDb`'s notes describe the link as it is now: 24 hours for a public file,
+  `expires` (10 minutes by default, 1 hour at most) for any other, `?v=<etag>` so a changed file
+  is a new address, and minted only for a caller who may read the file. The widget's own
+  behaviour is unchanged.
 
 ## 1.16.0 (2026-10-23)
 

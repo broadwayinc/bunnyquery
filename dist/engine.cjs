@@ -534,7 +534,7 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
 
 ` + sections.join("\n\n");
     }
-    const urlFiles = [];
+    const urlFiles = attachmentUrls.filter((u) => u.url && !isServerExtractable(u.name)) ;
     if (urlFiles.length > 0) {
       fileUrls = urlFiles.map((u) => ({ path: u.storagePath || u.name, url: u.url }));
     }
