@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.16.1**. The latest version on npm
+- **Published vs built.** The source tree is at **1.17.0**. The latest version on npm
   when this was written is 1.16.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.17.0 (2026-10-26, not yet published)
+
+The chat prompt no longer sends spreadsheet numbers to `queryGrid`. It now gives the agent a search path through the database (tables, then indexes and tags, then records, each searched by beginning and by ending when the exact name is unknown) and computes figures from the detail rows of the indexed records, with the roll-up sheets and total rows excluded. Pairs with the MCP server dropping `queryGrid` from the chat tool profile.
 
 ## 1.16.1 (2026-10-24)
 
