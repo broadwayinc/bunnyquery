@@ -37,6 +37,8 @@
  * requests to today.
  */
 
+import { normalizeStoredPathTarget, normalizeTrailingInlineToken } from './links';
+
 export type RetrievalHit = { path: string; page: number };
 
 export type RetrievalNote = {
@@ -259,16 +261,22 @@ function noteFromToolBlocks(body: any): RetrievalNote | null {
 export function retrievalNoteFromText(text: string | null | undefined): RetrievalNote | null {
 	if (typeof text !== 'string' || !text) return null;
 	var note = emptyNote('answer');
-	// [label](db:path) and [label](db:path "title"); the path ends at the closing
-	// paren or at the title's opening quote. Bounded character class, no nested
-	// quantifiers, so a long answer cannot make this slow.
-	var link = /\]\(db:([^)\s"]+)/g;
+	// [label](db:path) and [label](db:path "title"). The path is read with the SAME
+	// grammar the chip renderer uses (createInlineLinkRegex's path branch): spaces
+	// allowed, one level of balanced parens. The old `[^)\s"]+` stopped at the
+	// first space or ")", so `db:testing/2023-09 (1).xlsx` was remembered as
+	// `testing/2023-09` and the encoded form as `testing/2023-09%20(1`, and the
+	// citation chip drawn from this note linked to a file that does not exist.
+	// One character per step and disjoint alternatives, so it stays linear.
+	var link = /\]\(db:((?:[^()\n"]|\([^()\n"]*\))+)(?:"[^"\n]*")?\)/g;
 	var m: RegExpExecArray | null;
-	while ((m = link.exec(text)) !== null) pushUnique(note.files, m[1]);
-	var src = /src::([^\s"'`<>)\]]+)/g;
+	while ((m = link.exec(text)) !== null) pushUnique(note.files, normalizeStoredPathTarget(m[1]));
+	// src::<token>, read exactly as classifyInlineLink reads it: the token runs to
+	// whitespace and normalizeTrailingInlineToken drops sentence punctuation and
+	// unmatched wrappers while keeping a balanced `(1)` inside the name.
+	var src = /src::(\S+)/g;
 	while ((m = src.exec(text)) !== null) {
-		// Trailing sentence punctuation is prose, not path.
-		pushUnique(note.files, m[1].replace(/[.,;:!?]+$/, ''));
+		pushUnique(note.files, normalizeStoredPathTarget(normalizeTrailingInlineToken(m[1])));
 	}
 	return noteHasContent(note) ? note : null;
 }

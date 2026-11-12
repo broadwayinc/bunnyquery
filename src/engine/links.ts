@@ -206,6 +206,24 @@ export function encodePathSegments(path: string): string {
 	return path.split('/').filter(Boolean).map(function (s) { return encodeURIComponent(s); }).join('/');
 }
 
+/**
+ * A stored-file path the MODEL wrote (a `db:` link target or a `src::` token).
+ *
+ * The prompt says the path is written exactly as stored, NOT url-encoded, and
+ * models do not always obey: a GPT answer linked `db:testing/2023-09%20(1).xlsx`
+ * for the stored file `testing/2023-09 (1).xlsx`, and the chip minted a url for a
+ * key that does not exist. A stored name CAN contain a literal "%20" too, which
+ * is why this does not decode unconditionally. The two are told apart by the one
+ * thing an encoder never leaves behind: raw whitespace. A path with a real space
+ * in it was not encoded and is kept as written; a path with no whitespace and a
+ * valid %XX escape was, and is decoded.
+ */
+export function normalizeStoredPathTarget(value: string): string {
+	var p = String(value || '').trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+	if (!/\s/.test(p) && /%[0-9A-Fa-f]{2}/.test(p)) p = safeDecodeURIComponent(p);
+	return p;
+}
+
 export function normalizeAttachmentPathCandidate(value: string): string {
 	return safeDecodeURIComponent((value || '').trim()).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
 }
@@ -529,9 +547,9 @@ export function classifyInlineLink(
 		var srcPath = readExpiredAttachmentHref(rawPath)
 			|| (srcIsUrl
 				? (extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath))
-				// bare stored path: same NON-decoding normalize as the db: branch; only
-				// URL-derived paths genuinely arrive percent-encoded.
-				: rawPath.trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/'));
+				// bare stored path: same normalize as the db: branch (decoded only when
+				// the model visibly url-encoded it, see normalizeStoredPathTarget).
+				: normalizeStoredPathTarget(rawPath));
 		var srcBuilt = asStoredFile(srcPath, srcPath);
 		return srcBuilt ? { part: srcBuilt.part, tail: tail } : null;
 	}
@@ -546,11 +564,13 @@ export function classifyInlineLink(
 		// EMITTING it; until then this branch simply never fires.
 		var dbTarget = /^db:(.+)$/i.exec(g5.trim());
 		if (dbTarget) {
-			// NON-decoding normalize: the prompt guarantees a db: target is the path exactly
-			// as stored, NOT url-encoded, and the MCP's own key builder refuses to decode
-			// bare paths for the same corruption: percent-decoding here turned a stored name
-			// containing a literal "%20" into the wrong key.
-			var rawDbPath = dbTarget[1].trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+			// The prompt asks for the path exactly as stored, NOT url-encoded, and the
+			// MCP's own key builder never decodes a bare path. Decoding every target
+			// turned a stored name containing a literal "%20" into the wrong key, and
+			// decoding none sent a model's encoded `2023-09%20(1).xlsx` to a key that
+			// does not exist. normalizeStoredPathTarget decodes only the visibly encoded.
+			// A markdown title, `[a](db:x.pdf "title")`, is not part of the path.
+			var rawDbPath = normalizeStoredPathTarget(dbTarget[1].replace(/\s+"[^"\n]*"\s*$/, ''));
 			var declared = asStoredFile(rawDbPath, g4);
 			if (!declared) return null;
 			declared.part.label = truncateLabelForDisplay(g4);

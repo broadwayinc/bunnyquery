@@ -1025,6 +1025,11 @@ function encodePathSegments(path) {
     return encodeURIComponent(s);
   }).join("/");
 }
+function normalizeStoredPathTarget(value) {
+  var p = String(value || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+  if (!/\s/.test(p) && /%[0-9A-Fa-f]{2}/.test(p)) p = safeDecodeURIComponent(p);
+  return p;
+}
 function normalizeAttachmentPathCandidate(value) {
   return safeDecodeURIComponent((value || "").trim()).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
 }
@@ -1190,14 +1195,14 @@ function classifyInlineLink(full, groups, ctx) {
         tail
       };
     }
-    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath) : rawPath.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/"));
+    var srcPath = readExpiredAttachmentHref(rawPath) || (srcIsUrl ? extractRemotePathFromAttachmentHref(rawPath, ctx.projectId) || normalizeAttachmentPathCandidate(rawPath) : normalizeStoredPathTarget(rawPath));
     var srcBuilt = asStoredFile(srcPath, srcPath);
     return srcBuilt ? { part: srcBuilt.part, tail } : null;
   }
   if (g4 && g5) {
     var dbTarget = /^db:(.+)$/i.exec(g5.trim());
     if (dbTarget) {
-      var rawDbPath = dbTarget[1].trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+      var rawDbPath = normalizeStoredPathTarget(dbTarget[1].replace(/\s+"[^"\n]*"\s*$/, ""));
       var declared = asStoredFile(rawDbPath, g4);
       if (!declared) return null;
       declared.part.label = truncateLabelForDisplay(g4);
@@ -1453,12 +1458,12 @@ function noteFromToolBlocks(body) {
 function retrievalNoteFromText(text) {
   if (typeof text !== "string" || !text) return null;
   var note = emptyNote("answer");
-  var link = /\]\(db:([^)\s"]+)/g;
+  var link = /\]\(db:((?:[^()\n"]|\([^()\n"]*\))+)(?:"[^"\n]*")?\)/g;
   var m;
-  while ((m = link.exec(text)) !== null) pushUnique(note.files, m[1]);
-  var src = /src::([^\s"'`<>)\]]+)/g;
+  while ((m = link.exec(text)) !== null) pushUnique(note.files, normalizeStoredPathTarget(m[1]));
+  var src = /src::(\S+)/g;
   while ((m = src.exec(text)) !== null) {
-    pushUnique(note.files, m[1].replace(/[.,;:!?]+$/, ""));
+    pushUnique(note.files, normalizeStoredPathTarget(normalizeTrailingInlineToken(m[1])));
   }
   return noteHasContent(note) ? note : null;
 }
@@ -9536,6 +9541,7 @@ exports.normalizeChatGreeting = normalizeChatGreeting;
 exports.normalizeExt = normalizeExt;
 exports.normalizeProjectAccessSetting = normalizeProjectAccessSetting;
 exports.normalizeSkipDuplicateFiles = normalizeSkipDuplicateFiles;
+exports.normalizeStoredPathTarget = normalizeStoredPathTarget;
 exports.normalizeTextContent = normalizeTextContent;
 exports.normalizeTrailingInlineToken = normalizeTrailingInlineToken;
 exports.normalizeUploadAccessGroup = normalizeUploadAccessGroup;
