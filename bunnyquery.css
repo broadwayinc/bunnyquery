@@ -1567,6 +1567,20 @@
 }
 /* A cancel that the server refused (the pass had already finished). */
 .bq-index-note.is-error { color: var(--bq-danger); }
+/* "Load more" inside an opened file row: the next page of that run's steps. */
+.bq-index-more {
+    display: inline-block;
+    margin: 0 0.6rem 0.45rem;
+    padding: 0.15rem 0.55rem;
+    font: inherit;
+    font-size: 0.7rem;
+    color: var(--bq-main);
+    background: transparent;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    cursor: pointer;
+}
+.bq-index-more:disabled { opacity: 0.5; cursor: default; }
 
 /* ---- in-bubble file / link anchors --------------------------------------*/
 .bq-file-download,

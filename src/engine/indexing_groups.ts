@@ -219,6 +219,8 @@ export type IndexingGroup = {
 	stub?: boolean;
 	/** The run:: record's stored error text, for a stub row's meta line. */
 	stubError?: string;
+	/** A run:: row that is live with no pass running yet: waiting in the queue. */
+	queued?: boolean;
 };
 
 export type DisplayEntry =
@@ -243,6 +245,10 @@ export type BuildDisplayListOptions = {
 	/** Whether `liveIndexKeys` has been answered at least once for this chat. False
 	 *  is "we do not know", and a worker-driven run stays unfinished on it. */
 	liveIndexChecked?: boolean;
+	/** Files of liveIndexKeys with a pass RUNNING (same keys). A live run:: row whose file
+	 *  is missing here has only waiting passes and is marked `queued`. Absent: unknown, and
+	 *  no row is marked. */
+	liveIndexRunningKeys?: { [fileKey: string]: boolean };
 	/** Files carrying the durable done:: completion marker (one prefix sweep),
 	 *  keyed like IndexingGroup.key (storage path; the bare-name fallback keys
 	 *  of very old prompts simply never match — they keep the queue inference).
@@ -935,6 +941,7 @@ export function buildChatDisplayList(
 			else if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
 		}
 		var now = opts && typeof opts.now === 'number' ? opts.now : Date.now();
+		var runningKeys = opts && opts.liveIndexRunningKeys;
 		var stubClearedAt = (opts && typeof opts.stubClearedAt === 'number' && opts.stubClearedAt > 0)
 			? opts.stubClearedAt : 0;
 		for (var sp in runStubs) {
@@ -1046,6 +1053,8 @@ export function buildChatDisplayList(
 				resolving: res,
 				resolvingReason: reason,
 				stub: true,
+				queued: live && !!runningKeys
+					&& !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : undefined,
 				stubError: rec.error || (st === 'error' && !rec.error
 					? 'Indexing did not finish.' : undefined),
 			};

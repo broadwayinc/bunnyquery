@@ -146,6 +146,9 @@ function readArguments(note: RetrievalNote, args: any): void {
 }
 
 /** Collect { path, page } pairs out of a tool RESULT, bounded. */
+/** A JSON string inside a tool result longer than this is not parsed for hits. */
+const RESULT_STRING_MAX_CHARS = 2 * 1024 * 1024;
+
 function readHits(note: RetrievalNote, result: any): void {
 	var parsed = parseJsonLoose(result);
 	if (!parsed || typeof parsed !== 'object') return;
@@ -164,6 +167,14 @@ function readHits(note: RetrievalNote, result: any): void {
 			if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
 			var v = node[k];
 			if (v && typeof v === 'object') walk(v, depth + 1);
+			// The MCP's paginated envelope carries the tool's own result as a JSON STRING
+			// ({"message": "Response retrieved...", "content": "{\"hits\": [...]}"}), so the
+			// hits were never seen and no turn remembered its pages (found 2026-11-20).
+			else if (typeof v === 'string' && v.length > 1 && v.length <= RESULT_STRING_MAX_CHARS
+				&& (v.charAt(0) === '{' || v.charAt(0) === '[')) {
+				var inner = parseJsonLoose(v);
+				if (inner && typeof inner === 'object') walk(inner, depth + 1);
+			}
 		}
 	};
 	walk(parsed, 0);

@@ -48,7 +48,8 @@ import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, c
 import { createSseParser, type SseParser } from './sse';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage, isCsrStatusEnvelope } from './errors';
 import { buildBoundedChatMessages } from './budget';
-import { extractRetrievalNote } from './retrieval_memory';
+import { extractRetrievalNote, type RetrievalNote } from './retrieval_memory';
+import { findingsForTurn } from './findings';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
 import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage } from './history';
@@ -88,6 +89,13 @@ const WORKER_PASS_ADOPT_ATTEMPTS = [0, 2000, 6000];
  *  round trips, while the cost of being too tight is a file that reads "Indexed"
  *  while it is still being read. */
 const RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1000;
+// While this chat is following a worker-driven indexing run and its tab is visible, look
+// for newly minted passes this often (2026-11-20). Adoption used to run only when a pass
+// this client tracked SETTLED, and with parallel windows the one pass the client sent is
+// just one of eight: the other lanes, and everything they finished, stayed invisible until
+// it ended (3.5 min on a 110-page PDF, nine passes done meanwhile). One look is the two
+// status queries (running, pending); it stops by itself when nothing is tracked.
+const ADOPT_TICK_MS = 10 * 1000;
 
 // awaitIndexingDrained: how often it re-asks the background-indexing queue, and
 // how many consecutive empty answers it needs before believing the chains are
@@ -548,6 +556,26 @@ type LiveStreamState = {
 	transport: { socket: number; poll: number };
 };
 
+/**
+ * Creation time (ms epoch) of a request id "stamp:entropy", whose stamp is a time_ns written
+ * as 8 bytes of base32hex without padding (the worker's and the producer's _generate_req_id).
+ * 0 when it is not one.
+ */
+export function requestIdTimeMs(rid: string): number {
+	if (typeof rid !== 'string') return 0;
+	var stamp = rid.split(':')[0] || '';
+	if (stamp.length !== 13) return 0;
+	var alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
+	var v = 0;
+	for (var i = 0; i < stamp.length; i++) {
+		var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
+		if (d < 0) return 0;
+		v = v * 32 + d;
+	}
+	// 13 digits are 65 bits for 64 of data: the last bit is padding.
+	return Math.floor(v / 2 / 1e6);
+}
+
 export class ChatSession {
 	host: ChatHost;
 	state: ChatState;
@@ -642,7 +670,10 @@ export class ChatSession {
 			historyRequestToken: 0,
 			gateRefreshToken: 0,
 			liveIndexKeys: {},
+			indexPageProgress: {},
+			passPaging: {},
 			liveIndexChecked: false,
+			liveIndexRunning: {},
 			stoppedIndexIds: {},
 		};
 		this.bgTaskQueue = [];
@@ -670,8 +701,8 @@ export class ChatSession {
 	/** What the display layer needs to decide whether a run is finished. `keys` holds
 	 *  every file the server still has indexing work for; `checked` is false until the
 	 *  first answer for this chat, and false means "we do not know yet". */
-	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean } {
-		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean; running: { [fileKey: string]: boolean } } {
+		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {} };
 	}
 
 	/** Passes that were on a row when the user stopped it, so the display layer can
@@ -877,6 +908,7 @@ export class ChatSession {
 	 */
 	private _recordLiveIndexKeys(lists: any[]): void {
 		var next: { [k: string]: boolean } = {};
+		var running: { [k: string]: boolean } = {};
 		// A page that came back FULL is not a whole-queue answer: the query is capped
 		// and ordered newest-first, so a bulk upload of 40 files returns the 20 newest
 		// and omits the 20 about to run. Absence would then read as "finished" for
@@ -914,6 +946,10 @@ export class ChatSession {
 				// wrong.
 				if (ref.path) next[ref.path] = true;
 				if (ref.name) next[ref.name] = true;
+				if (item.status === 'running') {
+					if (ref.path) running[ref.path] = true;
+					if (ref.name) running[ref.name] = true;
+				}
 			}
 		}
 		var nowChecked = !truncated;
@@ -922,7 +958,13 @@ export class ChatSession {
 			for (var k in next) if (!was[k]) { changed = true; break; }
 			if (!changed) for (var k2 in was) if (!next[k2]) { changed = true; break; }
 		}
+		if (!changed) {
+			var wasRun = this.state.liveIndexRunning || {};
+			for (var r1 in running) if (!wasRun[r1]) { changed = true; break; }
+			if (!changed) for (var r2 in wasRun) if (!running[r2]) { changed = true; break; }
+		}
 		this.state.liveIndexKeys = next;
+		this.state.liveIndexRunning = running;
 		this.state.liveIndexChecked = nowChecked;
 		this._liveIndexAt = nowMs();
 		// Claim the snapshot for the CURRENT chat. Both callers verify identity before
@@ -943,8 +985,11 @@ export class ChatSession {
 	 *  project the user just switched to is unknown until it is asked for again. */
 	private _resetLiveIndexKeys(): void {
 		this.state.liveIndexKeys = {};
+		this.state.liveIndexRunning = {};
 		this.state.liveIndexChecked = false;
 		this._liveIndexAt = 0;
+		// Steps loaded into rows belong to that chat too.
+		this.state.passPaging = {};
 	}
 
 	/**
@@ -976,7 +1021,21 @@ export class ChatSession {
 		// pass-boundary gap the ladder exists for presumes a chain was alive,
 		// and on an idle tab return the climb was three round trips of asking
 		// a question whose answer had not changed.
+		//
+		// SKIPPED (2026-11-20) when a look already confirmed the queue idle, no pass on
+		// screen is newer than that, and this page tracks nothing live: then the answer is
+		// known, and every tab return used to ask it again. "Nothing live" is still RECORDED,
+		// as the look would have, so finished rows do not fall back to spinning. A run begun
+		// elsewhere since shows up in the history page this follows (newer `_ts`, or a bg
+		// poll attached to its running item), which is evidence, and the look runs.
+		var sid = this.host.getIdentity().projectId;
+		var idleAt = sid ? this._idleVerdictAt[sid] : 0;
+		if (sid && idleAt && !this._hasLocalLiveIndexWork(sid) && this._newestIndexPassTs() <= idleAt) {
+			this._recordLiveIndexKeys([{ list: [] }, { list: [] }]);
+			return;
+		}
 		this._adoptWorkerIndexingPasses(0, true);
+		this._ensureAdoptTick();
 	}
 
 	/** Forget what we know about which files are indexing — but ONLY when the
@@ -2170,6 +2229,7 @@ export class ChatSession {
 		if (!isErr) {
 			var rNote = extractRetrievalNote(body, text);
 			if (rNote) reply._retrieval = rNote;
+			this._saveFindings(itemId, body, text, rNote);
 		}
 		if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
 			// The reader is in another chat. Settle it where it belongs and touch
@@ -2320,10 +2380,40 @@ export class ChatSession {
 		return Promise.resolve()
 			.then(function () {
 				self.drainBgTaskQueue();
-				return self.loadHistory(false, self.state.gateRefreshToken);
+				// History is loaded ONCE (owner, 2026-11-20): coming back to the tab does not
+				// refetch it. What changed while away arrives the way it would have live:
+				// replies through their polls (foreground polls never paused), indexing
+				// passes through the queue check that drainBgTaskQueue restarts. Only a
+				// waiting bubble left with nothing to settle it needs the first page again.
+				if (self.needsHistoryRefetch()) return self.loadHistory(false, self.state.gateRefreshToken);
+				self.refreshLiveIndexState();
 			})
 			.catch(function (e: any) { console.error('[chat-engine] resume polling failed', e); })
 			.then(function () { self._resuming = false; });
+	}
+
+	/**
+	 * Does the chat on screen need its first history page fetched again to stay right?
+	 * Only when a waiting bubble of THIS chat has nothing that will settle it: no live poll
+	 * and no entry in bgTaskQueue (whose passes the drain and the queue check follow). Then
+	 * the page is the only place its poll handle or its answer can come from (a turn on the
+	 * background queue whose poll paused while the tab was hidden, for instance). A bubble
+	 * with no server id yet is a send still in flight, which resolves on its own.
+	 */
+	needsHistoryRefetch(): boolean {
+		var key = this.getHistoryCacheKey();
+		var tracked: { [id: string]: true } = {};
+		for (var q = 0; q < this.bgTaskQueue.length; q++) if (this.bgTaskQueue[q]) tracked[this.bgTaskQueue[q].id] = true;
+		for (var i = 0; i < this.state.messages.length; i++) {
+			var m = this.state.messages[i];
+			if (!m || !(m.isPending || m.isPendingQueued || m.isPendingInProcess)) continue;
+			if (m._ownerKey !== undefined && m._ownerKey !== key) continue;
+			var sid = m._serverItemId;
+			if (!sid) continue;
+			if (this.historyItemPolls.has(sid) || tracked[sid]) continue;
+			return true;
+		}
+		return false;
 	}
 
 	private _newLocalId(): string {
@@ -2680,7 +2770,7 @@ export class ChatSession {
 				answer = (answer || '').trim();
 				// Retrieval memory: what this turn read, off the body's tool blocks (a
 				// streamed turn's `response` is already the assembled body here).
-				return { content: answer || 'No text response received from AI provider.', isError: false, retrieval: extractRetrievalNote(response, answer) };
+				return { content: answer || 'No text response received from AI provider.', isError: false, retrieval: extractRetrievalNote(response, answer), body: response };
 			})
 			.catch(function (err: any) { return { content: getErrorMessage(err), isError: true }; })
 			.then(function (result: any) {
@@ -2700,6 +2790,7 @@ export class ChatSession {
 				var reply: ChatMessage = { role: 'assistant', content: result.content, isError: result.isError };
 				if (dispatchItemId) reply._serverItemId = dispatchItemId;
 				if (result.retrieval) reply._retrieval = result.retrieval;
+				if (!result.isError && result.body) self._saveFindings(dispatchItemId, result.body, result.content, result.retrieval);
 
 				// REPLACE the trailing pending "Thinking..." bubble in the cache with
 				// the answer, regardless of whether this chat is the currently-visible
@@ -3337,9 +3428,19 @@ export class ChatSession {
 	}
 
 	promoteNextBgQueuedToRunning(): void {
-		if (this.state.messages.some(function (m) { return m.isPending && m.role === 'assistant' && m.isBackgroundTask; })) return;
+		// Passes the queue check follows (byListing) are never promoted by this guess: the
+		// worker runs several at once in any order, so "the next waiting one" is often the
+		// wrong one, and the running listing promotes them by id (_promoteListedRunning).
+		// The guess stays for anything else on the background queue.
+		var listed: { [id: string]: true } = {};
+		for (var q = 0; q < this.bgTaskQueue.length; q++) {
+			var qe = this.bgTaskQueue[q];
+			if (qe && qe.byListing) listed[qe.id] = true;
+		}
+		var guessed = function (m: ChatMessage) { return !(m._serverItemId && listed[m._serverItemId]); };
+		if (this.state.messages.some(function (m) { return m.isPending && m.role === 'assistant' && m.isBackgroundTask && guessed(m); })) return;
 		var nextIdx = this.state.messages.findIndex(function (m) {
-			return m.isPendingQueued && m.role === 'user' && m.isBackgroundTask;
+			return m.isPendingQueued && m.role === 'user' && m.isBackgroundTask && guessed(m);
 		});
 		if (nextIdx === -1) return;
 		var existing = this.state.messages[nextIdx];
@@ -3538,6 +3639,7 @@ export class ChatSession {
 			if (!offReply.isError) {
 				var offNote = extractRetrievalNote(response, offReply.content);
 				if (offNote) offReply._retrieval = offNote;
+				this._saveFindings(serverId, response, offReply.content, offNote);
 			}
 			this._applyReplyToCache(ownerKey, offReply, serverId);
 			if (serverId) this.cancelledServerIds.delete(serverId);
@@ -3557,6 +3659,7 @@ export class ChatSession {
 			// Retrieval memory for this turn, attached to whichever bubble below ends up
 			// holding the answer.
 			var qNote = extractRetrievalNote(response, answer);
+			this._saveFindings(serverId, response, answer, qNote);
 			var lid = this._newLocalId();
 			if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
 				// Same resume as the immediate-send path: keep what the stream painted
@@ -4541,6 +4644,7 @@ export class ChatSession {
 		// Retrieval memory for a CHAT turn that settled through a re-attached poll.
 		// Read once here; the background branches below never use it.
 		var hNote = isErr ? null : extractRetrievalNote(response, answer);
+		if (hNote) this._saveFindings(itemId, response, answer, hNote);
 		var stripMarker = function (t: string): string {
 			return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join('').trim() : t;
 		};
@@ -4754,7 +4858,487 @@ export class ChatSession {
 	 * shape that previously looped fetchHistoryPage after an already-DONE index.
 	 */
 	private _adoptingWorkerPasses = false;
-	private _adoptWorkerIndexingPasses(attempt: number, passive?: boolean): void {
+	/** Per project: when a look last CONFIRMED the bg queue held nothing pending or running
+	 *  (2026-11-20). A recent pass older than this is a finished run, not evidence of live
+	 *  work, so a tab return no longer re-asks for ten minutes after every run. Memory only:
+	 *  a reload starts without it and asks once, as before. */
+	private _idleVerdictAt: { [svcId: string]: number } = {};
+	private _adoptTickTimer: any = null;
+
+	/** Newest wall-clock `_ts` of any indexing pass on screen, or 0. */
+	private _newestIndexPassTs(): number {
+		var newest = 0;
+		var msgs = this.state.messages;
+		for (var i = 0; i < msgs.length; i++) {
+			var m = msgs[i];
+			if (m && m._indexFile && typeof m._ts === 'number' && m._ts > newest) newest = m._ts;
+		}
+		return newest;
+	}
+
+	/** Live indexing work THIS page is tracking for the project: a queued or adopted pass,
+	 *  an attached bg poll, or a live key a look recorded. No recency guess. */
+	private _hasLocalLiveIndexWork(svcId: string): boolean {
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.projectId === svcId) return true;
+		}
+		var keys = this.state.liveIndexKeys || {};
+		for (var k in keys) { if (keys[k]) return true; }
+		var found = false;
+		this.historyItemPolls.forEach(function (h: any) { if (h && h.kind === 'bg') found = true; });
+		return found;
+	}
+
+	/** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
+	 *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
+	 *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+	private _ensureAdoptTick(): void {
+		if (this._adoptTickTimer) return;
+		var self = this;
+		var id = this.host.getIdentity();
+		if (!id.projectId || (id.platform !== 'claude' && id.platform !== 'openai')) return;
+		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+		if (!this._hasLocalLiveIndexWork(id.projectId)) return;
+		this._adoptTickTimer = setTimeout(function () {
+			self._adoptTickTimer = null;
+			var now = self.host.getIdentity();
+			if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+			if (now.projectId !== id.projectId) { self._ensureAdoptTick(); return; }
+			if (!self._hasLocalLiveIndexWork(now.projectId)) return;
+			self._adoptWorkerIndexingPasses(0, false, true);
+			self._settleByListing();
+			self._refreshPageProgress();
+			self._ensureAdoptTick();
+		}, ADOPT_TICK_MS);
+	}
+
+	/** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
+	 *  live. Complete means both lists came back shorter than their limit, so a tracked pass
+	 *  missing from it really has left the queue. */
+	private _lastLiveLook: { svcId: string; platform: string; at: number; ids: { [id: string]: true } } | null = null;
+	/** By-listing passes whose by-id lookup is in flight, so one tick never reads a pass twice. */
+	private _listingSettling: { [id: string]: true } = {};
+	private _listingLookInflight = false;
+
+	/**
+	 * Follow an indexing pass found in a loaded history page through the queue check
+	 * instead of polling it (owner, 2026-11-20): polls on one queue run one at a time in
+	 * skapi-js, so after a reload mid-run every lane waited behind the first. Only for a
+	 * pass the worker drives (a client-driven chain is resumed off its dispatching entry,
+	 * whose pass count caps it) and only when the host can read a row by id. True when the
+	 * pass is now tracked (the caller then attaches no poll).
+	 */
+	trackHistoryIndexPass(item: any): boolean {
+		if (typeof chatEngineConfig().csrHistoryItemLookup !== 'function') return false;
+		if (!item || typeof item.id !== 'string' || !item.id) return false;
+		if (item.status !== 'pending' && item.status !== 'running') return false;
+		for (var q = 0; q < this.bgTaskQueue.length; q++) {
+			if (this.bgTaskQueue[q] && this.bgTaskQueue[q].id === item.id) return !!this.bgTaskQueue[q].byListing;
+		}
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return false;
+		var text = typeof item.request_text === 'string' && item.request_text
+			? item.request_text
+			: extractLastUserTextFromRequest(item.request_body);
+		var ref = parseIndexingRequestText(text);
+		if (!ref || !ref.name) return false;
+		if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
+		this.bgTaskQueue.push({
+			projectId: id.projectId,
+			platform: platform,
+			id: item.id,
+			filename: ref.name,
+			storagePath: ref.path,
+			mime: ref.mime,
+			size: ref.size,
+			status: item.status === 'running' ? 'running' : 'pending',
+			poll: typeof item.poll === 'function' ? item.poll : undefined,
+			resumePass: ref.continued ? 1 : 0,
+			byListing: true,
+			adoptedAt: Date.now(),
+		});
+		return true;
+	}
+
+	/**
+	 * Show a pass as RUNNING once the queue says it is. A pass this client sent starts out
+	 * waiting (the server queues it), and its own poll's running tick used to be what
+	 * moved it on. Settled from the listing, it has no poll, so the running listing the
+	 * 10-second check already takes does it instead (owner, 2026-11-20).
+	 */
+	private _promoteListedRunning(runningRes: any): void {
+		var list = runningRes && Array.isArray(runningRes.list) ? runningRes.list : [];
+		if (!list.length) return;
+		var running: { [id: string]: true } = {};
+		for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === 'string') running[list[i].id] = true;
+		var changed = false;
+		for (var q = 0; q < this.bgTaskQueue.length; q++) {
+			var e = this.bgTaskQueue[q];
+			if (!e || e.status !== 'pending' || !running[e.id]) continue;
+			e.status = 'running';
+			if (this._promoteBgItemToRunning(e.id)) changed = true;
+		}
+		if (changed) {
+			this.host.notify();
+			this.updateHistoryCache();
+		}
+	}
+
+	/** promoteNextBgQueuedToRunning for one named pass: its waiting request bubble becomes
+	 *  the running one, with a "Thinking..." placeholder under it. False when that pass has
+	 *  no waiting bubble (already running, settled, or not on screen). */
+	private _promoteBgItemToRunning(itemId: string): boolean {
+		var idx = this.state.messages.findIndex(function (m) {
+			return m.role === 'user' && m.isBackgroundTask && m.isPendingQueued && m._serverItemId === itemId;
+		});
+		if (idx === -1) return false;
+		var existing = this.state.messages[idx];
+		var promoted: ChatMessage = { role: 'user', content: existing.content, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: itemId };
+		if (existing._indexFile) promoted._indexFile = existing._indexFile;
+		if (existing._ts !== undefined) promoted._ts = existing._ts;
+		if (existing._ownerKey !== undefined) promoted._ownerKey = existing._ownerKey;
+		this.state.messages[idx] = promoted;
+		var placeholder: ChatMessage = { role: 'assistant', content: '', isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: itemId };
+		if (existing._ownerKey !== undefined) placeholder._ownerKey = existing._ownerKey;
+		this.state.messages.splice(idx + 1, 0, placeholder);
+		return true;
+	}
+
+	/** Turns whose findings were already looked at (a turn can settle by more than one path). */
+	private _findingsDone: { [itemId: string]: true } = {};
+
+	/**
+	 * Save where a hard search found its answer (findings.ts), through the host's
+	 * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
+	 * throws, never waited on.
+	 */
+	private _saveFindings(itemId: string | undefined, body: any, answer: string | null | undefined, note: RetrievalNote | null | undefined): void {
+		try {
+			var save = chatEngineConfig().saveSearchFinding;
+			if (typeof save !== 'function' || !note || !body) return;
+			if (itemId) {
+				if (this._findingsDone[itemId]) return;
+				this._findingsDone[itemId] = true;
+			}
+			// The question: the user bubble of this turn (same server id), when it is on screen.
+			var question: string | null = null;
+			if (itemId) {
+				for (var i = 0; i < this.state.messages.length; i++) {
+					var m = this.state.messages[i];
+					if (m && m.role === 'user' && m._serverItemId === itemId) {
+						if (m.isBackgroundTask) return;   // an indexing pass, not a chat turn
+						question = typeof m.content === 'string' ? m.content : null;
+						break;
+					}
+				}
+			}
+			var found = findingsForTurn({ question: question, body: body, note: note, answer: answer });
+			if (!found.length) return;
+			var id = this.host.getIdentity();
+			if (!id.projectId) return;
+			for (var f = 0; f < found.length; f++) {
+				var payload = Object.assign({ service: id.projectId, owner: id.owner }, found[f]);
+				Promise.resolve(save(payload)).catch(function () { /* best effort */ });
+			}
+		} catch (e) { /* never in the way of the answer */ }
+	}
+
+	/**
+	 * Chats-only history (owner, 2026-11-21): on when the host can list a file's passes
+	 * (listIndexPasses) and read one by id (csrHistoryItemLookup). The history fetch then
+	 * skips the indexing queue, a file's row comes from its run:: record, and opening the
+	 * row loads its passes (loadRunPasses), a page at a time.
+	 */
+	lazyIndexRowsEnabled(): boolean {
+		var cfg = chatEngineConfig();
+		return typeof cfg.listIndexPasses === 'function' && typeof cfg.csrHistoryItemLookup === 'function';
+	}
+
+	/** How many passes one "Load more" brings into a file's row. */
+	static RUN_PASS_PAGE = 10;
+
+	/** The paging state of a file's passes, or null before its row was first opened. */
+	runPassPaging(storagePath?: string): { ids: string[]; loaded: number; loading: boolean; done: boolean; error?: string } | null {
+		if (!storagePath || !this.state.passPaging) return null;
+		return this.state.passPaging[storagePath] || null;
+	}
+
+	/**
+	 * Load the next page of a file's indexing passes into the chat, newest first (owner,
+	 * 2026-11-21). The ids come from the file's pass records (listIndexPasses, once), each
+	 * pass is read by id (csrHistoryItemLookup) and lands as the same request + reply bubbles
+	 * a live pass produces, so its file's row groups it like any other. A pass still running
+	 * or waiting is left to the live queue check, which shows it as it settles; one already
+	 * in the chat is not read again. Never throws.
+	 */
+	loadRunPasses(storagePath: string, fileName?: string): Promise<void> {
+		var self = this;
+		var cfg = chatEngineConfig();
+		var list = cfg.listIndexPasses, lookup = cfg.csrHistoryItemLookup;
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!storagePath || typeof list !== 'function' || typeof lookup !== 'function') return Promise.resolve();
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return Promise.resolve();
+		if (!this.state.passPaging) this.state.passPaging = {};
+		var paging = this.state.passPaging[storagePath];
+		if (paging && (paging.loading || paging.done)) return Promise.resolve();
+		if (!paging) {
+			paging = { ids: [], loaded: 0, loading: false, done: false };
+			this.state.passPaging[storagePath] = paging;
+		}
+		var p = paging;
+		p.loading = true;
+		p.error = undefined;
+		this.host.notify();
+		var svcId = id.projectId, owner = id.owner;
+		var name = fileName || storagePath.split('/').pop() || storagePath;
+		var idsReady: Promise<string[]> = p.ids.length
+			? Promise.resolve(p.ids)
+			: Promise.resolve(list(svcId, storagePath)).then(function (ids) {
+				var clean = (Array.isArray(ids) ? ids : []).filter(function (x) { return typeof x === 'string' && !!x; });
+				// Request ids sort by time ("stamp:entropy", the stamp a time_ns): newest first.
+				clean.sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
+				p.ids = clean;
+				return clean;
+			});
+		return idsReady.then(function (ids) {
+			var oldest = ids.length ? ids[ids.length - 1] : '';
+			var present: { [rid: string]: true } = {};
+			for (var i = 0; i < self.state.messages.length; i++) {
+				var m = self.state.messages[i];
+				if (m && m._serverItemId) present[m._serverItemId] = true;
+			}
+			// The next RUN_PASS_PAGE steps not already on screen (a step the live check or an
+			// earlier page brought in is passed over, not counted).
+			var page: string[] = [];
+			var next = p.loaded;
+			while (next < ids.length && page.length < ChatSession.RUN_PASS_PAGE) {
+				if (!present[ids[next]]) page.push(ids[next]);
+				next++;
+			}
+			return Promise.all(page.map(function (rid) {
+				return Promise.resolve(lookup!(buildHistoryItemFullId(platform as 'claude' | 'openai', svcId, rid), svcId, owner))
+					.then(function (body: any) { return { rid: rid, body: body, err: null as any }; },
+						function (err: any) { return { rid: rid, body: null, err: err }; });
+			})).then(function (got) {
+				if (self.host.getIdentity().projectId !== svcId) return;
+				var add: ChatMessage[][] = [];
+				for (var g = 0; g < got.length; g++) {
+					var r = got[g];
+					if (!r) continue;
+					var body = r.body;
+					// Live work (running or waiting) is the queue check's to show.
+					if (isCsrStatusEnvelope(body) && (body.status === 'running' || body.status === 'pending')) continue;
+					var notExists = r.err && (r.err.code === 'NOT_EXISTS' || (r.err.body && r.err.body.code === 'NOT_EXISTS'));
+					if (notExists) continue;
+					var continued = r.rid !== oldest;
+					var when = requestIdTimeMs(r.rid);
+					var user: ChatMessage = {
+						role: 'user',
+						content: self.host.formatIndexingLabel(name, undefined, null, storagePath, false, continued),
+						isBackgroundTask: true,
+						_serverItemId: r.rid,
+						_indexFile: { name: name, path: storagePath, isReindex: false, continued: continued },
+					};
+					if (when) user._ts = when;
+					var reply: ChatMessage;
+					if (r.err) {
+						reply = { role: 'assistant', content: getErrorMessage(r.err), isError: true, isBackgroundTask: true, _serverItemId: r.rid };
+					} else if (isCsrStatusEnvelope(body) && body.status === 'cancelled') {
+						user.isCancelled = true;
+						add.push([user]);
+						continue;
+					} else if (isErrorResponseBody(body)) {
+						reply = { role: 'assistant', content: getErrorMessage(body), isError: true, isBackgroundTask: true, _serverItemId: r.rid };
+					} else {
+						var text = ((platform === 'openai' ? extractOpenAIText(body) : extractClaudeText(body)) || '').trim();
+						var complete = text.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+						if (complete) text = text.split(INDEXING_COMPLETE_MARKER).join('').trim();
+						reply = { role: 'assistant', content: text || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: r.rid };
+						if (complete) reply._indexComplete = true;
+					}
+					if (when) reply._ts = when;
+					add.push([user, reply]);
+				}
+				// Oldest first, each pair at its place in time among the messages.
+				add.sort(function (a, b) { return (a[0]._ts || 0) - (b[0]._ts || 0); });
+				for (var k = 0; k < add.length; k++) self._insertByTime(add[k]);
+				p.loaded = next;
+				p.done = p.loaded >= ids.length;
+			});
+		}).catch(function (err: any) {
+			p.error = getErrorMessage(err) || 'The steps could not be loaded.';
+		}).then(function () {
+			p.loading = false;
+			self.host.notify();
+			self.updateHistoryCache();
+		});
+	}
+
+	/** Insert bubbles before the first message that is newer than them (by `_ts`); messages
+	 *  without a time are skipped over, and the end of the list takes them otherwise. */
+	private _insertByTime(bubbles: ChatMessage[]): void {
+		var at = bubbles[0] && bubbles[0]._ts;
+		var idx = this.state.messages.length;
+		if (typeof at === 'number') {
+			for (var i = 0; i < this.state.messages.length; i++) {
+				var t = this.state.messages[i] && this.state.messages[i]._ts;
+				if (typeof t === 'number' && t > at) { idx = i; break; }
+			}
+		}
+		Array.prototype.splice.apply(this.state.messages, ([idx, 0] as any[]).concat(bubbles));
+	}
+
+	private _progressInflight = false;
+
+	/**
+	 * Refresh the page progress ("175 of 530 pages") of the documents this page is still
+	 * tracking passes for, one read per file (config readIndexProgress, the MCP's
+	 * prog::<path> record). Runs on the ADOPT_TICK_MS check; a file with nothing tracked is
+	 * not asked about. Never throws.
+	 */
+	private _refreshPageProgress(): void {
+		var read = chatEngineConfig().readIndexProgress;
+		if (typeof read !== 'function' || this._progressInflight) return;
+		var id = this.host.getIdentity();
+		if (!id.projectId || this.isPollingPaused() || !this.host.isViewMounted()) return;
+		var svcId = id.projectId;
+		var paths: string[] = [];
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.projectId === svcId && e.storagePath && paths.indexOf(e.storagePath) === -1) paths.push(e.storagePath);
+		}
+		if (!paths.length) return;
+		var self = this;
+		this._progressInflight = true;
+		Promise.all(paths.map(function (path) {
+			return Promise.resolve(read!(svcId, path)).then(function (data) { return { path: path, data: data }; }, function () { return { path: path, data: null }; });
+		})).then(function (rows) {
+			self._progressInflight = false;
+			if (self.host.getIdentity().projectId !== svcId) return;
+			if (!self.state.indexPageProgress) self.state.indexPageProgress = {};
+			var changed = false;
+			for (var r = 0; r < rows.length; r++) {
+				var d: any = rows[r].data;
+				var saved = d && typeof d.pages_saved === 'number' ? d.pages_saved : null;
+				if (saved === null) continue;
+				var total = d && typeof d.pages_total === 'number' && d.pages_total > 0 ? d.pages_total : null;
+				var prev = self.state.indexPageProgress[rows[r].path];
+				if (prev && prev.saved === saved && prev.total === total) continue;
+				self.state.indexPageProgress[rows[r].path] = { saved: saved, total: total, at: Date.now() };
+				changed = true;
+			}
+			if (changed) self.host.notify();
+		}, function () { self._progressInflight = false; });
+	}
+
+	/** The page progress to show for a file's row, or null (see _refreshPageProgress). */
+	pageProgressFor(storagePath?: string): { saved: number; total: number | null } | null {
+		if (!storagePath || !this.state.indexPageProgress) return null;
+		var p = this.state.indexPageProgress[storagePath];
+		return p ? { saved: p.saved, total: p.total } : null;
+	}
+
+	private _noteLiveLook(svcId: string, platform: 'claude' | 'openai', results: any[]): void {
+		var ids: { [id: string]: true } = {};
+		var complete = true;
+		for (var r = 0; r < results.length; r++) {
+			var list = results[r] && Array.isArray(results[r].list) ? results[r].list : [];
+			if (list.length >= WORKER_PASS_ADOPT_LIMIT) complete = false;
+			for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === 'string') ids[list[i].id] = true;
+		}
+		this._lastLiveLook = complete ? { svcId: svcId, platform: platform, at: Date.now(), ids: ids } : null;
+	}
+
+	/**
+	 * Settle indexing passes from the queue instead of from their own polls (owner,
+	 * 2026-11-20): the worker's lanes AND the first passes this client sent. Runs on the
+	 * ADOPT_TICK_MS check, beside the adoption look.
+	 *
+	 * WHY. skapi-js runs every poll on one queue one at a time, each until its request
+	 * finishes. The worker runs a document's windows in parallel lanes on that one queue, so
+	 * a lane that finished waited behind every pass ahead of it (measured: passes done at
+	 * 17:04 shown at 17:06-17:07, one every ~5 s, after a 3-minute first pass).
+	 *
+	 * HOW. One compact listing each of the queue's `resolved` and `failed` rows (stubs, no
+	 * bodies). A tracked pass found there, or one missing from a COMPLETE running+pending look
+	 * taken after it was adopted (cancelled, removed), is read ONCE by id through the host's
+	 * csrHistoryItemLookup, the same row a poll's last read returns, and settled through
+	 * _settleBgOutcome exactly as its poll would have been. A lookup that still says
+	 * running/pending (the status index lags the table) leaves the pass for the next tick.
+	 */
+	private _settleByListing(): void {
+		var self = this;
+		if (this._listingLookInflight) return;
+		var lookup = chatEngineConfig().csrHistoryItemLookup;
+		if (typeof lookup !== 'function') return;
+		var id = this.host.getIdentity();
+		var platform = id.platform;
+		if (!id.projectId || (platform !== 'claude' && platform !== 'openai')) return;
+		if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+		var svcId = id.projectId, owner = id.owner;
+		var waiting: BgTaskEntry[] = [];
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.byListing && e.projectId === svcId && e.platform === platform && !this._listingSettling[e.id]) waiting.push(e);
+		}
+		if (!waiting.length) return;
+		var queue = bgIndexingQueueName(id.userId, svcId);
+		var ask = function (status: 'resolved' | 'failed') {
+			return Promise.resolve(getChatHistory(
+				{ service: svcId, owner: owner, platform: platform as 'claude' | 'openai', queue: queue, status: status, queue_exact: true, compact: true },
+				{ limit: WORKER_PASS_ADOPT_LIMIT, fetchMore: false },
+			)).then(function (res: any) { return res && Array.isArray(res.list) ? res.list : []; })
+				.catch(function () { return []; });
+		};
+		this._listingLookInflight = true;
+		Promise.all([ask('resolved'), ask('failed')]).then(function (lists: any[][]) {
+			self._listingLookInflight = false;
+			var now = self.host.getIdentity();
+			if (now.projectId !== svcId || now.platform !== platform || !self.host.isViewMounted()) return;
+			var finished: { [id: string]: any } = {};
+			for (var l = 0; l < lists.length; l++) {
+				for (var k = 0; k < lists[l].length; k++) {
+					var row = lists[l][k];
+					if (row && typeof row.id === 'string') finished[row.id] = row;
+				}
+			}
+			var look = self._lastLiveLook;
+			var lookUsable = !!look && look.svcId === svcId && look.platform === platform && Date.now() - look.at <= 2 * ADOPT_TICK_MS;
+			for (var w = 0; w < waiting.length; w++) {
+				var entry = waiting[w];
+				if (self.bgTaskQueue.indexOf(entry) === -1) continue; // settled meanwhile (history, cancel)
+				var row2 = finished[entry.id];
+				var leftQueue = !row2 && lookUsable && !look!.ids[entry.id]
+					&& typeof entry.adoptedAt === 'number' && entry.adoptedAt < look!.at;
+				if (!row2 && !leftQueue) continue;
+				self._settleListedEntry(entry, platform as 'claude' | 'openai', lookup,
+					row2 && typeof row2.executed === 'number' && row2.executed > 0 ? row2.executed : undefined);
+			}
+		}, function () { self._listingLookInflight = false; });
+	}
+
+	/** One by-id read of a by-listing pass, then the shared settle. */
+	private _settleListedEntry(entry: BgTaskEntry, platform: 'claude' | 'openai', lookup: (fullId: string, service: string, owner: string) => Promise<any>, executedAt: number | undefined): void {
+		var self = this;
+		var id = this.host.getIdentity();
+		this._listingSettling[entry.id] = true;
+		Promise.resolve(lookup(buildHistoryItemFullId(platform, entry.projectId, entry.id), entry.projectId, id.owner)).then(function (body: any) {
+			delete self._listingSettling[entry.id];
+			if (self.bgTaskQueue.indexOf(entry) === -1) return;
+			// Still going by the table's own reading: leave it for the next tick.
+			if (isCsrStatusEnvelope(body) && (body.status === 'running' || body.status === 'pending')) return;
+			self._settleBgOutcome(entry, platform, Promise.resolve(body), function () { return executedAt; });
+		}, function (err: any) {
+			delete self._listingSettling[entry.id];
+			if (self.bgTaskQueue.indexOf(entry) === -1) return;
+			self._settleBgOutcome(entry, platform, Promise.reject(err), function () { return executedAt; });
+		});
+	}
+
+	private _adoptWorkerIndexingPasses(attempt: number, passive?: boolean, single?: boolean): void {
 		var self = this;
 		// One in flight at a time. The query is queue-WIDE, so a second file's pass
 		// settling in the same moment is covered by the query already running.
@@ -4790,7 +5374,14 @@ export class ChatSession {
 			// list — harmless there (nothing to adopt) but not here: recording it would
 			// publish "the queue holds nothing" on the strength of a request that never
 			// answered, which reads as finished. Not knowing is the honest state.
-			if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
+			if (results[0] !== null && results[1] !== null) {
+				self._recordLiveIndexKeys(results);
+				self._noteLiveLook(svcId, platform as 'claude' | 'openai', results);
+			}
+			if (results[0] !== null) self._promoteListedRunning(results[0]);
+			// Both queries answered and both empty: the queue holds nothing for this user.
+			var emptyLook = results[0] !== null && results[1] !== null
+				&& !((results[0].list || []).length) && !((results[1].list || []).length);
 			var adoptedIds: string[] = [];
 			for (var ri = 0; ri < results.length; ri++) {
 				var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
@@ -4807,8 +5398,10 @@ export class ChatSession {
 				// pass belonging to a file the user stopped is dropped on sight. Both
 				// used to read as "found the next pass", which ended the search for a
 				// pass that had not been written yet.
-				if (self._isTrackingAny(adoptedIds)) return;
+				if (self._isTrackingAny(adoptedIds)) { self._ensureAdoptTick(); return; }
 			}
+			// A periodic look (_ensureAdoptTick) never climbs: the next tick is its retry.
+			if (single) return;
 			// Nothing yet. The worker writes pass N+1 a few milliseconds AFTER it
 			// flips pass N to resolved, so a poll that lands in that gap sees an
 			// empty queue for a chain that is very much alive — and with no pass
@@ -4822,8 +5415,12 @@ export class ChatSession {
 			// re-asked an unchanged question three more times on every tab return.
 			// (No nudge here either: a send waiting on indexing implies local
 			// entries, which IS evidence, so the passive stop never starves it.)
-			if (passive && !self._hasLiveIndexEvidence(svcId)) return;
+			if (passive && !self._hasLiveIndexEvidence(svcId)) {
+				if (emptyLook) self._idleVerdictAt[svcId] = Date.now();
+				return;
+			}
 			if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
+				if (emptyLook) self._idleVerdictAt[svcId] = Date.now();
 				// The ladder is the only thing that can tell a worker-driven chain has
 				// really ended, and it just did. This is the earliest honest moment to
 				// let a turn waiting on these files stop waiting.
@@ -4878,6 +5475,9 @@ export class ChatSession {
 		// true for any chat that has ever indexed anything: exactly the always-climb
 		// this gate was added to stop.
 		var cutoff = Date.now() - RECENT_INDEX_PASS_EVIDENCE_MS;
+		// A pass from before the last confirmed-idle look belongs to a run that is over.
+		var idleAt = this._idleVerdictAt[svcId] || 0;
+		if (idleAt > cutoff) cutoff = idleAt;
 		var msgs = this.state.messages;
 		for (var mi = msgs.length - 1; mi >= 0; mi--) {
 			var m = msgs[mi];
@@ -4949,6 +5549,10 @@ export class ChatSession {
 			// _applyIndexCancellations, which must not read a CONTINUE pass as the
 			// fresh first pass that lifts a stop.
 			resumePass: ref.continued ? 1 : 0,
+			// Settled by the 10-second queue check when the host can look a row up by id
+			// (csrHistoryItemLookup); otherwise polled as before.
+			byListing: typeof chatEngineConfig().csrHistoryItemLookup === 'function',
+			adoptedAt: Date.now(),
 		});
 		return true;
 	}
@@ -4983,6 +5587,8 @@ export class ChatSession {
 		// pass of a stopped file that reached the chat through history.
 		this._applyIndexCancellations();
 		this._sweepCancelledIndexing();
+		// A dispatched or adopted pass is live work: follow the run while the tab shows it.
+		this._ensureAdoptTick();
 		// Index messages by _serverItemId ONCE, so the per-entry presence/pending
 		// checks below are O(1) instead of a full messages.some() scan each. With a
 		// large bg queue (bulk uploads) the old nested scan was O(queue x messages)
@@ -5016,6 +5622,13 @@ export class ChatSession {
 		// entry; only the polling is rationed, and an unpolled entry picks up a
 		// poll on the drain that follows the next resolution.
 		var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+		// Every indexing pass is settled by the 10-second queue check rather than by its own
+		// poll when the host can read a row by id (owner, 2026-11-20): first passes too, not
+		// only the worker's lanes. skapi-js runs a queue's polls one at a time, so a file's
+		// first pass that finished waited behind another file's (a PDF's first pass runs for
+		// minutes). Decided HERE, the one place polls are attached, so a pass added by any
+		// caller (this engine, agent.vue, the files page) is covered alike.
+		var listingSettles = typeof chatEngineConfig().csrHistoryItemLookup === 'function';
 		// Set by the injection branch; drives the single render/cache/scroll below.
 		var injectedAny = false;
 		this.bgTaskQueue.forEach(function (entry) {
@@ -5085,11 +5698,17 @@ export class ChatSession {
 			// are gone.
 			injectedAny = true;
 			}
-			if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
+			if (listingSettles && !entry.byListing) {
+				entry.byListing = true;
+				if (typeof entry.adoptedAt !== 'number') entry.adoptedAt = Date.now();
+			}
+			// A by-listing pass is never polled: the 10-second queue check settles it
+			// (_settleByListing), so it neither waits in skapi-js's per-queue poll line nor
+			// spends this budget.
+			if (!entry.byListing && bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry.id) && typeof entry.poll === 'function') {
 				bgPollBudget--;
-				var capturedId = entry.id, capturedPlat = plat;
+				var capturedPlat = plat;
 				var capturedEntry = entry;
-				var wasStopped = false;
 				// When the worker BEGAN running this pass. It rides on the poll's status
 				// envelope (a running tick), never on the terminal read, which hands back
 				// the destination's own body. Captured here so a settled pass can show how
@@ -5104,68 +5723,7 @@ export class ChatSession {
 					},
 				});
 				self._trackPoll(entry.id, 'bg', bp);
-				bp.then(function (response: any) {
-					// A stopped poll is not a result: leave the bubble and the queue entry
-					// exactly as they were so resumePolling can re-attach.
-					if (isPollStopped(response)) { wasStopped = true; return; }
-					self.handleHistoryItemResolution(capturedId, response, capturedPlat, executedAt);
-					self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
-				}).catch(function (err: any) {
-					self.historyItemPolls.delete(capturedId);
-					var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
-					// Settle the REQUEST bubble first, unconditionally. Only a RUNNING
-					// pass gets an assistant placeholder, so for a queued one the lookup
-					// below finds nothing and every branch was skipped — leaving the
-					// request bubble isPendingQueued with its queue entry about to be
-					// spliced away, i.e. no poll left to ever clear it. One such bubble
-					// pins the whole collapsed row to "active": a spinner and a Stop
-					// button against a dead id, until the page is reloaded.
-					self._clearPendingUserBubble(capturedId);
-					var bi = self.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === capturedId; });
-					if (bi !== -1) {
-						if (isNotExists) self.state.messages.splice(bi, 1);
-						else self.state.messages[bi] = { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
-					} else if (!isNotExists) {
-						// No placeholder to turn into the error (a queued pass). Put one
-						// after the request bubble so the row reports the failure instead
-						// of quietly settling to "Indexed".
-						var ui = self.state.messages.findIndex(function (m) { return m.role === 'user' && m._serverItemId === capturedId; });
-						if (ui !== -1) {
-							self.state.messages.splice(ui + 1, 0, { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
-						}
-					}
-					self.host.notify(); self.updateHistoryCache();
-					// A pass that FAILED dispatches no continuation on any path, so a
-					// CLIENT-driven file is finished either way — let a turn waiting on it
-					// look now. Not for a worker-driven one: this catch also fires on a
-					// dropped poll, and the worker may have resolved that pass and written
-					// the next one regardless. Nudging there would pull the two confirming
-					// looks into the window where the new pass is not yet in the status
-					// index, which is the same way a nudge on work STARTING went wrong.
-					if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
-						// Also close the run record: for a CLIENT-driven file a failed
-						// pass ends the chain on every path, and a removed row reads as
-						// a cancel. Worker-driven files are excluded for the same reason
-						// as the nudge — this catch fires on dropped polls too, and the
-						// worker may be writing the next pass regardless.
-						if (isNotExists) self._flipRunRecord(capturedEntry, 'cancelled');
-						else self._flipRunRecord(capturedEntry, 'error', self._runErrorText(err));
-						self._nudgeIndexingDrain();
-					}
-				}).then(function () {
-					// Keep the queue entry when the poll was merely stopped, or resuming
-					// would have nothing left to re-attach to.
-					if (wasStopped) return;
-					var qi = self.bgTaskQueue.findIndex(function (q) { return q.id === capturedId; });
-					if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
-					// This resolution freed a slot in the MAX_CONCURRENT_BG_POLLS budget,
-					// so hand it to the next-oldest unpolled entry. Load-bearing under the
-					// cap: with thousands of entries queued, only the handful holding
-					// polls can ever settle, and without this re-drain the remaining
-					// entries would sit unpolled forever. Not left to a host-side watcher
-					// on bgTaskQueue — agent.vue has one, the widget does not.
-					self.drainBgTaskQueue();
-				});
+				self._settleBgOutcome(capturedEntry, capturedPlat, bp, function () { return executedAt; });
 			}
 		});
 		// One render, one cache write, one scroll for the whole drain — however many
@@ -5176,6 +5734,83 @@ export class ChatSession {
 			this.host.scrollToBottomIfSticky(false);
 		}
 		this.promoteNextBgQueuedToRunning();
+	}
+
+
+	/**
+	 * Settle one background pass from the outcome of reading it: its poll (drainBgTaskQueue)
+	 * or a single by-id lookup made by the 10-second queue check (_settleByListing). Both
+	 * read the same row the same way, so they share this one path: the resolution, the
+	 * resume/chain follow-up, the failure bubble and run record, and the queue entry's removal.
+	 * A stopped poll (isPollStopped) leaves the bubble and the entry as they were.
+	 */
+	private _settleBgOutcome(entry: BgTaskEntry, plat: 'claude' | 'openai', outcome: Promise<any>, getExecutedAt: () => number | undefined): void {
+		var self = this;
+		var capturedId = entry.id, capturedPlat = plat;
+		var capturedEntry = entry;
+		var wasStopped = false;
+		outcome.then(function (response: any) {
+			// A stopped poll is not a result: leave the bubble and the queue entry
+			// exactly as they were so resumePolling can re-attach.
+			if (isPollStopped(response)) { wasStopped = true; return; }
+			self.handleHistoryItemResolution(capturedId, response, capturedPlat, getExecutedAt());
+			self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
+		}).catch(function (err: any) {
+			self.historyItemPolls.delete(capturedId);
+			var isNotExists = err && (err.code === 'NOT_EXISTS' || (err.body && err.body.code === 'NOT_EXISTS'));
+			// Settle the REQUEST bubble first, unconditionally. Only a RUNNING
+			// pass gets an assistant placeholder, so for a queued one the lookup
+			// below finds nothing and every branch was skipped — leaving the
+			// request bubble isPendingQueued with its queue entry about to be
+			// spliced away, i.e. no poll left to ever clear it. One such bubble
+			// pins the whole collapsed row to "active": a spinner and a Stop
+			// button against a dead id, until the page is reloaded.
+			self._clearPendingUserBubble(capturedId);
+			var bi = self.state.messages.findIndex(function (m) { return m.isPending && m._serverItemId === capturedId; });
+			if (bi !== -1) {
+				if (isNotExists) self.state.messages.splice(bi, 1);
+				else self.state.messages[bi] = { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
+			} else if (!isNotExists) {
+				// No placeholder to turn into the error (a queued pass). Put one
+				// after the request bubble so the row reports the failure instead
+				// of quietly settling to "Indexed".
+				var ui = self.state.messages.findIndex(function (m) { return m.role === 'user' && m._serverItemId === capturedId; });
+				if (ui !== -1) {
+					self.state.messages.splice(ui + 1, 0, { role: 'assistant', content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
+				}
+			}
+			self.host.notify(); self.updateHistoryCache();
+			// A pass that FAILED dispatches no continuation on any path, so a
+			// CLIENT-driven file is finished either way — let a turn waiting on it
+			// look now. Not for a worker-driven one: this catch also fires on a
+			// dropped poll, and the worker may have resolved that pass and written
+			// the next one regardless. Nudging there would pull the two confirming
+			// looks into the window where the new pass is not yet in the status
+			// index, which is the same way a nudge on work STARTING went wrong.
+			if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+				// Also close the run record: for a CLIENT-driven file a failed
+				// pass ends the chain on every path, and a removed row reads as
+				// a cancel. Worker-driven files are excluded for the same reason
+				// as the nudge — this catch fires on dropped polls too, and the
+				// worker may be writing the next pass regardless.
+				if (isNotExists) self._flipRunRecord(capturedEntry, 'cancelled');
+				else self._flipRunRecord(capturedEntry, 'error', self._runErrorText(err));
+				self._nudgeIndexingDrain();
+			}
+		}).then(function () {
+			// Keep the queue entry when the poll was merely stopped, or resuming
+			// would have nothing left to re-attach to.
+			if (wasStopped) return;
+			var qi = self.bgTaskQueue.findIndex(function (q) { return q.id === capturedId; });
+			if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+			// This resolution freed a slot in the MAX_CONCURRENT_BG_POLLS budget,
+			// so hand it to the next-oldest unpolled entry. Load-bearing under the
+			// cap: with thousands of entries queued, only the handful holding
+			// polls can ever settle, and without this re-drain the remaining
+			// entries would sit unpolled forever. Not left to a host-side watcher
+			// on bgTaskQueue — agent.vue has one, the widget does not.
+			self.drainBgTaskQueue();
+		});
 	}
 
 	// Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
@@ -5417,6 +6052,8 @@ export class ChatSession {
 			this._resetLiveIndexKeys();
 		}
 		if (fetchMore) this.state.loadingOlderHistory = true;
+		// A first page replaces the messages, and with them any steps loaded into rows.
+		if (!fetchMore) this.state.passPaging = {};
 		this.host.notify(); // surface "Fetching history..." while it loads
 		var platform = id.platform as 'claude' | 'openai';
 		var projectId = id.projectId, owner = id.owner;
@@ -5438,6 +6075,8 @@ export class ChatSession {
 				// share. Read this device's own queue instead. See
 				// scopeSurfaceToQueue.
 				scopeSurfaceToQueue: !!id.anonymous,
+				// Chats only when a file's row can load its own passes (lazyIndexRowsEnabled).
+				skipBg: self.lazyIndexRowsEnabled(),
 			}, options);
 		};
 
@@ -5867,6 +6506,9 @@ export class ChatSession {
 					// poll had since died — with no live poller, leaving a "Thinking..."
 					// that never clears even after the server settled everything.
 					if (self.historyItemPolls.has(item.id)) return;
+					// An indexing pass the worker drives is followed by the queue check, not
+					// polled (see trackHistoryIndexPass).
+					if (item._isBgTask && self.trackHistoryIndexPass(item)) return;
 					// An in-flight immediate dispatch polls its own MAIN-QUEUE item but
 					// registers that id in historyItemPolls only AFTER its provider POST
 					// returns; in the sliver before that, a remount can surface the item

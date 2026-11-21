@@ -5,9 +5,7 @@
  * original are dependency-injection seams:
  *   - `skapi.clientSecretRequest*`  -> resolveForwardRequest*() in config.ts,
  *                                    which dispatches through the host's
- *                                    `forwardRequest*` keys, or the deprecated
- *                                    `clientSecretRequest*` ones a host written
- *                                    before the rename still injects
+ *                                    `forwardRequest*` keys (the only ones read)
  *   - MCP endpoint URL              -> chatEngineConfig().mcpBaseUrl
  *   - `poll` on each request        -> pollOpt() (set per consumer; see config.ts)
  *   - Vue `reactive`/`ref` removed  (bgTaskQueue/agentViewMounted are app-level
@@ -1399,6 +1397,53 @@ export const BG_INDEXING_QUEUE_SUFFIX = '-bg';
  * fall back to the live-queue probe (fetchLiveIndexingKeys) before reading
  * absence as anything.
  */
+/** What the MCP's /internal/index-reset answered. */
+export type IndexResetResult = {
+	path: string;
+	/** The access group the old file record had, or null when there was none. */
+	access_group: string | number | null;
+	removed: number;
+	missing: number;
+	failed: number;
+	decorations: number;
+	ambiguous: number;
+	ms?: number;
+};
+
+/**
+ * Clear a file's index on the SERVER before a Reindex or an Overwrite (owner,
+ * 2026-11-20): the MCP's /internal/index-reset removes the file record (and, through its
+ * cascade, everything referencing it), the agent's decorated per-window ids and the
+ * done::/run:: markers, in parallel, as the signed-in user. Reached through the host's
+ * forwardRequest with "$ACCESS_TOKEN", which skapi fills in with the caller's own token,
+ * so no client code ever holds it.
+ *
+ * Resolves to the server's answer, or null when the call could not be made or answered
+ * something else (an older MCP without the route, a timeout): the caller then clears
+ * the index itself, as it always did. Never rejects.
+ */
+export async function resetFileIndexOnServer(args: { service: string; owner?: string; storagePath: string }): Promise<IndexResetResult | null> {
+	try {
+		const base = String(mcpUrl() || '').replace(/\/+$/, '');
+		if (!base || !args || !args.service || !args.storagePath) return null;
+		const res: any = await forwardRequest({
+			service: args.service,
+			...(args.owner ? { owner: args.owner } : {}),
+			url: base + '/internal/index-reset',
+			method: 'POST',
+			headers: { 'content-type': 'application/json', Authorization: 'Bearer $ACCESS_TOKEN' },
+			data: { project_id: args.service, path: args.storagePath },
+		});
+		const body = typeof res === 'string' ? JSON.parse(res) : res;
+		if (body && typeof body === 'object' && typeof body.removed === 'number' && body.path === args.storagePath) {
+			return body as IndexResetResult;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 export function indexDoneUniqueId(storagePath: string): string {
 	return 'done::' + storagePath;
 }
@@ -1510,6 +1555,15 @@ export type BgTaskEntry = {
 	 *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
 	 *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
 	stageId?: string;
+	/** Settled from the 10-second queue check instead of its own poll (owner, 2026-11-20).
+	 *  Set by drainBgTaskQueue on every pass when the host has csrHistoryItemLookup, and on
+	 *  adoption for the worker's lanes. Polls on one queue run one at a time in skapi-js, so
+	 *  a pass that finished waited behind every pass ahead of it; see
+	 *  ChatSession._settleByListing. */
+	byListing?: boolean;
+	/** When this client first tracked the pass (ms). A pass missing from a listing taken
+	 *  BEFORE that proves nothing about it. */
+	adoptedAt?: number;
 };
 
 // Token the indexing agent appends to its final message ONLY when it has fully read and

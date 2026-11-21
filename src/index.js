@@ -34,6 +34,7 @@ import {
     extractOpenAIText,
     getChatHistory,
     indexDoneUniqueId,
+    resetFileIndexOnServer,
     runIndexUniqueId,
     composeUserMessage,
     groupAttachmentFailures,
@@ -186,8 +187,8 @@ import {
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
 
     // Google OAuth endpoint. The token exchange goes through skapi with the project's
-    // "ggl" client secret, exactly like bunnyquery oauth.ts: forwardRequest, or
-    // clientSecretRequest on an older skapi-js (see skapiForwardWithSecret).
+    // "ggl" client secret, exactly like bunnyquery oauth.ts: forwardRequest (see
+    // skapiForwardWithSecret).
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
     var GOOGLE_SCOPE =
@@ -520,112 +521,43 @@ import {
             .catch(function () { return null; });
     }
 
-    // WHICH REQUEST FAMILY THE EMBEDDER'S SKAPI-JS SPEAKS, asked in one place.
-    //
-    // skapi-js renamed clientSecretRequest and its companions to the forwardRequest
-    // family and kept every old name working, so a new SDK answers to both names and
-    // an old one only to the old. This widget is handed the EMBEDDER's instance, and
-    // its version is whatever their page pinned, so the widget has to ask rather
-    // than assume.
+    // THE EMBEDDER'S SKAPI-JS MUST HAVE THE forwardRequest FAMILY (skapi-js 2.1.0 or newer).
+    // The clientSecretRequest fallback was removed (owner, 2026-11-20: the old name is being
+    // deprecated), and init() refuses an older SDK with a message that says what to load.
     //
     // NEVER BY forwardRequest ALONE. An older skapi-js also has a method called
     // forwardRequest, taking the same (form, options), and it means something else
-    // entirely: the retired streaming forwarder, which posts to a different endpoint
-    // and injects the project's api key. A presence check on that name answers "new"
-    // for exactly the SDKs that are old, and every chat turn, cancel and Google
-    // sign-in would then go down the wrong path. forwardRequestHistory is the
-    // discriminator: it shipped with the rename, and no skapi-js before it has
-    // anything by that name. forwardRequest is asked for too only because it is the
-    // method the new branch then calls.
-    //
-    // Everything in the widget that touches the family goes through this: the
-    // engine's transport (skapiEngineTransport), the queued-send cancel
-    // (skapiCancelRequest) and the Google code exchange (skapiForwardWithSecret).
-    // Two call sites asking two different questions is how half a widget ends up on
-    // each family, which on an old SDK means a turn sent one way and cancelled the
-    // other.
+    // entirely: the retired streaming forwarder, which posts to a different endpoint and
+    // injects the project's api key. forwardRequestHistory is the discriminator: it
+    // shipped with the rename, and no skapi-js before it has anything by that name.
     function skapiHasForwardRequest(sk) {
         return !!sk
             && typeof sk.forwardRequestHistory === "function"
             && typeof sk.forwardRequest === "function";
     }
 
-    // One request of the widget's OWN (the engine's go through skapiEngineTransport),
-    // through whichever family the embedder's skapi-js speaks. `request` is everything
-    // except the secret's name, because that is the one field the two families spell
-    // differently: "secretName" on the new one, "clientSecretName" on the old one,
-    // where this is byte for byte the call the widget always made. The new method's
-    // first argument is the form, and this widget never has one.
+    // One request of the widget's OWN (the engine's go through skapiEngineTransport).
+    // The first argument is the form, and this widget never has one.
     function skapiForwardWithSecret(secretName, request) {
-        if (skapiHasForwardRequest(S.skapi)) {
-            return S.skapi.forwardRequest(null, Object.assign({ secretName: secretName }, request));
-        }
-        return S.skapi.clientSecretRequest(Object.assign({ clientSecretName: secretName }, request));
+        return S.skapi.forwardRequest(null, Object.assign({ secretName: secretName }, request));
     }
 
-    // Cancel a queued or running turn through the family that sent it. Same probe as
-    // the transport, so the two can never disagree about which one that was.
+    // Cancel a queued or running turn.
     function skapiCancelRequest(opts) {
-        return skapiHasForwardRequest(S.skapi)
-            ? S.skapi.cancelForwardRequest(opts)
-            : S.skapi.cancelClientSecretRequest(opts);
+        return S.skapi.cancelForwardRequest(opts);
     }
 
-    // The transport keys handed to configureChatEngine, all from ONE family.
-    //
-    // A new skapi-js gets the new keys and an old one gets the old keys, exactly as
-    // this widget injected them before the rename. The engine accepts either family
-    // and prefers the new one, so injecting both would work too; one family is
-    // injected so that what the engine calls is plainly what the probe decided.
-    //
-    // `canStream` is skapiSupportsStreaming's answer for this instance, and it means
-    // the same thing under both families: on a new skapi-js the old names are aliases
-    // of the new ones, so an instance that has either pair has the one used here.
-    //
-    // What the two optional hooks are for, since they are the half of this that is
-    // easy to drop:
-    //
-    // FINALIZE stores the version of a streamed turn that history keeps. The engine
-    // sends the ASSEMBLED provider body, so a streamed turn reads back through exactly
-    // the extractors a buffered one does, with no branch in the mapper; storing is
-    // also what releases the chunks. Called only for a streamed turn, and best-effort
-    // inside the engine.
-    //
-    // STREAM is THE SECOND HALF OF THE DURABILITY GUARANTEE. A streamed row settles
-    // with a status and NO body: the answer is chunks until finalize copies a version
-    // onto the row. A row that settles while no poll is attached (the tab was closed,
-    // a mobile browser discarded it, the device slept and the interval stopped) is
-    // therefore never finalized, and without this hook the engine has no way back to
-    // it - the answer reads as gone from the conversation with every byte of it still
-    // stored. Given the request id this drains that turn's chunks in one pass, and the
-    // engine parses them exactly as it parses a live stream, finalizing what it read
-    // so the row becomes ordinary history and is never re-read.
-    //
-    // Both are handed over only when the SDK actually has them, so the engine's own
-    // "is this host able to?" checks answer honestly instead of a call reaching an
-    // undefined method mid-turn.
+    // The transport keys handed to configureChatEngine. The two streaming hooks only when
+    // canStream, so the engine streams exactly when the embedder's SDK can.
     function skapiEngineTransport(canStream) {
-        if (skapiHasForwardRequest(S.skapi)) {
-            return {
-                forwardRequest: function (form, o) { return S.skapi.forwardRequest(form, o); },
-                forwardRequestHistory: function (p, f) { return S.skapi.forwardRequestHistory(p, f); },
-                forwardRequestFinalize: canStream ? function (requestId, data, options) {
-                    return S.skapi.forwardRequestFinalize(requestId, data, options);
-                } : undefined,
-                forwardRequestStream: canStream ? function (requestId, options) {
-                    return S.skapi.forwardRequestStream(requestId, options);
-                } : undefined,
-            };
-        }
-        // An older skapi-js: the deprecated keys, which the engine still accepts.
         return {
-            clientSecretRequest: function (o) { return S.skapi.clientSecretRequest(o); },
-            clientSecretRequestHistory: function (p, f) { return S.skapi.clientSecretRequestHistory(p, f); },
-            clientSecretRequestFinalize: canStream ? function (requestId, data, options) {
-                return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+            forwardRequest: function (form, o) { return S.skapi.forwardRequest(form, o); },
+            forwardRequestHistory: function (p, f) { return S.skapi.forwardRequestHistory(p, f); },
+            forwardRequestFinalize: canStream ? function (requestId, data, options) {
+                return S.skapi.forwardRequestFinalize(requestId, data, options);
             } : undefined,
-            clientSecretRequestStream: canStream ? function (requestId, options) {
-                return S.skapi.clientSecretRequestStream(requestId, options);
+            forwardRequestStream: canStream ? function (requestId, options) {
+                return S.skapi.forwardRequestStream(requestId, options);
             } : undefined,
         };
     }
@@ -926,10 +858,88 @@ import {
     // beginMcpOAuthOnLogin(); mid-chat callers stay silent so the host page
     // isn't yanked away (the next boot re-establishes the hard case).
     function ensureMcpGrantFresh() {
-        if (!S.user || !mcpGrantNeedsRefresh(S.user)) return Promise.resolve(true);
+        if (!S.user) return Promise.resolve(true);
+        if (!mcpGrantNeedsRefresh(S.user)) {
+            // Called after a 401 with a token that looks fine: the SERVER lost the session.
+            return syncMcpSession().then(function () { return true; });
+        }
         return refreshMcpToken().then(function (tok) {
-            return !!(tok && !mcpGrantNeedsRefresh(S.user));
+            if (tok && !mcpGrantNeedsRefresh(S.user)) return true;
+            return syncMcpSession().then(function (t) { return !!(t && !mcpGrantNeedsRefresh(S.user)); });
         });
+    }
+
+    // Session sync, NO redirect (2026-11-20). The MCP server keeps its own copy of the user's
+    // session, made when the grant was first obtained; a server that lost it (a new server, a
+    // reset state folder) refused every indexing call with "Session file not found" while this
+    // page's MCP token still looked valid, until the user signed in again. /oauth/session-exchange
+    // (made for this embed) takes the current skapi tokens, verifies the id_token against its
+    // pool and stores the session; its one-time code is swapped for an MCP token. A server that
+    // does not know this page's client answers 401: register again, once. Same as www's
+    // code/mcp_oauth.ts syncMcpSession.
+    var mcpSyncInFlight = null;
+    function currentSkapiTokens() {
+        var s = S.skapi && S.skapi.session;
+        var id = s && s.idToken && s.idToken.jwtToken;
+        var acc = s && s.accessToken && s.accessToken.jwtToken;
+        if (!id || !acc) return null;
+        return { id_token: id, access_token: acc, refresh_token: (s.refreshToken && s.refreshToken.token) || "" };
+    }
+    function syncMcpSession() {
+        if (mcpSyncInFlight) return mcpSyncInFlight;
+        var tokens = currentSkapiTokens();
+        if (!tokens) return Promise.resolve(null);
+        function exchange(client) {
+            return fetch(mcpBaseUrl() + "/oauth/session-exchange", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    client_id: client.client_id,
+                    redirect_uri: mcpRedirectUri(),
+                    id_token: tokens.id_token,
+                    access_token: tokens.access_token,
+                    refresh_token: tokens.refresh_token,
+                }),
+            }).then(function (res) { return { client: client, res: res }; });
+        }
+        var stored = getStoredMcpClient();
+        mcpSyncInFlight = (stored ? Promise.resolve(stored) : registerMcpClient())
+            .then(exchange)
+            .then(function (r) {
+                return r.res.status === 401 ? registerMcpClient().then(exchange) : r;
+            })
+            .then(function (r) {
+                if (!r.res.ok) return null;
+                return r.res.json().then(function (j) {
+                    if (!j || !j.code) return null;
+                    var headers = { "Content-Type": "application/x-www-form-urlencoded" };
+                    if (r.client.client_secret) headers.Authorization = basicAuthHeader(r.client.client_id, r.client.client_secret);
+                    var body = new URLSearchParams({
+                        grant_type: "authorization_code",
+                        code: j.code,
+                        redirect_uri: mcpRedirectUri(),
+                        client_id: r.client.client_id,
+                    });
+                    return fetch(mcpBaseUrl() + "/oauth/token", { method: "POST", headers: headers, body: body.toString() })
+                        .then(function (tr) {
+                            if (!tr.ok) return null;
+                            return tr.json().then(function (json) {
+                                if (!json || !json.access_token) return null;
+                                var token = Object.assign({}, json, {
+                                    expires_at: typeof json.expires_in === "number" ? Date.now() + json.expires_in * 1000 : undefined,
+                                });
+                                lsSet(skey(SK.mcpToken), JSON.stringify(token));
+                                return token;
+                            });
+                        });
+                });
+            })
+            .catch(function (err) {
+                try { console.error("[bunnyquery] MCP session sync failed", err); } catch (e) {}
+                return null;
+            })
+            .then(function (t) { mcpSyncInFlight = null; return t; });
+        return mcpSyncInFlight;
     }
 
     /* ---- Google OAuth (outbound) ----------------------------------------- */
@@ -2619,21 +2629,54 @@ import {
         return uid + "/" + (sanitized || "file");
     }
 
+    // Idle limit for one storage POST (2026-11-20): it fails only after this long with NOTHING
+    // moving (no bytes sent, no answer), so a slow upload that keeps moving is never cut off and
+    // a dead connection no longer waits forever (there was no limit at all). Once the body is
+    // fully handed off, MB can still drain from the network buffers with no progress event, so
+    // the answer gets UPLOAD_SENT_WAIT_FACTOR times longer. Same rule as skapi-js uploadFiles
+    // and www's Service.uploadHostFiles.
+    var UPLOAD_IDLE_TIMEOUT_MS = 60 * 1000;
+    var UPLOAD_SENT_WAIT_FACTOR = 5;
     function xhrUploadForm(url, form, onProgress, setAbort) {
-        return new Promise(function (resolve, reject) {
+        return new Promise(function (resolveUpload, rejectUpload) {
             var xhr = new XMLHttpRequest();
+            var idleTimer = null, bodySent = false;
+            function clearIdle() { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } }
+            function resolve(v) { clearIdle(); resolveUpload(v); }
+            function reject(e) { clearIdle(); rejectUpload(e); }
+            function touch() {
+                clearIdle();
+                var wait = bodySent ? UPLOAD_IDLE_TIMEOUT_MS * UPLOAD_SENT_WAIT_FACTOR : UPLOAD_IDLE_TIMEOUT_MS;
+                idleTimer = setTimeout(function () {
+                    idleTimer = null;
+                    var err = new Error(bodySent
+                        ? "Upload timeout: no answer " + Math.round(wait / 1000) + " seconds after the file was sent."
+                        : "Upload timeout: nothing was sent for " + Math.round(wait / 1000) + " seconds.");
+                    err.code = "TIMEOUT";
+                    reject(err);
+                    try { xhr.abort(); } catch (e) {}
+                }, wait);
+            }
             xhr.open("POST", url);
             xhr.onload = function () {
+                clearIdle();
                 var result = xhr.responseText;
                 try { result = JSON.parse(result); } catch (e) {}
                 if (xhr.status >= 200 && xhr.status < 300) resolve(result);
                 else reject(result);
             };
+            xhr.onreadystatechange = function () { if (xhr.readyState === 4) clearIdle(); else touch(); };
+            xhr.addEventListener("progress", function () { if (xhr.readyState !== 4) touch(); });
             xhr.onerror = function () { reject(new Error("Network error")); };
             xhr.onabort = function () { reject(new Error("Aborted")); };
             xhr.ontimeout = function () { reject(new Error("Timeout")); };
+            if (xhr.upload) {
+                xhr.upload.addEventListener("progress", touch);
+                xhr.upload.addEventListener("load", function () { bodySent = true; touch(); });
+            }
             if (xhr.upload && typeof onProgress === "function") xhr.upload.onprogress = onProgress;
             if (typeof setAbort === "function") setAbort(function () { try { xhr.abort(); } catch (e) {} });
+            touch();
             xhr.send(form);
         });
     }
@@ -2666,8 +2709,48 @@ import {
     // record that references it (its reference-linked children). Best-effort: a
     // missing record (file never indexed, or an anon upload that can't carry a
     // unique_id) or a permission error must not block indexing.
+    // The agent's own DECORATED unique ids for per-window summaries
+    // ("src::<path>::sheet_X::R54_window", "src::<path>|file_summary|window190") are not
+    // reference-linked to src::<path>, so its delete never cascades to them and a re-index
+    // stacked a fresh set on the old. Same sweep as www's deleteFileIndexRecord
+    // (code/ai_agent.ts): ids starting with src::<path> whose continuation begins with a
+    // character no filename starts with. '/' is left out: it is the folder separator, and
+    // "src::docs/a.pdf" is another file, not a decoration of a file "docs". Best effort.
+    var DECORATION_START = /^[<>:"\\|?*]/;
+    function deleteFileIndexDecorations(storagePath) {
+        if (!S.skapi || typeof S.skapi.getUniqueId !== "function") return Promise.resolve();
+        var prefix = "src::" + storagePath;
+        return Promise.resolve(S.skapi.getUniqueId(
+            { service: S.projectId, unique_id: prefix, condition: ">=" },
+            { fetchMore: false, limit: 1000 }
+        )).then(function (found) {
+            var list = (found && found.list) || [];
+            var ids = [];
+            for (var i = 0; i < list.length; i++) {
+                var id = String((list[i] && list[i].unique_id) || "");
+                if (id && id !== prefix && id.indexOf(prefix) === 0 && DECORATION_START.test(id.slice(prefix.length))) ids.push(id);
+            }
+            return ids.reduce(function (p, uid) {
+                return p.then(function () {
+                    return S.skapi.deleteRecords({ service: S.projectId, unique_id: uid }).catch(function () { });
+                });
+            }, Promise.resolve());
+        }).catch(function (err) {
+            try { console.warn("[bunnyquery] decoration sweep failed (non-fatal)", storagePath, err); } catch (e) { }
+        });
+    }
     function deleteFileIndexRecordDb(storagePath) {
         if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
+        // Cleared on the SERVER first (owner, 2026-11-20): the MCP's /internal/index-reset
+        // removes the same records in parallel, as this user. Only when that cannot be
+        // reached does this page clear them itself, below, as it always did.
+        return resetFileIndexOnServer({ service: S.projectId, owner: S.owner || undefined, storagePath: storagePath })
+            .then(function (done) {
+                if (done) return;
+                return deleteFileIndexRecordInPage(storagePath);
+            });
+    }
+    function deleteFileIndexRecordInPage(storagePath) {
         // Also drop the backend's "indexing finished" marker (done::<path>): it
         // references the src:: record so the cascade normally sweeps it, but a
         // record from before the cascade flag has no cascade, and a re-index must
@@ -2677,8 +2760,11 @@ import {
             .catch(function () { });
         var runDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: runIndexUniqueId(storagePath) })
             .catch(function () { });
-        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
-            .catch(function () { })
+        return deleteFileIndexDecorations(storagePath)
+            .then(function () {
+                return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath })
+                    .catch(function () { });
+            })
             .then(function () { return doneDelete; })
             .then(function () { return runDelete; });
     }
@@ -4026,8 +4112,9 @@ import {
         // 196px for both: a 26-character verb ate the name down to a few characters
         // for the whole wait, which trades one confusing row for another.
         if (group.resolving) {
-            return group.resolvingReason === "history" ? "Loading history:" : "Checking status:";
+            return group.resolvingReason === "history" ? "Loading history:" : "Fetching status:";
         }
+        if (group.queued) return "Queued:";
         if (!group.finished) return group.isReindex ? "Reindexing" : "Indexing";
         if (group.status === "error") return "Indexing failed:";
         return group.isReindex ? "Reindexed" : "Indexed";
@@ -4045,8 +4132,12 @@ import {
     function indexGroupCount(group) {
         // A run:: stub has NO loaded passes — "0+ passes" is noise (agent.vue same).
         if (group.stub) return "";
-        if (group.passCount <= 1 && !group.mayHaveOlder) return "";
-        return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+        // While the file is indexing: how many of its pages are saved (the MCP's count,
+        // refreshed by the engine's 10-second check), ahead of the passes.
+        var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path) : null;
+        var pages = prog ? (prog.total ? prog.saved + " of " + prog.total + " pages" : prog.saved + " pages") : "";
+        var passes = group.passCount <= 1 && !group.mayHaveOlder ? "" : group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+        return [pages, passes].filter(Boolean).join(" \u00b7 ");
     }
 
     // Everything buildChatDisplayList needs to state a row's case, in ONE place:
@@ -4240,6 +4331,8 @@ import {
             loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
             liveIndexKeys: liveIndex.keys,
             liveIndexChecked: liveIndex.checked,
+            // Which live files have a pass running: a live row without one says "Queued".
+            liveIndexRunningKeys: liveIndex.running,
             // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
             // cancelled bubble behind (that pass finishes and answers normally), so
             // without this the row reports the stop as a finished "Indexed".
@@ -4460,10 +4553,17 @@ import {
             // wants to read them. The engine memoizes per chat, so refreshes
             // cannot revert an expanded row to its stub heads.
             hydrateCompactIndexGroup(key);
-            // And an INCOMPLETE row starts paging its history in now — opening
-            // it is the demand signal the lazy split fetch was waiting for
-            // (agent.vue same).
-            void loadIndexGroupHistory(key);
+            if (session.lazyIndexRowsEnabled()) {
+                // The row's own steps, first page; later pages from its Load more
+                // button (agent.vue same).
+                var og = findIndexGroup(key);
+                if (og && og.path && !session.runPassPaging(og.path)) void session.loadRunPasses(og.path, og.name);
+            } else {
+                // And an INCOMPLETE row starts paging its history in now — opening
+                // it is the demand signal the lazy split fetch was waiting for
+                // (agent.vue same).
+                void loadIndexGroupHistory(key);
+            }
         }
         renderMessages();
         // Collapsing a row can drop the list below one screen, which removes the
@@ -4478,6 +4578,15 @@ import {
      * whatever its status verdict (a green row can be fetching detail). */
     var INDEX_GROUP_FETCH_MAX_PAGES = 40;
     var indexGroupFetching = {};
+    function findIndexGroup(key) {
+        try {
+            var entries = buildChatDisplayList(CS.messages, displayListOptions());
+            for (var i = 0; i < entries.length; i++) {
+                if (entries[i].kind === "indexing" && entries[i].group.key === key) return entries[i].group;
+            }
+        } catch (e) { /* none */ }
+        return null;
+    }
     function groupNeedsHistory(key) {
         if (CS.historyEndOfList) return false;
         try {
@@ -4625,10 +4734,39 @@ import {
                 text: "Could not stop this file: " + group.cancelError,
             }));
         }
+        var paging = group.path ? session.runPassPaging(group.path) : null;
+        if (isOpen && session.lazyIndexRowsEnabled()) {
+            // Rows that load their own steps (agent.vue same): a loader while a page of
+            // steps is read, Load more while older ones remain, and a plain note for a
+            // run from before steps were recorded.
+            if (paging && paging.loading) {
+                el.appendChild(h("div", { class: "bq-index-note" },
+                    h("span", { text: "Loading this file's indexing steps" }),
+                    h("span", { class: "bq-loader" })));
+            } else if (paging && paging.error) {
+                el.appendChild(h("div", { class: "bq-index-note is-error", text: "Could not load the steps: " + paging.error }));
+            } else if (!group.path && !group.visibleMembers.length) {
+                el.appendChild(h("div", { class: "bq-index-note", text: "This file's indexing steps can't be listed." }));
+            } else if (paging && paging.done && !group.visibleMembers.length) {
+                el.appendChild(h("div", {
+                    class: "bq-index-note",
+                    text: "The steps of this indexing run were not recorded. Steps are kept for files indexed from now on.",
+                }));
+            }
+            if (group.path && !(paging && (paging.loading || paging.done))) {
+                var moreBtn = h("button", { class: "bq-index-more", type: "button", text: "Load more" });
+                moreBtn.addEventListener("click", function (ev) {
+                    ev.stopPropagation();
+                    void session.loadRunPasses(group.path, group.name);
+                });
+                moreBtn.addEventListener("keydown", function (ev) { ev.stopPropagation(); });
+                el.appendChild(moreBtn);
+            }
+        }
         // "Scroll up to load them" is an instruction, so it must not be given while
         // the loading it asks for is already in flight: following it does nothing the
         // row is not doing, and reads as the row not having noticed.
-        if (isOpen && indexGroupFetching[group.key]) {
+        else if (isOpen && indexGroupFetching[group.key]) {
             // While the expand-triggered fetch runs, the note IS the progress:
             // dot-trail loader, not an instruction (agent.vue same).
             el.appendChild(h("div", { class: "bq-index-note" },
@@ -5211,6 +5349,17 @@ import {
         // load markdown renderer, then show history
         loadMarked().then(function () {
             renderMessages();
+            // History is loaded ONCE per chat (owner, 2026-11-20). Drawing the chat view
+            // again (back from settings, a theme change) reuses what is in memory; what
+            // changed meanwhile arrives through the polls and the engine's queue check.
+            // The first page is fetched again only when a waiting bubble has nothing
+            // else to settle it.
+            var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[session.getHistoryCacheKey()];
+            if (loaded && !session.needsHistoryRefetch()) {
+                session.drainBgTaskQueue();
+                session.refreshLiveIndexState();
+                return;
+            }
             return session.loadHistory(false, CS.gateRefreshToken);
         }).then(function () { schedulePendingPoll(); });
     }
@@ -5584,18 +5733,23 @@ import {
                 return;
             }
             if (mcpGrantNeedsRefresh(user)) {
-                // Prefer a SILENT refresh (no redirect): reconnects a returning
-                // user whose local grant aged out but whose server session +
-                // refresh_token are still valid (~30d). Only fall back to the
-                // full OAuth redirect when the silent path can't refresh.
-                return refreshMcpToken().then(function (tok) {
-                    if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
-                    return beginMcpOAuthOnLogin("chat").catch(function (err) {
-                        console.error("[bunnyquery] MCP refresh failed", err);
-                        return enterAfterLogin();
+                // Prefer SILENT paths (no redirect): hand the server the current session
+                // (covers a server that lost it), then the refresh_token flow. Only fall back
+                // to the full OAuth redirect when neither gives this user a token.
+                return syncMcpSession().then(function (synced) {
+                    if (synced && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+                    return refreshMcpToken().then(function (tok) {
+                        if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+                        return beginMcpOAuthOnLogin("chat").catch(function (err) {
+                            console.error("[bunnyquery] MCP refresh failed", err);
+                            return enterAfterLogin();
+                        });
                     });
                 });
             }
+            // The token looks fine, which says nothing about whether the SERVER still has the
+            // session: sync it in the background on every boot. Nothing waits on it.
+            syncMcpSession();
             return enterAfterLogin();
         });
     }
@@ -5610,6 +5764,9 @@ import {
             return PUBLIC;
         }
         if (!skapi) throw new Error("BunnyQuery.init: a Skapi instance is required");
+        if (!skapiHasForwardRequest(skapi)) {
+            throw new Error("BunnyQuery.init: this page's skapi-js is too old (it has no forwardRequest / forwardRequestHistory). Load skapi-js 2.1.0 or newer, e.g. https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js");
+        }
 
         var mountEl = typeof target === "string" ? document.getElementById(target) : target;
         if (!mountEl) throw new Error("BunnyQuery.init: mount element not found: " + target);
@@ -5705,8 +5862,8 @@ import {
         // page pinned. Degrade to BUFFERED rather than to a broken turn: without
         // skapi's half of the flag the destination still streams SSE into a buffered
         // row and every answer reads back empty, which is worse than not streaming in
-        // every way. See skapiSupportsStreaming for why the two methods are the probe,
-        // under either family's names. Streaming is granted by handing the engine the
+        // every way. See skapiSupportsStreaming for why the two methods are the probe.
+        // Streaming is granted by handing the engine the
         // finalize hook and the chunk reader (skapiEngineTransport below does that only
         // when canStream), and the engine derives "this host streams" from their
         // presence. Loud, because an embedder on an old SDK has no other way to find
@@ -5714,8 +5871,7 @@ import {
         var canStream = skapiSupportsStreaming(S.skapi);
         if (!canStream) {
             console.warn(
-                "[bunnyquery] this page's skapi-js has neither forwardRequestStream/forwardRequestFinalize " +
-                "nor the older clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of " +
+                "[bunnyquery] this page's skapi-js has no forwardRequestStream/forwardRequestFinalize, so skapi's half of " +
                 "the stream flag would be dropped and every reply would read back empty. " +
                 "Replies are buffered - update skapi-js to stream them."
             );
@@ -5750,12 +5906,76 @@ import {
         // cancel relies on (the agent.vue build omits poll; see chat-engine).
         //
         // The transport itself (dispatch, history, finalize and the chunk reader)
-        // comes from skapiEngineTransport, which picks ONE family by the embedder's
-        // skapi-js and is assigned over the rest below. See skapiHasForwardRequest
-        // for why that probe is not forwardRequest's own presence.
+        // comes from skapiEngineTransport and is assigned over the rest below.
         configureChatEngine(Object.assign({
             // Single-item csr-poll point lookup: how the engine hydrates a
             // compact history stub's real body when an indexing row expands.
+            // Saved search findings (engine findings.ts; agent.vue same): where a hard search
+            // found its answer, at the source file's own access group, one record per page.
+            saveSearchFinding: function (f) {
+                if (!S.skapi || typeof S.skapi.postRecord !== "function") return;
+                return S.skapi.getRecords({ service: f.service, unique_id: "src::" + f.storagePath })
+                    .then(function (found) {
+                        var src = found && found.list && found.list[0];
+                        var group = src && src.table ? src.table.access_group : undefined;
+                        if (group === undefined || group === null || group === "") return;
+                        return S.skapi.postRecord(f.data, {
+                            service: f.service,
+                            unique_id: f.uniqueId,
+                            table: { name: "search_findings", access_group: group },
+                            reference: "src::" + f.storagePath,
+                            tags: f.tags
+                        }).catch(function (err) {
+                            if (!/already taken|already exist/i.test(String((err && err.message) || err))) return;
+                            return S.skapi.getRecords({ service: f.service, unique_id: f.uniqueId }).then(function (r) {
+                                var rec = r && r.list && r.list[0];
+                                if (!rec || !rec.record_id) return;
+                                var union = function (a, b) {
+                                    var out = [];
+                                    (Array.isArray(a) ? a : []).concat(Array.isArray(b) ? b : []).forEach(function (x) { if (out.indexOf(x) === -1) out.push(x); });
+                                    return out.slice(0, 40);
+                                };
+                                var old = rec.data && typeof rec.data === "object" ? rec.data : {};
+                                return S.skapi.postRecord(Object.assign({}, old, {
+                                    question_words: union(old.question_words, f.data.question_words),
+                                    search_terms: union(old.search_terms, f.data.search_terms),
+                                    found_at: f.data.found_at
+                                }), { service: f.service, record_id: rec.record_id, tags: union(rec.tags, f.tags) });
+                            });
+                        });
+                    })
+                    .catch(function () { });
+            },
+            // A document's page progress, the MCP's prog::<path> record (agent.vue same).
+            // A file's indexing pass ids, from the "pass::<path>#<id>" records the worker
+            // writes as each pass starts (agent.vue same).
+            listIndexPasses: function (service, storagePath) {
+                var prefix = "pass::" + storagePath + "#";
+                var ids = [], seen = {};
+                var page = function (fetchMore) {
+                    return Promise.resolve(S.skapi.getUniqueId(
+                        { service: service, unique_id: prefix, condition: ">=" },
+                        { fetchMore: fetchMore, limit: 1000 }
+                    )).then(function (found) {
+                        var list = (found && found.list) || [];
+                        for (var i = 0; i < list.length; i++) {
+                            var u = String((list[i] && list[i].unique_id) || "");
+                            if (u.indexOf(prefix) !== 0) continue;
+                            var rid = u.slice(prefix.length);
+                            if (!/^[0-9A-V]{13}:[0-9A-V]{13}$/.test(rid) || seen[rid]) continue;
+                            seen[rid] = true;
+                            ids.push(rid);
+                        }
+                        if (found && found.endOfList === false && list.length) return page(true);
+                        return ids;
+                    });
+                };
+                return page(false);
+            },
+            readIndexProgress: function (service, storagePath) {
+                return S.skapi.getRecords({ service: service, unique_id: "prog::" + storagePath })
+                    .then(function (found) { return (found && found.list && found.list[0] && found.list[0].data) || null; });
+            },
             csrHistoryItemLookup: function (fullId, service, owner) {
                 return S.skapi.util.request('csr-poll', { id: fullId, service: service, owner: owner }, { auth: true });
             },

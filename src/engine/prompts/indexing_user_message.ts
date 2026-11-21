@@ -145,7 +145,7 @@ export function buildIndexingUserMessage(
 			head +
 			`\nRead this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. ` +
 			`readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. ` +
-			`Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. ` +
+			`Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item; spreadsheet rows in "spreadsheet_rows", everything else in "document_entries"), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. ` +
 			`Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` +
 			(attachment.url ? `\n(A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : '')
 		);
@@ -264,7 +264,8 @@ function buildRenderDatafy(placeholder: string): string {
 	return (
 		`\n${placeholder}\n\n` +
 		`LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page ` +
-		`call postRecords and save records - one record per row / table entry / line item visible on the page ` +
+		`call postRecords and save records in table "document_entries", with "page" set to the DOCUMENT PAGE number ` +
+		`from the page's label - one record per row / table entry / line item visible on the page ` +
 		`(or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables ` +
 		`cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.\n\n` +
 		`Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - ` +
@@ -317,7 +318,7 @@ export function buildIndexingWindowMessage(
 		where +
 		`\n${placeholder}\n\n` +
 		`DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW ` +
-		`for tabular data (keyed by the column headers), or one record per section for prose. Capture every ` +
+		`for tabular data (keyed by the column headers), or one record per section for prose in table "document_entries". Capture every ` +
 		`value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, ` +
 		`and link every row/section record to it by reference.\n\n` +
 		`If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows. ` +

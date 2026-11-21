@@ -352,6 +352,14 @@ export async function getSplitChatHistory(
 		 * are non-confidential by construction.
 		 */
 		scopeSurfaceToQueue?: boolean;
+		/**
+		 * CHATS ONLY (owner, 2026-11-21): fetch the conversation and NOT the background
+		 * indexing queue. A file's indexing passes are listed from its own pass records when
+		 * its row is opened (ChatSession.loadRunPasses), and its row comes from the run::
+		 * record, so the history pager never walks the indexing queue: reaching the first
+		 * chat message is the end of history.
+		 */
+		skipBg?: boolean;
 	},
 	fetchOptions: Record<string, any>,
 	/** Test seam: replaces getChatHistory. Not for production callers. */
@@ -401,6 +409,14 @@ async function _getSplitChatHistoryLocked(
 		 * are non-confidential by construction.
 		 */
 		scopeSurfaceToQueue?: boolean;
+		/**
+		 * CHATS ONLY (owner, 2026-11-21): fetch the conversation and NOT the background
+		 * indexing queue. A file's indexing passes are listed from its own pass records when
+		 * its row is opened (ChatSession.loadRunPasses), and its row comes from the run::
+		 * record, so the history pager never walks the indexing queue: reaching the first
+		 * chat message is the end of history.
+		 */
+		skipBg?: boolean;
 	},
 	fetchOptions: Record<string, any>,
 	releaseLock: () => void,
@@ -451,6 +467,13 @@ async function _getSplitChatHistoryLocked(
 		}
 	}
 	const state = splitHistoryStates[key];
+	// CHATS ONLY: the indexing queue counts as walked, so no bg page is ever fetched and the
+	// end of history is the end of the conversation (see params.skipBg).
+	const skipBg = !!params.skipBg;
+	if (skipBg) {
+		state.bgEnd = true;
+		state.bgBuffer = [];
+	}
 
 	// A held page fetched under the OTHER mode is not this call's page —
 	// discard it rather than replay page 1 as an "older" page (or vice versa).
@@ -491,7 +514,7 @@ async function _getSplitChatHistoryLocked(
 	// The caller paints the CONVERSATION from this return immediately; the
 	// stub fetch happens behind the resolved promise, under the same lock.
 	// Anything already buffered ships now (it costs nothing).
-	if (fetchOptions && fetchOptions.deferBg && (!state.bgEnd || headRefresh)) {
+	if (fetchOptions && fetchOptions.deferBg && !skipBg && (!state.bgEnd || headRefresh)) {
 		const surfaceList0 = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
 		state.surfaceCarry = [];
 		const emitNow: any[] = surfaceList0.concat(state.bgBuffer);
@@ -575,7 +598,9 @@ async function _getSplitChatHistoryLocked(
 	const boundary = surface.endOfList ? -Infinity : oldestCreated(surfaceList);
 
 	// ── bg coverage ─────────────────────────────────────────────────────────
-	if (headRefresh) {
+	if (skipBg) {
+		// Chats only: nothing of the indexing queue is read.
+	} else if (headRefresh) {
 		// Non-deferred head refresh: the same single HEAD page the deferred
 		// branch fetches, under the same rules — new settles are caught, the
 		// end-knowledge (bgEnd/bgStarted) is left untouched, EXCEPT when a full

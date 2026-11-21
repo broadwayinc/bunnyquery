@@ -273,6 +273,15 @@ export interface ChatState {
 	historyStartKeyHistory: string[];
 	historyRequestToken: number;
 	gateRefreshToken: number;
+	/** Saved pages of each document being indexed, by storage path (owner, 2026-11-20):
+	 *  `saved` of `total` pages, read from the MCP's prog::<path> record by the 10-second
+	 *  queue check (config readIndexProgress). Only files with passes still tracked are
+	 *  refreshed; a row shows it while the file is indexing. */
+	indexPageProgress?: { [storagePath: string]: { saved: number; total: number | null; at: number } };
+	/** Per-file paging of a run's passes loaded on demand (ChatSession.loadRunPasses), by
+	 *  storage path: every pass id the file has (newest first), how many are on screen,
+	 *  whether a load is in flight, and whether the oldest one is loaded. */
+	passPaging?: { [storagePath: string]: { ids: string[]; loaded: number; loading: boolean; done: boolean; error?: string } };
 	/** Files the SERVER still has unresolved indexing work for, by the key a
 	 *  collapsed row uses (storage path, else filename). Lives on the state rather
 	 *  than privately so a reactive consumer re-renders when it changes. */
@@ -281,6 +290,9 @@ export interface ChatState {
 	 *  means "we have not found out", which the display layer reads as still
 	 *  working — never as an all-clear. */
 	liveIndexChecked: boolean;
+	/** The files of liveIndexKeys that have a pass RUNNING, same keys. A live file missing
+	 *  here only has passes waiting: its row says "Queued". */
+	liveIndexRunning?: { [fileKey: string]: boolean };
 	/** Server item ids of the indexing passes that existed — on the row, or on the
 	 *  bg queue — when the user STOPPED that file. Two readers, one fact:
 	 *  buildChatDisplayList reports the run as stopped when it holds any of them

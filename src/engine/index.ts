@@ -42,13 +42,25 @@ export {
 } from './config';
 
 // "Has this user already uploaded this file here?", answered from the `src::` file
-// records. The widget wires it as the host's findDuplicateUpload hook; it never throws.
+// records and the stored copy's indexing state. The widget wires it as the host's
+// findDuplicateUpload hook, and www's duplicates.ts wraps it; it never throws.
+// Saved search findings: where a hard search found its answer (findings.ts).
+export {
+	FINDINGS_TABLE,
+	FINDING_ID_PREFIX,
+	findingsForTurn,
+	keyWords as findingKeyWords,
+	type SearchFinding,
+} from './findings';
 export {
 	findDuplicateUpload,
 	isDuplicateCandidateId,
 	DUPLICATE_LOOKUP_MAX_CANDIDATES,
+	DUPLICATE_LOOKUP_TIMEOUT_MS,
+	DUPLICATE_LOOKUP_LIMIT,
 	type DuplicateUploadMatch,
 	type DuplicateUploadFile,
+	type StoredCopyIndexing,
 } from './duplicates';
 
 export {
@@ -232,6 +244,8 @@ export {
 	isBgIndexingQueue,
 	indexDoneUniqueId,
 	runIndexUniqueId,
+	resetFileIndexOnServer,
+	type IndexResetResult,
 	upsertIndexRunRecordSafe,
 	type IndexRunStatus,
 	type IndexRunPatch,

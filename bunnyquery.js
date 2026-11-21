@@ -167,39 +167,27 @@
     if (typeof fwd === "function") {
       return (opts) => fwd.call(cfg, null, opts);
     }
-    const legacy = cfg.clientSecretRequest;
-    if (typeof legacy === "function") {
-      return (opts) => {
-        if (!opts || typeof opts !== "object" || !("secretName" in opts)) return legacy.call(cfg, opts);
-        const { secretName, ...rest } = opts;
-        return legacy.call(cfg, Object.assign({ clientSecretName: secretName }, rest));
-      };
-    }
     throw new Error(
-      "[chat-engine] No request transport: configureChatEngine() needs forwardRequest (or the deprecated clientSecretRequest), bound to a skapi instance."
+      "[chat-engine] No request transport: configureChatEngine() needs forwardRequest, bound to a skapi instance (skapi-js 2.1.0 or newer). The clientSecretRequest key is no longer read."
     );
   }
   function resolveForwardRequestHistory() {
     const cfg = chatEngineConfig();
-    const hist = typeof cfg.forwardRequestHistory === "function" ? cfg.forwardRequestHistory : cfg.clientSecretRequestHistory;
+    const hist = cfg.forwardRequestHistory;
     if (typeof hist === "function") {
       return (params, fetchOptions) => hist.call(cfg, params, fetchOptions);
     }
     throw new Error(
-      "[chat-engine] No history transport: configureChatEngine() needs forwardRequestHistory (or the deprecated clientSecretRequestHistory), bound to a skapi instance."
+      "[chat-engine] No history transport: configureChatEngine() needs forwardRequestHistory, bound to a skapi instance (skapi-js 2.1.0 or newer). The clientSecretRequestHistory key is no longer read."
     );
   }
   function resolveForwardRequestFinalize() {
     const cfg = chatEngineConfig();
-    if (typeof cfg.forwardRequestFinalize === "function") return cfg.forwardRequestFinalize;
-    if (typeof cfg.clientSecretRequestFinalize === "function") return cfg.clientSecretRequestFinalize;
-    return void 0;
+    return typeof cfg.forwardRequestFinalize === "function" ? cfg.forwardRequestFinalize : void 0;
   }
   function resolveForwardRequestStream() {
     const cfg = chatEngineConfig();
-    if (typeof cfg.forwardRequestStream === "function") return cfg.forwardRequestStream;
-    if (typeof cfg.clientSecretRequestStream === "function") return cfg.clientSecretRequestStream;
-    return void 0;
+    return typeof cfg.forwardRequestStream === "function" ? cfg.forwardRequestStream : void 0;
   }
   function windowedIndexingEnabled() {
     return _config?.windowedIndexing === true;
@@ -237,59 +225,328 @@
   }
   function skapiSupportsStreaming(sk) {
     if (!sk) return false;
-    return typeof sk.forwardRequestStream === "function" && typeof sk.forwardRequestFinalize === "function" || typeof sk.clientSecretRequestStream === "function" && typeof sk.clientSecretRequestFinalize === "function";
+    return typeof sk.forwardRequestStream === "function" && typeof sk.forwardRequestFinalize === "function";
   }
   function pollOpt() {
     const p = _config?.poll;
     return p === void 0 ? {} : { poll: p };
   }
 
-  // src/engine/duplicates.ts
-  var DUPLICATE_LOOKUP_MAX_CANDIDATES = 25;
-  var SRC_PREFIX = "src::";
-  function isDuplicateCandidateId(uniqueId, name) {
-    if (typeof uniqueId !== "string" || !name) return false;
-    if (uniqueId.indexOf(SRC_PREFIX) !== 0) return false;
-    if (uniqueId === SRC_PREFIX + name) return true;
-    const tail = "/" + name;
-    return uniqueId.length > SRC_PREFIX.length + tail.length && uniqueId.slice(-tail.length) === tail;
-  }
-  function listOf(res) {
-    if (!res) return [];
-    if (Array.isArray(res)) return res;
-    return Array.isArray(res.list) ? res.list : [];
-  }
-  async function findDuplicateUpload(skapi, file, userId, opts) {
+  // src/engine/findings.ts
+  var FINDINGS_TABLE = "search_findings";
+  var FINDING_ID_PREFIX = "find::";
+  var FINDING_MIN_TOOL_CALLS = 3;
+  var FINDING_MAX_PER_TURN = 3;
+  var FINDING_MAX_WORDS = 8;
+  var FINDING_MAX_TAGS = 40;
+  var STOP_WORDS = /* @__PURE__ */ new Set([
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "what",
+    "whats",
+    "which",
+    "who",
+    "where",
+    "when",
+    "how",
+    "why",
+    "please",
+    "tell",
+    "me",
+    "show",
+    "give",
+    "find",
+    "can",
+    "you",
+    "could",
+    "would",
+    "of",
+    "for",
+    "to",
+    "in",
+    "on",
+    "at",
+    "and",
+    "or",
+    "about",
+    "i",
+    "my",
+    "our",
+    "do",
+    "does",
+    "did",
+    "\uC880",
+    "\uC54C\uB824\uC918",
+    "\uC54C\uB824\uC8FC\uC138\uC694",
+    "\uC54C\uB824",
+    "\uC918",
+    "\uC8FC\uC138\uC694",
+    "\uBB50\uC57C",
+    "\uBB50\uC608\uC694",
+    "\uBB54\uAC00\uC694",
+    "\uBB34\uC5C7",
+    "\uBB34\uC5C7\uC778\uAC00\uC694",
+    "\uC5B4\uB5BB\uAC8C",
+    "\uD574\uC918",
+    "\uD574\uC8FC\uC138\uC694",
+    "\uC788\uC5B4",
+    "\uC788\uB098\uC694",
+    "\uC788\uC5B4\uC694",
+    "\uC5B4\uB514",
+    "\uC5B4\uB514\uC57C",
+    "\uB9D0\uD574\uC918",
+    "\uCC3E\uC544\uC918",
+    "\uBCF4\uC5EC\uC918"
+  ]);
+  var WORD_SPLIT = /[\s\-_/,;|+&]+/u;
+  var NOT_KEPT = /[\s\p{P}\p{S}]+/gu;
+  function nfkcLower(text) {
+    var s = String(text == null ? "" : text);
     try {
-      if (!skapi || typeof skapi.getUniqueId !== "function" || typeof skapi.getRecords !== "function") return null;
-      const name = file && typeof file.name === "string" ? file.name : "";
-      const size = file && typeof file.size === "number" ? file.size : NaN;
-      if (!name || !(size >= 0) || !userId) return null;
-      const service = opts && opts.service ? { service: opts.service } : {};
-      const found = listOf(await skapi.getUniqueId(Object.assign({ unique_id: name, condition: "<=" }, service)));
-      const ids = [];
-      for (const item of found) {
-        const id = item && typeof item === "object" ? item.unique_id : item;
-        if (isDuplicateCandidateId(id, name) && ids.indexOf(id) === -1) ids.push(id);
-        if (ids.length >= DUPLICATE_LOOKUP_MAX_CANDIDATES) break;
+      s = s.normalize("NFKC");
+    } catch (e) {
+    }
+    return s.toLowerCase();
+  }
+  function normalizeTagText(text) {
+    return nfkcLower(text).replace(NOT_KEPT, "");
+  }
+  function tagForms(text) {
+    if (typeof text !== "string") return [];
+    if (text.indexOf("::") !== -1) return [text];
+    var joined = normalizeTagText(text);
+    if (!joined) return [];
+    var words = nfkcLower(text).split(WORD_SPLIT).map(function(w) {
+      return w.replace(NOT_KEPT, "");
+    }).filter(function(w) {
+      return Array.from(w).length >= 2;
+    });
+    var out = [joined];
+    if (words.length > 1) {
+      for (var i = 0; i < words.length; i++) if (words[i] !== joined) out.push(words[i]);
+    }
+    return out;
+  }
+  var KO_ENDINGS = [
+    "\uC5D0\uC11C\uB294",
+    "\uC73C\uB85C\uB294",
+    "\uC5D0\uC11C",
+    "\uC73C\uB85C",
+    "\uC5D0\uAC8C",
+    "\uAE4C\uC9C0",
+    "\uBD80\uD130",
+    "\uC774\uB098",
+    "\uC774\uB791",
+    "\uD558\uACE0",
+    "\uCC98\uB7FC",
+    "\uC2DC",
+    "\uC880",
+    "\uC740",
+    "\uB294",
+    "\uC774",
+    "\uAC00",
+    "\uC744",
+    "\uB97C",
+    "\uC758",
+    "\uC5D0",
+    "\uB85C",
+    "\uC640",
+    "\uACFC",
+    "\uB3C4",
+    "\uB9CC",
+    "\uB791",
+    "\uB098",
+    "\uC694"
+  ];
+  function koreanStem(word) {
+    if (!/[\uac00-\ud7a3]$/.test(word)) return "";
+    for (var i = 0; i < KO_ENDINGS.length; i++) {
+      var e = KO_ENDINGS[i];
+      if (word.length > e.length && word.slice(-e.length) === e) {
+        var stem = word.slice(0, -e.length);
+        return Array.from(stem).length >= 2 ? stem : "";
       }
-      for (const uniqueId of ids) {
-        let record = null;
-        try {
-          record = listOf(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
-        } catch {
-          continue;
-        }
-        if (!record || typeof record !== "object") continue;
-        const data = record.data && typeof record.data === "object" ? record.data : null;
-        if (!data || data.size_bytes !== size) continue;
-        if (record.user_id !== userId) continue;
-        return { storagePath: uniqueId.slice(SRC_PREFIX.length), uniqueId, record };
-      }
-      return null;
-    } catch {
+    }
+    return "";
+  }
+  function keyWords(text) {
+    if (typeof text !== "string" || !text.trim()) return [];
+    var out = [];
+    var parts = nfkcLower(text).split(WORD_SPLIT);
+    for (var i = 0; i < parts.length && out.length < FINDING_MAX_WORDS; i++) {
+      var w = parts[i].replace(NOT_KEPT, "");
+      if (Array.from(w).length < 2 || STOP_WORDS.has(w)) continue;
+      var stem = koreanStem(w);
+      if (stem && STOP_WORDS.has(w.slice(stem.length))) w = stem, stem = "";
+      if (out.indexOf(w) === -1) out.push(w);
+      if (stem && out.indexOf(stem) === -1 && out.length < FINDING_MAX_WORDS) out.push(stem);
+    }
+    return out;
+  }
+  function citedPages(answer) {
+    var out = [];
+    if (typeof answer !== "string" || !answer) return out;
+    var add = function(n) {
+      var v = Number(n);
+      if (Number.isInteger(v) && v > 0 && v < 1e5 && out.indexOf(v) === -1) out.push(v);
+    };
+    var m;
+    var after = /((?:\d{1,5}\s*(?:[·,/~\-–]|및|와|과)\s*)*\d{1,5})\s*(?:쪽|페이지|면)/g;
+    while (m = after.exec(answer)) {
+      var nums = m[1].match(/\d{1,5}/g) || [];
+      for (var a = 0; a < nums.length; a++) add(nums[a]);
+    }
+    var before = /\b(?:pages?|pp?\.?)\s*(\d{1,5}(?:\s*(?:,|and|&|-|–)\s*\d{1,5})*)/gi;
+    while (m = before.exec(answer)) {
+      var list = m[1].match(/\d{1,5}/g) || [];
+      for (var b = 0; b < list.length; b++) add(list[b]);
+    }
+    return out;
+  }
+  function parseJsonLoose(value) {
+    if (typeof value !== "string") return value;
+    try {
+      return JSON.parse(value);
+    } catch (e) {
       return null;
     }
+  }
+  function toolCallsOf(body) {
+    var calls = 0;
+    var queries = [];
+    var readPaths = [];
+    var add = function(name, args) {
+      calls += 1;
+      if (name === "searchText" && args && typeof args.query === "string" && args.query.trim()) queries.push(args.query.trim());
+      if (name === "readFileContent" && args && typeof args.path === "string" && args.path.trim() && readPaths.indexOf(args.path.trim()) === -1) readPaths.push(args.path.trim());
+    };
+    if (body && Array.isArray(body.content)) {
+      for (var i = 0; i < body.content.length; i++) {
+        var b = body.content[i];
+        if (b && (b.type === "mcp_tool_use" || b.type === "tool_use")) add(b.name, b.input);
+      }
+    }
+    if (body && Array.isArray(body.output)) {
+      for (var j = 0; j < body.output.length; j++) {
+        var o = body.output[j];
+        if (o && (o.type === "mcp_call" || o.type === "function_call")) add(o.name, parseJsonLoose(o.arguments) || o.arguments);
+      }
+    }
+    return { calls, queries, readPaths };
+  }
+  function usedAFinding(body) {
+    var returned = function(out) {
+      var text = typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
+      return text.indexOf("record_id") !== -1;
+    };
+    var isFindingsQuery = function(name, a) {
+      return name === "getRecords" && !!a && (a.table_name === FINDINGS_TABLE || a.table === FINDINGS_TABLE);
+    };
+    if (body && Array.isArray(body.output)) {
+      for (var i = 0; i < body.output.length; i++) {
+        var o = body.output[i];
+        if (o && (o.type === "mcp_call" || o.type === "function_call") && isFindingsQuery(o.name, parseJsonLoose(o.arguments) || o.arguments) && returned(o.output)) return true;
+      }
+    }
+    if (body && Array.isArray(body.content)) {
+      var ids = {};
+      for (var j = 0; j < body.content.length; j++) {
+        var b = body.content[j];
+        if (b && (b.type === "mcp_tool_use" || b.type === "tool_use") && isFindingsQuery(b.name, b.input) && typeof b.id === "string") ids[b.id] = true;
+        else if (b && (b.type === "mcp_tool_result" || b.type === "tool_result") && ids[b.tool_use_id] && !b.is_error && returned(b.content)) return true;
+      }
+    }
+    return false;
+  }
+  function findingsForTurn(args) {
+    var note = args.note;
+    if (!note) return [];
+    var tc = toolCallsOf(args.body);
+    if (tc.calls < FINDING_MIN_TOOL_CALLS) return [];
+    if (usedAFinding(args.body)) return [];
+    var answer = typeof args.answer === "string" ? args.answer : "";
+    var linked = function(path) {
+      if (!answer) return false;
+      if (answer.indexOf("db:" + path) !== -1) return true;
+      var name = path.split("/").pop() || path;
+      return answer.indexOf(name) !== -1;
+    };
+    var questionWords = keyWords(args.question);
+    var searchWords = [];
+    for (var q = 0; q < tc.queries.length; q++) {
+      var ws = keyWords(tc.queries[q]);
+      for (var k = 0; k < ws.length && searchWords.length < FINDING_MAX_WORDS; k++) {
+        if (searchWords.indexOf(ws[k]) === -1) searchWords.push(ws[k]);
+      }
+    }
+    if (!questionWords.length && !searchWords.length) return [];
+    var tags = [];
+    var addTags = function(list) {
+      for (var i = 0; i < list.length; i++) {
+        var forms = tagForms(list[i]);
+        for (var f = 0; f < forms.length; f++) if (tags.indexOf(forms[f]) === -1 && tags.length < FINDING_MAX_TAGS) tags.push(forms[f]);
+      }
+    };
+    addTags(questionWords);
+    addTags(searchWords);
+    var cited = citedPages(answer);
+    var out = [];
+    var seen = {};
+    var make = function(path, page) {
+      return {
+        storagePath: path,
+        page,
+        uniqueId: FINDING_ID_PREFIX + path + "#p" + page,
+        tags: tags.slice(),
+        data: {
+          path,
+          page,
+          question_words: questionWords,
+          search_terms: searchWords,
+          found_at: typeof args.now === "number" ? args.now : Date.now()
+        }
+      };
+    };
+    var hitsList = Array.isArray(note.hits) ? note.hits : [];
+    for (var h = 0; h < hitsList.length && out.length < FINDING_MAX_PER_TURN; h++) {
+      var hit = hitsList[h];
+      if (!hit || typeof hit.path !== "string" || !hit.path || typeof hit.page !== "number") continue;
+      if (!linked(hit.path)) continue;
+      if (cited.length ? cited.indexOf(hit.page) === -1 : out.length > 0) continue;
+      var id = FINDING_ID_PREFIX + hit.path + "#p" + hit.page;
+      if (seen[id]) continue;
+      seen[id] = true;
+      out.push({
+        storagePath: hit.path,
+        page: hit.page,
+        uniqueId: id,
+        tags: tags.slice(),
+        data: {
+          path: hit.path,
+          page: hit.page,
+          question_words: questionWords,
+          search_terms: searchWords,
+          found_at: typeof args.now === "number" ? args.now : Date.now()
+        }
+      });
+    }
+    if (!out.length && cited.length) {
+      for (var r = 0; r < tc.readPaths.length && out.length < FINDING_MAX_PER_TURN; r++) {
+        var rp = tc.readPaths[r];
+        if (!linked(rp)) continue;
+        for (var c = 0; c < cited.length && out.length < FINDING_MAX_PER_TURN; c++) {
+          var rid = FINDING_ID_PREFIX + rp + "#p" + cited[c];
+          if (seen[rid]) continue;
+          seen[rid] = true;
+          out.push(make(rp, cited[c]));
+        }
+      }
+    }
+    return out;
   }
 
   // src/engine/office.ts
@@ -498,28 +755,6 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
     return { composed, composedForLlm, extractContent, fileUrls };
   }
 
-  // src/engine/attachments.ts
-  function groupAttachmentFailures(attachments) {
-    const groups = {};
-    const order = [];
-    (attachments || []).forEach(function(att) {
-      if (!att || att.status !== "error" && att.status !== "indexError") return;
-      const code = String(att.errorCode || "");
-      const message = String(
-        att.errorDetail || att.errorMessage || (att.status === "indexError" ? "File indexing failed" : "File upload has failed")
-      );
-      const key = code + "\0" + message;
-      if (!groups[key]) {
-        groups[key] = { code, message, files: [] };
-        order.push(key);
-      }
-      groups[key].files.push(String(att.name || "(unnamed file)"));
-    });
-    return order.map(function(k) {
-      return groups[k];
-    });
-  }
-
   // src/engine/prompts/chat_system_prompt.ts
   function buildChatSystemPrompt(params) {
     const { projectId, serviceName, serviceDescription, greeting, canUpload} = params;
@@ -536,7 +771,8 @@ You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
 ${groundingRules}
-FINDING THE DATA: the database is the way in, for every kind of file. Step 1, getTables with fetch_all true. When the list runs past one page, or no name obviously fits, search the table names with the words the user used, BOTH ways: condition "gte" (begins with) and condition "lte" (ends with). Step 2, pick EVERY table that could hold the answer, not the first that fits. Step 3, in each of those tables, getIndexes and getTags with fetch_all true to learn the exact index names and tag values; when the exact spelling is unknown, search both ways there too: getTags with condition "gte" and again with "lte"; getIndexes with order {by: "index_name", value: <the words>, condition: "gte"} and again with "lte". Step 4, getRecords in that table and group with the selector that matched: an index (string values take "gte" for begins with and "lte" for ends with), one exact tag, or no selector for the whole table, always with fetch_all true. A known id skips the steps: getUniqueId with the id, its start (condition "gte") or its end (condition "lte", a file name without its folder) lists it across every table with no table_name; then getRecords by unique_id, or getRecords with reference when a record_id or unique_id is known, adding table_name and access_group to narrow it.
+SAVED FINDINGS FIRST: where an earlier search found an answer is saved in table "search_findings" (one record per file page; its tags are the key words of the question that led there and of the search terms, stored lowercase without spaces). Before any other search, call getRecords with table_name "search_findings", access_group ${indexGroupLiteral} and tags set to ONE specific key word of the question (a name or a term, in the user's words; when nothing comes back, try one more word, or the word in the documents' language). A finding gives data.path and data.page: read THAT page (searchText with that path and the question's words) and answer from the page itself, quoting and citing it as usual. A finding is only a pointer, never the answer: when its page does not answer the question, or nothing is found, search as below.
+FINDING THE DATA: the database is the way in, for every kind of file. Step 1, getTables (one page). ONLY when the list runs past that page (end_of_list false), search the table names with the words the user used, BOTH ways: condition "gte" (begins with) and condition "lte" (ends with), instead of listing them all. When the list is complete, never search table names: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Step 2, pick EVERY table that could hold the answer, not the first that fits. Step 3, in each of those tables, getIndexes and getTags (one page each, never fetch_all) to learn the exact index names and tag values; when that page does not show the name or the list runs past it, search both ways with the user's words: getTags with table_name and condition "gte", and again with "lte"; getIndexes with order {by: "index_name", value: <the words>, condition: "gte"} and again with "lte". Name and tag lists can be millions of characters long and are never read whole. Never call getTags with neither table_name nor tag: that lists every tag of every table. Step 4, getRecords in that table and group with the selector that matched: an index (string values take "gte" for begins with and "lte" for ends with), one exact tag, or no selector for the whole table, always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>". TAGS are stored lowercase without spaces or punctuation, plus one tag per word: search a tag as one word ("leak") or as the joined phrase ("oilleak"); the server also normalizes the tag you send. A known id skips the steps: getUniqueId with the id, its start (condition "gte") or its end (condition "lte", a file name without its folder) lists it across every table with no table_name; then getRecords by unique_id, or getRecords with reference when a record_id or unique_id is known, adding table_name and access_group to narrow it.
 NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and never from a guess. Each row of each sheet is one record in its table: reference "src::<path>", unique_id "row::<path>#<sheet>#R<n>", the cells by header name, plus "_sheet", "_row", "_grain" ("detail" or "summary") and, on a total or preamble row, "_row_type". Its tags carry the file name, the sheet, the grain and up to four key values of the row (a name, a code), so getRecords with one exact tag selects every row about that thing across all the files in the table. Workbooks state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that re-total it, plus a summary. Use rows whose "_grain" is "detail" and whose "_row_type" is not "total", pick ONE sheet per file and say which, and never add a sheet to its summary. Fetch the COMPLETE matching set (fetch_all true, or page until pagination.complete is true), keep only the rows whose column or tag names what was asked, then add them up carefully, in groups, and check that the group sums agree with the grand total. Quote the row count, the sheet(s) and the file(s) the figure was made from and label it as calculated.
 A FILE TOTAL IS NOT A ROW'S TOTAL. The biggest number on a summary sheet is the whole file, not the thing that was asked about. Before quoting any figure, check it is scoped to what the question named: filter by the column that identifies it and report how many rows matched.
 ${documentRules}
@@ -606,11 +842,11 @@ Project description: """${serviceDescription}"""`;
 - ONE RECORD PER GRID ROW, ALWAYS. "Row" means the numbered row of the sheet (R37 is one record), never a visual block, item, section or left/right pair. Sheets that repeat the same columns side by side (an A/B block beside a C/D block, "paired" or "mirrored" layouts) still get ONE record per grid row, holding BOTH sides - suffix the keys to keep them apart (PART_NO_A / PART_NO_B). Collapsing a 16-row window into 2 or 3 "block" records is the single most damaging mistake here: it silently loses most of the cells and makes every later total wrong, because some windows were counted per row and others per block. If a window shows rows R37 to R52, you save records for R37..R52 and the count you report is the number of grid rows you actually wrote.
 - THE FILE NAME AND ITS FOLDERS ARE EVIDENCE ABOUT WHAT THE DATA MEANS, and often the only evidence there is. A grid of bare figures filed under "2026/Q2/royalties" is a quarterly royalty settlement; the same grid under "inspections/KCG-B507" is one aircraft's inspection. Nothing inside the sheet says so. Read the trail in the metadata block and use it: name the period, the entity, the counterparty or the subject in the file record's description, and TAG the records with the meaningful parts of it (the client, the aircraft, the quarter, the site), so a later question about that entity finds this file at all. A folder that is only an id or a date is still worth a tag; a folder like "uploads", "new" or "temp" is not.
 - BUT NEVER INSTEAD OF READING. The path tells you what the data is ABOUT; only the content tells you what it SAYS. Never infer a value, a column meaning, a row count or a total from a name, never let a name override what the cells actually contain, and never derive a TABLE name from a folder or a file name - table names are fixed (see below), and a table named after a folder scatters one kind of record across as many tables as the user has folders. Where the name and the content disagree, the content wins and the disagreement is worth recording.
-- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "book_chapters" for a chapter record, "email_messages" for an email message record (see EMAIL below), and "file_summaries" for the file-level record (which already exists, so update it and never post it). Embedded photos and other embedded files get NO table of your choosing: their records already exist in table "__MEDIA__", see EXTRACTED MEDIA below. For a content type none of those fit, choose ONE plain descriptive name, use that same name for every pass of the file, and never mint variants of it (inspection_items / item_records / sheet_items / inspection_data are four names for what is one table).
+- FIXED TABLE NAMES. Never invent a table name for one pass, and never vary the name between passes of the SAME file: that scatters one file's data across tables nobody can enumerate later, so the data is effectively lost even though every save succeeded. Use exactly "spreadsheet_rows" for spreadsheet row records, "book_chapters" for a chapter record, "email_messages" for an email message record (see EMAIL below), "file_summaries" for the file-level record (which already exists, so update it and never post it), and "document_entries" for EVERYTHING you take from a document's pages or sections (a PDF, a Word file, slides, a scan, a web page, an attachment's prose): one record per row / table entry / line item / section, with "page" (the DOCUMENT PAGE number, when the content has pages) and "kind" (row, entry, section, figure or note) in its data. Embedded photos and other embedded files get NO table of your choosing: their records already exist in table "__MEDIA__", see EXTRACTED MEDIA below. There is NO other table: content that fits none of the above goes to "document_entries" too. Never choose a table name of your own (inspection_items / item_records / manual_page_entries / pdf_pages are names for what is one table): the passes of one file run side by side and cannot agree on a name, and the server stores a post to any other table in "document_entries" anyway. TAGS are stored normalized by the server (lowercase, no spaces or punctuation, plus one tag per word): write each tag naturally, one concept per tag, and never try to vary its spelling or case.
 - EXTRACTED MEDIA: every PICTURE embedded in an uploaded document (photos, diagrams, chart images) is pulled out and saved as a real permanent file under "__MEDIA__/<the document's storage path>/<name>", and a record for each one ALREADY EXISTS in table "__MEDIA__" with unique_id "src::<that path>", reference "src::<the document>", and its path, anchor and sheet already in data. Do NOT create it - the unique_id is taken and your post is rejected. UPDATE it with updateRecords, addressed by that unique_id, adding what the file actually SHOWS plus TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). An update REPLACES the fields you send, so send the existing tags back with your new ones and keep every field already in data (path, anchor, sheet, source, mime, bytes). ONE FILE, ONE RECORD: never also create a photo record in another table. If the update reports that the record does not exist, create it with that same unique_id, reference and data.path - the path must never be lost. Audio and video clips and non-picture attachments are never saved as separate files (an email's attachment text is read inline instead, see EMAIL below), so never claim a separate file or a "__MEDIA__" record exists for one of those.
 - AUDIO files: transcribe the speech, and capture speakers (named where identifiable), the topics discussed, and timestamps of key moments in the record's data. TAG the language, the audio type (call, meeting, dictation, music), each speaker and every named entity; INDEX the duration in seconds as duration_seconds. VIDEO files: everything audio gets, PLUS transcribe on-screen text verbatim (same transcription discipline as photos) and capture the visual timeline - scene changes and what each scene shows, with timestamps. Same tags as audio plus every entity visible on screen, and INDEX duration_seconds here too. These audio and video rules apply to files UPLOADED AS FILES: the transcript and timeline land on the file's own "src::" record, which already exists. Audio or video embedded inside a document is NOT extracted, so never look for or promise a "__MEDIA__" record for it.
 - EPUB / e-books / long-form books (.epub or any book-length prose, provided inline in reading order with chapter headings preserved): you MUST save ONE record per CHAPTER (or, when chapters are unclear, per major section/topic) in the table "book_chapters" - never collapse the whole book into a single record. INDEX each chapter record on its chapter number (so chapters sort and range-query in order) and include the chapter title among its tags; the record's "data" must capture the chapter title plus its order/number AND a substantive summary of that chapter's content (key events, arguments, characters, places, concepts, terms, notable quotes). Apply AS MANY relevant tags as possible to EVERY chapter record (characters, locations, themes, topics, key concepts, key terms, dates, named entities) so the book is easy to SEARCH and cross-reference later - this is the whole point. ALSO put the book-level facts (title, author, language, overall summary, chapter list / table of contents, genre/subjects) onto the "src::" file record that ALREADY EXISTS in "file_summaries", using updateRecords. Do NOT post a second book-level record, and set every chapter record's reference to exactly "src::" + the storage path. This per-chapter completeness OVERRIDES brevity; human-readable summaries only, never raw/binary bytes.
-- EMAIL (.eml, provided inline with "=== EMAIL ===" / "=== BODY ===" / "=== ATTACHMENT i/N: ..." / "=== FORWARDED MESSAGE k (depth d) ===" headings, which always start at column 0; a body line that merely looks like one is body text): you MUST save ONE record per email MESSAGE in the table "email_messages", and a forwarded message inside it (its own "=== EMAIL ===" block) gets its OWN record. Each record carries subject, from, to, cc, date (the Date line: an ISO string when the layer could parse it, otherwise the raw header text), message_id, in_reply_to, and the body text (quoted earlier replies included). INDEX each record on its date as that string exactly as given, and include the sender address, every recipient address and the subject among its tags. Text under an "=== ATTACHMENT" heading is that attachment's extracted content: datafy it by its own kind (rows into "spreadsheet_rows" for a spreadsheet, one record per section for a document), tag those records with the attachment's filename, and give EVERY record the same "src::" reference as the email. Picture attachments are extracted into "__MEDIA__" like any other embedded picture (their media anchor is quoted on the "[picture ...]" line); other attachments are read inline: their content becomes the records above, but no separate FILE or file record exists for one, so never cite a path for it.
+- EMAIL (.eml, provided inline with "=== EMAIL ===" / "=== BODY ===" / "=== ATTACHMENT i/N: ..." / "=== FORWARDED MESSAGE k (depth d) ===" headings, which always start at column 0; a body line that merely looks like one is body text): you MUST save ONE record per email MESSAGE in the table "email_messages", and a forwarded message inside it (its own "=== EMAIL ===" block) gets its OWN record. Each record carries subject, from, to, cc, date (the Date line: an ISO string when the layer could parse it, otherwise the raw header text), message_id, in_reply_to, and the body text (quoted earlier replies included). INDEX each record on its date as that string exactly as given, and include the sender address, every recipient address and the subject among its tags. Text under an "=== ATTACHMENT" heading is that attachment's extracted content: datafy it by its own kind (rows into "spreadsheet_rows" for a spreadsheet, one record per section in "document_entries" for a document), tag those records with the attachment's filename, and give EVERY record the same "src::" reference as the email. Picture attachments are extracted into "__MEDIA__" like any other embedded picture (their media anchor is quoted on the "[picture ...]" line); other attachments are read inline: their content becomes the records above, but no separate FILE or file record exists for one, so never cite a path for it.
 - URL SOURCES: when the source being indexed is a URL rather than an uploaded file (a temporary or signed URL that merely DELIVERS an uploaded file's bytes is not a URL source; that file keeps its storage-path identity), its identity is "src::" + the FULL URL INCLUDING the query string (the query string often selects the content, so dropping it collapses different pages into one identity). If no record with that unique_id exists, create it; if the slot is already taken, update that record or reference it - never mint a variant id. For a WEB PAGE: extract everything on it, infer the page's primary entity type when it is not obvious (product, listing, article, profile), TAG that entity type plus the entities on the page, and INDEX the ONE number every entity of that type can be compared by (a price for a product, a date for an article). Any OTHER URL (a file behind a link) is downloaded and indexed under whichever per-type rule above matches its content. When the URL's content offers more index points than one record carries, add reference-linked records reachable from its "src::" record.
 - This is a background indexing task: do ALL the MCP saving FIRST, never reply mid-task, and never ask the user questions. Be exhaustive about meaning (and, for tabular data, about every row). SAVE AS YOU GO: persist each window's records before reading the next, so progress is never lost. If the file is so large you cannot finish in one turn, still save everything you have read so far; a follow-up pass will automatically continue from where you stopped. NEVER store raw or encoded file bytes in ANY field: no base64, no data: URIs, no hex or blob dumps. A long opaque non-human-readable string is not data - replace it with a structured description of what it encodes. If base64 or a data: URI is all you have for something, describe it conceptually and never paste it; if nothing human-readable can be extracted at all, OMIT that record rather than saving noise.
 - COMPLETION SIGNAL: only when YOU paged the file yourself with readFileContent and it reported "END OF FILE", with every row/item saved, end your final message with the token INDEXING_COMPLETE on its own line. If more rows remain, do NOT write that token - leaving it out is how the system knows to run another pass to continue. When the file arrives INSIDE this message one window at a time (an embedded window of rows/text, or rendered PDF page images), you are NOT the one who decides it is finished: the system advances the window off the real page/row count and sends the next pass automatically, so save this window, report what you saved, and never imply you have seen the whole file.
@@ -667,7 +903,7 @@ ${options.inlineContentPlaceholder}
     }
     if (options?.pagedRead) {
       return head + `
-Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` + (attachment.url ? `
+Read this file with the readFileContent tool, using the storage path above - do NOT fetch a URL and do NOT rely on a single sample. readFileContent returns the file ONE WINDOW at a time: spreadsheets as coordinate-tagged grid rows (e.g. 'R4 A:E&I NUMBER | B:E1007'), scanned/large PDFs as rendered PAGE IMAGES, and windows may include embedded photos - LOOK at any images and datafy what they show. Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item; spreadsheet rows in "spreadsheet_rows", everything else in "document_entries"), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` + (attachment.url ? `
 (A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : "");
     }
     return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
@@ -709,7 +945,7 @@ Records for the earlier pages are ALREADY saved (they reference "${src}"). The N
     return `
 ${placeholder}
 
-LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.
+LOOK at each rendered page image in this message and DATAFY what it shows: for EVERY page call postRecords and save records in table "document_entries", with "page" set to the DOCUMENT PAGE number from the page's label - one record per row / table entry / line item visible on the page (or one record for the page if it is prose), capturing every value you can read (OCR the text, read tables cell by cell, describe any photos/diagrams). Set EVERY record's reference to exactly "src::" + the storage path above. That file record ALREADY EXISTS, so do NOT post it, and do NOT give your page records a "src::" unique_id of their own. A record with no reference back to it is an ORPHAN: re-indexing the file deletes the linked records and leaves the orphan behind forever as stale data.
 
 Each image is preceded by a label giving its DOCUMENT PAGE number. That label is the page's identity - use it, and ignore any page number PRINTED on the document itself (a scan often restarts its own numbering per section, so a footer reading "PAGE 4 OF 8" routinely disagrees with the real position). Whether a page is one you have already saved is stated in the note above the images - decide from that, never from a printed page number.
 
@@ -732,7 +968,7 @@ This file is delivered to you ONE WINDOW at a time, embedded directly in this me
     return head + buildRenderMeta(attachment) + where + `
 ${placeholder}
 
-DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose. Capture every value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, and link every row/section record to it by reference.
+DATAFY this window: call postRecords and save records for everything in it - ONE RECORD PER ROW for tabular data (keyed by the column headers), or one record per section for prose in table "document_entries". Capture every value you can read. The file-level record ALREADY EXISTS with unique_id "src::" + the storage path above: do NOT post it (a duplicate unique_id is rejected), enrich it with updateRecords, and link every row/section record to it by reference.
 
 If this window has PHOTOS attached as images, LOOK at each one and datafy what it actually shows. A \xABPHOTO ...\xBB marker in the grid text ties a picture to its row and comes in two forms. \xABPHOTO A88 -> __MEDIA__/...\xBB means the picture at cell A88 is saved as a permanent file at exactly that storage path, and its record in table "__MEDIA__" has unique_id "src::" + that path: UPDATE that record with updateRecords, adding what the picture SHOWS and TAGS for every identifier visible in it (part numbers, tag ids, item names, serial numbers). Do NOT create a duplicate and do NOT add a second photo record in another table: one file, one record. If that update reports the record does not exist, create it ONCE with that same unique_id, reference "src::" + the storage path above, table "__MEDIA__", access group "authorized", and data carrying the path - the path must never be lost. A bare \xABPHOTO A88\xBB marker with no arrow is a picture with no stored path of its own in this window: usually a repeat stored under an earlier anchor, or one too small to keep. NEVER construct a storage path or unique_id for it: find its record, if any, with getRecords reference "src::" + the storage path above, matching the cell against data.anchor or tags, and enrich what you find. The row record stays about its row's cells. Never report that photo contents could not be extracted when images are attached here.
 
@@ -754,143 +990,6 @@ Records for the earlier windows/pages of this file are ALREADY saved (they refer
  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
  - Text: the cursor is the character offset already read.
 Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. A \xABPHOTO <cell>\xBB marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. Do NOT re-save windows that are already saved. Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
-  }
-
-  // src/engine/greeting.ts
-  function buildChatGreeting(params) {
-    const custom = typeof params.custom === "string" ? params.custom.trim() : "";
-    if (custom) return { lead: custom, name: "", tail: "", text: custom };
-    const name = params.projectName ? '"' + params.projectName + '"' : "";
-    const lead = params.canUpload === false ? "Hi! Ask me anything about the data in your project" : "Hi! Start by attaching the files related to your project";
-    const tail = params.canUpload === false ? "." : ", or pasting plain text into the chat. Once they are indexed, ask me anything about that data.";
-    return { lead, name, tail, text: lead + (name ? " " + name : "") + tail };
-  }
-
-  // src/engine/errors.ts
-  var STATUS_MESSAGE = {
-    "408": "The AI provider timed out before it started.",
-    "409": "The AI provider rejected the request as conflicting.",
-    "413": "The request was too large for the AI provider.",
-    "429": "The AI provider is rate limiting requests right now.",
-    "500": "The AI provider hit an internal error.",
-    "502": "The AI provider is temporarily unreachable.",
-    "503": "The AI provider is temporarily unavailable.",
-    "504": "The AI provider timed out."
-  };
-  function isTransientStatus(status) {
-    return status === 408 || status === 425 || status === 429 || status >= 500;
-  }
-  function isCsrStatusEnvelope(res) {
-    return !!res && typeof res === "object" && !Array.isArray(res) && typeof res.status === "string" && typeof res.id === "string" && "in_queue" in res;
-  }
-  function csrEnvelopeError(input) {
-    if (!isCsrStatusEnvelope(input)) return void 0;
-    if (input.status !== "failed") return void 0;
-    return input.error != null ? input.error : { message: "The AI provider request failed." };
-  }
-  function getErrorMessage(input) {
-    var envErr = csrEnvelopeError(input);
-    if (envErr !== void 0) input = envErr;
-    if (!input) return "Something went wrong.";
-    if (typeof input === "string") return input;
-    if (input.error && input.error.message) return input.error.message;
-    if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
-    if (input.body && typeof input.body.message === "string") return input.body.message;
-    if (input.message) return input.message;
-    var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : 0;
-    if (status) {
-      var text = STATUS_MESSAGE[String(status)] || (status >= 500 ? "The AI provider returned a server error." : "The AI provider rejected the request.");
-      return text + " (error " + status + ")" + (isTransientStatus(status) ? " This is usually temporary, please try again." : "");
-    }
-    return "Something went wrong.";
-  }
-  function isRetriedFailure(input) {
-    var envErr = csrEnvelopeError(input);
-    if (envErr !== void 0) input = envErr;
-    return !!input && typeof input === "object" && input.retried === true;
-  }
-  function isErrorResponseBody(response) {
-    var envErr = csrEnvelopeError(response);
-    if (envErr !== void 0) response = envErr;
-    if (!response || typeof response !== "object") return envErr !== void 0;
-    if (typeof response.status_code === "number" && response.status_code >= 400) return true;
-    if (response.type === "error") return true;
-    if (response.error && (response.error.message || response.error.type)) return true;
-    var body = response.body;
-    if (body && typeof body === "object") {
-      if (body.type === "error") return true;
-      if (body.error && (body.error.message || body.error.type)) return true;
-    }
-    if (typeof response.message === "string" && response.message.length) {
-      var hasClaude = Array.isArray(response.content);
-      var hasOpenAI = typeof response.output_text === "string" || Array.isArray(response.output) || Array.isArray(response.choices);
-      if (!hasClaude && !hasOpenAI) return true;
-    }
-    return false;
-  }
-  function isNonRetryableRequestError(input) {
-    var envErr = csrEnvelopeError(input);
-    if (envErr !== void 0) input = envErr;
-    if (!input || typeof input !== "object") return false;
-    var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
-    var param = void 0;
-    var blobs = [];
-    var sources = [input.error, input.body && input.body.error, input.body, input];
-    for (var i = 0; i < sources.length; i++) {
-      var e = sources[i];
-      if (!e) continue;
-      if (typeof e === "string") {
-        blobs.push(e);
-        continue;
-      }
-      if (typeof e !== "object") continue;
-      if (param === void 0 && e.param != null) param = e.param;
-      if (typeof e.code === "string") blobs.push(e.code);
-      if (typeof e.type === "string") blobs.push(e.type);
-      if (typeof e.message === "string") blobs.push(e.message);
-    }
-    var hay = blobs.join(" | ").toLowerCase();
-    if (hay.indexOf("unknown_parameter") !== -1 || hay.indexOf("unknown parameter") !== -1 || hay.indexOf("unsupported_parameter") !== -1 || hay.indexOf("unsupported parameter") !== -1) {
-      return true;
-    }
-    var isClientReqStatus = status === 400 || status === 422;
-    if (isClientReqStatus && param != null && param !== "") return true;
-    if (isClientReqStatus && hay.indexOf("invalid_request") !== -1 && (hay.indexOf("parameter") !== -1 || hay.indexOf("param") !== -1)) {
-      return true;
-    }
-    return false;
-  }
-  function isAuthExpiredError(input) {
-    var envErr = csrEnvelopeError(input);
-    if (envErr !== void 0) input = envErr;
-    if (!input) return false;
-    var blobs = [];
-    var push = function(v) {
-      if (typeof v === "string" && v) blobs.push(v);
-    };
-    if (typeof input === "string") push(input);
-    else {
-      push(input.message);
-      push(input.code);
-      if (input.error) {
-        push(input.error.message);
-        push(input.error.code);
-        push(input.error.type);
-      }
-      if (input.body) {
-        push(input.body.message);
-        if (input.body.error) {
-          push(input.body.error.message);
-          push(input.body.error.code);
-          push(input.body.error.type);
-        }
-      }
-      if (typeof input.status === "number" && input.status === 401) return true;
-      if (typeof input.status_code === "number" && input.status_code === 401) return true;
-    }
-    var hay = blobs.join(" | ").toLowerCase();
-    if (!hay) return false;
-    return hay.indexOf("token has expired") !== -1 || hay.indexOf("token is expired") !== -1 || hay.indexOf("expired_token") !== -1 || hay.indexOf("invalid_token") !== -1 || hay.indexOf("unauthorized") !== -1 || hay.indexOf("not authorized") !== -1 || hay.indexOf("invalid_request") !== -1 && hay.indexOf("token") !== -1;
   }
 
   // src/engine/links.ts
@@ -1224,7 +1323,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var FILE_KEYS = ["path", "storage_path", "storagePath", "file", "file_path", "filePath"];
   var TABLE_KEYS = ["table_name", "tableName"];
   var GROUP_KEYS = ["access_group", "accessGroup"];
-  var SRC_PREFIX2 = "src::";
+  var SRC_PREFIX = "src::";
   var RESULT_WALK_MAX_NODES = 400;
   var RESULT_WALK_MAX_DEPTH = 5;
   function isWebToolName(name) {
@@ -1253,11 +1352,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   function pathFromSrcId(value) {
     if (typeof value !== "string") return null;
-    if (value.indexOf(SRC_PREFIX2) !== 0) return null;
-    var rest = value.slice(SRC_PREFIX2.length).trim();
+    if (value.indexOf(SRC_PREFIX) !== 0) return null;
+    var rest = value.slice(SRC_PREFIX.length).trim();
     return rest ? rest : null;
   }
-  function parseJsonLoose(value) {
+  function parseJsonLoose2(value) {
     if (typeof value !== "string") return value;
     var t = value.trim();
     if (!t || t[0] !== "{" && t[0] !== "[") return null;
@@ -1283,8 +1382,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var uid = pathFromSrcId(args.unique_id);
     if (uid) pushUnique(note.files, uid);
   }
+  var RESULT_STRING_MAX_CHARS = 2 * 1024 * 1024;
   function readHits(note, result) {
-    var parsed = parseJsonLoose(result);
+    var parsed = parseJsonLoose2(result);
     if (!parsed || typeof parsed !== "object") return;
     var visited = 0;
     var walk = function(node, depth) {
@@ -1301,6 +1401,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
         var v = node[k];
         if (v && typeof v === "object") walk(v, depth + 1);
+        else if (typeof v === "string" && v.length > 1 && v.length <= RESULT_STRING_MAX_CHARS && (v.charAt(0) === "{" || v.charAt(0) === "[")) {
+          var inner = parseJsonLoose2(v);
+          if (inner && typeof inner === "object") walk(inner, depth + 1);
+        }
       }
     };
     walk(parsed, 0);
@@ -1361,7 +1465,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (kind === "mcp_call" || kind === "function_call") {
           sawTool = true;
           pushUnique(note.tools, item.name);
-          readArguments(note, parseJsonLoose(item.arguments) || item.arguments);
+          readArguments(note, parseJsonLoose2(item.arguments) || item.arguments);
           if (!item.error && item.name === "searchText") readHits(note, item.output);
         } else if (kind.indexOf("web_search") === 0 || kind.indexOf("web_fetch") === 0) {
           sawTool = true;
@@ -1647,6 +1751,1400 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       estimatedInputTokens: used + systemCost,
       estimatedBudget: availableInputBudget
     };
+  }
+
+  // src/engine/requests.ts
+  var ANTHROPIC_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages";
+  var ANTHROPIC_VERSION = "2023-06-01";
+  var ANTHROPIC_MCP_BETA = "mcp-client-2025-11-20";
+  var ANTHROPIC_WEB_FETCH_BETA = "web-fetch-2025-09-10";
+  var ANTHROPIC_PROMPT_CACHING_BETA = "prompt-caching-2024-07-31";
+  var ANTHROPIC_BETA_HEADER = `${ANTHROPIC_MCP_BETA},${ANTHROPIC_WEB_FETCH_BETA},${ANTHROPIC_PROMPT_CACHING_BETA}`;
+  var WEB_FETCH_MAX_USES = 40;
+  var WEB_FETCH_MAX_CONTENT_TOKENS = 2e5;
+  var claudeWebFetchTool = () => ({
+    type: "web_fetch_20250910",
+    name: "web_fetch",
+    max_uses: WEB_FETCH_MAX_USES,
+    citations: { enabled: true },
+    max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS
+  });
+  var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
+  var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
+  var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
+  var openaiWebSearchTool = () => ({
+    type: "web_search",
+    external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS
+  });
+  var webToolsForChat = (platform, webAccess) => {
+    if (webAccess !== true) return [];
+    if (platform === "claude") return [claudeWebFetchTool()];
+    return [openaiWebSearchTool()] ;
+  };
+  var MCP_NAME = "BunnyQuery";
+  var DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+  var DEFAULT_OPENAI_MODEL = "gpt-6-luna";
+  var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
+  function withMcpParams(base, params) {
+    if (!base) return base;
+    const pairs = Object.keys(params).filter((k) => params[k] !== void 0 && params[k] !== null && params[k] !== "").map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(String(params[k])));
+    if (!pairs.length) return base;
+    const [addr, existing] = base.split("?");
+    const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
+    const path = hasPath ? addr : addr.replace(/\/+$/, "") + "/";
+    return path + "?" + (existing ? existing + "&" : "") + pairs.join("&");
+  }
+  var mcpContextParam = (platform, model) => getModelContextWindow(platform, model);
+  var mcpIndexingUrl = (platform = "openai", model) => withMcpParams(mcpUrl(), { profile: "index", ctx: mcpContextParam(platform, model) });
+  var mcpChatUrl = (endpointUrl, platform, model) => withMcpParams(endpointUrl, { profile: "chat", ctx: mcpContextParam(platform, model) });
+  function mcpEndpointFor(anonymous, publicProjectId, service) {
+    if (!anonymous) return { url: mcpUrl(), token: "$ACCESS_TOKEN" };
+    const project = publicProjectId || service;
+    return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
+  }
+  var forwardRequest = (opts) => resolveForwardRequest()(opts);
+  var CHAT_STREAM_ON = Object.freeze({
+    transport: Object.freeze({ stream: true }),
+    body: Object.freeze({ stream: true })
+  });
+  var CHAT_STREAM_OFF = Object.freeze({
+    transport: Object.freeze({}),
+    body: Object.freeze({})
+  });
+  var CHAT_STREAM_ON_REALTIME = Object.freeze({
+    // `realtime` rides on the TRANSPORT arm only. It is a skapi option, not a field
+    // the destination understands, so it must never reach `data`: the body arm stays
+    // exactly what it is with the socket off.
+    transport: Object.freeze({ stream: true, realtime: true }),
+    body: Object.freeze({ stream: true })
+  });
+  function chatStreamWiring(queue) {
+    if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
+    if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
+    return liveStreamingSocketEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
+  }
+  var VARIANT_IMAGE_DETAIL = "original";
+  var VARIANT_TEXT_VERBOSITY = "high";
+  var OLDEST_NANO_REASONING_EFFORT = "high";
+  var isOpenAINano = (model) => {
+    const normalized = (model).trim().toLowerCase();
+    if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+    if (!match) return false;
+    const major = Number(match[1]);
+    const minor = match[2] === void 0 ? null : Number(match[2]);
+    return major > 5 || major === 5 && minor !== null && minor >= 4;
+  };
+  var variantIndexingOptions = (model) => {
+    if (!isOpenAINano(model) || !isOldestNano(model)) return {};
+    return {
+      ...{ text: { verbosity: VARIANT_TEXT_VERBOSITY } } ,
+      ...{ reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } 
+    };
+  };
+  var getOpenAIImageDetail = (model) => {
+    const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+    if (!match) {
+      return DEFAULT_OPENAI_IMAGE_DETAIL;
+    }
+    const major = Number(match[1]);
+    const minor = match[2] === void 0 ? null : Number(match[2]);
+    const isVariant = !!match[3];
+    const supportsOriginal = major > 5 || major === 5 && minor !== null && minor >= 4;
+    if (!supportsOriginal) {
+      return DEFAULT_OPENAI_IMAGE_DETAIL;
+    }
+    return isVariant ? VARIANT_IMAGE_DETAIL : "original";
+  };
+  var getRenderImageDetail = (model) => {
+    const detail = getOpenAIImageDetail(model);
+    return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? "high" : detail;
+  };
+  var OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
+  var isRecognisedOpenAIVersion = (model) => OPENAI_VERSIONED_ID.test((model).trim().toLowerCase());
+  var isOldestNano = (model) => {
+    const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
+    if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
+    if (!match) return true;
+    const major = Number(match[1]);
+    const minor = match[2] === void 0 ? null : Number(match[2]);
+    if (major < 5) return true;
+    if (major > 5) return false;
+    return minor === null || minor <= 4;
+  };
+  var SMALL_TIER_PAGES_PER_WINDOW = 2;
+  var DOWNSAMPLED_TIER_TILE = 2;
+  function getVisionProfile(model) {
+    const detail = getRenderImageDetail(model);
+    if (!isRecognisedOpenAIVersion(model)) {
+      return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+    }
+    if (detail !== "original") {
+      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
+    }
+    if (isOldestNano(model)) {
+      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
+    }
+    return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+  }
+  var IMAGE_URL_REGEX = /\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
+  function transformContentWithImages(content) {
+    if (typeof content !== "string" || !content) {
+      return content;
+    }
+    const matches = content.match(IMAGE_URL_REGEX);
+    if (!matches || !matches.length) {
+      return content;
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const imageBlocks = [];
+    for (const url of matches) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      imageBlocks.push({
+        type: "image",
+        source: { type: "url", url }
+      });
+    }
+    return [...imageBlocks, { type: "text", text: content }];
+  }
+  function prepareClaudeMessages(messages) {
+    if (!messages.length) return messages;
+    const lastIndex = messages.length - 1;
+    const last = messages[lastIndex];
+    if (last.role !== "user") return messages;
+    const content = transformContentWithImages(last.content);
+    if (content === last.content) return messages;
+    const next = messages.slice();
+    next[lastIndex] = { role: last.role, content };
+    return next;
+  }
+  function transformContentWithOpenAIImages(content, detail = DEFAULT_OPENAI_IMAGE_DETAIL) {
+    if (typeof content !== "string" || !content) {
+      return content;
+    }
+    const matches = content.match(IMAGE_URL_REGEX);
+    if (!matches || !matches.length) {
+      return content;
+    }
+    const seen = /* @__PURE__ */ new Set();
+    const imageBlocks = [];
+    for (const url of matches) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      imageBlocks.push({
+        type: "input_image",
+        image_url: url,
+        detail
+      });
+    }
+    return [{ type: "input_text", text: content }, ...imageBlocks];
+  }
+  function prepareOpenAIMessages(messages, detail = DEFAULT_OPENAI_IMAGE_DETAIL) {
+    if (!messages.length) return messages;
+    const lastIndex = messages.length - 1;
+    const last = messages[lastIndex];
+    if (last.role !== "user") return messages;
+    const content = transformContentWithOpenAIImages(last.content, detail);
+    if (content === last.content) return messages;
+    const next = messages.slice();
+    next[lastIndex] = { role: last.role, content };
+    return next;
+  }
+  function applyHistoryCacheBreakpoint(messages) {
+    if (messages.length < 2) return messages;
+    const breakpointIndex = messages.length - 2;
+    return messages.map((m, i) => {
+      if (i !== breakpointIndex) return m;
+      const blocks = Array.isArray(m.content) ? m.content.slice() : [{ type: "text", text: m.content }];
+      if (!blocks.length) return m;
+      const lastBlockIndex = blocks.length - 1;
+      blocks[lastBlockIndex] = {
+        ...blocks[lastBlockIndex],
+        cache_control: { type: "ephemeral" }
+      };
+      return { ...m, content: blocks };
+    });
+  }
+  var POLL_INTERVAL = 3e3;
+  var STREAM_POLL_INTERVAL = 1e3;
+  var MAX_CONCURRENT_BG_POLLS = 6;
+  async function callClaudeWithMcp({
+    prompt,
+    messages,
+    service,
+    owner,
+    userId,
+    model = DEFAULT_CLAUDE_MODEL,
+    maxTokens = 1e3,
+    system,
+    mcpServer,
+    extractContent,
+    fileUrls,
+    webAccess
+  }) {
+    const web = await resolveWebAccess(service, typeof webAccess === "boolean" ? webAccess : void 0);
+    const mcpServerDefinition = {
+      type: "url",
+      name: mcpServer.name,
+      url: mcpServer.url
+    };
+    if (mcpServer.authorizationToken) {
+      mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
+    }
+    const stream = chatStreamWiring(userId || service);
+    return forwardRequest({
+      secretName: "claude",
+      queue: userId || service,
+      service,
+      owner,
+      ...pollOpt(),
+      ...stream.transport,
+      url: ANTHROPIC_MESSAGES_API_URL,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "$CLIENT_SECRET",
+        "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": ANTHROPIC_BETA_HEADER
+      },
+      data: {
+        model,
+        max_tokens: maxTokens,
+        // Top level beside model/messages/mcp_servers, which is where the
+        // Messages API takes it.
+        ...stream.body,
+        ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
+        ...system ? {
+          system: [
+            {
+              type: "text",
+              text: system,
+              cache_control: { type: "ephemeral" }
+            }
+          ]
+        } : {},
+        messages: (() => {
+          const prepared = messages && messages.length ? prepareClaudeMessages(messages) : [
+            {
+              role: "user",
+              content: transformContentWithImages(prompt)
+            }
+          ];
+          return applyHistoryCacheBreakpoint(prepared);
+        })(),
+        mcp_servers: [mcpServerDefinition],
+        tools: [
+          {
+            type: "mcp_toolset",
+            mcp_server_name: mcpServer.name,
+            ...mcpServer.defaultConfig ? { default_config: mcpServer.defaultConfig } : {},
+            ...mcpServer.configs ? { configs: mcpServer.configs } : {}
+          },
+          // `web_fetch` rides here only when the project's web switch is on. The
+          // beta header above is left as it is: it only makes the tool TYPE
+          // available, and a request that does not list the tool cannot use it.
+          ...webToolsForChat("claude", web)
+        ]
+      }
+    });
+  }
+  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
+    return callClaudeWithMcp({
+      prompt,
+      messages,
+      service,
+      owner,
+      userId,
+      model: model || DEFAULT_CLAUDE_MODEL,
+      maxTokens: getMaxOutputTokens("claude", model || DEFAULT_CLAUDE_MODEL),
+      system,
+      extractContent,
+      fileUrls,
+      mcpServer: {
+        name: MCP_NAME,
+        url: mcpChatUrl(endpoint.url, "claude", model || DEFAULT_CLAUDE_MODEL),
+        // Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
+        // guard below drops the key rather than sending an empty one.
+        authorizationToken: endpoint.token
+      }});
+  }
+  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
+    const resolvedModel = model || DEFAULT_OPENAI_MODEL;
+    const imageDetail = getOpenAIImageDetail(resolvedModel);
+    const web = await resolveWebAccess(service);
+    const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
+      {
+        role: "user",
+        content: transformContentWithOpenAIImages(prompt, imageDetail)
+      }
+    ];
+    const responseInput = [
+      ...system ? [
+        {
+          role: "system",
+          content: system
+        }
+      ] : [],
+      ...messageList.map((m) => ({
+        role: m.role,
+        content: m.content
+      }))
+    ];
+    const stream = chatStreamWiring(userId || service);
+    return forwardRequest({
+      secretName: "openai",
+      queue: userId || service,
+      service,
+      owner,
+      ...pollOpt(),
+      ...stream.transport,
+      url: OPENAI_RESPONSES_API_URL,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Authorization: "Bearer $CLIENT_SECRET"
+      },
+      data: {
+        model: resolvedModel,
+        max_output_tokens: getMaxOutputTokens("openai", resolvedModel),
+        // Top level beside model/input/tools, which is where the Responses API
+        // takes it.
+        ...stream.body,
+        ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
+        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
+        input: responseInput,
+        tools: [
+          {
+            type: "mcp",
+            server_label: MCP_NAME,
+            server_url: mcpChatUrl(endpoint.url, "openai", resolvedModel),
+            require_approval: "never",
+            // No `headers` at all for an anonymous turn: `Bearer ` with an
+            // empty token is a credential the MCP server rejects, and the
+            // project-scoped endpoint needs none.
+            ...endpoint.token ? { headers: { Authorization: "Bearer " + endpoint.token } } : {}
+          },
+          // `web_search` rides here only when the project's web switch is on.
+          ...webToolsForChat("openai", web)
+        ]
+      }
+    });
+  }
+  async function notifyAgentContinueIndexing(info) {
+    return notifyAgentSaveAttachment({ ...info, continueIndexing: true });
+  }
+  async function notifyAgentSaveAttachment(info) {
+    const { platform, service, owner, attachment, parsedContent } = info;
+    const continuing = !!info.continueIndexing;
+    if (!continuing) {
+      upsertIndexRunRecordSafe(service, attachment.storagePath, {
+        status: "working",
+        filename: attachment.name,
+        started: Date.now(),
+        queue: bgIndexingQueueName(info.userId, service),
+        platform
+      });
+    }
+    const tapDispatchFailure = (p) => {
+      if (continuing) return p;
+      return p.then(
+        (ack) => ack,
+        (err) => {
+          upsertIndexRunRecordSafe(service, attachment.storagePath, {
+            status: "error",
+            finished: Date.now(),
+            error: err && (err.message || String(err)) || "The indexing request could not be enqueued."
+          });
+          throw err;
+        }
+      );
+    };
+    const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
+    const renderFrom = Math.max(0, info.renderFrom || 0);
+    const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
+    const renderDetail = platform === "openai" ? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
+    const visionProfile = platform === "openai" ? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL) : { pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
+    const skapiRender = visionFile && renderPlaceholder ? {
+      _skapi_render: [
+        {
+          path: attachment.storagePath,
+          from: renderFrom,
+          count: visionProfile.pagesPerWindow,
+          placeholder: renderPlaceholder,
+          name: attachment.name,
+          mime: attachment.mime,
+          detail: renderDetail,
+          tile: visionProfile.tile,
+          auto_continue: true,
+          continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder)
+        }
+      ]
+    } : {};
+    const windowedRead = !visionFile && !parsedContent && windowedIndexingEnabled() && isWindowedReadFile(attachment.name, attachment.mime);
+    const windowPlaceholder = windowedRead ? makeWindowPlaceholder(attachment.storagePath) : void 0;
+    const skapiWindow = windowedRead && windowPlaceholder ? {
+      _skapi_window: [
+        {
+          path: attachment.storagePath,
+          cursor: null,
+          placeholder: windowPlaceholder,
+          name: attachment.name,
+          mime: attachment.mime,
+          kind: "window",
+          // Same per-image `detail` the render path sends. Without it the worker falls
+          // back to its model-blind default of 'high', so a spreadsheet's embedded
+          // photos were tiled at lower resolution than the SAME model gets for a PDF
+          // page or a chat attachment. That is why a model could describe an attached
+          // photo but reported the pictures inside a sheet as only partly legible.
+          detail: renderDetail,
+          auto_continue: true,
+          continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true)
+        }
+      ]
+    } : {};
+    const pagedRead = !visionFile && !windowedRead && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
+    const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
+    const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
+    const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
+    const skapiExtract = extractContent && extractContent.length ? {
+      _skapi_extract: extractContent.map((d) => ({
+        ...d,
+        // FIRST pass of an INDEXING run only: tells the worker to also pull the
+        // file's embedded pictures into __MEDIA__ and register their records.
+        // Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
+        // never sets this, so merely ATTACHING a file to a chat message cannot
+        // write media records; a CONTINUE pass skips it because the first pass
+        // already saved (the save is whole-file, not windowed).
+        save_media: !continuing
+      }))
+    } : {};
+    const skapiFileUrls = attachment.url && attachment.storagePath ? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] } : {};
+    const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
+      attachment,
+      parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
+    );
+    const systemPrompt = buildIndexingSystemPrompt({
+      // The model copies this id verbatim into project_id tool calls, so it must be
+      // the PUBLIC token whenever the host supplied one; the raw code is rejected
+      // by the tools' schema pattern.
+      projectId: info.publicProjectId || service,
+      serviceName: info.serviceName,
+      serviceDescription: info.serviceDescription,
+      // Per-FILE, not per-project: one project holds public and private files at
+      // once, so this travels on the attachment rather than the identity.
+      accessGroup: attachment.accessGroup
+    });
+    if (platform === "openai") {
+      const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
+      const imageDetail = getOpenAIImageDetail(resolvedModel2);
+      return tapDispatchFailure(forwardRequest({
+        secretName: "openai",
+        queue: bgIndexingQueueName(info.userId, service),
+        service,
+        owner,
+        ...pollOpt(),
+        url: OPENAI_RESPONSES_API_URL,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: "Bearer $CLIENT_SECRET"
+        },
+        data: {
+          model: resolvedModel2,
+          max_output_tokens: getMaxOutputTokens("openai", resolvedModel2, "indexing"),
+          // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
+          ...variantIndexingOptions(resolvedModel2),
+          ...skapiExtract,
+          ...skapiRender,
+          ...skapiWindow,
+          ...skapiFileUrls,
+          input: [
+            { role: "system", content: systemPrompt },
+            {
+              role: "user",
+              content: transformContentWithOpenAIImages(userMessage, imageDetail)
+            }
+          ],
+          tools: [
+            {
+              type: "mcp",
+              server_label: MCP_NAME,
+              server_url: mcpIndexingUrl("openai", resolvedModel2),
+              require_approval: "never",
+              headers: { Authorization: "Bearer $ACCESS_TOKEN" }
+            },
+            // UNCONDITIONAL, unlike a chat turn: the project's web switch
+            // governs answers, not indexing. Kept exactly as it was.
+            ...[openaiWebSearchTool()] 
+          ]
+        }
+      }));
+    }
+    const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
+    return tapDispatchFailure(forwardRequest({
+      secretName: "claude",
+      queue: bgIndexingQueueName(info.userId, service),
+      service,
+      owner,
+      ...pollOpt(),
+      url: ANTHROPIC_MESSAGES_API_URL,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "$CLIENT_SECRET",
+        "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": ANTHROPIC_BETA_HEADER
+      },
+      data: {
+        model: resolvedModel,
+        max_tokens: getMaxOutputTokens("claude", resolvedModel, "indexing"),
+        ...skapiExtract,
+        ...skapiRender,
+        ...skapiWindow,
+        ...skapiFileUrls,
+        system: [
+          {
+            type: "text",
+            text: systemPrompt,
+            cache_control: { type: "ephemeral" }
+          }
+        ],
+        messages: [
+          {
+            role: "user",
+            content: transformContentWithImages(userMessage)
+          }
+        ],
+        mcp_servers: [
+          {
+            type: "url",
+            name: MCP_NAME,
+            url: mcpIndexingUrl("claude", resolvedModel),
+            authorization_token: "$ACCESS_TOKEN"
+          }
+        ],
+        tools: [
+          {
+            type: "mcp_toolset",
+            mcp_server_name: MCP_NAME
+          },
+          // UNCONDITIONAL, unlike a chat turn: the project's web switch governs
+          // answers, not indexing. Kept exactly as it was.
+          claudeWebFetchTool()
+        ]
+      }
+    }));
+  }
+  function extractClaudeText(response) {
+    if (!Array.isArray(response?.content)) {
+      return "";
+    }
+    return response.content.filter((block) => block?.type === "text").map((block) => block.text).join("\n");
+  }
+  function extractOpenAIText(response) {
+    if (typeof response?.output_text === "string" && response.output_text.length) {
+      return response.output_text;
+    }
+    if (Array.isArray(response?.output)) {
+      const text = response.output.flatMap((item) => item?.content || []).filter((part) => part?.type === "output_text").map((part) => part.text || "").join("\n").trim();
+      if (text) {
+        return text;
+      }
+    }
+    const content = response?.choices?.[0]?.message?.content;
+    if (typeof content === "string") {
+      return content;
+    }
+    if (Array.isArray(content)) {
+      return content.map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        if (part?.type === "text") {
+          return part.text || "";
+        }
+        return "";
+      }).join("\n");
+    }
+    return "";
+  }
+  var BG_INDEXING_QUEUE_SUFFIX = "-bg";
+  async function resetFileIndexOnServer(args) {
+    try {
+      const base = String(mcpUrl() || "").replace(/\/+$/, "");
+      if (!base || !args || !args.service || !args.storagePath) return null;
+      const res = await forwardRequest({
+        service: args.service,
+        ...args.owner ? { owner: args.owner } : {},
+        url: base + "/internal/index-reset",
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: "Bearer $ACCESS_TOKEN" },
+        data: { project_id: args.service, path: args.storagePath }
+      });
+      const body = typeof res === "string" ? JSON.parse(res) : res;
+      if (body && typeof body === "object" && typeof body.removed === "number" && body.path === args.storagePath) {
+        return body;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  function indexDoneUniqueId(storagePath) {
+    return "done::" + storagePath;
+  }
+  function runIndexUniqueId(storagePath) {
+    return "run::" + storagePath;
+  }
+  function upsertIndexRunRecordSafe(service, storagePath, patch) {
+    if (!service || !storagePath) return;
+    try {
+      const hook = chatEngineConfig().upsertIndexRunRecord;
+      if (typeof hook !== "function") return;
+      hook({ service, storagePath, patch });
+    } catch (e) {
+    }
+  }
+  function bgIndexingQueueName(userId, service) {
+    return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
+  }
+  function isBgIndexingQueue(queueName) {
+    if (typeof queueName !== "string" || !queueName) return false;
+    const prefix = queueName.split("|")[0];
+    const idx = prefix.lastIndexOf(":");
+    const name = idx === -1 ? prefix : prefix.slice(idx + 1);
+    return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
+  }
+  var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+  var EMPTY_INDEXING_REPLY = "Finished reading this file.";
+  var MAX_INDEXING_RESUME_PASSES = 6;
+  var CHAT_HISTORY_PAGE_LIMIT = 500;
+  async function getChatHistory(params, fetchOptions) {
+    const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+    const p = Object.assign(
+      {
+        url,
+        method: "POST"
+      },
+      { service: params.service, owner: params.owner },
+      params.queue ? { queue: params.queue } : {},
+      params.status ? { status: params.status } : {},
+      params.queue_exact ? { queue_exact: true } : {},
+      params.compact ? { compact: true } : {},
+      params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
+    );
+    return resolveForwardRequestHistory()(
+      p,
+      Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
+    );
+  }
+  function buildHistoryItemFullId(platform, service, itemId) {
+    const url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
+    return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
+  }
+
+  // src/engine/indexing_groups.ts
+  function canonIndexKey(s) {
+    return typeof s === "string" && s ? s.trim() : "";
+  }
+  var RUN_RECORD_WORKING_STALE_MS = 6 * 60 * 60 * 1e3;
+  var INDEXING_LABEL_RE = /^(Re)?[Ii]ndexing(\s*\(continuing\))?\s*:?\s+(.+)$/;
+  var LEADING_MD_LINK_RE = /^\[([^\]]+)\]\(([^)]+)\)/;
+  function parseIndexingLabel(content) {
+    if (typeof content !== "string" || !content) return null;
+    var firstLine = content.split("\n")[0].trim();
+    var m = firstLine.match(INDEXING_LABEL_RE);
+    if (!m) return null;
+    var head = m[3].split(" \xB7 ")[0].trim();
+    var link = head.match(LEADING_MD_LINK_RE);
+    var name = link ? link[1].trim() : head;
+    if (!name) return null;
+    return {
+      name,
+      path: link ? link[2].trim() : void 0,
+      continued: !!m[2],
+      isReindex: !!m[1]
+    };
+  }
+  function readFileRef(msg) {
+    var ref = msg && msg._indexFile;
+    if (ref && (ref.path || ref.name)) {
+      return {
+        name: ref.name || ref.path || "",
+        path: ref.path,
+        mime: ref.mime,
+        size: ref.size,
+        isReindex: ref.isReindex,
+        continued: !!ref.continued
+      };
+    }
+    var parsed = parseIndexingLabel(msg && msg.content);
+    if (!parsed) return null;
+    return {
+      name: parsed.name,
+      path: parsed.path,
+      isReindex: parsed.isReindex,
+      continued: parsed.continued
+    };
+  }
+  function isPendingMsg(m) {
+    return !!(m.isPending || m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
+  }
+  function isHiddenPass(m) {
+    if (m.role === "user") {
+      if (m.isCancelled) return false;
+      var ref = readFileRef(m);
+      return !!(ref && ref.continued);
+    }
+    return !!m.isPending;
+  }
+  function overlayRunRecordVerdict(grp, rec, liveIndexKeys) {
+    if (!grp.members.length || grp.status === "active" || grp.cancelling) return;
+    if (rec.status === "working" || typeof rec.started !== "number") return;
+    if (liveIndexKeys[grp.key] || liveIndexKeys[canonIndexKey(grp.key)]) return;
+    var firstTs = grp.members[0].msg._ts;
+    var lastTs = grp.members[grp.members.length - 1].msg._ts;
+    if (typeof lastTs !== "number" || typeof firstTs !== "number") return;
+    if (rec.started > lastTs) return;
+    var when = typeof rec.finished === "number" ? rec.finished : void 0;
+    if (when === void 0) return;
+    if (when < firstTs) return;
+    if (when < lastTs - 5e3) return;
+    if (rec.status === "error" || rec.status === "cancelled") {
+      grp.status = rec.status;
+    } else if (rec.status === "done") {
+      grp.status = "done";
+    } else {
+      return;
+    }
+    grp.finished = true;
+    grp.resolving = false;
+    grp.resolvingReason = void 0;
+  }
+  function buildChatDisplayList(messages, opts) {
+    var list = Array.isArray(messages) ? messages : [];
+    var liveIndexKeys = opts && opts.liveIndexKeys || {};
+    var liveIndexChecked = !!(opts && opts.liveIndexChecked);
+    var doneKeys = opts && opts.doneKeys || {};
+    var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
+    var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
+    var hasMoreHistory = !!(opts && opts.hasMoreHistory);
+    var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
+    var stubPlatform = opts && opts.stubPlatform;
+    var groups = {};
+    var order = [];
+    var runOfIndex = new Array(list.length);
+    var runByItemId = {};
+    var keyByName = {};
+    var openRunOfKey = {};
+    var runsOfKey = {};
+    var keyOfRun = {};
+    var newestTsOfRun = {};
+    var runSeq = 0;
+    for (var i = 0; i < list.length; i++) {
+      var msg = list[i];
+      if (!msg || !msg.isBackgroundTask) continue;
+      var runId;
+      var ref = msg.role === "user" ? readFileRef(msg) : null;
+      if (msg._serverItemId && runByItemId[msg._serverItemId]) {
+        runId = runByItemId[msg._serverItemId];
+      } else if (ref) {
+        var key = ref.path || keyByName[ref.name] || ref.name;
+        var alreadySeen = !!(msg._serverItemId && runByItemId[msg._serverItemId]);
+        var openId = openRunOfKey[key];
+        var notLater = false;
+        if (openId && typeof msg._ts === "number" && typeof newestTsOfRun[openId] === "number") {
+          notLater = msg._ts <= newestTsOfRun[openId];
+        }
+        if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
+        runId = openRunOfKey[key];
+        if (!runId) {
+          runId = "run" + runSeq++;
+          openRunOfKey[key] = runId;
+          keyOfRun[runId] = key;
+          (runsOfKey[key] || (runsOfKey[key] = [])).push(runId);
+        }
+      } else if (msg.role !== "user") {
+        runId = runOfIndex[i - 1];
+      }
+      if (!runId) continue;
+      if (typeof msg._ts === "number") {
+        var prevTs = newestTsOfRun[runId];
+        if (typeof prevTs !== "number" || msg._ts > prevTs) newestTsOfRun[runId] = msg._ts;
+      }
+      var g = groups[runId];
+      if (!g) {
+        var fileKey = keyOfRun[runId];
+        g = groups[runId] = {
+          key: fileKey,
+          runKey: runId,
+          // provisional; renumbered newest-first below
+          name: ref ? ref.name : fileKey,
+          path: ref ? ref.path : void 0,
+          mime: ref ? ref.mime : void 0,
+          size: ref ? ref.size : void 0,
+          isReindex: !!(ref && ref.isReindex),
+          members: [],
+          passCount: 0,
+          status: "done",
+          cancellableIds: [],
+          cancelling: false,
+          stopped: false,
+          mayHaveOlder: false,
+          // The run's first loaded pass, and never re-stamped: see the file
+          // docstring. `anchorId` is filled in once every member is known.
+          anchorIndex: i,
+          anchorId: "",
+          // All five are derived once every member is known, below.
+          visibleMembers: [],
+          driver: "single",
+          finished: false,
+          resolving: false
+        };
+        order.push(runId);
+      }
+      if (ref) {
+        if (ref.name) g.name = ref.name;
+        if (ref.path) g.path = ref.path;
+        if (ref.mime) g.mime = ref.mime;
+        if (typeof ref.size === "number") g.size = ref.size;
+        if (ref.isReindex) g.isReindex = true;
+        if (!ref.continued) g.mayHaveOlder = false;
+        g.passCount++;
+      }
+      g.members.push({ msg, index: i });
+      runOfIndex[i] = runId;
+      if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
+      if (ref && ref.name) keyByName[ref.name] = g.key;
+    }
+    var newestRunOfKey = {};
+    for (var nk in runsOfKey) {
+      var nrs = runsOfKey[nk];
+      if (nrs.length) newestRunOfKey[nrs[nrs.length - 1]] = true;
+    }
+    for (var rk in runsOfKey) {
+      var runIds = runsOfKey[rk];
+      for (var ri = 0; ri < runIds.length; ri++) {
+        var grpR = groups[runIds[ri]];
+        if (!grpR) continue;
+        var first = grpR.members[0];
+        var firstId = first && first.msg && (first.msg._serverItemId || first.msg._localId);
+        grpR.runKey = rk + "#" + (firstId || "n" + ri);
+      }
+    }
+    for (var oi = 0; oi < order.length; oi++) {
+      var grp = groups[order[oi]];
+      var lastSettled = -1;
+      for (var si = 0; si < grp.members.length; si++) {
+        if (!isPendingMsg(grp.members[si].msg)) lastSettled = si;
+      }
+      var active = false;
+      for (var mi = lastSettled + 1; mi < grp.members.length; mi++) {
+        if (isPendingMsg(grp.members[mi].msg)) {
+          active = true;
+          break;
+        }
+      }
+      var stopped = false;
+      for (var ki = 0; ki < grp.members.length; ki++) {
+        var km = grp.members[ki].msg;
+        if (km.isCancelled) {
+          stopped = true;
+          break;
+        }
+        if (km._serverItemId && stoppedIndexIds[km._serverItemId]) {
+          stopped = true;
+          break;
+        }
+      }
+      grp.stopped = stopped;
+      for (var xi = 0; xi < grp.members.length; xi++) {
+        if (grp.members[xi].msg._cancelling) {
+          grp.cancelling = true;
+          break;
+        }
+      }
+      var seenIds = {};
+      for (var ci = 0; ci < grp.members.length; ci++) {
+        var cm = grp.members[ci].msg;
+        if (cm._cancelError && !stopped && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
+        if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
+        if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
+        if (ci < lastSettled) continue;
+        if (seenIds[cm._serverItemId]) continue;
+        seenIds[cm._serverItemId] = true;
+        grp.cancellableIds.push(cm._serverItemId);
+      }
+      if (active) {
+        grp.status = "active";
+        if (stopped) grp.cancelling = true;
+      } else if (stopped) {
+        grp.status = "cancelled";
+      } else {
+        var retriedIds = {};
+        for (var ri = 0; ri < grp.members.length; ri++) {
+          var rm = grp.members[ri].msg;
+          if (rm.isRetried && rm._serverItemId) retriedIds[rm._serverItemId] = true;
+        }
+        var li = grp.members.length - 1;
+        while (li >= 0 && (grp.members[li].msg.isRetried || grp.members[li].msg._serverItemId && retriedIds[grp.members[li].msg._serverItemId])) li--;
+        if (li < 0) {
+          grp.status = "active";
+        } else {
+          var last = grp.members[li].msg;
+          grp.status = last.isError ? "error" : "done";
+        }
+      }
+      var sawFirstPass = false;
+      for (var pi = 0; pi < grp.members.length; pi++) {
+        var pm = grp.members[pi].msg;
+        if (pm.role !== "user") continue;
+        var pref = readFileRef(pm);
+        if (pref && !pref.continued) {
+          sawFirstPass = true;
+          break;
+        }
+      }
+      grp.mayHaveOlder = !sawFirstPass && hasMoreHistory;
+      var anchor = grp.members[0];
+      grp.anchorIndex = anchor.index;
+      grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
+      var sawComplete = false;
+      for (var vi = 0; vi < grp.members.length; vi++) {
+        var vm = grp.members[vi];
+        if (vm.msg._indexComplete) sawComplete = true;
+        if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+      }
+      grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
+      if (grp.status === "active") {
+        grp.finished = false;
+      } else if (grp.status === "cancelled") {
+        grp.finished = true;
+      } else if (grp.driver === "single") {
+        grp.finished = true;
+      } else if (grp.driver === "client") {
+        grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
+      } else {
+        grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
+      }
+      if (grp.status !== "done") {
+        grp.resolving = false;
+      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !doneKeys[grp.key] && newestRunOfKey[order[oi]]) {
+        grp.resolving = true;
+        grp.resolvingReason = "history";
+      } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
+        grp.resolving = true;
+        grp.resolvingReason = "status";
+      } else {
+        grp.resolving = false;
+      }
+    }
+    var superseded = {};
+    for (var sk in runsOfKey) {
+      var srs = runsOfKey[sk];
+      for (var sri = 0; sri < srs.length - 1; sri++) {
+        var sgp = groups[srs[sri]];
+        if (!sgp || sgp.status === "active" || sgp.cancelling) continue;
+        superseded[srs[sri]] = true;
+      }
+    }
+    var stubList = [];
+    var runStubs = opts && opts.runStubs;
+    if (runStubs) {
+      var coveredPaths = {};
+      var coveredPathlessNames = {};
+      for (var ci = 0; ci < order.length; ci++) {
+        var cg = groups[order[ci]];
+        if (cg.path) {
+          coveredPaths[canonIndexKey(cg.path)] = true;
+          if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
+        } else if (cg.name) coveredPathlessNames[canonIndexKey(cg.name)] = true;
+        else if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
+      }
+      var now = opts && typeof opts.now === "number" ? opts.now : Date.now();
+      var runningKeys = opts && opts.liveIndexRunningKeys;
+      var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
+      for (var sp in runStubs) {
+        var rec = runStubs[sp];
+        if (!sp || !rec || !rec.status || coveredPaths[canonIndexKey(sp)]) continue;
+        var fname = rec.filename || sp.split("/").pop() || sp;
+        if (coveredPathlessNames[canonIndexKey(fname)]) continue;
+        if (stubPlatform && rec.platform && rec.platform !== stubPlatform) continue;
+        var live = !!liveIndexKeys[sp] || !!liveIndexKeys[canonIndexKey(sp)];
+        if (!live && (liveIndexKeys[fname] || liveIndexKeys[canonIndexKey(fname)])) {
+          var claimedByOther = false;
+          for (var lk in liveIndexKeys) {
+            if (!liveIndexKeys[lk]) continue;
+            var lkc = canonIndexKey(lk);
+            if (lkc === canonIndexKey(sp)) continue;
+            if (lkc.length > fname.length && lkc.slice(-(fname.length + 1)) === "/" + fname) {
+              claimedByOther = true;
+              break;
+            }
+          }
+          live = !claimedByOther;
+        }
+        var recWhen = typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : void 0;
+        if (stubClearedAt && !live && recWhen !== void 0 && recWhen <= stubClearedAt) continue;
+        var st = "active";
+        var fin = false;
+        var res = false;
+        var reason;
+        if (!live) {
+          if (rec.status === "done" || doneKeys[sp] || doneKeys[canonIndexKey(sp)] || doneKeys[fname] || doneKeys[canonIndexKey(fname)]) {
+            st = "done";
+            fin = true;
+          } else if (rec.status === "error") {
+            st = "error";
+            fin = true;
+          } else if (rec.status === "cancelled") {
+            st = "cancelled";
+            fin = true;
+          } else if (liveIndexChecked) {
+            st = "done";
+            fin = true;
+          } else if (typeof rec.started === "number" && now - rec.started > RUN_RECORD_WORKING_STALE_MS) {
+            st = "error";
+            fin = true;
+          } else {
+            res = true;
+            reason = "status";
+          }
+        }
+        var sg = {
+          key: sp,
+          // ONE identity for the run whether it renders from the record or
+          // from its loaded passes: the views key the DOM off runKey, so a
+          // 'stub:'-prefixed key meant every handoff was an unmount plus a
+          // remount somewhere else. Named after the record's start, which
+          // the real group below reuses when it has one.
+          runKey: "run:" + sp + "#" + (typeof rec.started === "number" ? rec.started : "n"),
+          name: fname,
+          path: sp,
+          mime: void 0,
+          size: void 0,
+          isReindex: false,
+          members: [],
+          passCount: 0,
+          status: st,
+          cancellableIds: [],
+          cancelling: false,
+          stopped: st === "cancelled",
+          mayHaveOlder: hasMoreHistory,
+          anchorIndex: -1,
+          anchorId: "",
+          visibleMembers: [],
+          driver: !isPagedReadFile(fname, void 0) ? "single" : isImageVisionFile(fname, void 0) ? "worker" : windowedIndexing ? "worker" : "client",
+          finished: fin,
+          resolving: res,
+          resolvingReason: reason,
+          stub: true,
+          queued: live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
+          stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0)
+        };
+        stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
+      }
+    }
+    var suppressAnchor = {};
+    var stubByCanon = {};
+    if (runStubs) for (var ck in runStubs) stubByCanon[canonIndexKey(ck)] = runStubs[ck];
+    if (runStubs) {
+      for (var ti2 = 0; ti2 < order.length; ti2++) {
+        var tg = groups[order[ti2]];
+        if (!newestRunOfKey[order[ti2]]) continue;
+        var trec = tg.path && (runStubs[tg.path] || stubByCanon[canonIndexKey(tg.path)]) || runStubs[tg.key] || stubByCanon[canonIndexKey(tg.key)];
+        if (!trec || typeof trec.started !== "number") continue;
+        if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
+        suppressAnchor[order[ti2]] = true;
+        tg.runKey = "run:" + (tg.path || tg.key) + "#" + trec.started;
+        stubList.push({ started: trec.started, group: tg });
+        overlayRunRecordVerdict(tg, trec, liveIndexKeys);
+      }
+    }
+    stubList.sort(function(a, b) {
+      return a.started - b.started;
+    });
+    var out = [];
+    var si = 0;
+    for (var j = 0; j < list.length; j++) {
+      var mts = list[j] && typeof list[j]._ts === "number" ? list[j]._ts : void 0;
+      if (mts !== void 0) {
+        while (si < stubList.length && stubList[si].started <= mts) {
+          out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
+          si++;
+        }
+      }
+      var r = runOfIndex[j];
+      if (r === void 0) {
+        out.push({ kind: "message", msg: list[j], index: j });
+        continue;
+      }
+      if (groups[r].anchorIndex === j && !suppressAnchor[r] && !superseded[r]) {
+        out.push({ kind: "indexing", group: groups[r], index: j });
+      }
+    }
+    while (si < stubList.length) {
+      out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
+      si++;
+    }
+    return out;
+  }
+
+  // src/engine/duplicates.ts
+  var DUPLICATE_LOOKUP_MAX_CANDIDATES = 25;
+  var SRC_PREFIX2 = "src::";
+  function isDuplicateCandidateId(uniqueId, name) {
+    if (typeof uniqueId !== "string" || !name) return false;
+    if (uniqueId.indexOf(SRC_PREFIX2) !== 0) return false;
+    if (uniqueId === SRC_PREFIX2 + name) return true;
+    const tail = "/" + name;
+    return uniqueId.length > SRC_PREFIX2.length + tail.length && uniqueId.slice(-tail.length) === tail;
+  }
+  function listOf(res) {
+    if (!res) return [];
+    if (Array.isArray(res)) return res;
+    return Array.isArray(res.list) ? res.list : [];
+  }
+  var DUPLICATE_LOOKUP_TIMEOUT_MS = 15e3;
+  var DUPLICATE_LOOKUP_LIMIT = 500;
+  function nfc(text) {
+    try {
+      return String(text || "").normalize("NFC");
+    } catch {
+      return String(text || "");
+    }
+  }
+  async function storedCopyIndexing(skapi, storagePath, service) {
+    const doneId = "done::" + storagePath;
+    try {
+      const done = listOf(await skapi.getUniqueId(Object.assign({ unique_id: doneId }, service), { fetchMore: false, limit: 1 }));
+      if (done.some(function(it) {
+        return (it && typeof it === "object" ? it.unique_id : it) === doneId;
+      })) return "done";
+    } catch {
+    }
+    try {
+      const run = listOf(await skapi.getRecords(Object.assign({ unique_id: "run::" + storagePath }, service)))[0];
+      const data = run && run.data && typeof run.data === "object" ? run.data : null;
+      if (data && data.status === "working" && typeof data.started === "number" && Date.now() - data.started < RUN_RECORD_WORKING_STALE_MS) return "running";
+    } catch {
+    }
+    return "other";
+  }
+  async function findDuplicateUpload(skapi, file, userId, opts) {
+    const timeoutMs = opts && typeof opts.timeoutMs === "number" && opts.timeoutMs >= 0 ? opts.timeoutMs : DUPLICATE_LOOKUP_TIMEOUT_MS;
+    let timer;
+    const deadline = new Promise(function(resolve) {
+      timer = setTimeout(function() {
+        resolve(null);
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([lookupDuplicate(skapi, file, userId, opts), deadline]);
+    } catch {
+      return null;
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  }
+  async function lookupDuplicate(skapi, file, userId, opts) {
+    if (!skapi || typeof skapi.getUniqueId !== "function" || typeof skapi.getRecords !== "function") return null;
+    const name = nfc(file && typeof file.name === "string" ? file.name.split("/").pop() || "" : "");
+    const size = file && typeof file.size === "number" ? file.size : NaN;
+    if (!name || !(size >= 0) || !userId) return null;
+    const service = opts && opts.service ? { service: opts.service } : {};
+    const found = listOf(await skapi.getUniqueId(
+      Object.assign({ unique_id: name, condition: "<=" }, service),
+      { fetchMore: false, limit: DUPLICATE_LOOKUP_LIMIT }
+    ));
+    const ids = [];
+    for (const item of found) {
+      const id = item && typeof item === "object" ? item.unique_id : item;
+      if (isDuplicateCandidateId(id, name) && ids.indexOf(id) === -1) ids.push(id);
+      if (ids.length >= DUPLICATE_LOOKUP_MAX_CANDIDATES) break;
+    }
+    for (const uniqueId of ids) {
+      let record = null;
+      try {
+        record = listOf(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
+      } catch {
+        continue;
+      }
+      if (!record || typeof record !== "object") continue;
+      const data = record.data && typeof record.data === "object" ? record.data : null;
+      if (!data || data.size_bytes !== size) continue;
+      if (record.user_id !== userId) continue;
+      const storagePath = uniqueId.slice(SRC_PREFIX2.length);
+      const indexing = await storedCopyIndexing(skapi, storagePath, service);
+      if (indexing === "other") continue;
+      return { storagePath, uniqueId, record, indexing };
+    }
+    return null;
+  }
+
+  // src/engine/attachments.ts
+  function groupAttachmentFailures(attachments) {
+    const groups = {};
+    const order = [];
+    (attachments || []).forEach(function(att) {
+      if (!att || att.status !== "error" && att.status !== "indexError") return;
+      const code = String(att.errorCode || "");
+      const message = String(
+        att.errorDetail || att.errorMessage || (att.status === "indexError" ? "File indexing failed" : "File upload has failed")
+      );
+      const key = code + "\0" + message;
+      if (!groups[key]) {
+        groups[key] = { code, message, files: [] };
+        order.push(key);
+      }
+      groups[key].files.push(String(att.name || "(unnamed file)"));
+    });
+    return order.map(function(k) {
+      return groups[k];
+    });
+  }
+
+  // src/engine/greeting.ts
+  function buildChatGreeting(params) {
+    const custom = typeof params.custom === "string" ? params.custom.trim() : "";
+    if (custom) return { lead: custom, name: "", tail: "", text: custom };
+    const name = params.projectName ? '"' + params.projectName + '"' : "";
+    const lead = params.canUpload === false ? "Hi! Ask me anything about the data in your project" : "Hi! Start by attaching the files related to your project";
+    const tail = params.canUpload === false ? "." : ", or pasting plain text into the chat. Once they are indexed, ask me anything about that data.";
+    return { lead, name, tail, text: lead + (name ? " " + name : "") + tail };
+  }
+
+  // src/engine/errors.ts
+  var STATUS_MESSAGE = {
+    "408": "The AI provider timed out before it started.",
+    "409": "The AI provider rejected the request as conflicting.",
+    "413": "The request was too large for the AI provider.",
+    "429": "The AI provider is rate limiting requests right now.",
+    "500": "The AI provider hit an internal error.",
+    "502": "The AI provider is temporarily unreachable.",
+    "503": "The AI provider is temporarily unavailable.",
+    "504": "The AI provider timed out."
+  };
+  function isTransientStatus(status) {
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+  }
+  function isCsrStatusEnvelope(res) {
+    return !!res && typeof res === "object" && !Array.isArray(res) && typeof res.status === "string" && typeof res.id === "string" && "in_queue" in res;
+  }
+  function csrEnvelopeError(input) {
+    if (!isCsrStatusEnvelope(input)) return void 0;
+    if (input.status !== "failed") return void 0;
+    return input.error != null ? input.error : { message: "The AI provider request failed." };
+  }
+  function getErrorMessage(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
+    if (!input) return "Something went wrong.";
+    if (typeof input === "string") return input;
+    if (input.error && input.error.message) return input.error.message;
+    if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
+    if (input.body && typeof input.body.message === "string") return input.body.message;
+    if (input.message) return input.message;
+    var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : 0;
+    if (status) {
+      var text = STATUS_MESSAGE[String(status)] || (status >= 500 ? "The AI provider returned a server error." : "The AI provider rejected the request.");
+      return text + " (error " + status + ")" + (isTransientStatus(status) ? " This is usually temporary, please try again." : "");
+    }
+    return "Something went wrong.";
+  }
+  function isRetriedFailure(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
+    return !!input && typeof input === "object" && input.retried === true;
+  }
+  function isErrorResponseBody(response) {
+    var envErr = csrEnvelopeError(response);
+    if (envErr !== void 0) response = envErr;
+    if (!response || typeof response !== "object") return envErr !== void 0;
+    if (typeof response.status_code === "number" && response.status_code >= 400) return true;
+    if (response.type === "error") return true;
+    if (response.error && (response.error.message || response.error.type)) return true;
+    var body = response.body;
+    if (body && typeof body === "object") {
+      if (body.type === "error") return true;
+      if (body.error && (body.error.message || body.error.type)) return true;
+    }
+    if (typeof response.message === "string" && response.message.length) {
+      var hasClaude = Array.isArray(response.content);
+      var hasOpenAI = typeof response.output_text === "string" || Array.isArray(response.output) || Array.isArray(response.choices);
+      if (!hasClaude && !hasOpenAI) return true;
+    }
+    return false;
+  }
+  function isNonRetryableRequestError(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
+    if (!input || typeof input !== "object") return false;
+    var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
+    var param = void 0;
+    var blobs = [];
+    var sources = [input.error, input.body && input.body.error, input.body, input];
+    for (var i = 0; i < sources.length; i++) {
+      var e = sources[i];
+      if (!e) continue;
+      if (typeof e === "string") {
+        blobs.push(e);
+        continue;
+      }
+      if (typeof e !== "object") continue;
+      if (param === void 0 && e.param != null) param = e.param;
+      if (typeof e.code === "string") blobs.push(e.code);
+      if (typeof e.type === "string") blobs.push(e.type);
+      if (typeof e.message === "string") blobs.push(e.message);
+    }
+    var hay = blobs.join(" | ").toLowerCase();
+    if (hay.indexOf("unknown_parameter") !== -1 || hay.indexOf("unknown parameter") !== -1 || hay.indexOf("unsupported_parameter") !== -1 || hay.indexOf("unsupported parameter") !== -1) {
+      return true;
+    }
+    var isClientReqStatus = status === 400 || status === 422;
+    if (isClientReqStatus && param != null && param !== "") return true;
+    if (isClientReqStatus && hay.indexOf("invalid_request") !== -1 && (hay.indexOf("parameter") !== -1 || hay.indexOf("param") !== -1)) {
+      return true;
+    }
+    return false;
+  }
+  function isAuthExpiredError(input) {
+    var envErr = csrEnvelopeError(input);
+    if (envErr !== void 0) input = envErr;
+    if (!input) return false;
+    var blobs = [];
+    var push = function(v) {
+      if (typeof v === "string" && v) blobs.push(v);
+    };
+    if (typeof input === "string") push(input);
+    else {
+      push(input.message);
+      push(input.code);
+      if (input.error) {
+        push(input.error.message);
+        push(input.error.code);
+        push(input.error.type);
+      }
+      if (input.body) {
+        push(input.body.message);
+        if (input.body.error) {
+          push(input.body.error.message);
+          push(input.body.error.code);
+          push(input.body.error.type);
+        }
+      }
+      if (typeof input.status === "number" && input.status === 401) return true;
+      if (typeof input.status_code === "number" && input.status_code === 401) return true;
+    }
+    var hay = blobs.join(" | ").toLowerCase();
+    if (!hay) return false;
+    return hay.indexOf("token has expired") !== -1 || hay.indexOf("token is expired") !== -1 || hay.indexOf("expired_token") !== -1 || hay.indexOf("invalid_token") !== -1 || hay.indexOf("unauthorized") !== -1 || hay.indexOf("not authorized") !== -1 || hay.indexOf("invalid_request") !== -1 && hay.indexOf("token") !== -1;
   }
 
   // src/engine/citations.ts
@@ -2654,681 +4152,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return target;
   }
 
-  // src/engine/requests.ts
-  var ANTHROPIC_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages";
-  var ANTHROPIC_VERSION = "2023-06-01";
-  var ANTHROPIC_MCP_BETA = "mcp-client-2025-11-20";
-  var ANTHROPIC_WEB_FETCH_BETA = "web-fetch-2025-09-10";
-  var ANTHROPIC_PROMPT_CACHING_BETA = "prompt-caching-2024-07-31";
-  var ANTHROPIC_BETA_HEADER = `${ANTHROPIC_MCP_BETA},${ANTHROPIC_WEB_FETCH_BETA},${ANTHROPIC_PROMPT_CACHING_BETA}`;
-  var WEB_FETCH_MAX_USES = 40;
-  var WEB_FETCH_MAX_CONTENT_TOKENS = 2e5;
-  var claudeWebFetchTool = () => ({
-    type: "web_fetch_20250910",
-    name: "web_fetch",
-    max_uses: WEB_FETCH_MAX_USES,
-    citations: { enabled: true },
-    max_content_tokens: WEB_FETCH_MAX_CONTENT_TOKENS
-  });
-  var OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
-  var DEFAULT_OPENAI_IMAGE_DETAIL = "auto";
-  var OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS = true;
-  var openaiWebSearchTool = () => ({
-    type: "web_search",
-    external_web_access: OPENAI_WEB_SEARCH_EXTERNAL_WEB_ACCESS
-  });
-  var webToolsForChat = (platform, webAccess) => {
-    if (webAccess !== true) return [];
-    if (platform === "claude") return [claudeWebFetchTool()];
-    return [openaiWebSearchTool()] ;
-  };
-  var MCP_NAME = "BunnyQuery";
-  var DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
-  var DEFAULT_OPENAI_MODEL = "gpt-6-luna";
-  var mcpUrl = () => chatEngineConfig().mcpBaseUrl;
-  function withMcpParams(base, params) {
-    if (!base) return base;
-    const pairs = Object.keys(params).filter((k) => params[k] !== void 0 && params[k] !== null && params[k] !== "").map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(String(params[k])));
-    if (!pairs.length) return base;
-    const [addr, existing] = base.split("?");
-    const hasPath = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\/./i.test(addr);
-    const path = hasPath ? addr : addr.replace(/\/+$/, "") + "/";
-    return path + "?" + (existing ? existing + "&" : "") + pairs.join("&");
-  }
-  var mcpContextParam = (platform, model) => getModelContextWindow(platform, model);
-  var mcpIndexingUrl = (platform = "openai", model) => withMcpParams(mcpUrl(), { profile: "index", ctx: mcpContextParam(platform, model) });
-  var mcpChatUrl = (endpointUrl, platform, model) => withMcpParams(endpointUrl, { profile: "chat", ctx: mcpContextParam(platform, model) });
-  function mcpEndpointFor(anonymous, publicProjectId, service) {
-    if (!anonymous) return { url: mcpUrl(), token: "$ACCESS_TOKEN" };
-    const project = publicProjectId || service;
-    return { url: String(mcpUrl()).replace(/\/+$/, "") + "/p/" + project };
-  }
-  var forwardRequest = (opts) => resolveForwardRequest()(opts);
-  var CHAT_STREAM_ON = Object.freeze({
-    transport: Object.freeze({ stream: true }),
-    body: Object.freeze({ stream: true })
-  });
-  var CHAT_STREAM_OFF = Object.freeze({
-    transport: Object.freeze({}),
-    body: Object.freeze({})
-  });
-  var CHAT_STREAM_ON_REALTIME = Object.freeze({
-    // `realtime` rides on the TRANSPORT arm only. It is a skapi option, not a field
-    // the destination understands, so it must never reach `data`: the body arm stays
-    // exactly what it is with the socket off.
-    transport: Object.freeze({ stream: true, realtime: true }),
-    body: Object.freeze({ stream: true })
-  });
-  function chatStreamWiring(queue) {
-    if (!liveStreamingEnabled()) return CHAT_STREAM_OFF;
-    if (isBgIndexingQueue(queue)) return CHAT_STREAM_OFF;
-    return liveStreamingSocketEnabled() ? CHAT_STREAM_ON_REALTIME : CHAT_STREAM_ON;
-  }
-  var VARIANT_IMAGE_DETAIL = "original";
-  var VARIANT_TEXT_VERBOSITY = "high";
-  var OLDEST_NANO_REASONING_EFFORT = "high";
-  var isOpenAINano = (model) => {
-    const normalized = (model).trim().toLowerCase();
-    if (!/(^|-)nano(-|$)/.test(normalized)) return false;
-    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
-    if (!match) return false;
-    const major = Number(match[1]);
-    const minor = match[2] === void 0 ? null : Number(match[2]);
-    return major > 5 || major === 5 && minor !== null && minor >= 4;
-  };
-  var variantIndexingOptions = (model) => {
-    if (!isOpenAINano(model) || !isOldestNano(model)) return {};
-    return {
-      ...{ text: { verbosity: VARIANT_TEXT_VERBOSITY } } ,
-      ...{ reasoning: { effort: OLDEST_NANO_REASONING_EFFORT } } 
-    };
-  };
-  var getOpenAIImageDetail = (model) => {
-    const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
-    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
-    if (!match) {
-      return DEFAULT_OPENAI_IMAGE_DETAIL;
-    }
-    const major = Number(match[1]);
-    const minor = match[2] === void 0 ? null : Number(match[2]);
-    const isVariant = !!match[3];
-    const supportsOriginal = major > 5 || major === 5 && minor !== null && minor >= 4;
-    if (!supportsOriginal) {
-      return DEFAULT_OPENAI_IMAGE_DETAIL;
-    }
-    return isVariant ? VARIANT_IMAGE_DETAIL : "original";
-  };
-  var getRenderImageDetail = (model) => {
-    const detail = getOpenAIImageDetail(model);
-    return detail === DEFAULT_OPENAI_IMAGE_DETAIL ? "high" : detail;
-  };
-  var OPENAI_VERSIONED_ID = /^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/;
-  var isRecognisedOpenAIVersion = (model) => OPENAI_VERSIONED_ID.test((model).trim().toLowerCase());
-  var isOldestNano = (model) => {
-    const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
-    if (!/(^|-)nano(-|$)/.test(normalized)) return false;
-    const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
-    if (!match) return true;
-    const major = Number(match[1]);
-    const minor = match[2] === void 0 ? null : Number(match[2]);
-    if (major < 5) return true;
-    if (major > 5) return false;
-    return minor === null || minor <= 4;
-  };
-  var SMALL_TIER_PAGES_PER_WINDOW = 2;
-  var DOWNSAMPLED_TIER_TILE = 2;
-  function getVisionProfile(model) {
-    const detail = getRenderImageDetail(model);
-    if (!isRecognisedOpenAIVersion(model)) {
-      return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
-    }
-    if (detail !== "original") {
-      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: DOWNSAMPLED_TIER_TILE };
-    }
-    if (isOldestNano(model)) {
-      return { detail, pagesPerWindow: SMALL_TIER_PAGES_PER_WINDOW, tile: 1 };
-    }
-    return { detail, pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
-  }
-  var IMAGE_URL_REGEX = /\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
-  function transformContentWithImages(content) {
-    if (typeof content !== "string" || !content) {
-      return content;
-    }
-    const matches = content.match(IMAGE_URL_REGEX);
-    if (!matches || !matches.length) {
-      return content;
-    }
-    const seen = /* @__PURE__ */ new Set();
-    const imageBlocks = [];
-    for (const url of matches) {
-      if (seen.has(url)) continue;
-      seen.add(url);
-      imageBlocks.push({
-        type: "image",
-        source: { type: "url", url }
-      });
-    }
-    return [...imageBlocks, { type: "text", text: content }];
-  }
-  function prepareClaudeMessages(messages) {
-    if (!messages.length) return messages;
-    const lastIndex = messages.length - 1;
-    const last = messages[lastIndex];
-    if (last.role !== "user") return messages;
-    const content = transformContentWithImages(last.content);
-    if (content === last.content) return messages;
-    const next = messages.slice();
-    next[lastIndex] = { role: last.role, content };
-    return next;
-  }
-  function transformContentWithOpenAIImages(content, detail = DEFAULT_OPENAI_IMAGE_DETAIL) {
-    if (typeof content !== "string" || !content) {
-      return content;
-    }
-    const matches = content.match(IMAGE_URL_REGEX);
-    if (!matches || !matches.length) {
-      return content;
-    }
-    const seen = /* @__PURE__ */ new Set();
-    const imageBlocks = [];
-    for (const url of matches) {
-      if (seen.has(url)) continue;
-      seen.add(url);
-      imageBlocks.push({
-        type: "input_image",
-        image_url: url,
-        detail
-      });
-    }
-    return [{ type: "input_text", text: content }, ...imageBlocks];
-  }
-  function prepareOpenAIMessages(messages, detail = DEFAULT_OPENAI_IMAGE_DETAIL) {
-    if (!messages.length) return messages;
-    const lastIndex = messages.length - 1;
-    const last = messages[lastIndex];
-    if (last.role !== "user") return messages;
-    const content = transformContentWithOpenAIImages(last.content, detail);
-    if (content === last.content) return messages;
-    const next = messages.slice();
-    next[lastIndex] = { role: last.role, content };
-    return next;
-  }
-  function applyHistoryCacheBreakpoint(messages) {
-    if (messages.length < 2) return messages;
-    const breakpointIndex = messages.length - 2;
-    return messages.map((m, i) => {
-      if (i !== breakpointIndex) return m;
-      const blocks = Array.isArray(m.content) ? m.content.slice() : [{ type: "text", text: m.content }];
-      if (!blocks.length) return m;
-      const lastBlockIndex = blocks.length - 1;
-      blocks[lastBlockIndex] = {
-        ...blocks[lastBlockIndex],
-        cache_control: { type: "ephemeral" }
-      };
-      return { ...m, content: blocks };
-    });
-  }
-  var POLL_INTERVAL = 3e3;
-  var STREAM_POLL_INTERVAL = 1e3;
-  var MAX_CONCURRENT_BG_POLLS = 6;
-  async function callClaudeWithMcp({
-    prompt,
-    messages,
-    service,
-    owner,
-    userId,
-    model = DEFAULT_CLAUDE_MODEL,
-    maxTokens = 1e3,
-    system,
-    mcpServer,
-    extractContent,
-    fileUrls,
-    webAccess
-  }) {
-    const web = await resolveWebAccess(service, typeof webAccess === "boolean" ? webAccess : void 0);
-    const mcpServerDefinition = {
-      type: "url",
-      name: mcpServer.name,
-      url: mcpServer.url
-    };
-    if (mcpServer.authorizationToken) {
-      mcpServerDefinition.authorization_token = mcpServer.authorizationToken;
-    }
-    const stream = chatStreamWiring(userId || service);
-    return forwardRequest({
-      secretName: "claude",
-      queue: userId || service,
-      service,
-      owner,
-      ...pollOpt(),
-      ...stream.transport,
-      url: ANTHROPIC_MESSAGES_API_URL,
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": "$CLIENT_SECRET",
-        "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": ANTHROPIC_BETA_HEADER
-      },
-      data: {
-        model,
-        max_tokens: maxTokens,
-        // Top level beside model/messages/mcp_servers, which is where the
-        // Messages API takes it.
-        ...stream.body,
-        ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
-        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
-        ...system ? {
-          system: [
-            {
-              type: "text",
-              text: system,
-              cache_control: { type: "ephemeral" }
-            }
-          ]
-        } : {},
-        messages: (() => {
-          const prepared = messages && messages.length ? prepareClaudeMessages(messages) : [
-            {
-              role: "user",
-              content: transformContentWithImages(prompt)
-            }
-          ];
-          return applyHistoryCacheBreakpoint(prepared);
-        })(),
-        mcp_servers: [mcpServerDefinition],
-        tools: [
-          {
-            type: "mcp_toolset",
-            mcp_server_name: mcpServer.name,
-            ...mcpServer.defaultConfig ? { default_config: mcpServer.defaultConfig } : {},
-            ...mcpServer.configs ? { configs: mcpServer.configs } : {}
-          },
-          // `web_fetch` rides here only when the project's web switch is on. The
-          // beta header above is left as it is: it only makes the tool TYPE
-          // available, and a request that does not list the tool cannot use it.
-          ...webToolsForChat("claude", web)
-        ]
-      }
-    });
-  }
-  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
-    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
-    return callClaudeWithMcp({
-      prompt,
-      messages,
-      service,
-      owner,
-      userId,
-      model: model || DEFAULT_CLAUDE_MODEL,
-      maxTokens: getMaxOutputTokens("claude", model || DEFAULT_CLAUDE_MODEL),
-      system,
-      extractContent,
-      fileUrls,
-      mcpServer: {
-        name: MCP_NAME,
-        url: mcpChatUrl(endpoint.url, "claude", model || DEFAULT_CLAUDE_MODEL),
-        // Omitted entirely for an anonymous turn; the `if (mcpServer.authorizationToken)`
-        // guard below drops the key rather than sending an empty one.
-        authorizationToken: endpoint.token
-      }});
-  }
-  async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
-    const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
-    const resolvedModel = model || DEFAULT_OPENAI_MODEL;
-    const imageDetail = getOpenAIImageDetail(resolvedModel);
-    const web = await resolveWebAccess(service);
-    const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
-      {
-        role: "user",
-        content: transformContentWithOpenAIImages(prompt, imageDetail)
-      }
-    ];
-    const responseInput = [
-      ...system ? [
-        {
-          role: "system",
-          content: system
-        }
-      ] : [],
-      ...messageList.map((m) => ({
-        role: m.role,
-        content: m.content
-      }))
-    ];
-    const stream = chatStreamWiring(userId || service);
-    return forwardRequest({
-      secretName: "openai",
-      queue: userId || service,
-      service,
-      owner,
-      ...pollOpt(),
-      ...stream.transport,
-      url: OPENAI_RESPONSES_API_URL,
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        Authorization: "Bearer $CLIENT_SECRET"
-      },
-      data: {
-        model: resolvedModel,
-        max_output_tokens: getMaxOutputTokens("openai", resolvedModel),
-        // Top level beside model/input/tools, which is where the Responses API
-        // takes it.
-        ...stream.body,
-        ...extractContent && extractContent.length ? { _skapi_extract: extractContent } : {},
-        ...fileUrls && fileUrls.length ? { _skapi_file_urls: fileUrls } : {},
-        input: responseInput,
-        tools: [
-          {
-            type: "mcp",
-            server_label: MCP_NAME,
-            server_url: mcpChatUrl(endpoint.url, "openai", resolvedModel),
-            require_approval: "never",
-            // No `headers` at all for an anonymous turn: `Bearer ` with an
-            // empty token is a credential the MCP server rejects, and the
-            // project-scoped endpoint needs none.
-            ...endpoint.token ? { headers: { Authorization: "Bearer " + endpoint.token } } : {}
-          },
-          // `web_search` rides here only when the project's web switch is on.
-          ...webToolsForChat("openai", web)
-        ]
-      }
-    });
-  }
-  async function notifyAgentContinueIndexing(info) {
-    return notifyAgentSaveAttachment({ ...info, continueIndexing: true });
-  }
-  async function notifyAgentSaveAttachment(info) {
-    const { platform, service, owner, attachment, parsedContent } = info;
-    const continuing = !!info.continueIndexing;
-    if (!continuing) {
-      upsertIndexRunRecordSafe(service, attachment.storagePath, {
-        status: "working",
-        filename: attachment.name,
-        started: Date.now(),
-        queue: bgIndexingQueueName(info.userId, service),
-        platform
-      });
-    }
-    const tapDispatchFailure = (p) => {
-      if (continuing) return p;
-      return p.then(
-        (ack) => ack,
-        (err) => {
-          upsertIndexRunRecordSafe(service, attachment.storagePath, {
-            status: "error",
-            finished: Date.now(),
-            error: err && (err.message || String(err)) || "The indexing request could not be enqueued."
-          });
-          throw err;
-        }
-      );
-    };
-    const visionFile = !parsedContent && isImageVisionFile(attachment.name, attachment.mime);
-    const renderFrom = Math.max(0, info.renderFrom || 0);
-    const renderPlaceholder = visionFile ? makeRenderPlaceholder(attachment.storagePath) : void 0;
-    const renderDetail = platform === "openai" ? getRenderImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
-    const visionProfile = platform === "openai" ? getVisionProfile(info.model || DEFAULT_OPENAI_MODEL) : { pagesPerWindow: RENDER_PAGES_PER_WINDOW, tile: 1 };
-    const skapiRender = visionFile && renderPlaceholder ? {
-      _skapi_render: [
-        {
-          path: attachment.storagePath,
-          from: renderFrom,
-          count: visionProfile.pagesPerWindow,
-          placeholder: renderPlaceholder,
-          name: attachment.name,
-          mime: attachment.mime,
-          detail: renderDetail,
-          tile: visionProfile.tile,
-          auto_continue: true,
-          continue_text: buildIndexingRenderContinueTemplate(attachment, renderPlaceholder)
-        }
-      ]
-    } : {};
-    const windowedRead = !visionFile && !parsedContent && windowedIndexingEnabled() && isWindowedReadFile(attachment.name, attachment.mime);
-    const windowPlaceholder = windowedRead ? makeWindowPlaceholder(attachment.storagePath) : void 0;
-    const skapiWindow = windowedRead && windowPlaceholder ? {
-      _skapi_window: [
-        {
-          path: attachment.storagePath,
-          cursor: null,
-          placeholder: windowPlaceholder,
-          name: attachment.name,
-          mime: attachment.mime,
-          kind: "window",
-          // Same per-image `detail` the render path sends. Without it the worker falls
-          // back to its model-blind default of 'high', so a spreadsheet's embedded
-          // photos were tiled at lower resolution than the SAME model gets for a PDF
-          // page or a chat attachment. That is why a model could describe an attached
-          // photo but reported the pictures inside a sheet as only partly legible.
-          detail: renderDetail,
-          auto_continue: true,
-          continue_text: buildIndexingWindowMessage(attachment, windowPlaceholder, true)
-        }
-      ]
-    } : {};
-    const pagedRead = !visionFile && !windowedRead && (continuing || !parsedContent && isPagedReadFile(attachment.name, attachment.mime));
-    const serverExtract = !visionFile && !windowedRead && !continuing && !parsedContent && !pagedRead && isServerExtractable(attachment.name, attachment.mime);
-    const placeholder = serverExtract ? makeExtractPlaceholder(attachment.storagePath) : void 0;
-    const extractContent = serverExtract && placeholder ? [{ path: attachment.storagePath, placeholder, name: attachment.name, mime: attachment.mime }] : void 0;
-    const skapiExtract = extractContent && extractContent.length ? {
-      _skapi_extract: extractContent.map((d) => ({
-        ...d,
-        // FIRST pass of an INDEXING run only: tells the worker to also pull the
-        // file's embedded pictures into __MEDIA__ and register their records.
-        // Chat-turn extraction (callClaudeWithMcp / callOpenAIWithPublicMcp)
-        // never sets this, so merely ATTACHING a file to a chat message cannot
-        // write media records; a CONTINUE pass skips it because the first pass
-        // already saved (the save is whole-file, not windowed).
-        save_media: !continuing
-      }))
-    } : {};
-    const skapiFileUrls = attachment.url && attachment.storagePath ? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] } : {};
-    const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
-      attachment,
-      parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
-    );
-    const systemPrompt = buildIndexingSystemPrompt({
-      // The model copies this id verbatim into project_id tool calls, so it must be
-      // the PUBLIC token whenever the host supplied one; the raw code is rejected
-      // by the tools' schema pattern.
-      projectId: info.publicProjectId || service,
-      serviceName: info.serviceName,
-      serviceDescription: info.serviceDescription,
-      // Per-FILE, not per-project: one project holds public and private files at
-      // once, so this travels on the attachment rather than the identity.
-      accessGroup: attachment.accessGroup
-    });
-    if (platform === "openai") {
-      const resolvedModel2 = info.model || DEFAULT_OPENAI_MODEL;
-      const imageDetail = getOpenAIImageDetail(resolvedModel2);
-      return tapDispatchFailure(forwardRequest({
-        secretName: "openai",
-        queue: bgIndexingQueueName(info.userId, service),
-        service,
-        owner,
-        ...pollOpt(),
-        url: OPENAI_RESPONSES_API_URL,
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          Authorization: "Bearer $CLIENT_SECRET"
-        },
-        data: {
-          model: resolvedModel2,
-          max_output_tokens: getMaxOutputTokens("openai", resolvedModel2, "indexing"),
-          // Nano-only transcription knobs. Indexing only; see variantIndexingOptions.
-          ...variantIndexingOptions(resolvedModel2),
-          ...skapiExtract,
-          ...skapiRender,
-          ...skapiWindow,
-          ...skapiFileUrls,
-          input: [
-            { role: "system", content: systemPrompt },
-            {
-              role: "user",
-              content: transformContentWithOpenAIImages(userMessage, imageDetail)
-            }
-          ],
-          tools: [
-            {
-              type: "mcp",
-              server_label: MCP_NAME,
-              server_url: mcpIndexingUrl("openai", resolvedModel2),
-              require_approval: "never",
-              headers: { Authorization: "Bearer $ACCESS_TOKEN" }
-            },
-            // UNCONDITIONAL, unlike a chat turn: the project's web switch
-            // governs answers, not indexing. Kept exactly as it was.
-            ...[openaiWebSearchTool()] 
-          ]
-        }
-      }));
-    }
-    const resolvedModel = info.model || DEFAULT_CLAUDE_MODEL;
-    return tapDispatchFailure(forwardRequest({
-      secretName: "claude",
-      queue: bgIndexingQueueName(info.userId, service),
-      service,
-      owner,
-      ...pollOpt(),
-      url: ANTHROPIC_MESSAGES_API_URL,
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": "$CLIENT_SECRET",
-        "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": ANTHROPIC_BETA_HEADER
-      },
-      data: {
-        model: resolvedModel,
-        max_tokens: getMaxOutputTokens("claude", resolvedModel, "indexing"),
-        ...skapiExtract,
-        ...skapiRender,
-        ...skapiWindow,
-        ...skapiFileUrls,
-        system: [
-          {
-            type: "text",
-            text: systemPrompt,
-            cache_control: { type: "ephemeral" }
-          }
-        ],
-        messages: [
-          {
-            role: "user",
-            content: transformContentWithImages(userMessage)
-          }
-        ],
-        mcp_servers: [
-          {
-            type: "url",
-            name: MCP_NAME,
-            url: mcpIndexingUrl("claude", resolvedModel),
-            authorization_token: "$ACCESS_TOKEN"
-          }
-        ],
-        tools: [
-          {
-            type: "mcp_toolset",
-            mcp_server_name: MCP_NAME
-          },
-          // UNCONDITIONAL, unlike a chat turn: the project's web switch governs
-          // answers, not indexing. Kept exactly as it was.
-          claudeWebFetchTool()
-        ]
-      }
-    }));
-  }
-  function extractClaudeText(response) {
-    if (!Array.isArray(response?.content)) {
-      return "";
-    }
-    return response.content.filter((block) => block?.type === "text").map((block) => block.text).join("\n");
-  }
-  function extractOpenAIText(response) {
-    if (typeof response?.output_text === "string" && response.output_text.length) {
-      return response.output_text;
-    }
-    if (Array.isArray(response?.output)) {
-      const text = response.output.flatMap((item) => item?.content || []).filter((part) => part?.type === "output_text").map((part) => part.text || "").join("\n").trim();
-      if (text) {
-        return text;
-      }
-    }
-    const content = response?.choices?.[0]?.message?.content;
-    if (typeof content === "string") {
-      return content;
-    }
-    if (Array.isArray(content)) {
-      return content.map((part) => {
-        if (typeof part === "string") {
-          return part;
-        }
-        if (part?.type === "text") {
-          return part.text || "";
-        }
-        return "";
-      }).join("\n");
-    }
-    return "";
-  }
-  var BG_INDEXING_QUEUE_SUFFIX = "-bg";
-  function indexDoneUniqueId(storagePath) {
-    return "done::" + storagePath;
-  }
-  function runIndexUniqueId(storagePath) {
-    return "run::" + storagePath;
-  }
-  function upsertIndexRunRecordSafe(service, storagePath, patch) {
-    if (!service || !storagePath) return;
-    try {
-      const hook = chatEngineConfig().upsertIndexRunRecord;
-      if (typeof hook !== "function") return;
-      hook({ service, storagePath, patch });
-    } catch (e) {
-    }
-  }
-  function bgIndexingQueueName(userId, service) {
-    return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
-  }
-  function isBgIndexingQueue(queueName) {
-    if (typeof queueName !== "string" || !queueName) return false;
-    const prefix = queueName.split("|")[0];
-    const idx = prefix.lastIndexOf(":");
-    const name = idx === -1 ? prefix : prefix.slice(idx + 1);
-    return name.slice(-BG_INDEXING_QUEUE_SUFFIX.length) === BG_INDEXING_QUEUE_SUFFIX;
-  }
-  var INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
-  var EMPTY_INDEXING_REPLY = "Finished reading this file.";
-  var MAX_INDEXING_RESUME_PASSES = 6;
-  var CHAT_HISTORY_PAGE_LIMIT = 500;
-  async function getChatHistory(params, fetchOptions) {
-    const url = params.platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
-    const p = Object.assign(
-      {
-        url,
-        method: "POST"
-      },
-      { service: params.service, owner: params.owner },
-      params.queue ? { queue: params.queue } : {},
-      params.status ? { status: params.status } : {},
-      params.queue_exact ? { queue_exact: true } : {},
-      params.compact ? { compact: true } : {},
-      params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
-    );
-    return resolveForwardRequestHistory()(
-      p,
-      Object.assign({ ascending: false, limit: CHAT_HISTORY_PAGE_LIMIT }, fetchOptions)
-    );
-  }
-  function buildHistoryItemFullId(platform, service, itemId) {
-    const url = platform === "claude" ? ANTHROPIC_MESSAGES_API_URL : OPENAI_RESPONSES_API_URL;
-    return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
-  }
-
   // src/engine/history.ts
   function filterListByClearHorizon(list, clearedAt) {
     if (!clearedAt) return list;
@@ -3468,6 +4291,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     }
     const state = splitHistoryStates[key];
+    const skipBg = !!params.skipBg;
+    if (skipBg) {
+      state.bgEnd = true;
+      state.bgBuffer = [];
+    }
     if (state.pendingSurface && state.pendingSurface.forFetchMore !== fetchMore) {
       state.pendingSurface = null;
     }
@@ -3494,7 +4322,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     }
     const surface = state.pendingSurface;
-    if (fetchOptions && fetchOptions.deferBg && (!state.bgEnd || headRefresh)) {
+    if (fetchOptions && fetchOptions.deferBg && !skipBg && (!state.bgEnd || headRefresh)) {
       const surfaceList0 = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
       state.surfaceCarry = [];
       const emitNow = surfaceList0.concat(state.bgBuffer);
@@ -3559,7 +4387,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     const surfaceList = state.surfaceCarry.length ? state.surfaceCarry.concat(surface.list) : surface.list.slice();
     const boundary = surface.endOfList ? -Infinity : oldestCreated(surfaceList);
-    if (headRefresh) {
+    if (skipBg) ; else if (headRefresh) {
       const hOpts = { fetchMore: false };
       if (limit) hOpts.limit = limit;
       const hb = await fetch2({ ...base, queue: bgQueue, queue_exact: true, compact: true }, hOpts);
@@ -4119,6 +4947,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
   var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
   var RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1e3;
+  var ADOPT_TICK_MS = 10 * 1e3;
   var EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
   var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
   var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -4247,7 +5076,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var LIVE_PAINT_MIN_MS = 250;
   var LIVE_TYPE_MAX_STEP = 1200;
-  var ChatSession = class {
+  function requestIdTimeMs(rid) {
+    if (typeof rid !== "string") return 0;
+    var stamp = rid.split(":")[0] || "";
+    if (stamp.length !== 13) return 0;
+    var alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var v = 0;
+    for (var i = 0; i < stamp.length; i++) {
+      var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
+      if (d < 0) return 0;
+      v = v * 32 + d;
+    }
+    return Math.floor(v / 2 / 1e6);
+  }
+  var _ChatSession = class _ChatSession {
     constructor(host) {
       // --- live streaming ----------------------------------------------------
       //
@@ -4326,6 +5168,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
        * shape that previously looped fetchHistoryPage after an already-DONE index.
        */
       this._adoptingWorkerPasses = false;
+      /** Per project: when a look last CONFIRMED the bg queue held nothing pending or running
+       *  (2026-11-20). A recent pass older than this is a finished run, not evidence of live
+       *  work, so a tab return no longer re-asks for ten minutes after every run. Memory only:
+       *  a reload starts without it and asks once, as before. */
+      this._idleVerdictAt = {};
+      this._adoptTickTimer = null;
+      /** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
+       *  live. Complete means both lists came back shorter than their limit, so a tracked pass
+       *  missing from it really has left the queue. */
+      this._lastLiveLook = null;
+      /** By-listing passes whose by-id lookup is in flight, so one tick never reads a pass twice. */
+      this._listingSettling = {};
+      this._listingLookInflight = false;
+      /** Turns whose findings were already looked at (a turn can settle by more than one path). */
+      this._findingsDone = {};
+      this._progressInflight = false;
       this.host = host;
       this.state = {
         messages: [],
@@ -4344,7 +5202,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         historyRequestToken: 0,
         gateRefreshToken: 0,
         liveIndexKeys: {},
+        indexPageProgress: {},
+        passPaging: {},
         liveIndexChecked: false,
+        liveIndexRunning: {},
         stoppedIndexIds: {}
       };
       this.bgTaskQueue = [];
@@ -4372,7 +5233,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  every file the server still has indexing work for; `checked` is false until the
      *  first answer for this chat, and false means "we do not know yet". */
     getLiveIndexState() {
-      return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked };
+      return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {} };
     }
     /** Passes that were on a row when the user stopped it, so the display layer can
      *  still tell that this run was stopped once the stop has left no other trace.
@@ -4555,6 +5416,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      */
     _recordLiveIndexKeys(lists) {
       var next = {};
+      var running = {};
       var truncated = false;
       var settledIds = {};
       this.state.messages.forEach(function(m) {
@@ -4575,6 +5437,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (!ref) continue;
           if (ref.path) next[ref.path] = true;
           if (ref.name) next[ref.name] = true;
+          if (item.status === "running") {
+            if (ref.path) running[ref.path] = true;
+            if (ref.name) running[ref.name] = true;
+          }
         }
       }
       var nowChecked = !truncated;
@@ -4591,7 +5457,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           }
         }
       }
+      if (!changed) {
+        var wasRun = this.state.liveIndexRunning || {};
+        for (var r1 in running) if (!wasRun[r1]) {
+          changed = true;
+          break;
+        }
+        if (!changed) {
+          for (var r2 in wasRun) if (!running[r2]) {
+            changed = true;
+            break;
+          }
+        }
+      }
       this.state.liveIndexKeys = next;
+      this.state.liveIndexRunning = running;
       this.state.liveIndexChecked = nowChecked;
       this._liveIndexAt = nowMs();
       this._liveIndexKey = this.getHistoryCacheKey();
@@ -4601,8 +5481,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  project the user just switched to is unknown until it is asked for again. */
     _resetLiveIndexKeys() {
       this.state.liveIndexKeys = {};
+      this.state.liveIndexRunning = {};
       this.state.liveIndexChecked = false;
       this._liveIndexAt = 0;
+      this.state.passPaging = {};
     }
     /**
      * Ask the queue what is still indexing, once, for the chat that is on screen.
@@ -4627,7 +5509,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * instead of merely unconfirmed.
      */
     refreshLiveIndexState() {
+      var sid = this.host.getIdentity().projectId;
+      var idleAt = sid ? this._idleVerdictAt[sid] : 0;
+      if (sid && idleAt && !this._hasLocalLiveIndexWork(sid) && this._newestIndexPassTs() <= idleAt) {
+        this._recordLiveIndexKeys([{ list: [] }, { list: [] }]);
+        return;
+      }
       this._adoptWorkerIndexingPasses(0, true);
+      this._ensureAdoptTick();
     }
     /** Forget what we know about which files are indexing — but ONLY when the
      *  snapshot was taken for a different chat than the one on screen now. For a
@@ -5460,6 +6349,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!isErr) {
         var rNote = extractRetrievalNote(body, text);
         if (rNote) reply._retrieval = rNote;
+        this._saveFindings(itemId, body, text, rNote);
       }
       if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
         this._applyReplyToCache(ownerKey, reply, itemId);
@@ -5598,12 +6488,36 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this._resuming = true;
       return Promise.resolve().then(function() {
         self.drainBgTaskQueue();
-        return self.loadHistory(false, self.state.gateRefreshToken);
+        if (self.needsHistoryRefetch()) return self.loadHistory(false, self.state.gateRefreshToken);
+        self.refreshLiveIndexState();
       }).catch(function(e) {
         console.error("[chat-engine] resume polling failed", e);
       }).then(function() {
         self._resuming = false;
       });
+    }
+    /**
+     * Does the chat on screen need its first history page fetched again to stay right?
+     * Only when a waiting bubble of THIS chat has nothing that will settle it: no live poll
+     * and no entry in bgTaskQueue (whose passes the drain and the queue check follow). Then
+     * the page is the only place its poll handle or its answer can come from (a turn on the
+     * background queue whose poll paused while the tab was hidden, for instance). A bubble
+     * with no server id yet is a send still in flight, which resolves on its own.
+     */
+    needsHistoryRefetch() {
+      var key = this.getHistoryCacheKey();
+      var tracked = {};
+      for (var q = 0; q < this.bgTaskQueue.length; q++) if (this.bgTaskQueue[q]) tracked[this.bgTaskQueue[q].id] = true;
+      for (var i = 0; i < this.state.messages.length; i++) {
+        var m = this.state.messages[i];
+        if (!m || !(m.isPending || m.isPendingQueued || m.isPendingInProcess)) continue;
+        if (m._ownerKey !== void 0 && m._ownerKey !== key) continue;
+        var sid = m._serverItemId;
+        if (!sid) continue;
+        if (this.historyItemPolls.has(sid) || tracked[sid]) continue;
+        return true;
+      }
+      return false;
     }
     _newLocalId() {
       this._lidSeq += 1;
@@ -5869,7 +6783,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
         var answer = params.aiPlatform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
         answer = (answer || "").trim();
-        return { content: answer || "No text response received from AI provider.", isError: false, retrieval: extractRetrievalNote(response, answer) };
+        return { content: answer || "No text response received from AI provider.", isError: false, retrieval: extractRetrievalNote(response, answer), body: response };
       }).catch(function(err) {
         return { content: getErrorMessage(err), isError: true };
       }).then(function(result) {
@@ -5882,6 +6796,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var reply = { role: "assistant", content: result.content, isError: result.isError };
         if (dispatchItemId) reply._serverItemId = dispatchItemId;
         if (result.retrieval) reply._retrieval = result.retrieval;
+        if (!result.isError && result.body) self._saveFindings(dispatchItemId, result.body, result.content, result.retrieval);
         self._applyReplyToCache(params.key, reply, dispatchItemId);
         return result;
       });
@@ -6390,11 +7305,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       else this.host.scrollToBottom(true);
     }
     promoteNextBgQueuedToRunning() {
+      var listed = {};
+      for (var q = 0; q < this.bgTaskQueue.length; q++) {
+        var qe = this.bgTaskQueue[q];
+        if (qe && qe.byListing) listed[qe.id] = true;
+      }
+      var guessed = function(m) {
+        return !(m._serverItemId && listed[m._serverItemId]);
+      };
       if (this.state.messages.some(function(m) {
-        return m.isPending && m.role === "assistant" && m.isBackgroundTask;
+        return m.isPending && m.role === "assistant" && m.isBackgroundTask && guessed(m);
       })) return;
       var nextIdx = this.state.messages.findIndex(function(m) {
-        return m.isPendingQueued && m.role === "user" && m.isBackgroundTask;
+        return m.isPendingQueued && m.role === "user" && m.isBackgroundTask && guessed(m);
       });
       if (nextIdx === -1) return;
       var existing = this.state.messages[nextIdx];
@@ -6548,6 +7471,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (!offReply.isError) {
           var offNote = extractRetrievalNote(response, offReply.content);
           if (offNote) offReply._retrieval = offNote;
+          this._saveFindings(serverId, response, offReply.content, offNote);
         }
         this._applyReplyToCache(ownerKey, offReply, serverId);
         if (serverId) this.cancelledServerIds.delete(serverId);
@@ -6571,6 +7495,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var answer = platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
         answer = (answer || "").trim() || "No text response received from AI provider.";
         var qNote = extractRetrievalNote(response, answer);
+        this._saveFindings(serverId, response, answer, qNote);
         var lid = this._newLocalId();
         if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
           var qPainted = this._paintedTextAt(targetIdx);
@@ -7404,6 +8329,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
       var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
       var hNote = isErr ? null : extractRetrievalNote(response, answer);
+      if (hNote) this._saveFindings(itemId, response, answer, hNote);
       var stripMarker = function(t) {
         return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join("").trim() : t;
       };
@@ -7564,7 +8490,478 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (isImageVisionFile(filename, mime)) return true;
       return windowedIndexingEnabled() && isWindowedReadFile(filename, mime);
     }
-    _adoptWorkerIndexingPasses(attempt, passive) {
+    /** Newest wall-clock `_ts` of any indexing pass on screen, or 0. */
+    _newestIndexPassTs() {
+      var newest = 0;
+      var msgs = this.state.messages;
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (m && m._indexFile && typeof m._ts === "number" && m._ts > newest) newest = m._ts;
+      }
+      return newest;
+    }
+    /** Live indexing work THIS page is tracking for the project: a queued or adopted pass,
+     *  an attached bg poll, or a live key a look recorded. No recency guess. */
+    _hasLocalLiveIndexWork(svcId) {
+      for (var i = 0; i < this.bgTaskQueue.length; i++) {
+        var e = this.bgTaskQueue[i];
+        if (e && e.projectId === svcId) return true;
+      }
+      var keys = this.state.liveIndexKeys || {};
+      for (var k in keys) {
+        if (keys[k]) return true;
+      }
+      var found = false;
+      this.historyItemPolls.forEach(function(h) {
+        if (h && h.kind === "bg") found = true;
+      });
+      return found;
+    }
+    /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
+     *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
+     *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+    _ensureAdoptTick() {
+      if (this._adoptTickTimer) return;
+      var self = this;
+      var id = this.host.getIdentity();
+      if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return;
+      if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+      if (!this._hasLocalLiveIndexWork(id.projectId)) return;
+      this._adoptTickTimer = setTimeout(function() {
+        self._adoptTickTimer = null;
+        var now = self.host.getIdentity();
+        if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+        if (now.projectId !== id.projectId) {
+          self._ensureAdoptTick();
+          return;
+        }
+        if (!self._hasLocalLiveIndexWork(now.projectId)) return;
+        self._adoptWorkerIndexingPasses(0, false, true);
+        self._settleByListing();
+        self._refreshPageProgress();
+        self._ensureAdoptTick();
+      }, ADOPT_TICK_MS);
+    }
+    /**
+     * Follow an indexing pass found in a loaded history page through the queue check
+     * instead of polling it (owner, 2026-11-20): polls on one queue run one at a time in
+     * skapi-js, so after a reload mid-run every lane waited behind the first. Only for a
+     * pass the worker drives (a client-driven chain is resumed off its dispatching entry,
+     * whose pass count caps it) and only when the host can read a row by id. True when the
+     * pass is now tracked (the caller then attaches no poll).
+     */
+    trackHistoryIndexPass(item) {
+      if (typeof chatEngineConfig().csrHistoryItemLookup !== "function") return false;
+      if (!item || typeof item.id !== "string" || !item.id) return false;
+      if (item.status !== "pending" && item.status !== "running") return false;
+      for (var q = 0; q < this.bgTaskQueue.length; q++) {
+        if (this.bgTaskQueue[q] && this.bgTaskQueue[q].id === item.id) return !!this.bgTaskQueue[q].byListing;
+      }
+      var id = this.host.getIdentity();
+      var platform = id.platform;
+      if (!id.projectId || platform !== "claude" && platform !== "openai") return false;
+      var text = typeof item.request_text === "string" && item.request_text ? item.request_text : extractLastUserTextFromRequest(item.request_body);
+      var ref = parseIndexingRequestText(text);
+      if (!ref || !ref.name) return false;
+      if (!this._isWorkerDrivenIndexing(ref.name, ref.mime)) return false;
+      this.bgTaskQueue.push({
+        projectId: id.projectId,
+        platform,
+        id: item.id,
+        filename: ref.name,
+        storagePath: ref.path,
+        mime: ref.mime,
+        size: ref.size,
+        status: item.status === "running" ? "running" : "pending",
+        poll: typeof item.poll === "function" ? item.poll : void 0,
+        resumePass: ref.continued ? 1 : 0,
+        byListing: true,
+        adoptedAt: Date.now()
+      });
+      return true;
+    }
+    /**
+     * Show a pass as RUNNING once the queue says it is. A pass this client sent starts out
+     * waiting (the server queues it), and its own poll's running tick used to be what
+     * moved it on. Settled from the listing, it has no poll, so the running listing the
+     * 10-second check already takes does it instead (owner, 2026-11-20).
+     */
+    _promoteListedRunning(runningRes) {
+      var list = runningRes && Array.isArray(runningRes.list) ? runningRes.list : [];
+      if (!list.length) return;
+      var running = {};
+      for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === "string") running[list[i].id] = true;
+      var changed = false;
+      for (var q = 0; q < this.bgTaskQueue.length; q++) {
+        var e = this.bgTaskQueue[q];
+        if (!e || e.status !== "pending" || !running[e.id]) continue;
+        e.status = "running";
+        if (this._promoteBgItemToRunning(e.id)) changed = true;
+      }
+      if (changed) {
+        this.host.notify();
+        this.updateHistoryCache();
+      }
+    }
+    /** promoteNextBgQueuedToRunning for one named pass: its waiting request bubble becomes
+     *  the running one, with a "Thinking..." placeholder under it. False when that pass has
+     *  no waiting bubble (already running, settled, or not on screen). */
+    _promoteBgItemToRunning(itemId) {
+      var idx = this.state.messages.findIndex(function(m) {
+        return m.role === "user" && m.isBackgroundTask && m.isPendingQueued && m._serverItemId === itemId;
+      });
+      if (idx === -1) return false;
+      var existing = this.state.messages[idx];
+      var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: itemId };
+      if (existing._indexFile) promoted._indexFile = existing._indexFile;
+      if (existing._ts !== void 0) promoted._ts = existing._ts;
+      if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
+      this.state.messages[idx] = promoted;
+      var placeholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: itemId };
+      if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
+      this.state.messages.splice(idx + 1, 0, placeholder);
+      return true;
+    }
+    /**
+     * Save where a hard search found its answer (findings.ts), through the host's
+     * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
+     * throws, never waited on.
+     */
+    _saveFindings(itemId, body, answer, note) {
+      try {
+        var save = chatEngineConfig().saveSearchFinding;
+        if (typeof save !== "function" || !note || !body) return;
+        if (itemId) {
+          if (this._findingsDone[itemId]) return;
+          this._findingsDone[itemId] = true;
+        }
+        var question = null;
+        if (itemId) {
+          for (var i = 0; i < this.state.messages.length; i++) {
+            var m = this.state.messages[i];
+            if (m && m.role === "user" && m._serverItemId === itemId) {
+              if (m.isBackgroundTask) return;
+              question = typeof m.content === "string" ? m.content : null;
+              break;
+            }
+          }
+        }
+        var found = findingsForTurn({ question, body, note, answer });
+        if (!found.length) return;
+        var id = this.host.getIdentity();
+        if (!id.projectId) return;
+        for (var f = 0; f < found.length; f++) {
+          var payload = Object.assign({ service: id.projectId, owner: id.owner }, found[f]);
+          Promise.resolve(save(payload)).catch(function() {
+          });
+        }
+      } catch (e) {
+      }
+    }
+    /**
+     * Chats-only history (owner, 2026-11-21): on when the host can list a file's passes
+     * (listIndexPasses) and read one by id (csrHistoryItemLookup). The history fetch then
+     * skips the indexing queue, a file's row comes from its run:: record, and opening the
+     * row loads its passes (loadRunPasses), a page at a time.
+     */
+    lazyIndexRowsEnabled() {
+      var cfg = chatEngineConfig();
+      return typeof cfg.listIndexPasses === "function" && typeof cfg.csrHistoryItemLookup === "function";
+    }
+    /** The paging state of a file's passes, or null before its row was first opened. */
+    runPassPaging(storagePath) {
+      if (!storagePath || !this.state.passPaging) return null;
+      return this.state.passPaging[storagePath] || null;
+    }
+    /**
+     * Load the next page of a file's indexing passes into the chat, newest first (owner,
+     * 2026-11-21). The ids come from the file's pass records (listIndexPasses, once), each
+     * pass is read by id (csrHistoryItemLookup) and lands as the same request + reply bubbles
+     * a live pass produces, so its file's row groups it like any other. A pass still running
+     * or waiting is left to the live queue check, which shows it as it settles; one already
+     * in the chat is not read again. Never throws.
+     */
+    loadRunPasses(storagePath, fileName) {
+      var self = this;
+      var cfg = chatEngineConfig();
+      var list = cfg.listIndexPasses, lookup = cfg.csrHistoryItemLookup;
+      var id = this.host.getIdentity();
+      var platform = id.platform;
+      if (!storagePath || typeof list !== "function" || typeof lookup !== "function") return Promise.resolve();
+      if (!id.projectId || platform !== "claude" && platform !== "openai") return Promise.resolve();
+      if (!this.state.passPaging) this.state.passPaging = {};
+      var paging = this.state.passPaging[storagePath];
+      if (paging && (paging.loading || paging.done)) return Promise.resolve();
+      if (!paging) {
+        paging = { ids: [], loaded: 0, loading: false, done: false };
+        this.state.passPaging[storagePath] = paging;
+      }
+      var p = paging;
+      p.loading = true;
+      p.error = void 0;
+      this.host.notify();
+      var svcId = id.projectId, owner = id.owner;
+      var name = fileName || storagePath.split("/").pop() || storagePath;
+      var idsReady = p.ids.length ? Promise.resolve(p.ids) : Promise.resolve(list(svcId, storagePath)).then(function(ids) {
+        var clean = (Array.isArray(ids) ? ids : []).filter(function(x) {
+          return typeof x === "string" && !!x;
+        });
+        clean.sort(function(a, b) {
+          return a < b ? 1 : a > b ? -1 : 0;
+        });
+        p.ids = clean;
+        return clean;
+      });
+      return idsReady.then(function(ids) {
+        var oldest = ids.length ? ids[ids.length - 1] : "";
+        var present = {};
+        for (var i = 0; i < self.state.messages.length; i++) {
+          var m = self.state.messages[i];
+          if (m && m._serverItemId) present[m._serverItemId] = true;
+        }
+        var page = [];
+        var next = p.loaded;
+        while (next < ids.length && page.length < _ChatSession.RUN_PASS_PAGE) {
+          if (!present[ids[next]]) page.push(ids[next]);
+          next++;
+        }
+        return Promise.all(page.map(function(rid) {
+          return Promise.resolve(lookup(buildHistoryItemFullId(platform, svcId, rid), svcId, owner)).then(
+            function(body) {
+              return { rid, body, err: null };
+            },
+            function(err) {
+              return { rid, body: null, err };
+            }
+          );
+        })).then(function(got) {
+          if (self.host.getIdentity().projectId !== svcId) return;
+          var add = [];
+          for (var g = 0; g < got.length; g++) {
+            var r = got[g];
+            if (!r) continue;
+            var body = r.body;
+            if (isCsrStatusEnvelope(body) && (body.status === "running" || body.status === "pending")) continue;
+            var notExists = r.err && (r.err.code === "NOT_EXISTS" || r.err.body && r.err.body.code === "NOT_EXISTS");
+            if (notExists) continue;
+            var continued = r.rid !== oldest;
+            var when = requestIdTimeMs(r.rid);
+            var user = {
+              role: "user",
+              content: self.host.formatIndexingLabel(name, void 0, null, storagePath, false, continued),
+              isBackgroundTask: true,
+              _serverItemId: r.rid,
+              _indexFile: { name, path: storagePath, isReindex: false, continued }
+            };
+            if (when) user._ts = when;
+            var reply;
+            if (r.err) {
+              reply = { role: "assistant", content: getErrorMessage(r.err), isError: true, isBackgroundTask: true, _serverItemId: r.rid };
+            } else if (isCsrStatusEnvelope(body) && body.status === "cancelled") {
+              user.isCancelled = true;
+              add.push([user]);
+              continue;
+            } else if (isErrorResponseBody(body)) {
+              reply = { role: "assistant", content: getErrorMessage(body), isError: true, isBackgroundTask: true, _serverItemId: r.rid };
+            } else {
+              var text = ((platform === "openai" ? extractOpenAIText(body) : extractClaudeText(body)) || "").trim();
+              var complete = text.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+              if (complete) text = text.split(INDEXING_COMPLETE_MARKER).join("").trim();
+              reply = { role: "assistant", content: text || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: r.rid };
+              if (complete) reply._indexComplete = true;
+            }
+            if (when) reply._ts = when;
+            add.push([user, reply]);
+          }
+          add.sort(function(a, b) {
+            return (a[0]._ts || 0) - (b[0]._ts || 0);
+          });
+          for (var k = 0; k < add.length; k++) self._insertByTime(add[k]);
+          p.loaded = next;
+          p.done = p.loaded >= ids.length;
+        });
+      }).catch(function(err) {
+        p.error = getErrorMessage(err) || "The steps could not be loaded.";
+      }).then(function() {
+        p.loading = false;
+        self.host.notify();
+        self.updateHistoryCache();
+      });
+    }
+    /** Insert bubbles before the first message that is newer than them (by `_ts`); messages
+     *  without a time are skipped over, and the end of the list takes them otherwise. */
+    _insertByTime(bubbles) {
+      var at = bubbles[0] && bubbles[0]._ts;
+      var idx = this.state.messages.length;
+      if (typeof at === "number") {
+        for (var i = 0; i < this.state.messages.length; i++) {
+          var t = this.state.messages[i] && this.state.messages[i]._ts;
+          if (typeof t === "number" && t > at) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      Array.prototype.splice.apply(this.state.messages, [idx, 0].concat(bubbles));
+    }
+    /**
+     * Refresh the page progress ("175 of 530 pages") of the documents this page is still
+     * tracking passes for, one read per file (config readIndexProgress, the MCP's
+     * prog::<path> record). Runs on the ADOPT_TICK_MS check; a file with nothing tracked is
+     * not asked about. Never throws.
+     */
+    _refreshPageProgress() {
+      var read = chatEngineConfig().readIndexProgress;
+      if (typeof read !== "function" || this._progressInflight) return;
+      var id = this.host.getIdentity();
+      if (!id.projectId || this.isPollingPaused() || !this.host.isViewMounted()) return;
+      var svcId = id.projectId;
+      var paths = [];
+      for (var i = 0; i < this.bgTaskQueue.length; i++) {
+        var e = this.bgTaskQueue[i];
+        if (e && e.projectId === svcId && e.storagePath && paths.indexOf(e.storagePath) === -1) paths.push(e.storagePath);
+      }
+      if (!paths.length) return;
+      var self = this;
+      this._progressInflight = true;
+      Promise.all(paths.map(function(path) {
+        return Promise.resolve(read(svcId, path)).then(function(data) {
+          return { path, data };
+        }, function() {
+          return { path, data: null };
+        });
+      })).then(function(rows) {
+        self._progressInflight = false;
+        if (self.host.getIdentity().projectId !== svcId) return;
+        if (!self.state.indexPageProgress) self.state.indexPageProgress = {};
+        var changed = false;
+        for (var r = 0; r < rows.length; r++) {
+          var d = rows[r].data;
+          var saved = d && typeof d.pages_saved === "number" ? d.pages_saved : null;
+          if (saved === null) continue;
+          var total = d && typeof d.pages_total === "number" && d.pages_total > 0 ? d.pages_total : null;
+          var prev = self.state.indexPageProgress[rows[r].path];
+          if (prev && prev.saved === saved && prev.total === total) continue;
+          self.state.indexPageProgress[rows[r].path] = { saved, total, at: Date.now() };
+          changed = true;
+        }
+        if (changed) self.host.notify();
+      }, function() {
+        self._progressInflight = false;
+      });
+    }
+    /** The page progress to show for a file's row, or null (see _refreshPageProgress). */
+    pageProgressFor(storagePath) {
+      if (!storagePath || !this.state.indexPageProgress) return null;
+      var p = this.state.indexPageProgress[storagePath];
+      return p ? { saved: p.saved, total: p.total } : null;
+    }
+    _noteLiveLook(svcId, platform, results) {
+      var ids = {};
+      var complete = true;
+      for (var r = 0; r < results.length; r++) {
+        var list = results[r] && Array.isArray(results[r].list) ? results[r].list : [];
+        if (list.length >= WORKER_PASS_ADOPT_LIMIT) complete = false;
+        for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === "string") ids[list[i].id] = true;
+      }
+      this._lastLiveLook = complete ? { svcId, platform, at: Date.now(), ids } : null;
+    }
+    /**
+     * Settle indexing passes from the queue instead of from their own polls (owner,
+     * 2026-11-20): the worker's lanes AND the first passes this client sent. Runs on the
+     * ADOPT_TICK_MS check, beside the adoption look.
+     *
+     * WHY. skapi-js runs every poll on one queue one at a time, each until its request
+     * finishes. The worker runs a document's windows in parallel lanes on that one queue, so
+     * a lane that finished waited behind every pass ahead of it (measured: passes done at
+     * 17:04 shown at 17:06-17:07, one every ~5 s, after a 3-minute first pass).
+     *
+     * HOW. One compact listing each of the queue's `resolved` and `failed` rows (stubs, no
+     * bodies). A tracked pass found there, or one missing from a COMPLETE running+pending look
+     * taken after it was adopted (cancelled, removed), is read ONCE by id through the host's
+     * csrHistoryItemLookup, the same row a poll's last read returns, and settled through
+     * _settleBgOutcome exactly as its poll would have been. A lookup that still says
+     * running/pending (the status index lags the table) leaves the pass for the next tick.
+     */
+    _settleByListing() {
+      var self = this;
+      if (this._listingLookInflight) return;
+      var lookup = chatEngineConfig().csrHistoryItemLookup;
+      if (typeof lookup !== "function") return;
+      var id = this.host.getIdentity();
+      var platform = id.platform;
+      if (!id.projectId || platform !== "claude" && platform !== "openai") return;
+      if (this.isPollingPaused() || !this.host.isViewMounted()) return;
+      var svcId = id.projectId, owner = id.owner;
+      var waiting = [];
+      for (var i = 0; i < this.bgTaskQueue.length; i++) {
+        var e = this.bgTaskQueue[i];
+        if (e && e.byListing && e.projectId === svcId && e.platform === platform && !this._listingSettling[e.id]) waiting.push(e);
+      }
+      if (!waiting.length) return;
+      var queue = bgIndexingQueueName(id.userId, svcId);
+      var ask = function(status) {
+        return Promise.resolve(getChatHistory(
+          { service: svcId, owner, platform, queue, status, queue_exact: true, compact: true },
+          { limit: WORKER_PASS_ADOPT_LIMIT, fetchMore: false }
+        )).then(function(res) {
+          return res && Array.isArray(res.list) ? res.list : [];
+        }).catch(function() {
+          return [];
+        });
+      };
+      this._listingLookInflight = true;
+      Promise.all([ask("resolved"), ask("failed")]).then(function(lists) {
+        self._listingLookInflight = false;
+        var now = self.host.getIdentity();
+        if (now.projectId !== svcId || now.platform !== platform || !self.host.isViewMounted()) return;
+        var finished = {};
+        for (var l = 0; l < lists.length; l++) {
+          for (var k = 0; k < lists[l].length; k++) {
+            var row = lists[l][k];
+            if (row && typeof row.id === "string") finished[row.id] = row;
+          }
+        }
+        var look = self._lastLiveLook;
+        var lookUsable = !!look && look.svcId === svcId && look.platform === platform && Date.now() - look.at <= 2 * ADOPT_TICK_MS;
+        for (var w = 0; w < waiting.length; w++) {
+          var entry2 = waiting[w];
+          if (self.bgTaskQueue.indexOf(entry2) === -1) continue;
+          var row2 = finished[entry2.id];
+          var leftQueue = !row2 && lookUsable && !look.ids[entry2.id] && typeof entry2.adoptedAt === "number" && entry2.adoptedAt < look.at;
+          if (!row2 && !leftQueue) continue;
+          self._settleListedEntry(
+            entry2,
+            platform,
+            lookup,
+            row2 && typeof row2.executed === "number" && row2.executed > 0 ? row2.executed : void 0
+          );
+        }
+      }, function() {
+        self._listingLookInflight = false;
+      });
+    }
+    /** One by-id read of a by-listing pass, then the shared settle. */
+    _settleListedEntry(entry2, platform, lookup, executedAt) {
+      var self = this;
+      var id = this.host.getIdentity();
+      this._listingSettling[entry2.id] = true;
+      Promise.resolve(lookup(buildHistoryItemFullId(platform, entry2.projectId, entry2.id), entry2.projectId, id.owner)).then(function(body) {
+        delete self._listingSettling[entry2.id];
+        if (self.bgTaskQueue.indexOf(entry2) === -1) return;
+        if (isCsrStatusEnvelope(body) && (body.status === "running" || body.status === "pending")) return;
+        self._settleBgOutcome(entry2, platform, Promise.resolve(body), function() {
+          return executedAt;
+        });
+      }, function(err) {
+        delete self._listingSettling[entry2.id];
+        if (self.bgTaskQueue.indexOf(entry2) === -1) return;
+        self._settleBgOutcome(entry2, platform, Promise.reject(err), function() {
+          return executedAt;
+        });
+      });
+    }
+    _adoptWorkerIndexingPasses(attempt, passive, single) {
       var self = this;
       if (this._adoptingWorkerPasses) return;
       var id = this.host.getIdentity();
@@ -7589,7 +8986,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var now = self.host.getIdentity();
         if (now.projectId !== svcId || now.platform !== platform) return;
         if (!self.host.isViewMounted()) return;
-        if (results[0] !== null && results[1] !== null) self._recordLiveIndexKeys(results);
+        if (results[0] !== null && results[1] !== null) {
+          self._recordLiveIndexKeys(results);
+          self._noteLiveLook(svcId, platform, results);
+        }
+        if (results[0] !== null) self._promoteListedRunning(results[0]);
+        var emptyLook = results[0] !== null && results[1] !== null && !(results[0].list || []).length && !(results[1].list || []).length;
         var adoptedIds = [];
         for (var ri = 0; ri < results.length; ri++) {
           var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
@@ -7599,10 +9001,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
         if (adoptedIds.length) {
           self.drainBgTaskQueue();
-          if (self._isTrackingAny(adoptedIds)) return;
+          if (self._isTrackingAny(adoptedIds)) {
+            self._ensureAdoptTick();
+            return;
+          }
         }
-        if (passive && !self._hasLiveIndexEvidence(svcId)) return;
+        if (single) return;
+        if (passive && !self._hasLiveIndexEvidence(svcId)) {
+          if (emptyLook) self._idleVerdictAt[svcId] = Date.now();
+          return;
+        }
         if (attempt + 1 >= WORKER_PASS_ADOPT_ATTEMPTS.length) {
+          if (emptyLook) self._idleVerdictAt[svcId] = Date.now();
           self._nudgeIndexingDrain();
           return;
         }
@@ -7634,6 +9044,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       if (found) return true;
       var cutoff = Date.now() - RECENT_INDEX_PASS_EVIDENCE_MS;
+      var idleAt = this._idleVerdictAt[svcId] || 0;
+      if (idleAt > cutoff) cutoff = idleAt;
       var msgs = this.state.messages;
       for (var mi = msgs.length - 1; mi >= 0; mi--) {
         var m = msgs[mi];
@@ -7689,7 +9101,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // Drives the "(continuing)" label and marks this as a continuation for
         // _applyIndexCancellations, which must not read a CONTINUE pass as the
         // fresh first pass that lifts a stop.
-        resumePass: ref.continued ? 1 : 0
+        resumePass: ref.continued ? 1 : 0,
+        // Settled by the 10-second queue check when the host can look a row up by id
+        // (csrHistoryItemLookup); otherwise polled as before.
+        byListing: typeof chatEngineConfig().csrHistoryItemLookup === "function",
+        adoptedAt: Date.now()
       });
       return true;
     }
@@ -7722,6 +9138,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
       this._applyIndexCancellations();
       this._sweepCancelledIndexing();
+      this._ensureAdoptTick();
       var presentIds = {};
       var pendingIds = {};
       this.state.messages.forEach(function(m) {
@@ -7739,6 +9156,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
+      var listingSettles = typeof chatEngineConfig().csrHistoryItemLookup === "function";
       var injectedAny = false;
       this.bgTaskQueue.forEach(function(entry2) {
         if (entry2.projectId !== svcId || entry2.platform !== plat) return;
@@ -7775,11 +9193,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           presentIds[entry2.id] = true;
           injectedAny = true;
         }
-        if (bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry2.id) && typeof entry2.poll === "function") {
+        if (listingSettles && !entry2.byListing) {
+          entry2.byListing = true;
+          if (typeof entry2.adoptedAt !== "number") entry2.adoptedAt = Date.now();
+        }
+        if (!entry2.byListing && bgPollBudget > 0 && !self.isPollingPaused() && !self.historyItemPolls.has(entry2.id) && typeof entry2.poll === "function") {
           bgPollBudget--;
-          var capturedId = entry2.id, capturedPlat = plat;
+          var capturedPlat = plat;
           var capturedEntry = entry2;
-          var wasStopped = false;
           var executedAt;
           var bp = entry2.poll({
             latency: POLL_INTERVAL,
@@ -7788,45 +9209,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }
           });
           self._trackPoll(entry2.id, "bg", bp);
-          bp.then(function(response) {
-            if (isPollStopped(response)) {
-              wasStopped = true;
-              return;
-            }
-            self.handleHistoryItemResolution(capturedId, response, capturedPlat, executedAt);
-            self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
-          }).catch(function(err) {
-            self.historyItemPolls.delete(capturedId);
-            var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
-            self._clearPendingUserBubble(capturedId);
-            var bi = self.state.messages.findIndex(function(m) {
-              return m.isPending && m._serverItemId === capturedId;
-            });
-            if (bi !== -1) {
-              if (isNotExists) self.state.messages.splice(bi, 1);
-              else self.state.messages[bi] = { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
-            } else if (!isNotExists) {
-              var ui = self.state.messages.findIndex(function(m) {
-                return m.role === "user" && m._serverItemId === capturedId;
-              });
-              if (ui !== -1) {
-                self.state.messages.splice(ui + 1, 0, { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
-              }
-            }
-            self.host.notify();
-            self.updateHistoryCache();
-            if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
-              if (isNotExists) self._flipRunRecord(capturedEntry, "cancelled");
-              else self._flipRunRecord(capturedEntry, "error", self._runErrorText(err));
-              self._nudgeIndexingDrain();
-            }
-          }).then(function() {
-            if (wasStopped) return;
-            var qi = self.bgTaskQueue.findIndex(function(q) {
-              return q.id === capturedId;
-            });
-            if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
-            self.drainBgTaskQueue();
+          self._settleBgOutcome(capturedEntry, capturedPlat, bp, function() {
+            return executedAt;
           });
         }
       });
@@ -7836,6 +9220,59 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         this.host.scrollToBottomIfSticky(false);
       }
       this.promoteNextBgQueuedToRunning();
+    }
+    /**
+     * Settle one background pass from the outcome of reading it: its poll (drainBgTaskQueue)
+     * or a single by-id lookup made by the 10-second queue check (_settleByListing). Both
+     * read the same row the same way, so they share this one path: the resolution, the
+     * resume/chain follow-up, the failure bubble and run record, and the queue entry's removal.
+     * A stopped poll (isPollStopped) leaves the bubble and the entry as they were.
+     */
+    _settleBgOutcome(entry2, plat, outcome, getExecutedAt) {
+      var self = this;
+      var capturedId = entry2.id, capturedPlat = plat;
+      var capturedEntry = entry2;
+      var wasStopped = false;
+      outcome.then(function(response) {
+        if (isPollStopped(response)) {
+          wasStopped = true;
+          return;
+        }
+        self.handleHistoryItemResolution(capturedId, response, capturedPlat, getExecutedAt());
+        self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
+      }).catch(function(err) {
+        self.historyItemPolls.delete(capturedId);
+        var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
+        self._clearPendingUserBubble(capturedId);
+        var bi = self.state.messages.findIndex(function(m) {
+          return m.isPending && m._serverItemId === capturedId;
+        });
+        if (bi !== -1) {
+          if (isNotExists) self.state.messages.splice(bi, 1);
+          else self.state.messages[bi] = { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
+        } else if (!isNotExists) {
+          var ui = self.state.messages.findIndex(function(m) {
+            return m.role === "user" && m._serverItemId === capturedId;
+          });
+          if (ui !== -1) {
+            self.state.messages.splice(ui + 1, 0, { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
+          }
+        }
+        self.host.notify();
+        self.updateHistoryCache();
+        if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
+          if (isNotExists) self._flipRunRecord(capturedEntry, "cancelled");
+          else self._flipRunRecord(capturedEntry, "error", self._runErrorText(err));
+          self._nudgeIndexingDrain();
+        }
+      }).then(function() {
+        if (wasStopped) return;
+        var qi = self.bgTaskQueue.findIndex(function(q) {
+          return q.id === capturedId;
+        });
+        if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+        self.drainBgTaskQueue();
+      });
     }
     // Resume-across-passes: if a background INDEXING task for a paged file (spreadsheet or
     // text) finished WITHOUT the completion marker, the agent ran out of room before reading
@@ -8034,6 +9471,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         this._resetLiveIndexKeys();
       }
       if (fetchMore) this.state.loadingOlderHistory = true;
+      if (!fetchMore) this.state.passPaging = {};
       this.host.notify();
       var platform = id.platform;
       var projectId = id.projectId, owner = id.owner;
@@ -8050,7 +9488,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           // ip + "(" + user_agent + ")", which two devices behind one NAT
           // share. Read this device's own queue instead. See
           // scopeSurfaceToQueue.
-          scopeSurfaceToQueue: !!id.anonymous
+          scopeSurfaceToQueue: !!id.anonymous,
+          // Chats only when a file's row can load its own passes (lazyIndexRowsEnabled).
+          skipBg: self.lazyIndexRowsEnabled()
         }, options);
       };
       return Promise.resolve().then(fetchHistory).catch(function(err) {
@@ -8356,6 +9796,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             if (item.status !== "running" && item.status !== "pending") return;
             if (!item.poll || !item.id) return;
             if (self.historyItemPolls.has(item.id)) return;
+            if (item._isBgTask && self.trackHistoryIndexPass(item)) return;
             if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
             if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
             if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
@@ -8717,451 +10158,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.state.gateRefreshToken += 1;
     }
   };
-
-  // src/engine/indexing_groups.ts
-  function canonIndexKey(s) {
-    return typeof s === "string" && s ? s.trim() : "";
-  }
-  var RUN_RECORD_WORKING_STALE_MS = 6 * 60 * 60 * 1e3;
-  var INDEXING_LABEL_RE = /^(Re)?[Ii]ndexing(\s*\(continuing\))?\s*:?\s+(.+)$/;
-  var LEADING_MD_LINK_RE = /^\[([^\]]+)\]\(([^)]+)\)/;
-  function parseIndexingLabel(content) {
-    if (typeof content !== "string" || !content) return null;
-    var firstLine = content.split("\n")[0].trim();
-    var m = firstLine.match(INDEXING_LABEL_RE);
-    if (!m) return null;
-    var head = m[3].split(" \xB7 ")[0].trim();
-    var link = head.match(LEADING_MD_LINK_RE);
-    var name = link ? link[1].trim() : head;
-    if (!name) return null;
-    return {
-      name,
-      path: link ? link[2].trim() : void 0,
-      continued: !!m[2],
-      isReindex: !!m[1]
-    };
-  }
-  function readFileRef(msg) {
-    var ref = msg && msg._indexFile;
-    if (ref && (ref.path || ref.name)) {
-      return {
-        name: ref.name || ref.path || "",
-        path: ref.path,
-        mime: ref.mime,
-        size: ref.size,
-        isReindex: ref.isReindex,
-        continued: !!ref.continued
-      };
-    }
-    var parsed = parseIndexingLabel(msg && msg.content);
-    if (!parsed) return null;
-    return {
-      name: parsed.name,
-      path: parsed.path,
-      isReindex: parsed.isReindex,
-      continued: parsed.continued
-    };
-  }
-  function isPendingMsg(m) {
-    return !!(m.isPending || m.isPendingInProcess || m.isPendingQueued || m.isSendingToServer);
-  }
-  function isHiddenPass(m) {
-    if (m.role === "user") {
-      if (m.isCancelled) return false;
-      var ref = readFileRef(m);
-      return !!(ref && ref.continued);
-    }
-    return !!m.isPending;
-  }
-  function overlayRunRecordVerdict(grp, rec, liveIndexKeys) {
-    if (!grp.members.length || grp.status === "active" || grp.cancelling) return;
-    if (rec.status === "working" || typeof rec.started !== "number") return;
-    if (liveIndexKeys[grp.key] || liveIndexKeys[canonIndexKey(grp.key)]) return;
-    var firstTs = grp.members[0].msg._ts;
-    var lastTs = grp.members[grp.members.length - 1].msg._ts;
-    if (typeof lastTs !== "number" || typeof firstTs !== "number") return;
-    if (rec.started > lastTs) return;
-    var when = typeof rec.finished === "number" ? rec.finished : void 0;
-    if (when === void 0) return;
-    if (when < firstTs) return;
-    if (when < lastTs - 5e3) return;
-    if (rec.status === "error" || rec.status === "cancelled") {
-      grp.status = rec.status;
-    } else if (rec.status === "done") {
-      grp.status = "done";
-    } else {
-      return;
-    }
-    grp.finished = true;
-    grp.resolving = false;
-    grp.resolvingReason = void 0;
-  }
-  function buildChatDisplayList(messages, opts) {
-    var list = Array.isArray(messages) ? messages : [];
-    var liveIndexKeys = opts && opts.liveIndexKeys || {};
-    var liveIndexChecked = !!(opts && opts.liveIndexChecked);
-    var doneKeys = opts && opts.doneKeys || {};
-    var stoppedIndexIds = opts && opts.stoppedIndexIds || {};
-    var windowedIndexing = opts && opts.windowedIndexing !== void 0 ? !!opts.windowedIndexing : windowedIndexingEnabled();
-    var hasMoreHistory = !!(opts && opts.hasMoreHistory);
-    var loadingOlderHistory = !!(opts && opts.loadingOlderHistory);
-    var stubPlatform = opts && opts.stubPlatform;
-    var groups = {};
-    var order = [];
-    var runOfIndex = new Array(list.length);
-    var runByItemId = {};
-    var keyByName = {};
-    var openRunOfKey = {};
-    var runsOfKey = {};
-    var keyOfRun = {};
-    var newestTsOfRun = {};
-    var runSeq = 0;
-    for (var i = 0; i < list.length; i++) {
-      var msg = list[i];
-      if (!msg || !msg.isBackgroundTask) continue;
-      var runId;
-      var ref = msg.role === "user" ? readFileRef(msg) : null;
-      if (msg._serverItemId && runByItemId[msg._serverItemId]) {
-        runId = runByItemId[msg._serverItemId];
-      } else if (ref) {
-        var key = ref.path || keyByName[ref.name] || ref.name;
-        var alreadySeen = !!(msg._serverItemId && runByItemId[msg._serverItemId]);
-        var openId = openRunOfKey[key];
-        var notLater = false;
-        if (openId && typeof msg._ts === "number" && typeof newestTsOfRun[openId] === "number") {
-          notLater = msg._ts <= newestTsOfRun[openId];
-        }
-        if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
-        runId = openRunOfKey[key];
-        if (!runId) {
-          runId = "run" + runSeq++;
-          openRunOfKey[key] = runId;
-          keyOfRun[runId] = key;
-          (runsOfKey[key] || (runsOfKey[key] = [])).push(runId);
-        }
-      } else if (msg.role !== "user") {
-        runId = runOfIndex[i - 1];
-      }
-      if (!runId) continue;
-      if (typeof msg._ts === "number") {
-        var prevTs = newestTsOfRun[runId];
-        if (typeof prevTs !== "number" || msg._ts > prevTs) newestTsOfRun[runId] = msg._ts;
-      }
-      var g = groups[runId];
-      if (!g) {
-        var fileKey = keyOfRun[runId];
-        g = groups[runId] = {
-          key: fileKey,
-          runKey: runId,
-          // provisional; renumbered newest-first below
-          name: ref ? ref.name : fileKey,
-          path: ref ? ref.path : void 0,
-          mime: ref ? ref.mime : void 0,
-          size: ref ? ref.size : void 0,
-          isReindex: !!(ref && ref.isReindex),
-          members: [],
-          passCount: 0,
-          status: "done",
-          cancellableIds: [],
-          cancelling: false,
-          stopped: false,
-          mayHaveOlder: false,
-          // The run's first loaded pass, and never re-stamped: see the file
-          // docstring. `anchorId` is filled in once every member is known.
-          anchorIndex: i,
-          anchorId: "",
-          // All five are derived once every member is known, below.
-          visibleMembers: [],
-          driver: "single",
-          finished: false,
-          resolving: false
-        };
-        order.push(runId);
-      }
-      if (ref) {
-        if (ref.name) g.name = ref.name;
-        if (ref.path) g.path = ref.path;
-        if (ref.mime) g.mime = ref.mime;
-        if (typeof ref.size === "number") g.size = ref.size;
-        if (ref.isReindex) g.isReindex = true;
-        if (!ref.continued) g.mayHaveOlder = false;
-        g.passCount++;
-      }
-      g.members.push({ msg, index: i });
-      runOfIndex[i] = runId;
-      if (msg._serverItemId) runByItemId[msg._serverItemId] = runId;
-      if (ref && ref.name) keyByName[ref.name] = g.key;
-    }
-    var newestRunOfKey = {};
-    for (var nk in runsOfKey) {
-      var nrs = runsOfKey[nk];
-      if (nrs.length) newestRunOfKey[nrs[nrs.length - 1]] = true;
-    }
-    for (var rk in runsOfKey) {
-      var runIds = runsOfKey[rk];
-      for (var ri = 0; ri < runIds.length; ri++) {
-        var grpR = groups[runIds[ri]];
-        if (!grpR) continue;
-        var first = grpR.members[0];
-        var firstId = first && first.msg && (first.msg._serverItemId || first.msg._localId);
-        grpR.runKey = rk + "#" + (firstId || "n" + ri);
-      }
-    }
-    for (var oi = 0; oi < order.length; oi++) {
-      var grp = groups[order[oi]];
-      var lastSettled = -1;
-      for (var si = 0; si < grp.members.length; si++) {
-        if (!isPendingMsg(grp.members[si].msg)) lastSettled = si;
-      }
-      var active = false;
-      for (var mi = lastSettled + 1; mi < grp.members.length; mi++) {
-        if (isPendingMsg(grp.members[mi].msg)) {
-          active = true;
-          break;
-        }
-      }
-      var stopped = false;
-      for (var ki = 0; ki < grp.members.length; ki++) {
-        var km = grp.members[ki].msg;
-        if (km.isCancelled) {
-          stopped = true;
-          break;
-        }
-        if (km._serverItemId && stoppedIndexIds[km._serverItemId]) {
-          stopped = true;
-          break;
-        }
-      }
-      grp.stopped = stopped;
-      for (var xi = 0; xi < grp.members.length; xi++) {
-        if (grp.members[xi].msg._cancelling) {
-          grp.cancelling = true;
-          break;
-        }
-      }
-      var seenIds = {};
-      for (var ci = 0; ci < grp.members.length; ci++) {
-        var cm = grp.members[ci].msg;
-        if (cm._cancelError && !stopped && (active || grp.cancelling)) grp.cancelError = cm._cancelError;
-        if (cm.role !== "user" || !cm._serverItemId || cm._cancelling || cm.isSendingToServer) continue;
-        if (!(cm.isPendingQueued || cm.isPendingInProcess)) continue;
-        if (ci < lastSettled) continue;
-        if (seenIds[cm._serverItemId]) continue;
-        seenIds[cm._serverItemId] = true;
-        grp.cancellableIds.push(cm._serverItemId);
-      }
-      if (active) {
-        grp.status = "active";
-        if (stopped) grp.cancelling = true;
-      } else if (stopped) {
-        grp.status = "cancelled";
-      } else {
-        var retriedIds = {};
-        for (var ri = 0; ri < grp.members.length; ri++) {
-          var rm = grp.members[ri].msg;
-          if (rm.isRetried && rm._serverItemId) retriedIds[rm._serverItemId] = true;
-        }
-        var li = grp.members.length - 1;
-        while (li >= 0 && (grp.members[li].msg.isRetried || grp.members[li].msg._serverItemId && retriedIds[grp.members[li].msg._serverItemId])) li--;
-        if (li < 0) {
-          grp.status = "active";
-        } else {
-          var last = grp.members[li].msg;
-          grp.status = last.isError ? "error" : "done";
-        }
-      }
-      var sawFirstPass = false;
-      for (var pi = 0; pi < grp.members.length; pi++) {
-        var pm = grp.members[pi].msg;
-        if (pm.role !== "user") continue;
-        var pref = readFileRef(pm);
-        if (pref && !pref.continued) {
-          sawFirstPass = true;
-          break;
-        }
-      }
-      grp.mayHaveOlder = !sawFirstPass && hasMoreHistory;
-      var anchor = grp.members[0];
-      grp.anchorIndex = anchor.index;
-      grp.anchorId = anchor.msg._serverItemId || anchor.msg._localId || "";
-      var sawComplete = false;
-      for (var vi = 0; vi < grp.members.length; vi++) {
-        var vm = grp.members[vi];
-        if (vm.msg._indexComplete) sawComplete = true;
-        if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
-      }
-      grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
-      if (grp.status === "active") {
-        grp.finished = false;
-      } else if (grp.status === "cancelled") {
-        grp.finished = true;
-      } else if (grp.driver === "single") {
-        grp.finished = true;
-      } else if (grp.driver === "client") {
-        grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
-      } else {
-        grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
-      }
-      if (grp.status !== "done") {
-        grp.resolving = false;
-      } else if (grp.mayHaveOlder && loadingOlderHistory && !liveIndexKeys[grp.key] && !doneKeys[grp.key] && newestRunOfKey[order[oi]]) {
-        grp.resolving = true;
-        grp.resolvingReason = "history";
-      } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
-        grp.resolving = true;
-        grp.resolvingReason = "status";
-      } else {
-        grp.resolving = false;
-      }
-    }
-    var superseded = {};
-    for (var sk in runsOfKey) {
-      var srs = runsOfKey[sk];
-      for (var sri = 0; sri < srs.length - 1; sri++) {
-        var sgp = groups[srs[sri]];
-        if (!sgp || sgp.status === "active" || sgp.cancelling) continue;
-        superseded[srs[sri]] = true;
-      }
-    }
-    var stubList = [];
-    var runStubs = opts && opts.runStubs;
-    if (runStubs) {
-      var coveredPaths = {};
-      var coveredPathlessNames = {};
-      for (var ci = 0; ci < order.length; ci++) {
-        var cg = groups[order[ci]];
-        if (cg.path) {
-          coveredPaths[canonIndexKey(cg.path)] = true;
-          if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
-        } else if (cg.name) coveredPathlessNames[canonIndexKey(cg.name)] = true;
-        else if (cg.key) coveredPaths[canonIndexKey(cg.key)] = true;
-      }
-      var now = opts && typeof opts.now === "number" ? opts.now : Date.now();
-      var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
-      for (var sp in runStubs) {
-        var rec = runStubs[sp];
-        if (!sp || !rec || !rec.status || coveredPaths[canonIndexKey(sp)]) continue;
-        var fname = rec.filename || sp.split("/").pop() || sp;
-        if (coveredPathlessNames[canonIndexKey(fname)]) continue;
-        if (stubPlatform && rec.platform && rec.platform !== stubPlatform) continue;
-        var live = !!liveIndexKeys[sp] || !!liveIndexKeys[canonIndexKey(sp)];
-        if (!live && (liveIndexKeys[fname] || liveIndexKeys[canonIndexKey(fname)])) {
-          var claimedByOther = false;
-          for (var lk in liveIndexKeys) {
-            if (!liveIndexKeys[lk]) continue;
-            var lkc = canonIndexKey(lk);
-            if (lkc === canonIndexKey(sp)) continue;
-            if (lkc.length > fname.length && lkc.slice(-(fname.length + 1)) === "/" + fname) {
-              claimedByOther = true;
-              break;
-            }
-          }
-          live = !claimedByOther;
-        }
-        var recWhen = typeof rec.finished === "number" ? rec.finished : typeof rec.started === "number" ? rec.started : void 0;
-        if (stubClearedAt && !live && recWhen !== void 0 && recWhen <= stubClearedAt) continue;
-        var st = "active";
-        var fin = false;
-        var res = false;
-        var reason;
-        if (!live) {
-          if (rec.status === "done" || doneKeys[sp] || doneKeys[canonIndexKey(sp)] || doneKeys[fname] || doneKeys[canonIndexKey(fname)]) {
-            st = "done";
-            fin = true;
-          } else if (rec.status === "error") {
-            st = "error";
-            fin = true;
-          } else if (rec.status === "cancelled") {
-            st = "cancelled";
-            fin = true;
-          } else if (liveIndexChecked) {
-            st = "done";
-            fin = true;
-          } else if (typeof rec.started === "number" && now - rec.started > RUN_RECORD_WORKING_STALE_MS) {
-            st = "error";
-            fin = true;
-          } else {
-            res = true;
-            reason = "status";
-          }
-        }
-        var sg = {
-          key: sp,
-          // ONE identity for the run whether it renders from the record or
-          // from its loaded passes: the views key the DOM off runKey, so a
-          // 'stub:'-prefixed key meant every handoff was an unmount plus a
-          // remount somewhere else. Named after the record's start, which
-          // the real group below reuses when it has one.
-          runKey: "run:" + sp + "#" + (typeof rec.started === "number" ? rec.started : "n"),
-          name: fname,
-          path: sp,
-          mime: void 0,
-          size: void 0,
-          isReindex: false,
-          members: [],
-          passCount: 0,
-          status: st,
-          cancellableIds: [],
-          cancelling: false,
-          stopped: st === "cancelled",
-          mayHaveOlder: hasMoreHistory,
-          anchorIndex: -1,
-          anchorId: "",
-          visibleMembers: [],
-          driver: !isPagedReadFile(fname, void 0) ? "single" : isImageVisionFile(fname, void 0) ? "worker" : windowedIndexing ? "worker" : "client",
-          finished: fin,
-          resolving: res,
-          resolvingReason: reason,
-          stub: true,
-          stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0)
-        };
-        stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
-      }
-    }
-    var suppressAnchor = {};
-    var stubByCanon = {};
-    if (runStubs) for (var ck in runStubs) stubByCanon[canonIndexKey(ck)] = runStubs[ck];
-    if (runStubs) {
-      for (var ti2 = 0; ti2 < order.length; ti2++) {
-        var tg = groups[order[ti2]];
-        if (!newestRunOfKey[order[ti2]]) continue;
-        var trec = tg.path && (runStubs[tg.path] || stubByCanon[canonIndexKey(tg.path)]) || runStubs[tg.key] || stubByCanon[canonIndexKey(tg.key)];
-        if (!trec || typeof trec.started !== "number") continue;
-        if (stubPlatform && trec.platform && trec.platform !== stubPlatform) continue;
-        suppressAnchor[order[ti2]] = true;
-        tg.runKey = "run:" + (tg.path || tg.key) + "#" + trec.started;
-        stubList.push({ started: trec.started, group: tg });
-        overlayRunRecordVerdict(tg, trec, liveIndexKeys);
-      }
-    }
-    stubList.sort(function(a, b) {
-      return a.started - b.started;
-    });
-    var out = [];
-    var si = 0;
-    for (var j = 0; j < list.length; j++) {
-      var mts = list[j] && typeof list[j]._ts === "number" ? list[j]._ts : void 0;
-      if (mts !== void 0) {
-        while (si < stubList.length && stubList[si].started <= mts) {
-          out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
-          si++;
-        }
-      }
-      var r = runOfIndex[j];
-      if (r === void 0) {
-        out.push({ kind: "message", msg: list[j], index: j });
-        continue;
-      }
-      if (groups[r].anchorIndex === j && !suppressAnchor[r] && !superseded[r]) {
-        out.push({ kind: "indexing", group: groups[r], index: j });
-      }
-    }
-    while (si < stubList.length) {
-      out.push({ kind: "indexing", group: stubList[si].group, index: -1 - si });
-      si++;
-    }
-    return out;
-  }
+  /** How many passes one "Load more" brings into a file's row. */
+  _ChatSession.RUN_PASS_PAGE = 10;
+  var ChatSession = _ChatSession;
 
   // src/index.js
   (function() {
@@ -9439,43 +10438,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return !!sk && typeof sk.forwardRequestHistory === "function" && typeof sk.forwardRequest === "function";
     }
     function skapiForwardWithSecret(secretName, request) {
-      if (skapiHasForwardRequest(S.skapi)) {
-        return S.skapi.forwardRequest(null, Object.assign({ secretName }, request));
-      }
-      return S.skapi.clientSecretRequest(Object.assign({ clientSecretName: secretName }, request));
+      return S.skapi.forwardRequest(null, Object.assign({ secretName }, request));
     }
     function skapiCancelRequest(opts) {
-      return skapiHasForwardRequest(S.skapi) ? S.skapi.cancelForwardRequest(opts) : S.skapi.cancelClientSecretRequest(opts);
+      return S.skapi.cancelForwardRequest(opts);
     }
     function skapiEngineTransport(canStream) {
-      if (skapiHasForwardRequest(S.skapi)) {
-        return {
-          forwardRequest: function(form, o) {
-            return S.skapi.forwardRequest(form, o);
-          },
-          forwardRequestHistory: function(p, f) {
-            return S.skapi.forwardRequestHistory(p, f);
-          },
-          forwardRequestFinalize: canStream ? function(requestId, data, options) {
-            return S.skapi.forwardRequestFinalize(requestId, data, options);
-          } : void 0,
-          forwardRequestStream: canStream ? function(requestId, options) {
-            return S.skapi.forwardRequestStream(requestId, options);
-          } : void 0
-        };
-      }
       return {
-        clientSecretRequest: function(o) {
-          return S.skapi.clientSecretRequest(o);
+        forwardRequest: function(form, o) {
+          return S.skapi.forwardRequest(form, o);
         },
-        clientSecretRequestHistory: function(p, f) {
-          return S.skapi.clientSecretRequestHistory(p, f);
+        forwardRequestHistory: function(p, f) {
+          return S.skapi.forwardRequestHistory(p, f);
         },
-        clientSecretRequestFinalize: canStream ? function(requestId, data, options) {
-          return S.skapi.clientSecretRequestFinalize(requestId, data, options);
+        forwardRequestFinalize: canStream ? function(requestId, data, options) {
+          return S.skapi.forwardRequestFinalize(requestId, data, options);
         } : void 0,
-        clientSecretRequestStream: canStream ? function(requestId, options) {
-          return S.skapi.clientSecretRequestStream(requestId, options);
+        forwardRequestStream: canStream ? function(requestId, options) {
+          return S.skapi.forwardRequestStream(requestId, options);
         } : void 0
       };
     }
@@ -9748,10 +10728,84 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
     }
     function ensureMcpGrantFresh() {
-      if (!S.user || !mcpGrantNeedsRefresh(S.user)) return Promise.resolve(true);
+      if (!S.user) return Promise.resolve(true);
+      if (!mcpGrantNeedsRefresh(S.user)) {
+        return syncMcpSession().then(function() {
+          return true;
+        });
+      }
       return refreshMcpToken().then(function(tok) {
-        return !!(tok && !mcpGrantNeedsRefresh(S.user));
+        if (tok && !mcpGrantNeedsRefresh(S.user)) return true;
+        return syncMcpSession().then(function(t) {
+          return !!(t && !mcpGrantNeedsRefresh(S.user));
+        });
       });
+    }
+    var mcpSyncInFlight = null;
+    function currentSkapiTokens() {
+      var s = S.skapi && S.skapi.session;
+      var id = s && s.idToken && s.idToken.jwtToken;
+      var acc = s && s.accessToken && s.accessToken.jwtToken;
+      if (!id || !acc) return null;
+      return { id_token: id, access_token: acc, refresh_token: s.refreshToken && s.refreshToken.token || "" };
+    }
+    function syncMcpSession() {
+      if (mcpSyncInFlight) return mcpSyncInFlight;
+      var tokens = currentSkapiTokens();
+      if (!tokens) return Promise.resolve(null);
+      function exchange(client) {
+        return fetch(mcpBaseUrl() + "/oauth/session-exchange", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            client_id: client.client_id,
+            redirect_uri: mcpRedirectUri(),
+            id_token: tokens.id_token,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token
+          })
+        }).then(function(res) {
+          return { client, res };
+        });
+      }
+      var stored = getStoredMcpClient();
+      mcpSyncInFlight = (stored ? Promise.resolve(stored) : registerMcpClient()).then(exchange).then(function(r) {
+        return r.res.status === 401 ? registerMcpClient().then(exchange) : r;
+      }).then(function(r) {
+        if (!r.res.ok) return null;
+        return r.res.json().then(function(j) {
+          if (!j || !j.code) return null;
+          var headers = { "Content-Type": "application/x-www-form-urlencoded" };
+          if (r.client.client_secret) headers.Authorization = basicAuthHeader(r.client.client_id, r.client.client_secret);
+          var body = new URLSearchParams({
+            grant_type: "authorization_code",
+            code: j.code,
+            redirect_uri: mcpRedirectUri(),
+            client_id: r.client.client_id
+          });
+          return fetch(mcpBaseUrl() + "/oauth/token", { method: "POST", headers, body: body.toString() }).then(function(tr) {
+            if (!tr.ok) return null;
+            return tr.json().then(function(json) {
+              if (!json || !json.access_token) return null;
+              var token = Object.assign({}, json, {
+                expires_at: typeof json.expires_in === "number" ? Date.now() + json.expires_in * 1e3 : void 0
+              });
+              lsSet(skey(SK.mcpToken), JSON.stringify(token));
+              return token;
+            });
+          });
+        });
+      }).catch(function(err) {
+        try {
+          console.error("[bunnyquery] MCP session sync failed", err);
+        } catch (e) {
+        }
+        return null;
+      }).then(function(t) {
+        mcpSyncInFlight = null;
+        return t;
+      });
+      return mcpSyncInFlight;
     }
     function googleEnabled() {
       return !!S.opts.googleClientId;
@@ -11440,11 +12494,43 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var sanitized = String(relPath == null ? "file" : relPath).split("/").map(sanitizeStorageSegment).filter(Boolean).join("/");
       return uid + "/" + (sanitized || "file");
     }
+    var UPLOAD_IDLE_TIMEOUT_MS = 60 * 1e3;
+    var UPLOAD_SENT_WAIT_FACTOR = 5;
     function xhrUploadForm(url, form, onProgress, setAbort) {
-      return new Promise(function(resolve, reject) {
+      return new Promise(function(resolveUpload, rejectUpload) {
         var xhr = new XMLHttpRequest();
+        var idleTimer = null, bodySent = false;
+        function clearIdle() {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+        }
+        function resolve(v) {
+          clearIdle();
+          resolveUpload(v);
+        }
+        function reject(e) {
+          clearIdle();
+          rejectUpload(e);
+        }
+        function touch() {
+          clearIdle();
+          var wait = bodySent ? UPLOAD_IDLE_TIMEOUT_MS * UPLOAD_SENT_WAIT_FACTOR : UPLOAD_IDLE_TIMEOUT_MS;
+          idleTimer = setTimeout(function() {
+            idleTimer = null;
+            var err = new Error(bodySent ? "Upload timeout: no answer " + Math.round(wait / 1e3) + " seconds after the file was sent." : "Upload timeout: nothing was sent for " + Math.round(wait / 1e3) + " seconds.");
+            err.code = "TIMEOUT";
+            reject(err);
+            try {
+              xhr.abort();
+            } catch (e) {
+            }
+          }, wait);
+        }
         xhr.open("POST", url);
         xhr.onload = function() {
+          clearIdle();
           var result = xhr.responseText;
           try {
             result = JSON.parse(result);
@@ -11453,6 +12539,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (xhr.status >= 200 && xhr.status < 300) resolve(result);
           else reject(result);
         };
+        xhr.onreadystatechange = function() {
+          if (xhr.readyState === 4) clearIdle();
+          else touch();
+        };
+        xhr.addEventListener("progress", function() {
+          if (xhr.readyState !== 4) touch();
+        });
         xhr.onerror = function() {
           reject(new Error("Network error"));
         };
@@ -11462,6 +12555,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         xhr.ontimeout = function() {
           reject(new Error("Timeout"));
         };
+        if (xhr.upload) {
+          xhr.upload.addEventListener("progress", touch);
+          xhr.upload.addEventListener("load", function() {
+            bodySent = true;
+            touch();
+          });
+        }
         if (xhr.upload && typeof onProgress === "function") xhr.upload.onprogress = onProgress;
         if (typeof setAbort === "function") setAbort(function() {
           try {
@@ -11469,6 +12569,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           } catch (e) {
           }
         });
+        touch();
         xhr.send(form);
       });
     }
@@ -11492,13 +12593,48 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return xhrUploadForm(signed.url, form, onProgress, setAbort);
       });
     }
+    var DECORATION_START = /^[<>:"\\|?*]/;
+    function deleteFileIndexDecorations(storagePath) {
+      if (!S.skapi || typeof S.skapi.getUniqueId !== "function") return Promise.resolve();
+      var prefix = "src::" + storagePath;
+      return Promise.resolve(S.skapi.getUniqueId(
+        { service: S.projectId, unique_id: prefix, condition: ">=" },
+        { fetchMore: false, limit: 1e3 }
+      )).then(function(found) {
+        var list = found && found.list || [];
+        var ids = [];
+        for (var i = 0; i < list.length; i++) {
+          var id = String(list[i] && list[i].unique_id || "");
+          if (id && id !== prefix && id.indexOf(prefix) === 0 && DECORATION_START.test(id.slice(prefix.length))) ids.push(id);
+        }
+        return ids.reduce(function(p, uid) {
+          return p.then(function() {
+            return S.skapi.deleteRecords({ service: S.projectId, unique_id: uid }).catch(function() {
+            });
+          });
+        }, Promise.resolve());
+      }).catch(function(err) {
+        try {
+          console.warn("[bunnyquery] decoration sweep failed (non-fatal)", storagePath, err);
+        } catch (e) {
+        }
+      });
+    }
     function deleteFileIndexRecordDb(storagePath) {
       if (!storagePath || !S.skapi || typeof S.skapi.deleteRecords !== "function") return Promise.resolve();
+      return resetFileIndexOnServer({ service: S.projectId, owner: S.owner || void 0, storagePath }).then(function(done) {
+        if (done) return;
+        return deleteFileIndexRecordInPage(storagePath);
+      });
+    }
+    function deleteFileIndexRecordInPage(storagePath) {
       var doneDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: indexDoneUniqueId(storagePath) }).catch(function() {
       });
       var runDelete = S.skapi.deleteRecords({ service: S.projectId, unique_id: runIndexUniqueId(storagePath) }).catch(function() {
       });
-      return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath }).catch(function() {
+      return deleteFileIndexDecorations(storagePath).then(function() {
+        return S.skapi.deleteRecords({ service: S.projectId, unique_id: "src::" + storagePath }).catch(function() {
+        });
       }).then(function() {
         return doneDelete;
       }).then(function() {
@@ -12564,8 +13700,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function indexGroupVerb(group) {
       if (group.status === "cancelled") return "Indexing cancelled:";
       if (group.resolving) {
-        return group.resolvingReason === "history" ? "Loading history:" : "Checking status:";
+        return group.resolvingReason === "history" ? "Loading history:" : "Fetching status:";
       }
+      if (group.queued) return "Queued:";
       if (!group.finished) return group.isReindex ? "Reindexing" : "Indexing";
       if (group.status === "error") return "Indexing failed:";
       return group.isReindex ? "Reindexed" : "Indexed";
@@ -12576,8 +13713,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function indexGroupCount(group) {
       if (group.stub) return "";
-      if (group.passCount <= 1 && !group.mayHaveOlder) return "";
-      return group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+      var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path) : null;
+      var pages = prog ? prog.total ? prog.saved + " of " + prog.total + " pages" : prog.saved + " pages" : "";
+      var passes = group.passCount <= 1 && !group.mayHaveOlder ? "" : group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
+      return [pages, passes].filter(Boolean).join(" \xB7 ");
     }
     var markerSweep = { svc: "", at: 0, gen: 0, done: {}, runs: {}, partial: false, inflight: null };
     var MARKER_SWEEP_TTL_MS = 3e4;
@@ -12743,6 +13882,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         loadingOlderHistory: !!(CS.loadingOlderHistory || CS.historyFilling),
         liveIndexKeys: liveIndex.keys,
         liveIndexChecked: liveIndex.checked,
+        // Which live files have a pass running: a live row without one says "Queued".
+        liveIndexRunningKeys: liveIndex.running,
         // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
         // cancelled bubble behind (that pass finishes and answers normally), so
         // without this the row reports the stop as a finished "Indexed".
@@ -12895,13 +14036,28 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       else {
         CS.indexGroupsOpen[key] = true;
         hydrateCompactIndexGroup(key);
-        void loadIndexGroupHistory(key);
+        if (session.lazyIndexRowsEnabled()) {
+          var og = findIndexGroup(key);
+          if (og && og.path && !session.runPassPaging(og.path)) void session.loadRunPasses(og.path, og.name);
+        } else {
+          void loadIndexGroupHistory(key);
+        }
       }
       renderMessages();
       ensureHistoryFillsViewport();
     }
     var INDEX_GROUP_FETCH_MAX_PAGES = 40;
     var indexGroupFetching = {};
+    function findIndexGroup(key) {
+      try {
+        var entries = buildChatDisplayList(CS.messages, displayListOptions());
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].kind === "indexing" && entries[i].group.key === key) return entries[i].group;
+        }
+      } catch (e) {
+      }
+      return null;
+    }
     function groupNeedsHistory(key) {
       if (CS.historyEndOfList) return false;
       try {
@@ -13024,7 +14180,37 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           text: "Could not stop this file: " + group.cancelError
         }));
       }
-      if (isOpen && indexGroupFetching[group.key]) {
+      var paging = group.path ? session.runPassPaging(group.path) : null;
+      if (isOpen && session.lazyIndexRowsEnabled()) {
+        if (paging && paging.loading) {
+          el.appendChild(h(
+            "div",
+            { class: "bq-index-note" },
+            h("span", { text: "Loading this file's indexing steps" }),
+            h("span", { class: "bq-loader" })
+          ));
+        } else if (paging && paging.error) {
+          el.appendChild(h("div", { class: "bq-index-note is-error", text: "Could not load the steps: " + paging.error }));
+        } else if (!group.path && !group.visibleMembers.length) {
+          el.appendChild(h("div", { class: "bq-index-note", text: "This file's indexing steps can't be listed." }));
+        } else if (paging && paging.done && !group.visibleMembers.length) {
+          el.appendChild(h("div", {
+            class: "bq-index-note",
+            text: "The steps of this indexing run were not recorded. Steps are kept for files indexed from now on."
+          }));
+        }
+        if (group.path && !(paging && (paging.loading || paging.done))) {
+          var moreBtn = h("button", { class: "bq-index-more", type: "button", text: "Load more" });
+          moreBtn.addEventListener("click", function(ev) {
+            ev.stopPropagation();
+            void session.loadRunPasses(group.path, group.name);
+          });
+          moreBtn.addEventListener("keydown", function(ev) {
+            ev.stopPropagation();
+          });
+          el.appendChild(moreBtn);
+        }
+      } else if (isOpen && indexGroupFetching[group.key]) {
         el.appendChild(h(
           "div",
           { class: "bq-index-note" },
@@ -13431,6 +14617,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       void refreshIndexMarkers();
       loadMarked().then(function() {
         renderMessages();
+        var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[session.getHistoryCacheKey()];
+        if (loaded && !session.needsHistoryRefetch()) {
+          session.drainBgTaskQueue();
+          session.refreshLiveIndexState();
+          return;
+        }
         return session.loadHistory(false, CS.gateRefreshToken);
       }).then(function() {
       });
@@ -13754,14 +14946,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           return;
         }
         if (mcpGrantNeedsRefresh(user)) {
-          return refreshMcpToken().then(function(tok) {
-            if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
-            return beginMcpOAuthOnLogin("chat").catch(function(err) {
-              console.error("[bunnyquery] MCP refresh failed", err);
-              return enterAfterLogin();
+          return syncMcpSession().then(function(synced) {
+            if (synced && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+            return refreshMcpToken().then(function(tok) {
+              if (tok && !mcpGrantNeedsRefresh(user)) return enterAfterLogin();
+              return beginMcpOAuthOnLogin("chat").catch(function(err) {
+                console.error("[bunnyquery] MCP refresh failed", err);
+                return enterAfterLogin();
+              });
             });
           });
         }
+        syncMcpSession();
         return enterAfterLogin();
       });
     }
@@ -13771,6 +14967,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return PUBLIC;
       }
       if (!skapi) throw new Error("BunnyQuery.init: a Skapi instance is required");
+      if (!skapiHasForwardRequest(skapi)) {
+        throw new Error("BunnyQuery.init: this page's skapi-js is too old (it has no forwardRequest / forwardRequestHistory). Load skapi-js 2.1.0 or newer, e.g. https://cdn.jsdelivr.net/npm/skapi-js@latest/dist/skapi.js");
+      }
       var mountEl = typeof target === "string" ? document.getElementById(target) : target;
       if (!mountEl) throw new Error("BunnyQuery.init: mount element not found: " + target);
       S.skapi = skapi;
@@ -13859,7 +15058,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var canStream = skapiSupportsStreaming(S.skapi);
       if (!canStream) {
         console.warn(
-          "[bunnyquery] this page's skapi-js has neither forwardRequestStream/forwardRequestFinalize nor the older clientSecretRequestStream/clientSecretRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Replies are buffered - update skapi-js to stream them."
+          "[bunnyquery] this page's skapi-js has no forwardRequestStream/forwardRequestFinalize, so skapi's half of the stream flag would be dropped and every reply would read back empty. Replies are buffered - update skapi-js to stream them."
         );
       }
       configureProjectSettings(function(service) {
@@ -13872,6 +15071,74 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       configureChatEngine(Object.assign({
         // Single-item csr-poll point lookup: how the engine hydrates a
         // compact history stub's real body when an indexing row expands.
+        // Saved search findings (engine findings.ts; agent.vue same): where a hard search
+        // found its answer, at the source file's own access group, one record per page.
+        saveSearchFinding: function(f) {
+          if (!S.skapi || typeof S.skapi.postRecord !== "function") return;
+          return S.skapi.getRecords({ service: f.service, unique_id: "src::" + f.storagePath }).then(function(found) {
+            var src = found && found.list && found.list[0];
+            var group = src && src.table ? src.table.access_group : void 0;
+            if (group === void 0 || group === null || group === "") return;
+            return S.skapi.postRecord(f.data, {
+              service: f.service,
+              unique_id: f.uniqueId,
+              table: { name: "search_findings", access_group: group },
+              reference: "src::" + f.storagePath,
+              tags: f.tags
+            }).catch(function(err) {
+              if (!/already taken|already exist/i.test(String(err && err.message || err))) return;
+              return S.skapi.getRecords({ service: f.service, unique_id: f.uniqueId }).then(function(r) {
+                var rec = r && r.list && r.list[0];
+                if (!rec || !rec.record_id) return;
+                var union = function(a, b) {
+                  var out = [];
+                  (Array.isArray(a) ? a : []).concat(Array.isArray(b) ? b : []).forEach(function(x) {
+                    if (out.indexOf(x) === -1) out.push(x);
+                  });
+                  return out.slice(0, 40);
+                };
+                var old = rec.data && typeof rec.data === "object" ? rec.data : {};
+                return S.skapi.postRecord(Object.assign({}, old, {
+                  question_words: union(old.question_words, f.data.question_words),
+                  search_terms: union(old.search_terms, f.data.search_terms),
+                  found_at: f.data.found_at
+                }), { service: f.service, record_id: rec.record_id, tags: union(rec.tags, f.tags) });
+              });
+            });
+          }).catch(function() {
+          });
+        },
+        // A document's page progress, the MCP's prog::<path> record (agent.vue same).
+        // A file's indexing pass ids, from the "pass::<path>#<id>" records the worker
+        // writes as each pass starts (agent.vue same).
+        listIndexPasses: function(service, storagePath) {
+          var prefix = "pass::" + storagePath + "#";
+          var ids = [], seen = {};
+          var page = function(fetchMore) {
+            return Promise.resolve(S.skapi.getUniqueId(
+              { service, unique_id: prefix, condition: ">=" },
+              { fetchMore, limit: 1e3 }
+            )).then(function(found) {
+              var list = found && found.list || [];
+              for (var i = 0; i < list.length; i++) {
+                var u = String(list[i] && list[i].unique_id || "");
+                if (u.indexOf(prefix) !== 0) continue;
+                var rid = u.slice(prefix.length);
+                if (!/^[0-9A-V]{13}:[0-9A-V]{13}$/.test(rid) || seen[rid]) continue;
+                seen[rid] = true;
+                ids.push(rid);
+              }
+              if (found && found.endOfList === false && list.length) return page(true);
+              return ids;
+            });
+          };
+          return page(false);
+        },
+        readIndexProgress: function(service, storagePath) {
+          return S.skapi.getRecords({ service, unique_id: "prog::" + storagePath }).then(function(found) {
+            return found && found.list && found.list[0] && found.list[0].data || null;
+          });
+        },
         csrHistoryItemLookup: function(fullId, service, owner) {
           return S.skapi.util.request("csr-poll", { id: fullId, service, owner }, { auth: true });
         },
