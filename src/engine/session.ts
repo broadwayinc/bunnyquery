@@ -5085,10 +5085,11 @@ export class ChatSession {
 		var paging = this.state.passPaging[storagePath];
 		if (paging && (paging.loading || paging.done)) return Promise.resolve();
 		if (!paging) {
-			paging = { ids: [], loaded: 0, loading: false, done: false };
-			this.state.passPaging[storagePath] = paging;
+			this.state.passPaging[storagePath] = { ids: [], loaded: 0, loading: false, done: false };
 		}
-		var p = paging;
+		// Read back through the state, never the object just stored: a host may hold the state
+		// as a reactive proxy (Vue), and writes to the raw object would never reach the screen.
+		var p = this.state.passPaging[storagePath];
 		p.loading = true;
 		p.error = undefined;
 		this.host.notify();
@@ -5377,17 +5378,32 @@ export class ChatSession {
 			if (results[0] !== null && results[1] !== null) {
 				self._recordLiveIndexKeys(results);
 				self._noteLiveLook(svcId, platform as 'claude' | 'openai', results);
+				// A file the queue still works on keeps being looked at until it leaves the
+				// queue, even when this page tracks none of its passes (a reload, or a run
+				// started elsewhere): its row is drawn from the look, and a look nobody
+				// repeats would leave the row "Indexing" after the run had ended.
+				self._ensureAdoptTick();
 			}
 			if (results[0] !== null) self._promoteListedRunning(results[0]);
 			// Both queries answered and both empty: the queue holds nothing for this user.
 			var emptyLook = results[0] !== null && results[1] !== null
 				&& !((results[0].list || []).length) && !((results[1].list || []).length);
 			var adoptedIds: string[] = [];
+			// OLDEST FIRST, across both lists. A file's row starts at the first pass the
+			// grouping meets: adopted in the queue's own order (running, then pending, each
+			// newest first), a run's "continuing" passes landed before its opening pass, and
+			// the run drew two rows until the opening pass settled. Request ids sort by time.
+			var found: any[] = [];
 			for (var ri = 0; ri < results.length; ri++) {
 				var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
-				for (var i = 0; i < list.length; i++) {
-					if (self._adoptWorkerIndexingItem(list[i], svcId, platform as 'claude' | 'openai')) adoptedIds.push(list[i].id);
-				}
+				for (var i = 0; i < list.length; i++) if (list[i]) found.push(list[i]);
+			}
+			found.sort(function (a: any, b: any) {
+				var x = String(a.id || ''), y = String(b.id || '');
+				return x < y ? -1 : x > y ? 1 : 0;
+			});
+			for (var fi = 0; fi < found.length; fi++) {
+				if (self._adoptWorkerIndexingItem(found[fi], svcId, platform as 'claude' | 'openai')) adoptedIds.push(found[fi].id);
 			}
 			if (adoptedIds.length) {
 				self.drainBgTaskQueue();

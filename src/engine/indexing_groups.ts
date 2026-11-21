@@ -891,6 +891,15 @@ export function buildChatDisplayList(
 		} else {
 			grp.resolving = false;
 		}
+		// Waiting, not working: the queue holds this file's next pass but none of its passes
+		// is running (files of one project take turns). Only on the queue's own word, both
+		// halves of it: live, and not among the running.
+		var runningNow = opts && opts.liveIndexRunningKeys;
+		if (runningNow && !grp.finished && !grp.resolving && grp.status === 'active'
+			&& (liveIndexKeys[grp.key] || (grp.path && liveIndexKeys[grp.path]))
+			&& !runningNow[grp.key] && !(grp.path && runningNow[grp.path]) && !(grp.name && runningNow[grp.name])) {
+			grp.queued = true;
+		}
 	}
 
 	// --- superseded runs -------------------------------------------------------

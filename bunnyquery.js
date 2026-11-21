@@ -2744,6 +2744,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else {
         grp.resolving = false;
       }
+      var runningNow = opts && opts.liveIndexRunningKeys;
+      if (runningNow && !grp.finished && !grp.resolving && grp.status === "active" && (liveIndexKeys[grp.key] || grp.path && liveIndexKeys[grp.path]) && !runningNow[grp.key] && !(grp.path && runningNow[grp.path]) && !(grp.name && runningNow[grp.name])) {
+        grp.queued = true;
+      }
     }
     var superseded = {};
     for (var sk in runsOfKey) {
@@ -8693,10 +8697,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var paging = this.state.passPaging[storagePath];
       if (paging && (paging.loading || paging.done)) return Promise.resolve();
       if (!paging) {
-        paging = { ids: [], loaded: 0, loading: false, done: false };
-        this.state.passPaging[storagePath] = paging;
+        this.state.passPaging[storagePath] = { ids: [], loaded: 0, loading: false, done: false };
       }
-      var p = paging;
+      var p = this.state.passPaging[storagePath];
       p.loading = true;
       p.error = void 0;
       this.host.notify();
@@ -8989,15 +8992,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (results[0] !== null && results[1] !== null) {
           self._recordLiveIndexKeys(results);
           self._noteLiveLook(svcId, platform, results);
+          self._ensureAdoptTick();
         }
         if (results[0] !== null) self._promoteListedRunning(results[0]);
         var emptyLook = results[0] !== null && results[1] !== null && !(results[0].list || []).length && !(results[1].list || []).length;
         var adoptedIds = [];
+        var found = [];
         for (var ri = 0; ri < results.length; ri++) {
           var list = results[ri] && Array.isArray(results[ri].list) ? results[ri].list : [];
-          for (var i = 0; i < list.length; i++) {
-            if (self._adoptWorkerIndexingItem(list[i], svcId, platform)) adoptedIds.push(list[i].id);
-          }
+          for (var i = 0; i < list.length; i++) if (list[i]) found.push(list[i]);
+        }
+        found.sort(function(a, b) {
+          var x = String(a.id || ""), y = String(b.id || "");
+          return x < y ? -1 : x > y ? 1 : 0;
+        });
+        for (var fi = 0; fi < found.length; fi++) {
+          if (self._adoptWorkerIndexingItem(found[fi], svcId, platform)) adoptedIds.push(found[fi].id);
         }
         if (adoptedIds.length) {
           self.drainBgTaskQueue();
