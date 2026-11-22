@@ -925,7 +925,16 @@ export function buildChatDisplayList(
 			// not hold: it is waiting, even when the pending list was cut off before it.
 			var openRun2 = opts && opts.runStubs && ((grp.path && opts.runStubs[grp.path]) || opts.runStubs[grp.key]);
 			var waitingOpenRun = !!(opts && opts.liveIndexRunningChecked && openRun2 && openRun2.status === 'working');
-			if (liveIndexKeys[grp.key] || (grp.path && liveIndexKeys[grp.path]) || otherRunning || waitingOpenRun) grp.queued = true;
+			// Only before the run has done anything: a file with a FINISHED pass is mid-run.
+			// Between two of its own passes it is briefly not running, and the look can still
+			// hold the pass that just ended; calling that "Queued" next to its saved pages read
+			// as going backwards.
+			var startedRun = false;
+			for (var mi = 0; mi < grp.members.length; mi++) {
+				var mm = grp.members[mi].msg;
+				if (mm && mm.role === 'assistant' && !mm.isPending && !mm.isPendingInProcess && !mm.isPendingQueued) { startedRun = true; break; }
+			}
+			if (!startedRun && (liveIndexKeys[grp.key] || (grp.path && liveIndexKeys[grp.path]) || otherRunning || waitingOpenRun)) grp.queued = true;
 		}
 	}
 

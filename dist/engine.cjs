@@ -2861,7 +2861,15 @@ function buildChatDisplayList(messages, opts) {
       }
       var openRun2 = opts && opts.runStubs && (grp.path && opts.runStubs[grp.path] || opts.runStubs[grp.key]);
       var waitingOpenRun = !!(opts && opts.liveIndexRunningChecked && openRun2 && openRun2.status === "working");
-      if (liveIndexKeys[grp.key] || grp.path && liveIndexKeys[grp.path] || otherRunning || waitingOpenRun) grp.queued = true;
+      var startedRun = false;
+      for (var mi = 0; mi < grp.members.length; mi++) {
+        var mm = grp.members[mi].msg;
+        if (mm && mm.role === "assistant" && !mm.isPending && !mm.isPendingInProcess && !mm.isPendingQueued) {
+          startedRun = true;
+          break;
+        }
+      }
+      if (!startedRun && (liveIndexKeys[grp.key] || grp.path && liveIndexKeys[grp.path] || otherRunning || waitingOpenRun)) grp.queued = true;
     }
   }
   var superseded = {};
@@ -9181,9 +9189,23 @@ var _ChatSession = class _ChatSession {
     });
   }
   /** The page progress to show for a file's row, or null (see _refreshPageProgress). */
-  pageProgressFor(storagePath) {
-    if (!storagePath || !this.state.indexPageProgress) return null;
-    var p = this.state.indexPageProgress[storagePath];
+  pageProgressFor(storagePath, fileName) {
+    var map = this.state.indexPageProgress;
+    if (!map) return null;
+    var p = storagePath ? map[storagePath] : void 0;
+    if (!p && fileName) {
+      var hit = null;
+      for (var k in map) {
+        if (k === fileName || k.slice(-(fileName.length + 1)) === "/" + fileName) {
+          if (hit) {
+            hit = null;
+            break;
+          }
+          hit = k;
+        }
+      }
+      if (hit) p = map[hit];
+    }
     return p ? { saved: p.saved, total: p.total } : null;
   }
   _noteLiveLook(svcId, platform, results) {
@@ -10307,7 +10329,19 @@ var _ChatSession = class _ChatSession {
           });
         }).then(function() {
           if (skipped) return;
-          return self.host.getTemporaryUrl(duplicateOf || member.storagePath);
+          return Promise.resolve(self.host.getTemporaryUrl(duplicateOf || member.storagePath)).catch(function(err) {
+            var ecode = err && (err.code || err.body && err.body.code);
+            var emsg = String(err && (err.message || err.body && err.body.message) || err || "");
+            var refused = /no access to this file/i.test(emsg) || ecode === "INVALID_REQUEST" && /access/i.test(emsg);
+            if (duplicateOf || !refused || typeof self.host.ensureFileIndexRecord !== "function") throw err;
+            return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
+              name: member.file.name,
+              mime: member.file.type || self.host.getMimeType(member.file.name),
+              size: member.file.size
+            })).then(function() {
+              return self.host.getTemporaryUrl(member.storagePath);
+            });
+          });
         }).then(function(url) {
           if (skipped) return;
           if (duplicateOf) {

@@ -4239,7 +4239,7 @@ import {
         if (group.stub) return "";
         // While the file is indexing: how many of its pages are saved (the MCP's count,
         // refreshed by the engine's 10-second check), ahead of the passes.
-        var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path) : null;
+        var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path || group.key, group.name) : null;
         var pages = prog ? (prog.total ? prog.saved + " of " + prog.total + " pages" : prog.saved + " pages") : "";
         var passes = group.passCount <= 1 && !group.mayHaveOlder ? "" : group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
         return [pages, passes].filter(Boolean).join(" \u00b7 ");

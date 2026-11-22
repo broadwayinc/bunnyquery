@@ -5293,7 +5293,7 @@ declare class ChatSession {
      */
     private _refreshPageProgress;
     /** The page progress to show for a file's row, or null (see _refreshPageProgress). */
-    pageProgressFor(storagePath?: string): {
+    pageProgressFor(storagePath?: string, fileName?: string): {
         saved: number;
         total: number | null;
     } | null;

@@ -5355,9 +5355,23 @@ export class ChatSession {
 	}
 
 	/** The page progress to show for a file's row, or null (see _refreshPageProgress). */
-	pageProgressFor(storagePath?: string): { saved: number; total: number | null } | null {
-		if (!storagePath || !this.state.indexPageProgress) return null;
-		var p = this.state.indexPageProgress[storagePath];
+	pageProgressFor(storagePath?: string, fileName?: string): { saved: number; total: number | null } | null {
+		var map = this.state.indexPageProgress;
+		if (!map) return null;
+		var p = storagePath ? map[storagePath] : undefined;
+		// A row put together from passes the queue check just found can lack its storage
+		// path for a moment (the first of them carries it); the file NAME still finds the
+		// progress then, when exactly one file of that name is being followed.
+		if (!p && fileName) {
+			var hit: string | null = null;
+			for (var k in map) {
+				if (k === fileName || k.slice(-(fileName.length + 1)) === '/' + fileName) {
+					if (hit) { hit = null; break; }
+					hit = k;
+				}
+			}
+			if (hit) p = map[hit];
+		}
 		return p ? { saved: p.saved, total: p.total } : null;
 	}
 
@@ -6879,7 +6893,22 @@ export class ChatSession {
 					// A duplicate takes the STORED copy's url: the same reuse an EXISTS
 					// answer gets when the user keeps the file, minus the prompt and
 					// minus the re-index.
-					return self.host.getTemporaryUrl(duplicateOf || member.storagePath);
+					return Promise.resolve(self.host.getTemporaryUrl(duplicateOf || member.storagePath)).catch(function (err: any) {
+						// A file nobody has indexed yet is readable by the project OWNER only
+						// (the store's access rule), so for any other uploader the link to the
+						// file they just uploaded is refused ("No access to this file.") and the
+						// file could never be indexed. Its file record makes it a file of the
+						// uploader's chosen group, which they can read: create it now (the step
+						// below would have created the same record a moment later, and a second
+						// create is refused harmlessly) and ask again.
+						var ecode = err && (err.code || (err.body && err.body.code));
+						var emsg = String((err && (err.message || (err.body && err.body.message))) || err || '');
+						var refused = /no access to this file/i.test(emsg) || (ecode === 'INVALID_REQUEST' && /access/i.test(emsg));
+						if (duplicateOf || !refused || typeof self.host.ensureFileIndexRecord !== 'function') throw err;
+						return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
+							name: member.file.name, mime: member.file.type || self.host.getMimeType(member.file.name), size: member.file.size,
+						})).then(function () { return self.host.getTemporaryUrl(member.storagePath); });
+					});
 				}).then(function (url: string) {
 					if (skipped) return; // guard the indexing branch for a skipped member
 					if (duplicateOf) {
