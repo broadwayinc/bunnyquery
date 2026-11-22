@@ -249,6 +249,11 @@ export type BuildDisplayListOptions = {
 	 *  is missing here has only waiting passes and is marked `queued`. Absent: unknown, and
 	 *  no row is marked. */
 	liveIndexRunningKeys?: { [fileKey: string]: boolean };
+	/** The running half of the queue look is complete (liveIndexRunningChecked). With the
+	 *  pending half cut off (liveIndexChecked false), a file whose run:: record is still
+	 *  'working' and that is not running is waiting: its row says "Queued" instead of
+	 *  "Fetching status" until the queue is small enough to list whole. */
+	liveIndexRunningChecked?: boolean;
 	/** Files carrying the durable done:: completion marker (one prefix sweep),
 	 *  keyed like IndexingGroup.key (storage path; the bare-name fallback keys
 	 *  of very old prompts simply never match — they keep the queue inference).
@@ -888,6 +893,16 @@ export function buildChatDisplayList(
 			// thing here that is actually known.
 			grp.resolving = true;
 			grp.resolvingReason = 'status';
+			// Same reading as a run:: row's: the running half is whole and this file is
+			// not in it, while its run record says the run is open, so it is waiting.
+			var openRun = opts && opts.runStubs && ((grp.path && opts.runStubs[grp.path]) || opts.runStubs[grp.key]);
+			var runNow = opts && opts.liveIndexRunningKeys;
+			if (opts && opts.liveIndexRunningChecked && openRun && openRun.status === 'working' && runNow
+				&& !runNow[grp.key] && !(grp.path && runNow[grp.path]) && !(grp.name && runNow[grp.name])) {
+				grp.resolving = false;
+				grp.resolvingReason = undefined;
+				grp.queued = true;
+			}
 		} else {
 			grp.resolving = false;
 		}
@@ -896,9 +911,21 @@ export function buildChatDisplayList(
 		// halves of it: live, and not among the running.
 		var runningNow = opts && opts.liveIndexRunningKeys;
 		if (runningNow && !grp.finished && !grp.resolving && grp.status === 'active'
-			&& (liveIndexKeys[grp.key] || (grp.path && liveIndexKeys[grp.path]))
 			&& !runningNow[grp.key] && !(grp.path && runningNow[grp.path]) && !(grp.name && runningNow[grp.name])) {
-			grp.queued = true;
+			// A file sent a moment ago is not in the last look yet, and the engine guesses
+			// its first pass is running. One project's files index one at a time, so when
+			// the look shows ANOTHER file running, this one is waiting whatever the guess.
+			var otherRunning = false;
+			if (opts && opts.liveIndexRunningChecked) {
+				for (var rk in runningNow) {
+					if (runningNow[rk] && rk !== grp.key && rk !== grp.path && rk !== grp.name) { otherRunning = true; break; }
+				}
+			}
+			// And a file whose run is open (its run:: record) that the WHOLE running list does
+			// not hold: it is waiting, even when the pending list was cut off before it.
+			var openRun2 = opts && opts.runStubs && ((grp.path && opts.runStubs[grp.path]) || opts.runStubs[grp.key]);
+			var waitingOpenRun = !!(opts && opts.liveIndexRunningChecked && openRun2 && openRun2.status === 'working');
+			if (liveIndexKeys[grp.key] || (grp.path && liveIndexKeys[grp.path]) || otherRunning || waitingOpenRun) grp.queued = true;
 		}
 	}
 
@@ -951,6 +978,7 @@ export function buildChatDisplayList(
 		}
 		var now = opts && typeof opts.now === 'number' ? opts.now : Date.now();
 		var runningKeys = opts && opts.liveIndexRunningKeys;
+		var runningChecked = !!(opts && opts.liveIndexRunningChecked);
 		var stubClearedAt = (opts && typeof opts.stubClearedAt === 'number' && opts.stubClearedAt > 0)
 			? opts.stubClearedAt : 0;
 		for (var sp in runStubs) {
@@ -1005,6 +1033,7 @@ export function buildChatDisplayList(
 			var st: IndexingGroupStatus = 'active';
 			var fin = false;
 			var res = false;
+			var waitingStub = false;
 			var reason: 'history' | 'status' | undefined;
 			if (!live) {
 				// A done:: marker from the same sweep is as terminal as the record's
@@ -1026,6 +1055,10 @@ export function buildChatDisplayList(
 					// Older than any real run and still unconfirmed: a dead claim, not
 					// an open question. Same horizon the files page applies.
 					st = 'error'; fin = true;
+				} else if (runningChecked && rec.status === 'working') {
+					// The pending half was cut off, the running half was not, and this
+					// file is not running: it is waiting behind the files that are.
+					waitingStub = true;
 				} else {
 					// Genuinely unanswered — the queue reply is one round trip away
 					// and this self-heals the moment it lands.
@@ -1062,8 +1095,8 @@ export function buildChatDisplayList(
 				resolving: res,
 				resolvingReason: reason,
 				stub: true,
-				queued: live && !!runningKeys
-					&& !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : undefined,
+				queued: waitingStub || (live && !!runningKeys
+					&& !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname]) ? true : undefined,
 				stubError: rec.error || (st === 'error' && !rec.error
 					? 'Indexing did not finish.' : undefined),
 			};

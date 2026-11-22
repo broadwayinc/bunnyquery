@@ -4438,6 +4438,7 @@ import {
             liveIndexChecked: liveIndex.checked,
             // Which live files have a pass running: a live row without one says "Queued".
             liveIndexRunningKeys: liveIndex.running,
+            liveIndexRunningChecked: liveIndex.runningChecked,
             // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
             // cancelled bubble behind (that pass finishes and answers normally), so
             // without this the row reports the stop as a finished "Indexed".
@@ -4445,7 +4446,8 @@ import {
             // Durable completion markers + run records (one sweep, see above).
             // doneKeys settle worker-run greens without a queue round trip;
             // runStubs paint rows for runs whose passes are not loaded yet.
-            doneKeys: fresh ? markerSweep.done : undefined,
+            // Plus the files the queue check saw leave the queue (agent.vue same).
+            doneKeys: Object.assign({}, fresh ? markerSweep.done : {}, liveIndex.settled || {}),
             runStubs: stubs,
             // Records are service-wide and horizon-blind; without this every
             // "Clear chat history" resurrected one row per indexed file.

@@ -293,6 +293,12 @@ export interface ChatState {
 	/** The files of liveIndexKeys that have a pass RUNNING, same keys. A live file missing
 	 *  here only has passes waiting: its row says "Queued". */
 	liveIndexRunning?: { [fileKey: string]: boolean };
+	/** The running half of the last look came back whole (see liveIndexRunning), even when
+	 *  the pending half did not: a file with an open run that is not running is waiting. */
+	liveIndexRunningChecked?: boolean;
+	/** Files a complete look saw leave the queue, kept until they are live again (same keys
+	 *  as liveIndexKeys). The display reads them like done:: markers. */
+	liveIndexSettled?: { [fileKey: string]: boolean };
 	/** Server item ids of the indexing passes that existed — on the row, or on the
 	 *  bg queue — when the user STOPPED that file. Two readers, one fact:
 	 *  buildChatDisplayList reports the run as stopped when it holds any of them

@@ -2966,6 +2966,14 @@ interface ChatState {
     liveIndexRunning?: {
         [fileKey: string]: boolean;
     };
+    /** The running half of the last look came back whole (see liveIndexRunning), even when
+     *  the pending half did not: a file with an open run that is not running is waiting. */
+    liveIndexRunningChecked?: boolean;
+    /** Files a complete look saw leave the queue, kept until they are live again (same keys
+     *  as liveIndexKeys). The display reads them like done:: markers. */
+    liveIndexSettled?: {
+        [fileKey: string]: boolean;
+    };
     /** Server item ids of the indexing passes that existed — on the row, or on the
      *  bg queue — when the user STOPPED that file. Two readers, one fact:
      *  buildChatDisplayList reports the run as stopped when it holds any of them
@@ -3846,6 +3854,11 @@ type BuildDisplayListOptions = {
     liveIndexRunningKeys?: {
         [fileKey: string]: boolean;
     };
+    /** The running half of the queue look is complete (liveIndexRunningChecked). With the
+     *  pending half cut off (liveIndexChecked false), a file whose run:: record is still
+     *  'working' and that is not running is waiting: its row says "Queued" instead of
+     *  "Fetching status" until the queue is small enough to list whole. */
+    liveIndexRunningChecked?: boolean;
     /** Files carrying the durable done:: completion marker (one prefix sweep),
      *  keyed like IndexingGroup.key (storage path; the bare-name fallback keys
      *  of very old prompts simply never match — they keep the queue inference).
@@ -4196,6 +4209,10 @@ declare class ChatSession {
         };
         checked: boolean;
         running: {
+            [fileKey: string]: boolean;
+        };
+        runningChecked: boolean;
+        settled: {
             [fileKey: string]: boolean;
         };
     };

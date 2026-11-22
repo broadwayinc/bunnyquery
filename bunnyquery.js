@@ -2741,12 +2741,30 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (!grp.finished && grp.driver === "worker" && !liveIndexChecked && !liveIndexKeys[grp.key]) {
         grp.resolving = true;
         grp.resolvingReason = "status";
+        var openRun = opts && opts.runStubs && (grp.path && opts.runStubs[grp.path] || opts.runStubs[grp.key]);
+        var runNow = opts && opts.liveIndexRunningKeys;
+        if (opts && opts.liveIndexRunningChecked && openRun && openRun.status === "working" && runNow && !runNow[grp.key] && !(grp.path && runNow[grp.path]) && !(grp.name && runNow[grp.name])) {
+          grp.resolving = false;
+          grp.resolvingReason = void 0;
+          grp.queued = true;
+        }
       } else {
         grp.resolving = false;
       }
       var runningNow = opts && opts.liveIndexRunningKeys;
-      if (runningNow && !grp.finished && !grp.resolving && grp.status === "active" && (liveIndexKeys[grp.key] || grp.path && liveIndexKeys[grp.path]) && !runningNow[grp.key] && !(grp.path && runningNow[grp.path]) && !(grp.name && runningNow[grp.name])) {
-        grp.queued = true;
+      if (runningNow && !grp.finished && !grp.resolving && grp.status === "active" && !runningNow[grp.key] && !(grp.path && runningNow[grp.path]) && !(grp.name && runningNow[grp.name])) {
+        var otherRunning = false;
+        if (opts && opts.liveIndexRunningChecked) {
+          for (var rk in runningNow) {
+            if (runningNow[rk] && rk !== grp.key && rk !== grp.path && rk !== grp.name) {
+              otherRunning = true;
+              break;
+            }
+          }
+        }
+        var openRun2 = opts && opts.runStubs && (grp.path && opts.runStubs[grp.path] || opts.runStubs[grp.key]);
+        var waitingOpenRun = !!(opts && opts.liveIndexRunningChecked && openRun2 && openRun2.status === "working");
+        if (liveIndexKeys[grp.key] || grp.path && liveIndexKeys[grp.path] || otherRunning || waitingOpenRun) grp.queued = true;
       }
     }
     var superseded = {};
@@ -2773,6 +2791,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       var now = opts && typeof opts.now === "number" ? opts.now : Date.now();
       var runningKeys = opts && opts.liveIndexRunningKeys;
+      var runningChecked = !!(opts && opts.liveIndexRunningChecked);
       var stubClearedAt = opts && typeof opts.stubClearedAt === "number" && opts.stubClearedAt > 0 ? opts.stubClearedAt : 0;
       for (var sp in runStubs) {
         var rec = runStubs[sp];
@@ -2799,6 +2818,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var st = "active";
         var fin = false;
         var res = false;
+        var waitingStub = false;
         var reason;
         if (!live) {
           if (rec.status === "done" || doneKeys[sp] || doneKeys[canonIndexKey(sp)] || doneKeys[fname] || doneKeys[canonIndexKey(fname)]) {
@@ -2816,6 +2836,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           } else if (typeof rec.started === "number" && now - rec.started > RUN_RECORD_WORKING_STALE_MS) {
             st = "error";
             fin = true;
+          } else if (runningChecked && rec.status === "working") {
+            waitingStub = true;
           } else {
             res = true;
             reason = "status";
@@ -2849,7 +2871,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           resolving: res,
           resolvingReason: reason,
           stub: true,
-          queued: live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
+          queued: waitingStub || live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
           stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0)
         };
         stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
@@ -5210,6 +5232,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         passPaging: {},
         liveIndexChecked: false,
         liveIndexRunning: {},
+        liveIndexRunningChecked: false,
+        liveIndexSettled: {},
         stoppedIndexIds: {}
       };
       this.bgTaskQueue = [];
@@ -5237,7 +5261,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *  every file the server still has indexing work for; `checked` is false until the
      *  first answer for this chat, and false means "we do not know yet". */
     getLiveIndexState() {
-      return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {} };
+      return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {}, runningChecked: !!this.state.liveIndexRunningChecked, settled: this.state.liveIndexSettled || {} };
     }
     /** Passes that were on a row when the user stopped it, so the display layer can
      *  still tell that this run was stopped once the stop has left no other trace.
@@ -5521,6 +5545,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var next = {};
       var running = {};
       var truncated = false;
+      var runningTruncated = false;
       var settledIds = {};
       this.state.messages.forEach(function(m) {
         if (!m._serverItemId) return;
@@ -5529,7 +5554,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       for (var li = 0; li < lists.length; li++) {
         var list = lists[li] && Array.isArray(lists[li].list) ? lists[li].list : [];
-        if (list.length >= WORKER_PASS_ADOPT_LIMIT) truncated = true;
+        if (list.length >= WORKER_PASS_ADOPT_LIMIT || lists[li] && lists[li].endOfList === false) {
+          truncated = true;
+          for (var si = 0; si < list.length; si++) {
+            if (list[si] && list[si].status === "running") {
+              runningTruncated = true;
+              break;
+            }
+          }
+        }
         for (var i = 0; i < list.length; i++) {
           var item = list[i];
           if (!item || item.status !== "pending" && item.status !== "running") continue;
@@ -5574,7 +5607,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       this.state.liveIndexKeys = next;
+      if (this.state.liveIndexRunningChecked !== !runningTruncated) changed = true;
+      var settledNow = this.state.liveIndexSettled || {};
+      var settledNext = {};
+      for (var sk in settledNow) if (settledNow[sk] && !next[sk]) settledNext[sk] = true;
+      if (nowChecked) {
+        for (var wk in was) if (was[wk] && !next[wk]) {
+          if (!settledNext[wk]) changed = true;
+          settledNext[wk] = true;
+        }
+      }
+      this.state.liveIndexSettled = settledNext;
       this.state.liveIndexRunning = running;
+      this.state.liveIndexRunningChecked = !runningTruncated;
       this.state.liveIndexChecked = nowChecked;
       this._liveIndexAt = nowMs();
       this._liveIndexKey = this.getHistoryCacheKey();
@@ -5585,6 +5630,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     _resetLiveIndexKeys() {
       this.state.liveIndexKeys = {};
       this.state.liveIndexRunning = {};
+      this.state.liveIndexRunningChecked = false;
+      this.state.liveIndexSettled = {};
       this.state.liveIndexChecked = false;
       this._liveIndexAt = 0;
       this.state.passPaging = {};
@@ -8963,7 +9010,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var complete = true;
       for (var r = 0; r < results.length; r++) {
         var list = results[r] && Array.isArray(results[r].list) ? results[r].list : [];
-        if (list.length >= WORKER_PASS_ADOPT_LIMIT) complete = false;
+        if (list.length >= WORKER_PASS_ADOPT_LIMIT || results[r] && results[r].endOfList === false) complete = false;
         for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === "string") ids[list[i].id] = true;
       }
       this._lastLiveLook = complete ? { svcId, platform, at: Date.now(), ids } : null;
@@ -14112,6 +14159,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         liveIndexChecked: liveIndex.checked,
         // Which live files have a pass running: a live row without one says "Queued".
         liveIndexRunningKeys: liveIndex.running,
+        liveIndexRunningChecked: liveIndex.runningChecked,
         // Runs the user stopped. A stop that landed on a RUNNING pass leaves no
         // cancelled bubble behind (that pass finishes and answers normally), so
         // without this the row reports the stop as a finished "Indexed".
@@ -14119,7 +14167,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // Durable completion markers + run records (one sweep, see above).
         // doneKeys settle worker-run greens without a queue round trip;
         // runStubs paint rows for runs whose passes are not loaded yet.
-        doneKeys: fresh ? markerSweep.done : void 0,
+        // Plus the files the queue check saw leave the queue (agent.vue same).
+        doneKeys: Object.assign({}, fresh ? markerSweep.done : {}, liveIndex.settled || {}),
         runStubs: stubs,
         // Records are service-wide and horizon-blind; without this every
         // "Clear chat history" resurrected one row per indexed file.

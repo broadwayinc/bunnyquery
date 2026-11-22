@@ -674,6 +674,8 @@ export class ChatSession {
 			passPaging: {},
 			liveIndexChecked: false,
 			liveIndexRunning: {},
+			liveIndexRunningChecked: false,
+			liveIndexSettled: {},
 			stoppedIndexIds: {},
 		};
 		this.bgTaskQueue = [];
@@ -701,8 +703,8 @@ export class ChatSession {
 	/** What the display layer needs to decide whether a run is finished. `keys` holds
 	 *  every file the server still has indexing work for; `checked` is false until the
 	 *  first answer for this chat, and false means "we do not know yet". */
-	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean; running: { [fileKey: string]: boolean } } {
-		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {} };
+	getLiveIndexState(): { keys: { [fileKey: string]: boolean }; checked: boolean; running: { [fileKey: string]: boolean }; runningChecked: boolean; settled: { [fileKey: string]: boolean } } {
+		return { keys: this.state.liveIndexKeys, checked: this.state.liveIndexChecked, running: this.state.liveIndexRunning || {}, runningChecked: !!this.state.liveIndexRunningChecked, settled: this.state.liveIndexSettled || {} };
 	}
 
 	/** Passes that were on a row when the user stopped it, so the display layer can
@@ -1003,6 +1005,11 @@ export class ChatSession {
 		// and omits the 20 about to run. Absence would then read as "finished" for
 		// exactly the files that have not been touched yet. Report not-knowing instead.
 		var truncated = false;
+		// The RUNNING half on its own. A file indexes in at most a few parallel lanes, so the
+		// running list practically never fills; the pending one fills on any bulk upload. A
+		// complete running half still proves something when the pending half is cut off: a
+		// file whose run is open and which is not running is waiting its turn.
+		var runningTruncated = false;
 		// Locally settled already. The adopt path refuses these items for the same
 		// reason and says why: the status index is eventually consistent, so the pass
 		// that just finished can still come back as running. Counting it as live work
@@ -1016,7 +1023,16 @@ export class ChatSession {
 		});
 		for (var li = 0; li < lists.length; li++) {
 			var list = lists[li] && Array.isArray(lists[li].list) ? lists[li].list : [];
-			if (list.length >= WORKER_PASS_ADOPT_LIMIT) truncated = true;
+			// Cut off when it came back full OR the server says more exist: a filtered
+			// listing can return fewer rows than asked for and still not be the end, and
+			// reading that page as whole turned every file past it into "Indexed".
+			if (list.length >= WORKER_PASS_ADOPT_LIMIT || (lists[li] && lists[li].endOfList === false)) {
+				truncated = true;
+				// Which half this is, from its items (the callers pass them in either order).
+				for (var si = 0; si < list.length; si++) {
+					if (list[si] && list[si].status === 'running') { runningTruncated = true; break; }
+				}
+			}
 			for (var i = 0; i < list.length; i++) {
 				var item = list[i];
 				if (!item || (item.status !== 'pending' && item.status !== 'running')) continue;
@@ -1053,7 +1069,19 @@ export class ChatSession {
 			if (!changed) for (var r2 in wasRun) if (!running[r2]) { changed = true; break; }
 		}
 		this.state.liveIndexKeys = next;
+		if (this.state.liveIndexRunningChecked !== !runningTruncated) changed = true;
+		// Files seen to LEAVE the queue: live in the previous look, absent from a complete
+		// one. Kept until the file is live again, so a later look that comes back cut off
+		// (a bulk upload behind it) cannot turn its "Indexed" back into "Indexing".
+		var settledNow = this.state.liveIndexSettled || {};
+		var settledNext: { [k: string]: boolean } = {};
+		for (var sk in settledNow) if (settledNow[sk] && !next[sk]) settledNext[sk] = true;
+		if (nowChecked) {
+			for (var wk in was) if (was[wk] && !next[wk]) { if (!settledNext[wk]) changed = true; settledNext[wk] = true; }
+		}
+		this.state.liveIndexSettled = settledNext;
 		this.state.liveIndexRunning = running;
+		this.state.liveIndexRunningChecked = !runningTruncated;
 		this.state.liveIndexChecked = nowChecked;
 		this._liveIndexAt = nowMs();
 		// Claim the snapshot for the CURRENT chat. Both callers verify identity before
@@ -1075,6 +1103,8 @@ export class ChatSession {
 	private _resetLiveIndexKeys(): void {
 		this.state.liveIndexKeys = {};
 		this.state.liveIndexRunning = {};
+		this.state.liveIndexRunningChecked = false;
+		this.state.liveIndexSettled = {};
 		this.state.liveIndexChecked = false;
 		this._liveIndexAt = 0;
 		// Steps loaded into rows belong to that chat too.
@@ -5336,7 +5366,7 @@ export class ChatSession {
 		var complete = true;
 		for (var r = 0; r < results.length; r++) {
 			var list = results[r] && Array.isArray(results[r].list) ? results[r].list : [];
-			if (list.length >= WORKER_PASS_ADOPT_LIMIT) complete = false;
+			if (list.length >= WORKER_PASS_ADOPT_LIMIT || (results[r] && results[r].endOfList === false)) complete = false;
 			for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === 'string') ids[list[i].id] = true;
 		}
 		this._lastLiveLook = complete ? { svcId: svcId, platform: platform, at: Date.now(), ids: ids } : null;
