@@ -727,6 +727,21 @@
     pointer-events: none;
     opacity: 0.92;
 }
+/* "Preparing files..." between a drop and its chips (agent.vue / main.less
+   .bq-drop-preparing). Swallows clicks on purpose, unlike the drag overlay:
+   it sits over controls whose files are still being read. */
+.bq-drop-preparing {
+    position: absolute;
+    inset: 0;
+    z-index: 11;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--bq-paper) 85%, transparent);
+    pointer-events: auto;
+    cursor: progress;
+    user-select: none;
+}
 .bq-drop-overlay-inner {
     display: flex;
     flex-direction: column;

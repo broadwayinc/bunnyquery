@@ -9994,6 +9994,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     uploadSingleAttachment(att, stageId) {
       var self = this;
       var id = this.host.getIdentity();
+      var isIndexRetry = att.status === "indexError";
       att.status = "uploading";
       att.progress = null;
       att.errorMessage = "";
@@ -10046,7 +10047,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               }
             });
           };
-          return findDuplicate(member).then(function(dup) {
+          if (isIndexRetry) {
+            hadExists = true;
+            existedBefore = true;
+          }
+          return (isIndexRetry ? Promise.resolve(null) : findDuplicate(member)).then(function(dup) {
+            if (isIndexRetry) return;
             if (dup) {
               duplicateOf = dup;
               console.log("[chat-engine] skipping an upload the user already has:", member.storagePath, "->", dup);
@@ -10243,7 +10249,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (!self.state.attachments.some(function(a) {
             return a.id === att.id;
           })) return;
-          if (att.status === "done" || att.status === "indexError") {
+          if (att.status === "done") {
             if (att.kind === "folder" && att.uploadedUrls) {
               att.uploadedUrls.forEach(function(u) {
                 collected.push({ name: u.path, url: u.url, storagePath: u.storagePath });
@@ -10651,7 +10657,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return h(
         "div",
         {
-          class: "bq-bunny-loader" + (""),
+          class: "bq-bunny-loader" + (overlay ? " bq-bunny-loader--overlay" : ""),
           "aria-hidden": "true",
           translate: "no"
         },
@@ -12553,6 +12559,21 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       });
     }
+    var genDotTick = 0, genDotTimer = null;
+    function startGenDotTicker() {
+      if (genDotTimer) return;
+      genDotTimer = setInterval(function() {
+        var els = CS.typing && CS.messagesBox ? CS.messagesBox.querySelectorAll(".bq-gen-dots") : [];
+        if (!els.length) {
+          clearInterval(genDotTimer);
+          genDotTimer = null;
+          genDotTick = 0;
+          return;
+        }
+        genDotTick = (genDotTick + 1) % 3;
+        for (var i = 0; i < els.length; i++) els[i].textContent = ".".repeat(genDotTick + 1);
+      }, 400);
+    }
     function parseMsgPartsHtml(content, opts) {
       var noPreviews = !!(opts && opts.imagePreviews === false);
       var placeholderHtml = [];
@@ -12573,7 +12594,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (CS.typing) {
         var openFence = working.match(/```([^\n`]+?\.[^\s.`]+)\n?/);
         if (openFence && typeof openFence.index === "number") {
-          working = working.slice(0, openFence.index) + "\n[generating " + openFence[1] + "\u2026]";
+          working = working.slice(0, openFence.index) + "\n[generating " + openFence[1] + pushPlaceholder('<span class="bq-gen-dots">' + ".".repeat(genDotTick + 1) + "</span>") + "]";
+          startGenDotTicker();
         }
       }
       var codeMasks = [];
@@ -12735,8 +12757,31 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var fields = signed && signed.fields ? signed.fields : {};
         for (var name in fields) form.append(name, fields[name]);
         form.append("file", file);
-        return xhrUploadForm(signed.url, form, onProgress, setAbort);
+        return xhrUploadForm(signed.url, form, onProgress, setAbort).catch(function(err) {
+          if (err && (err === "Aborted" || err.message === "Aborted")) throw err;
+          var sum = summarizeUploadError(err);
+          var e = new Error("Upload failed for " + file.name + (sum.message ? ": " + sum.message : ""));
+          if (sum.code) e.code = sum.code;
+          throw e;
+        });
       });
+    }
+    function summarizeUploadError(err) {
+      if (!err) return { code: "", message: "" };
+      if (typeof err === "string") {
+        var c = /<Code>([^<]+)<\/Code>/.exec(err), m = /<Message>([^<]+)<\/Message>/.exec(err);
+        var code = c ? c[1] : "", msg = m ? m[1] : "";
+        if (code || msg) return { code, message: msg || code };
+        return { code: "", message: err.length > 300 ? err.slice(0, 300) : err };
+      }
+      var ecode = err.code || err.body && err.body.code || "";
+      var emsg = err.message || err.body && err.body.message || "";
+      if (ecode || emsg) return { code: ecode, message: emsg };
+      try {
+        return { code: "", message: JSON.stringify(err).slice(0, 300) };
+      } catch (x) {
+        return { code: "", message: String(err) };
+      }
     }
     var DECORATION_START = /^[<>:"\\|?*]/;
     function deleteFileIndexDecorations(storagePath) {
@@ -13365,7 +13410,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (inputEl) inputEl.value = "";
     }
     function setupDragAndDrop(chatEl) {
-      var depth = 0, overlay = null;
+      var depth = 0, overlay = null, preparing = null;
       function showOverlay() {
         if (overlay || S.aiPlatform === "none") return;
         overlay = h(
@@ -13417,7 +13462,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         e.preventDefault();
         depth = 0;
         hideOverlay();
-        handleDrop(e.dataTransfer);
+        if (preparing) return;
+        preparing = h(
+          "div",
+          { class: "bq-drop-preparing", role: "status", "aria-live": "polite" },
+          bunnyLoader("Preparing files...", false)
+        );
+        chatEl.appendChild(preparing);
+        var done = function() {
+          if (preparing && preparing.parentNode) preparing.parentNode.removeChild(preparing);
+          preparing = null;
+        };
+        Promise.resolve().then(function() {
+          return handleDrop(e.dataTransfer);
+        }).then(done, done);
       });
     }
     function handleDrop(dt) {
@@ -13431,7 +13489,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var entry2 = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
           entries.push(entry2 || it.getAsFile());
         }
-        Promise.all(entries.map(function(entry3) {
+        return Promise.all(entries.map(function(entry3) {
           if (!entry3) return Promise.resolve(null);
           if (entry3 instanceof File) return Promise.resolve(newAttachment({ kind: "file", name: entry3.name, file: entry3 }));
           if (entry3.isFile) {
@@ -13595,11 +13653,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         anchor.click();
         return;
       }
+      var busy = document.createTextNode(" (fetching...)");
+      anchor.classList.add("is-refreshing");
+      anchor.appendChild(busy);
+      var unbusy = function() {
+        anchor.classList.remove("is-refreshing");
+        if (busy.parentNode) busy.parentNode.removeChild(busy);
+      };
       fetchFreshHrefForExpiredLink(originalHref, anchor.dataset.bqRemotePath).then(function(fresh) {
+        unbusy();
         anchor.href = fresh;
         anchor.dataset.bqExpired = "0";
         anchor.click();
       }).catch(function(err) {
+        unbusy();
         console.error("[bunnyquery] expired link refresh failed", err);
         markLinkUnavailable(linkUnavailableKeyForHref(originalHref));
         if (anchor.dataset.bqRemotePath) markLinkUnavailable(linkUnavailableKeyForPath(anchor.dataset.bqRemotePath));
@@ -14552,6 +14619,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               var moPatch = { status: "done", finished: typeof moLast === "number" ? moLast : Date.now() };
               if (typeof moFirst === "number") moPatch.started = moFirst;
               if (mog.name) moPatch.filename = mog.name;
+              if (S.aiPlatform === "claude" || S.aiPlatform === "openai") moPatch.platform = S.aiPlatform;
               void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
               if (morec) morec.status = "done";
               else markerSweep.runs[mog.path] = { status: "done" };
@@ -14615,6 +14683,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       clearImagePreviewCache(S.projectId || "default");
       chatScrollAnchor.forget();
       for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
+      var prevMessages = CS.messages || [];
       CS.messages = [];
       CS.messageEls = [];
       CS.indexGroupsOpen = {};
@@ -14730,10 +14799,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           }
         });
         input.addEventListener("keydown", function(e) {
-          if (e.key === "Enter" && !e.shiftKey && !composing) {
-            e.preventDefault();
-            sendMessage();
-          }
+          if (e.key !== "Enter" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+          if (composing || e.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          sendMessage();
         });
         requestAnimationFrame(function() {
           autoGrowInput(input);
@@ -14778,7 +14847,28 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       void refreshIndexMarkers();
       loadMarked().then(function() {
         renderMessages();
-        var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[session.getHistoryCacheKey()];
+        var cacheKey2 = session.getHistoryCacheKey();
+        var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[cacheKey2];
+        if (loaded) {
+          var restored = session.settleDeadStagedMessages(loaded.messages || []).filter(function(m) {
+            return m && (m._ownerKey === void 0 || m._ownerKey === cacheKey2);
+          }).map(function(m) {
+            return m.role === "user" ? Object.assign({}, m, { content: sanitizeAttachmentLinksForHistory(m.content) }) : m;
+          });
+          var cachedStageIds = {};
+          restored.forEach(function(m) {
+            if (m._stageId) cachedStageIds[m._stageId] = true;
+          });
+          var stagedLive = prevMessages.filter(function(m) {
+            return m && m._stageId && !cachedStageIds[m._stageId] && (m._ownerKey === void 0 || m._ownerKey === cacheKey2);
+          });
+          CS.messages = restored.concat(stagedLive);
+          CS.historyEndOfList = !!loaded.endOfList;
+          CS.historyStartKeyHistory = Array.isArray(loaded.startKeyHistory) ? loaded.startKeyHistory.slice() : [];
+          session.aiChatHistoryCache[cacheKey2] = Object.assign({}, loaded, { messages: restored });
+          renderMessages();
+          scrollToBottom();
+        }
         if (loaded && !session.needsHistoryRefetch()) {
           session.drainBgTaskQueue();
           session.refreshLiveIndexState();

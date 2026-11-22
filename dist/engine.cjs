@@ -10175,6 +10175,7 @@ var _ChatSession = class _ChatSession {
   uploadSingleAttachment(att, stageId) {
     var self = this;
     var id = this.host.getIdentity();
+    var isIndexRetry = att.status === "indexError";
     att.status = "uploading";
     att.progress = null;
     att.errorMessage = "";
@@ -10227,7 +10228,12 @@ var _ChatSession = class _ChatSession {
             }
           });
         };
-        return findDuplicate(member).then(function(dup) {
+        if (isIndexRetry) {
+          hadExists = true;
+          existedBefore = true;
+        }
+        return (isIndexRetry ? Promise.resolve(null) : findDuplicate(member)).then(function(dup) {
+          if (isIndexRetry) return;
           if (dup) {
             duplicateOf = dup;
             console.log("[chat-engine] skipping an upload the user already has:", member.storagePath, "->", dup);
@@ -10424,7 +10430,7 @@ var _ChatSession = class _ChatSession {
         if (!self.state.attachments.some(function(a) {
           return a.id === att.id;
         })) return;
-        if (att.status === "done" || att.status === "indexError") {
+        if (att.status === "done") {
           if (att.kind === "folder" && att.uploadedUrls) {
             att.uploadedUrls.forEach(function(u) {
               collected.push({ name: u.path, url: u.url, storagePath: u.storagePath });

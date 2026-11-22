@@ -6744,6 +6744,12 @@ export class ChatSession {
 	uploadSingleAttachment(att: any, stageId?: string): Promise<Array<{ name: string; url: string; storagePath: string }>> {
 		var self = this;
 		var id = this.host.getIdentity();
+		// Read BEFORE the status is reset below: a chip in "indexError" is one whose
+		// bytes are already stored and only whose indexing failed. Its retry (the next
+		// Send) re-indexes the stored copies through the "file is already there,
+		// reindex it" path: no second upload, no "already exists" question about the
+		// user's own file, no duplicate check (agent.vue isIndexRetry).
+		var isIndexRetry = att.status === 'indexError';
 		// progress stays null until the first byte-progress event. Every upload
 		// opens with a get-signed-url round trip that reports nothing, so a chip
 		// initialised to 0 rendered an empty, motionless bar for the whole
@@ -6810,7 +6816,9 @@ export class ChatSession {
 						onProgress: onProg, setAbort: function (abort) { att._abort = abort; },
 					});
 				};
-				return findDuplicate(member).then(function (dup) {
+				if (isIndexRetry) { hadExists = true; existedBefore = true; }
+				return (isIndexRetry ? Promise.resolve(null) : findDuplicate(member)).then(function (dup) {
+					if (isIndexRetry) return;
 					if (dup) {
 						duplicateOf = dup;
 						console.log('[chat-engine] skipping an upload the user already has:', member.storagePath, '->', dup);
@@ -7027,7 +7035,9 @@ export class ChatSession {
 		snapshot.forEach(function (att: any) {
 			chain = chain.then(function () {
 				if (!self.state.attachments.some(function (a: any) { return a.id === att.id; })) return; // removed
-				if (att.status === 'done' || att.status === 'indexError') {
+				// "indexError" is NOT collected as-is: its upload worked but its indexing
+				// did not, and uploadSingleAttachment retries just the indexing.
+				if (att.status === 'done') {
 					if (att.kind === 'folder' && att.uploadedUrls) {
 						att.uploadedUrls.forEach(function (u: any) { collected.push({ name: u.path, url: u.url, storagePath: u.storagePath }); });
 						return;

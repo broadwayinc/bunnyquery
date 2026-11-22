@@ -146,6 +146,7 @@ import {
     // The element a preview's own transitions actually resize (the anchor, not the
     // <img>). Shared so both this and the engine's layout hook measure one node.
     previewLayoutBox,
+    sanitizeAttachmentLinksForHistory,
 } from "./engine";
 
 (function () {
@@ -2521,6 +2522,18 @@ import {
     // opts.imagePreviews: false — used by the collapsed indexing-row HEADER,
     // whose file chip must stay a plain inline chip: an is-image-preview block
     // there breaks the header's horizontal alignment (mirror of agent.vue).
+    // Drives the dots in [generating file.ext...] placeholders: one 400 ms ticker,
+    // running only while a reply is being typed and a placeholder is on screen.
+    var genDotTick = 0, genDotTimer = null;
+    function startGenDotTicker() {
+        if (genDotTimer) return;
+        genDotTimer = setInterval(function () {
+            var els = CS.typing && CS.messagesBox ? CS.messagesBox.querySelectorAll(".bq-gen-dots") : [];
+            if (!els.length) { clearInterval(genDotTimer); genDotTimer = null; genDotTick = 0; return; }
+            genDotTick = (genDotTick + 1) % 3;
+            for (var i = 0; i < els.length; i++) els[i].textContent = ".".repeat(genDotTick + 1);
+        }, 400);
+    }
     function parseMsgPartsHtml(content, opts) {
         var noPreviews = !!(opts && opts.imagePreviews === false);
         var placeholderHtml = [];
@@ -2533,7 +2546,11 @@ import {
         if (CS.typing) {
             var openFence = working.match(/```([^\n`]+?\.[^\s.`]+)\n?/);
             if (openFence && typeof openFence.index === "number") {
-                working = working.slice(0, openFence.index) + "\n[generating " + openFence[1] + "…]";
+                // Animated dots, as in agent.vue (dotTick): a span the ticker below
+                // updates in place, so the dots move even while the stream stalls.
+                working = working.slice(0, openFence.index) + "\n[generating " + openFence[1]
+                    + pushPlaceholder('<span class="bq-gen-dots">' + ".".repeat(genDotTick + 1) + "</span>") + "]";
+                startGenDotTicker();
             }
         }
         var codeMasks = [];
@@ -2712,8 +2729,33 @@ import {
             var fields = signed && signed.fields ? signed.fields : {};
             for (var name in fields) form.append(name, fields[name]);
             form.append("file", file);
-            return xhrUploadForm(signed.url, form, onProgress, setAbort);
+            return xhrUploadForm(signed.url, form, onProgress, setAbort).catch(function (err) {
+                // An abort stays as it is: the engine recognises it by its message.
+                if (err && (err === "Aborted" || err.message === "Aborted")) throw err;
+                // Surface the REAL reason (storage code/message, network, timeout)
+                // instead of a raw XML body (agent.vue summarizeUploadError).
+                var sum = summarizeUploadError(err);
+                var e = new Error("Upload failed for " + file.name + (sum.message ? ": " + sum.message : ""));
+                if (sum.code) e.code = sum.code;
+                throw e;
+            });
         });
+    }
+    // Distil a raw upload error (a storage XML error body, a JSON object, or a
+    // "Network error"/"Timeout" Error) into { code, message }. Mirrors agent.vue.
+    function summarizeUploadError(err) {
+        if (!err) return { code: "", message: "" };
+        if (typeof err === "string") {
+            var c = /<Code>([^<]+)<\/Code>/.exec(err), m = /<Message>([^<]+)<\/Message>/.exec(err);
+            var code = c ? c[1] : "", msg = m ? m[1] : "";
+            if (code || msg) return { code: code, message: msg || code };
+            return { code: "", message: err.length > 300 ? err.slice(0, 300) : err };
+        }
+        var ecode = err.code || (err.body && err.body.code) || "";
+        var emsg = err.message || (err.body && err.body.message) || "";
+        if (ecode || emsg) return { code: ecode, message: emsg };
+        try { return { code: "", message: JSON.stringify(err).slice(0, 300) }; }
+        catch (x) { return { code: "", message: String(err) }; }
     }
     // Delete a file's AI-index record ("src::<storagePath>") ahead of a
     // reindex/overwrite so the agent re-creates it fresh instead of colliding/
@@ -3475,7 +3517,7 @@ import {
         if (inputEl) inputEl.value = ""; // allow re-selecting the same file
     }
     function setupDragAndDrop(chatEl) {
-        var depth = 0, overlay = null;
+        var depth = 0, overlay = null, preparing = null;
         function showOverlay() {
             if (overlay || S.aiPlatform === "none") return;
             overlay = h("div", { class: "bq-drop-overlay" },
@@ -3506,7 +3548,20 @@ import {
         chatEl.addEventListener("drop", function (e) {
             if (!hasFiles(e) || S.aiPlatform === "none" || CS.chatSettingsOpen) return;
             e.preventDefault(); depth = 0; hideOverlay();
-            handleDrop(e.dataTransfer);
+            // A second drop while the first is still being read would queue another
+            // directory walk behind the one already making the page feel slow.
+            if (preparing) return;
+            // "Preparing files..." from the instant of the drop until the chips exist:
+            // a dropped folder takes a directory walk to become a file list, and the
+            // chat looked like it had ignored the drop meanwhile (agent.vue preparingDrop).
+            preparing = h("div", { class: "bq-drop-preparing", role: "status", "aria-live": "polite" },
+                bunnyLoader("Preparing files...", false));
+            chatEl.appendChild(preparing);
+            var done = function () {
+                if (preparing && preparing.parentNode) preparing.parentNode.removeChild(preparing);
+                preparing = null;
+            };
+            Promise.resolve().then(function () { return handleDrop(e.dataTransfer); }).then(done, done);
         });
     }
     // Build file/folder attachments from a drop. Uses webkitGetAsEntry so dropped
@@ -3522,7 +3577,7 @@ import {
                 var entry = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
                 entries.push(entry || it.getAsFile());
             }
-            Promise.all(entries.map(function (entry) {
+            return Promise.all(entries.map(function (entry) {
                 if (!entry) return Promise.resolve(null);
                 if (entry instanceof File) return Promise.resolve(newAttachment({ kind: "file", name: entry.name, file: entry }));
                 if (entry.isFile) {
@@ -3720,9 +3775,22 @@ import {
         if (refreshingLinkMap[originalHref]) return;
         var cached = refreshedExpiredLinkMap[originalHref];
         if (cached) { anchor.href = cached; anchor.dataset.bqExpired = "0"; anchor.click(); return; }
+        // Show the chip as busy while its url is fetched (agent.vue repaints the
+        // bubble off refreshingLinkMap; the same class and suffix
+        // renderInlineLinkHtml gives a refreshing chip, applied in place so the
+        // anchor clicked below is still the one on screen).
+        var busy = document.createTextNode(" (fetching...)");
+        anchor.classList.add("is-refreshing");
+        anchor.appendChild(busy);
+        var unbusy = function () {
+            anchor.classList.remove("is-refreshing");
+            if (busy.parentNode) busy.parentNode.removeChild(busy);
+        };
         fetchFreshHrefForExpiredLink(originalHref, anchor.dataset.bqRemotePath).then(function (fresh) {
+            unbusy();
             anchor.href = fresh; anchor.dataset.bqExpired = "0"; anchor.click();
         }).catch(function (err) {
+            unbusy();
             console.error("[bunnyquery] expired link refresh failed", err);
             // The chip itself is the message now: it turns grey and takes a ✕,
             // which survives past the moment an alert would have been dismissed
@@ -5091,6 +5159,10 @@ import {
                         var moPatch = { status: "done", finished: typeof moLast === "number" ? moLast : Date.now() };
                         if (typeof moFirst === "number") moPatch.started = moFirst;
                         if (mog.name) moPatch.filename = mog.name;
+                        // `platform` is not optional (agent.vue same): a record minted
+                        // without it is shown in BOTH chats, so a run finished under one
+                        // model painted a green "Indexed" row into the other's.
+                        if (S.aiPlatform === "claude" || S.aiPlatform === "openai") moPatch.platform = S.aiPlatform;
                         void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
                         // Patch the local sweep too, or its TTL-cached 'working'
                         // re-fires this block on every re-render (agent.vue same).
@@ -5237,6 +5309,9 @@ import {
         // Same reason, and the same blast radius: a "this file has no url" mark
         // is keyed by a project-relative storage path.
         for (var uk in unavailableLinkMap) delete unavailableLinkMap[uk];
+        // Kept for the cache restore below: a STAGED turn exists only here between
+        // Send and the first cache write, and must survive a redraw.
+        var prevMessages = CS.messages || [];
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.drafting = false; CS.draftingEl = null;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
@@ -5339,7 +5414,14 @@ import {
                 }
             });
             input.addEventListener("keydown", function (e) {
-                if (e.key === "Enter" && !e.shiftKey && !composing) { e.preventDefault(); sendMessage(); }
+                // Same rule as agent.vue (@keydown.enter.exact + handlePromptEnter): no
+                // modifier sends, and an Enter that is still part of an IME composition
+                // never does. Safari ends the composition BEFORE the Enter keydown that
+                // confirms a Korean/Japanese syllable, so the local flag alone missed it;
+                // isComposing / keyCode 229 catch that one.
+                if (e.key !== "Enter" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+                if (composing || e.isComposing || e.keyCode === 229) return;
+                e.preventDefault(); sendMessage();
             });
             // size the empty input correctly once it's in the DOM (avoids a
             // first-keystroke height jump / bottom clip from the CSS min-height)
@@ -5391,7 +5473,32 @@ import {
             // changed meanwhile arrives through the polls and the engine's queue check.
             // The first page is fetched again only when a waiting bubble has nothing
             // else to settle it.
-            var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[session.getHistoryCacheKey()];
+            var cacheKey = session.getHistoryCacheKey();
+            var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[cacheKey];
+            if (loaded) {
+                // Refill the list from memory FIRST (agent.vue loadChatHistory): the
+                // re-entry above emptied it, and without this a second draw of the
+                // same chat (sign out and back in, Back from e-mail verification)
+                // showed only the greeting, with nothing left to fetch it again.
+                // Bubbles stamped for another chat are dropped, dead staged turns
+                // settled, user links cleaned the way history shows them.
+                var restored = session.settleDeadStagedMessages(loaded.messages || [])
+                    .filter(function (m) { return m && (m._ownerKey === undefined || m._ownerKey === cacheKey); })
+                    .map(function (m) {
+                        return m.role === "user" ? Object.assign({}, m, { content: sanitizeAttachmentLinksForHistory(m.content) }) : m;
+                    });
+                var cachedStageIds = {};
+                restored.forEach(function (m) { if (m._stageId) cachedStageIds[m._stageId] = true; });
+                var stagedLive = prevMessages.filter(function (m) {
+                    return m && m._stageId && !cachedStageIds[m._stageId] && (m._ownerKey === undefined || m._ownerKey === cacheKey);
+                });
+                CS.messages = restored.concat(stagedLive);
+                CS.historyEndOfList = !!loaded.endOfList;
+                CS.historyStartKeyHistory = Array.isArray(loaded.startKeyHistory) ? loaded.startKeyHistory.slice() : [];
+                session.aiChatHistoryCache[cacheKey] = Object.assign({}, loaded, { messages: restored });
+                renderMessages();
+                scrollToBottom();
+            }
             if (loaded && !session.needsHistoryRefetch()) {
                 session.drainBgTaskQueue();
                 session.refreshLiveIndexState();
