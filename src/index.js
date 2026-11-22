@@ -2005,7 +2005,10 @@ import {
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
         getTemporaryUrl: function (path) { return getTemporaryUrlDb(path, ATTACHMENT_URL_EXPIRES_SECONDS); },
         deleteExistingFileRecord: function (path) { return deleteFileIndexRecordDb(path); },
-        ensureFileIndexRecord: function (path, meta) {
+        ensureFileIndexRecord: function (path, meta, keepGroup) {
+            // A re-index or an overwrite hands in the group the file's old record
+            // was at (readFileAccessGroup below): the file keeps it, nothing is asked.
+            if (keepGroup) return ensureFileIndexRecordDb(path, meta, keepGroup);
             // Resolve the group FIRST and remember it: the engine asks for it
             // straight after, and both the record and the answer have to be the
             // same decision or the file's own record and its extracted rows end
@@ -2015,6 +2018,9 @@ import {
             });
         },
         uploadAccessGroup: function (path) { return resolveUploadAccessGroup(path); },
+        // Read BEFORE a re-index deletes the file's src:: record, so the file keeps
+        // its visibility (mirrors agent.vue's readFileIndexAccessGroup).
+        readFileAccessGroup: function (path) { return readFileIndexAccessGroupDb(path); },
         // "Already uploaded by this user?" from the src:: file records. The engine
         // asks only while the skip-duplicates switch is on; null means upload.
         findDuplicateUpload: function (file) {
@@ -2181,14 +2187,20 @@ import {
         return session.uploadPendingAttachments(job.batchId, job.stageId).then(function (attachmentUrls) {
             // Collect any failures (upload or indexing) now, grouped by error
             // code + description, so we can report them once below.
-            var failureGroups = groupAttachmentFailures(CS.attachments.filter(function (a) {
+            var batchChips = CS.attachments.filter(function (a) {
                 return a._batchId === job.batchId;
-            }));
+            });
+            var failureGroups = groupAttachmentFailures(batchChips);
+            // Members skipped as duplicates (the engine records the stored copy each
+            // one matched), read BEFORE clearSuccessfulAttachments drops the finished
+            // chips they are recorded on. Same dialog, own section (agent.vue).
+            var duplicates = [];
+            batchChips.forEach(function (a) { (a.duplicates || []).forEach(function (d) { duplicates.push(d); }); });
             // Per-file "Indexing:" bubbles were already injected during upload (#1).
             // Keep only this batch's FAILED chips (red/yellow) so the user can
             // see/retry them; clear the successful ones.
             clearSuccessfulAttachments(job.batchId);
-            if (failureGroups.length) showUploadErrorReport(failureGroups);
+            if (failureGroups.length || duplicates.length) showUploadErrorReport(failureGroups, duplicates);
             return attachmentUrls;
         }).catch(function (err) {
             console.error("[bunnyquery] attachment upload failed", err);
@@ -2902,6 +2914,31 @@ import {
     // "__MEDIA__" media-index writes, which land while window 1 is still being BUILT, before
     // the model's first turn could create anything. Best-effort: losing the guarantee must
     // not lose the upload.
+    // The access group a file's EXISTING "src::" record is at, or null when there is
+    // no such record. A re-index deletes that record and posts it again, so without
+    // this the new one lands at whatever the upload setting says now: an "Only me"
+    // file silently becomes readable by every signed-in user, and a project set to
+    // "ask" prompts again. "No such record" comes back from the backend as a
+    // NOT_EXISTS error and is an answer (null); any other failure is unknown and
+    // rejects, so the caller never deletes the only record of the group on a guess.
+    // Mirrors web-bunnyquery's ai_agent.ts readFileIndexAccessGroup.
+    function readFileIndexAccessGroupDb(storagePath) {
+        if (!storagePath || !S.skapi || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+        return Promise.resolve(S.skapi.getRecords({ service: S.projectId, unique_id: "src::" + storagePath }))
+            .then(function (found) {
+                var rec = found && found.list && found.list[0];
+                var group = rec && rec.table ? rec.table.access_group : undefined;
+                if (group === "private") return "private";
+                if (group === 0 || group === "public") return "public";
+                if (group === 1 || group === "authorized") return "authorized";
+                return null;
+            }, function (err) {
+                var code = err && (err.code || (err.error && err.error.code));
+                var message = String((err && err.message) || "");
+                if (code === "NOT_EXISTS" || /unique id does not exist/i.test(message)) return null;
+                throw err;
+            });
+    }
     function ensureFileIndexRecordDb(storagePath, meta, accessGroup) {
         if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
         return Promise.resolve(S.skapi.postRecord(null, {
@@ -5554,25 +5591,53 @@ import {
      * pre-grouped by (error code, description) from groupAttachmentFailures(); we
      * list each distinct error once with the files it affected. The failed chips
      * stay in the attachment row so the user can remove or retry them. */
-    function showUploadErrorReport(groups) {
-        if (!groups || !groups.length) return;
+    // One report after a send: files that failed (they stay in the attachment row to
+    // retry) and files skipped as duplicates (the stored copy went with the message),
+    // with a Reindex for the stored copies. Mirrors agent.vue's upload report modal.
+    function showUploadErrorReport(groups, duplicates) {
+        groups = groups || []; duplicates = duplicates || [];
+        if (!groups.length && !duplicates.length) return;
         var totalFiles = groups.reduce(function (n, g) { return n + g.files.length; }, 0);
-        openModal(function (close) {
-            var sections = groups.map(function (g) {
-                var heading = g.code ? g.code + " — " + g.message : g.message;
-                return h("div", { class: "bq-upload-error-group" },
-                    h("p", { class: "bq-upload-error-heading", text: heading }),
-                    h("ul", { class: "bq-upload-error-files" },
-                        g.files.map(function (name) { return h("li", { text: name }); })));
-            });
+        var title = totalFiles
+            ? (totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added")
+            : (duplicates.length === 1 ? "1 file was already uploaded" : duplicates.length + " files were already uploaded");
+        var reindexing = false;
+        var handle = openModal(function (close) {
+            var body = [];
+            if (groups.length) {
+                body.push(h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }));
+                body.push(h("div", { class: "bq-upload-error-list" }, groups.map(function (g) {
+                    var heading = g.code ? g.code + ": " + g.message : g.message;
+                    return h("div", { class: "bq-upload-error-group" },
+                        h("p", { class: "bq-upload-error-heading", text: heading }),
+                        h("ul", { class: "bq-upload-error-files" },
+                            g.files.map(function (name) { return h("li", { text: name, translate: "no" }); })));
+                })));
+            }
+            var closeBtn = h("button", { class: "btn btn--outline", type: "button", onclick: function () { if (!reindexing) close(); } }, "Close");
+            var reindexBtn = null;
+            if (duplicates.length) {
+                body.push(h("p", { class: "bq-modal-desc", text: "This account had already uploaded these files, with the same name and size. The stored copy was attached to your message; nothing was uploaded or indexed again." }));
+                body.push(h("div", { class: "bq-upload-error-list" },
+                    h("div", { class: "bq-upload-error-group" },
+                        h("p", { class: "bq-upload-error-heading", text: "already uploaded (same name and size)" }),
+                        h("ul", { class: "bq-upload-error-files" },
+                            duplicates.map(function (d) { return h("li", { text: d.label, translate: "no" }); })))));
+                body.push(h("p", { class: "bq-modal-desc", text: "To index the stored copies again, choose Reindex. To upload such files again instead, turn off \"Skip duplicate files\" in the project settings." }));
+                reindexBtn = h("button", { class: "btn", type: "button", onclick: function () {
+                    if (reindexing) return;
+                    reindexing = true;
+                    reindexBtn.disabled = true; closeBtn.disabled = true;
+                    reindexBtn.textContent = "Reindexing...";
+                    session.reindexStoredFiles(duplicates).then(function () { close(); });
+                } }, "Reindex");
+            }
             return h("div", { class: "bq-modal" },
-                h("div", { class: "bq-modal-delete-header" },
-                    h("span", { text: totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added" })),
-                h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }),
-                h("div", { class: "bq-upload-error-list" }, sections),
-                h("div", { class: "bq-modal-btns" },
-                    h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Close")));
+                h("div", { class: "bq-modal-delete-header" }, h("span", { text: title })),
+                body,
+                h("div", { class: "bq-modal-btns" }, closeBtn, reindexBtn));
         });
+        return handle;
     }
 
     /* ========================================================================

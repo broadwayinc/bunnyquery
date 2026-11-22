@@ -3054,7 +3054,19 @@ interface ChatHost {
         name?: string;
         mime?: string;
         size?: number;
-    }): Promise<any>;
+    }, accessGroup?: 'public' | 'authorized' | 'private'): Promise<any>;
+    /**
+     * The access group a file's EXISTING "src::" record is at, or null when it has
+     * none (never indexed). Read by the engine BEFORE it deletes that record for a
+     * re-index or an overwrite: re-indexing a file is not a decision about who may
+     * read it, so the file keeps its group, and it is then passed to
+     * ensureFileIndexRecord as `accessGroup` and used for the indexing prompt
+     * instead of asking uploadAccessGroup (which may prompt again, or apply a
+     * changed project default and declassify a private file). Optional; a host
+     * without it re-decides the group as before. Should reject (not answer null)
+     * when the record could not be read, so a read failure never re-classifies.
+     */
+    readFileAccessGroup?(storagePath: string): Promise<'public' | 'authorized' | 'private' | null>;
     /**
      * The access group this file's records must be written at: the uploader's
      * choice, which is the project default or a per-upload answer.
@@ -4255,6 +4267,22 @@ declare class ChatSession {
     claimIndexRun(storagePath?: string): Promise<boolean>;
     /** Give the slot back — the dispatch failed, or was abandoned. */
     releaseIndexRun(storagePath?: string): void;
+    /**
+     * Index files that are ALREADY STORED again, without uploading anything: the
+     * Reindex answer of the "already uploaded" report, offered for the members a send
+     * skipped as duplicates (att.duplicates, see uploadSingleAttachment). The same
+     * steps the Files page's Reindex takes: claim the file (one already being indexed
+     * is left alone), keep its access group (host.readFileAccessGroup, read before the
+     * delete), clear the old index, re-create the file record, queue the first pass.
+     * Each file appears in the chat as a "Reindexing" row. Never rejects; resolves to
+     * the number of files queued.
+     */
+    reindexStoredFiles(list: Array<{
+        storagePath: string;
+        name?: string;
+        size?: number;
+        mime?: string;
+    }>): Promise<number>;
     /**
      * The same question, asked of the SERVER when this page cannot answer it.
      *

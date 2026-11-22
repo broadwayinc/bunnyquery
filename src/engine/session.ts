@@ -841,6 +841,95 @@ export class ChatSession {
 	}
 
 	/**
+	 * Index files that are ALREADY STORED again, without uploading anything: the
+	 * Reindex answer of the "already uploaded" report, offered for the members a send
+	 * skipped as duplicates (att.duplicates, see uploadSingleAttachment). The same
+	 * steps the Files page's Reindex takes: claim the file (one already being indexed
+	 * is left alone), keep its access group (host.readFileAccessGroup, read before the
+	 * delete), clear the old index, re-create the file record, queue the first pass.
+	 * Each file appears in the chat as a "Reindexing" row. Never rejects; resolves to
+	 * the number of files queued.
+	 */
+	reindexStoredFiles(list: Array<{ storagePath: string; name?: string; size?: number; mime?: string }>): Promise<number> {
+		var self = this;
+		var id = this.host.getIdentity();
+		var queued = 0;
+		if (!id.projectId || (id.platform !== 'claude' && id.platform !== 'openai')) return Promise.resolve(0);
+		var chain: Promise<any> = Promise.resolve();
+		(list || []).forEach(function (d) {
+			if (!d || !d.storagePath) return;
+			var storagePath = d.storagePath;
+			var name = d.name || storagePath.split('/').filter(Boolean).pop() || storagePath;
+			var mime = d.mime || self.host.getMimeType(name) || undefined;
+			chain = chain.then(function () {
+				var claimed = false;
+				var url = '';
+				var group: 'public' | 'authorized' | 'private' | undefined;
+				return self.claimIndexRun(storagePath).then(function (ok) {
+					claimed = ok;
+					if (!ok) return; // already being indexed
+					return Promise.resolve(self.host.getTemporaryUrl(storagePath)).then(function (u: any) {
+						url = typeof u === 'string' ? u : (u && u.url) || '';
+						if (!url) return;
+						return typeof self.host.readFileAccessGroup === 'function'
+							? Promise.resolve(self.host.readFileAccessGroup(storagePath)).then(function (g) { group = g || undefined; })
+							: undefined;
+					}).then(function () {
+						if (!url) return;
+						if (typeof self.host.deleteExistingFileRecord === 'function') {
+							return Promise.resolve(self.host.deleteExistingFileRecord(storagePath)).catch(function () { });
+						}
+					}).then(function () {
+						if (!url) return;
+						if (typeof self.host.ensureFileIndexRecord === 'function') {
+							return Promise.resolve(self.host.ensureFileIndexRecord(storagePath, { name: name, mime: mime, size: d.size }, group)).catch(function () { });
+						}
+					}).then(function () {
+						if (!url || group || typeof self.host.uploadAccessGroup !== 'function') return;
+						// No stored group (the file record was gone): the group the
+						// re-created record was just written at.
+						return Promise.resolve(self.host.uploadAccessGroup(storagePath)).then(function (g) { group = g || undefined; }).catch(function () { });
+					}).then(function () {
+						if (!url) { self.releaseIndexRun(storagePath); return; }
+						return self.trackIndexDispatch(notifyAgentSaveAttachment({
+							platform: id.platform as 'claude' | 'openai',
+							model: id.model,
+							service: id.projectId,
+							publicProjectId: id.publicProjectId,
+							owner: id.owner,
+							userId: id.userId || id.projectId,
+							serviceName: id.serviceName,
+							serviceDescription: id.serviceDescription,
+							attachment: { name: name, storagePath: storagePath, mime: mime, size: d.size, url: url, accessGroup: group },
+						})).then(function (ack: any) {
+							if (ack && typeof ack.id === 'string') {
+								queued += 1;
+								self.bgTaskQueue.push({
+									projectId: id.projectId, platform: id.platform as 'claude' | 'openai', id: ack.id,
+									filename: name,
+									storagePath: storagePath,
+									isReindex: true,
+									mime: mime,
+									size: d.size,
+									status: ack.status === 'running' ? 'running' : 'pending',
+									poll: ack.poll,
+								});
+								self.drainBgTaskQueue();
+							} else {
+								self.releaseIndexRun(storagePath);
+							}
+						});
+					});
+				}).catch(function (err: any) {
+					console.error('[chat-engine] reindex of a stored file failed', storagePath, err);
+					if (claimed) self.releaseIndexRun(storagePath);
+				});
+			});
+		});
+		return chain.then(function () { self.drainBgTaskQueue(); return queued; });
+	}
+
+	/**
 	 * The same question, asked of the SERVER when this page cannot answer it.
 	 *
 	 * hasLiveIndexRun only knows what this page did. That is not enough for the
@@ -6674,6 +6763,10 @@ export class ChatSession {
 		// below). Counted so a folder chip can say how many it reused.
 		var reusedCount = 0;
 		att.reused = false;
+		// The members skipped as duplicates, with the STORED copy each one matched, so
+		// the host can report them after the send and offer to reindex the stored
+		// copies (reindexStoredFiles). A retry decides afresh.
+		delete att.duplicates;
 		var chain: Promise<any> = Promise.resolve();
 		// "Already uploaded by this user, same name and size" -> the stored copy's
 		// storage path, else null. Asked only while the skip-duplicates switch
@@ -6753,6 +6846,14 @@ export class ChatSession {
 					if (skipped) return; // guard the indexing branch for a skipped member
 					if (duplicateOf) {
 						urls.push({ name: member.relPath, url: url, storagePath: duplicateOf });
+						if (!att.duplicates) att.duplicates = [];
+						att.duplicates.push({
+							label: member.relPath,
+							storagePath: duplicateOf,
+							name: member.file.name,
+							size: member.file.size,
+							mime: member.file.type || self.host.getMimeType(member.file.name) || undefined,
+						});
 						reusedCount += 1;
 						if (att.kind !== 'folder') { att.uploadedUrl = url; att.storagePath = duplicateOf; att.reused = true; }
 						else att.reusedCount = reusedCount;
@@ -6782,15 +6883,31 @@ export class ChatSession {
 					// run has already written and then not re-index them. Asked of the
 					// QUEUE, not just this page — see isIndexRunLive.
 					var alreadyIndexing = false;
+					// The group the file's EXISTING src:: record is at, read BEFORE the
+					// delete below destroys it: a re-index or an overwrite keeps the file's
+					// visibility instead of re-deciding it (host.readFileAccessGroup).
+					var existingGroup: 'public' | 'authorized' | 'private' | null = null;
 					var preIndex = self.claimIndexRun(member.storagePath).then(function (claimed) {
 						alreadyIndexing = !claimed;
 						if (alreadyIndexing) {
 							console.log('[chat-engine] skipping a duplicate index request for', member.storagePath);
 							return;
 						}
-						if (existedBefore && typeof self.host.deleteExistingFileRecord === 'function') {
-							return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { });
-						}
+						if (!existedBefore) return;
+						var readGroup = typeof self.host.readFileAccessGroup === 'function'
+							? Promise.resolve(self.host.readFileAccessGroup(member.storagePath)).then(function (g) { existingGroup = g || null; }, function (err: any) {
+								// Unknown is not "no group": deleting now would destroy the only
+								// record of it. Fail this member (the chip turns red and can be
+								// retried) and hand the claim back so the retry is not refused.
+								self.releaseIndexRun(member.storagePath);
+								throw err;
+							})
+							: Promise.resolve();
+						return readGroup.then(function () {
+							if (typeof self.host.deleteExistingFileRecord === 'function') {
+								return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { });
+							}
+						});
 					});
 					preIndex = preIndex.then(function () {
 						if (alreadyIndexing) return;
@@ -6799,7 +6916,7 @@ export class ChatSession {
 							name: member.file.name,
 							mime: mime || undefined,
 							size: member.file.size,
-						})).catch(function () { });
+						}, existingGroup || undefined)).catch(function () { });
 					});
 					// The access group the host actually recorded this file at. Read
 					// AFTER ensureFileIndexRecord so the value here is the one the
@@ -6807,6 +6924,7 @@ export class ChatSession {
 					var accessGroup: 'public' | 'authorized' | 'private' | undefined;
 					preIndex = preIndex.then(function () {
 						if (alreadyIndexing) return;
+						if (existingGroup) { accessGroup = existingGroup; return; }
 						if (typeof self.host.uploadAccessGroup !== 'function') return;
 						return Promise.resolve(self.host.uploadAccessGroup(member.storagePath))
 							.then(function (g) { accessGroup = g || undefined; })

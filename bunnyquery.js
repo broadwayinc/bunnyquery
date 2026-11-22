@@ -5356,6 +5356,105 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (storagePath) delete this._indexClaims[this._indexClaimKey(storagePath)];
     }
     /**
+     * Index files that are ALREADY STORED again, without uploading anything: the
+     * Reindex answer of the "already uploaded" report, offered for the members a send
+     * skipped as duplicates (att.duplicates, see uploadSingleAttachment). The same
+     * steps the Files page's Reindex takes: claim the file (one already being indexed
+     * is left alone), keep its access group (host.readFileAccessGroup, read before the
+     * delete), clear the old index, re-create the file record, queue the first pass.
+     * Each file appears in the chat as a "Reindexing" row. Never rejects; resolves to
+     * the number of files queued.
+     */
+    reindexStoredFiles(list) {
+      var self = this;
+      var id = this.host.getIdentity();
+      var queued = 0;
+      if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return Promise.resolve(0);
+      var chain = Promise.resolve();
+      (list || []).forEach(function(d) {
+        if (!d || !d.storagePath) return;
+        var storagePath = d.storagePath;
+        var name = d.name || storagePath.split("/").filter(Boolean).pop() || storagePath;
+        var mime = d.mime || self.host.getMimeType(name) || void 0;
+        chain = chain.then(function() {
+          var claimed = false;
+          var url = "";
+          var group;
+          return self.claimIndexRun(storagePath).then(function(ok) {
+            claimed = ok;
+            if (!ok) return;
+            return Promise.resolve(self.host.getTemporaryUrl(storagePath)).then(function(u) {
+              url = typeof u === "string" ? u : u && u.url || "";
+              if (!url) return;
+              return typeof self.host.readFileAccessGroup === "function" ? Promise.resolve(self.host.readFileAccessGroup(storagePath)).then(function(g) {
+                group = g || void 0;
+              }) : void 0;
+            }).then(function() {
+              if (!url) return;
+              if (typeof self.host.deleteExistingFileRecord === "function") {
+                return Promise.resolve(self.host.deleteExistingFileRecord(storagePath)).catch(function() {
+                });
+              }
+            }).then(function() {
+              if (!url) return;
+              if (typeof self.host.ensureFileIndexRecord === "function") {
+                return Promise.resolve(self.host.ensureFileIndexRecord(storagePath, { name, mime, size: d.size }, group)).catch(function() {
+                });
+              }
+            }).then(function() {
+              if (!url || group || typeof self.host.uploadAccessGroup !== "function") return;
+              return Promise.resolve(self.host.uploadAccessGroup(storagePath)).then(function(g) {
+                group = g || void 0;
+              }).catch(function() {
+              });
+            }).then(function() {
+              if (!url) {
+                self.releaseIndexRun(storagePath);
+                return;
+              }
+              return self.trackIndexDispatch(notifyAgentSaveAttachment({
+                platform: id.platform,
+                model: id.model,
+                service: id.projectId,
+                publicProjectId: id.publicProjectId,
+                owner: id.owner,
+                userId: id.userId || id.projectId,
+                serviceName: id.serviceName,
+                serviceDescription: id.serviceDescription,
+                attachment: { name, storagePath, mime, size: d.size, url, accessGroup: group }
+              })).then(function(ack) {
+                if (ack && typeof ack.id === "string") {
+                  queued += 1;
+                  self.bgTaskQueue.push({
+                    projectId: id.projectId,
+                    platform: id.platform,
+                    id: ack.id,
+                    filename: name,
+                    storagePath,
+                    isReindex: true,
+                    mime,
+                    size: d.size,
+                    status: ack.status === "running" ? "running" : "pending",
+                    poll: ack.poll
+                  });
+                  self.drainBgTaskQueue();
+                } else {
+                  self.releaseIndexRun(storagePath);
+                }
+              });
+            });
+          }).catch(function(err) {
+            console.error("[chat-engine] reindex of a stored file failed", storagePath, err);
+            if (claimed) self.releaseIndexRun(storagePath);
+          });
+        });
+      });
+      return chain.then(function() {
+        self.drainBgTaskQueue();
+        return queued;
+      });
+    }
+    /**
      * The same question, asked of the SERVER when this page cannot answer it.
      *
      * hasLiveIndexRun only knows what this page did. That is not enough for the
@@ -9910,6 +10009,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var anyIndexFailed = false;
       var reusedCount = 0;
       att.reused = false;
+      delete att.duplicates;
       var chain = Promise.resolve();
       var findDuplicate = function(member) {
         if (typeof self.host.findDuplicateUpload !== "function") return Promise.resolve(null);
@@ -9978,6 +10078,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             if (skipped) return;
             if (duplicateOf) {
               urls.push({ name: member.relPath, url, storagePath: duplicateOf });
+              if (!att.duplicates) att.duplicates = [];
+              att.duplicates.push({
+                label: member.relPath,
+                storagePath: duplicateOf,
+                name: member.file.name,
+                size: member.file.size,
+                mime: member.file.type || self.host.getMimeType(member.file.name) || void 0
+              });
               reusedCount += 1;
               if (att.kind !== "folder") {
                 att.uploadedUrl = url;
@@ -9994,16 +10102,26 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }
             var mime = member.file.type || self.host.getMimeType(member.file.name);
             var alreadyIndexing = false;
+            var existingGroup = null;
             var preIndex = self.claimIndexRun(member.storagePath).then(function(claimed) {
               alreadyIndexing = !claimed;
               if (alreadyIndexing) {
                 console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
                 return;
               }
-              if (existedBefore && typeof self.host.deleteExistingFileRecord === "function") {
-                return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
-                });
-              }
+              if (!existedBefore) return;
+              var readGroup = typeof self.host.readFileAccessGroup === "function" ? Promise.resolve(self.host.readFileAccessGroup(member.storagePath)).then(function(g) {
+                existingGroup = g || null;
+              }, function(err) {
+                self.releaseIndexRun(member.storagePath);
+                throw err;
+              }) : Promise.resolve();
+              return readGroup.then(function() {
+                if (typeof self.host.deleteExistingFileRecord === "function") {
+                  return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+                  });
+                }
+              });
             });
             preIndex = preIndex.then(function() {
               if (alreadyIndexing) return;
@@ -10012,12 +10130,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                 name: member.file.name,
                 mime: mime || void 0,
                 size: member.file.size
-              })).catch(function() {
+              }, existingGroup || void 0)).catch(function() {
               });
             });
             var accessGroup;
             preIndex = preIndex.then(function() {
               if (alreadyIndexing) return;
+              if (existingGroup) {
+                accessGroup = existingGroup;
+                return;
+              }
               if (typeof self.host.uploadAccessGroup !== "function") return;
               return Promise.resolve(self.host.uploadAccessGroup(member.storagePath)).then(function(g) {
                 accessGroup = g || void 0;
@@ -12063,13 +12185,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       deleteExistingFileRecord: function(path) {
         return deleteFileIndexRecordDb(path);
       },
-      ensureFileIndexRecord: function(path, meta) {
+      ensureFileIndexRecord: function(path, meta, keepGroup) {
+        if (keepGroup) return ensureFileIndexRecordDb(path, meta, keepGroup);
         return resolveUploadAccessGroup(path).then(function(g) {
           return ensureFileIndexRecordDb(path, meta, g);
         });
       },
       uploadAccessGroup: function(path) {
         return resolveUploadAccessGroup(path);
+      },
+      // Read BEFORE a re-index deletes the file's src:: record, so the file keeps
+      // its visibility (mirrors agent.vue's readFileIndexAccessGroup).
+      readFileAccessGroup: function(path) {
+        return readFileIndexAccessGroupDb(path);
       },
       // "Already uploaded by this user?" from the src:: file records. The engine
       // asks only while the skip-duplicates switch is on; null means upload.
@@ -12244,11 +12372,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     function runAttachmentUpload(job) {
       return session.uploadPendingAttachments(job.batchId, job.stageId).then(function(attachmentUrls) {
-        var failureGroups = groupAttachmentFailures(CS.attachments.filter(function(a) {
+        var batchChips = CS.attachments.filter(function(a) {
           return a._batchId === job.batchId;
-        }));
+        });
+        var failureGroups = groupAttachmentFailures(batchChips);
+        var duplicates = [];
+        batchChips.forEach(function(a) {
+          (a.duplicates || []).forEach(function(d) {
+            duplicates.push(d);
+          });
+        });
         clearSuccessfulAttachments(job.batchId);
-        if (failureGroups.length) showUploadErrorReport(failureGroups);
+        if (failureGroups.length || duplicates.length) showUploadErrorReport(failureGroups, duplicates);
         return attachmentUrls;
       }).catch(function(err) {
         console.error("[bunnyquery] attachment upload failed", err);
@@ -12751,6 +12886,22 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         });
       }
       return createChain();
+    }
+    function readFileIndexAccessGroupDb(storagePath) {
+      if (!storagePath || !S.skapi || typeof S.skapi.getRecords !== "function") return Promise.resolve(null);
+      return Promise.resolve(S.skapi.getRecords({ service: S.projectId, unique_id: "src::" + storagePath })).then(function(found) {
+        var rec = found && found.list && found.list[0];
+        var group = rec && rec.table ? rec.table.access_group : void 0;
+        if (group === "private") return "private";
+        if (group === 0 || group === "public") return "public";
+        if (group === 1 || group === "authorized") return "authorized";
+        return null;
+      }, function(err) {
+        var code = err && (err.code || err.error && err.error.code);
+        var message = String(err && err.message || "");
+        if (code === "NOT_EXISTS" || /unique id does not exist/i.test(message)) return null;
+        throw err;
+      });
     }
     function ensureFileIndexRecordDb(storagePath, meta, accessGroup) {
       if (!storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
@@ -14809,44 +14960,78 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }, { dismissible: false });
       });
     }
-    function showUploadErrorReport(groups) {
-      if (!groups || !groups.length) return;
+    function showUploadErrorReport(groups, duplicates) {
+      groups = groups || [];
+      duplicates = duplicates || [];
+      if (!groups.length && !duplicates.length) return;
       var totalFiles = groups.reduce(function(n, g) {
         return n + g.files.length;
       }, 0);
-      openModal(function(close) {
-        var sections = groups.map(function(g) {
-          var heading = g.code ? g.code + " \u2014 " + g.message : g.message;
-          return h(
+      var title = totalFiles ? totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added" : duplicates.length === 1 ? "1 file was already uploaded" : duplicates.length + " files were already uploaded";
+      var reindexing = false;
+      var handle = openModal(function(close) {
+        var body = [];
+        if (groups.length) {
+          body.push(h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }));
+          body.push(h("div", { class: "bq-upload-error-list" }, groups.map(function(g) {
+            var heading = g.code ? g.code + ": " + g.message : g.message;
+            return h(
+              "div",
+              { class: "bq-upload-error-group" },
+              h("p", { class: "bq-upload-error-heading", text: heading }),
+              h(
+                "ul",
+                { class: "bq-upload-error-files" },
+                g.files.map(function(name) {
+                  return h("li", { text: name, translate: "no" });
+                })
+              )
+            );
+          })));
+        }
+        var closeBtn = h("button", { class: "btn btn--outline", type: "button", onclick: function() {
+          if (!reindexing) close();
+        } }, "Close");
+        var reindexBtn = null;
+        if (duplicates.length) {
+          body.push(h("p", { class: "bq-modal-desc", text: "This account had already uploaded these files, with the same name and size. The stored copy was attached to your message; nothing was uploaded or indexed again." }));
+          body.push(h(
             "div",
-            { class: "bq-upload-error-group" },
-            h("p", { class: "bq-upload-error-heading", text: heading }),
+            { class: "bq-upload-error-list" },
             h(
-              "ul",
-              { class: "bq-upload-error-files" },
-              g.files.map(function(name) {
-                return h("li", { text: name });
-              })
+              "div",
+              { class: "bq-upload-error-group" },
+              h("p", { class: "bq-upload-error-heading", text: "already uploaded (same name and size)" }),
+              h(
+                "ul",
+                { class: "bq-upload-error-files" },
+                duplicates.map(function(d) {
+                  return h("li", { text: d.label, translate: "no" });
+                })
+              )
             )
-          );
-        });
+          ));
+          body.push(h("p", { class: "bq-modal-desc", text: 'To index the stored copies again, choose Reindex. To upload such files again instead, turn off "Skip duplicate files" in the project settings.' }));
+          reindexBtn = h("button", { class: "btn", type: "button", onclick: function() {
+            if (reindexing) return;
+            reindexing = true;
+            reindexBtn.disabled = true;
+            closeBtn.disabled = true;
+            reindexBtn.textContent = "Reindexing...";
+            session.reindexStoredFiles(duplicates).then(function() {
+              close();
+            });
+          } }, "Reindex");
+        }
         return h(
           "div",
           { class: "bq-modal" },
-          h(
-            "div",
-            { class: "bq-modal-delete-header" },
-            h("span", { text: totalFiles === 1 ? "1 file could not be added" : totalFiles + " files could not be added" })
-          ),
-          h("p", { class: "bq-modal-desc", text: "These files were not added to your message. They stay in the attachment row so you can remove or retry them." }),
-          h("div", { class: "bq-upload-error-list" }, sections),
-          h(
-            "div",
-            { class: "bq-modal-btns" },
-            h("button", { class: "btn btn--outline", type: "button", onclick: close }, "Close")
-          )
+          h("div", { class: "bq-modal-delete-header" }, h("span", { text: title })),
+          body,
+          h("div", { class: "bq-modal-btns" }, closeBtn, reindexBtn)
         );
       });
+      return handle;
     }
     function parseAiAgentValue2(value) {
       var raw = (value || "").trim();

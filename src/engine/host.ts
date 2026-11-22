@@ -380,7 +380,19 @@ export interface ChatHost {
 	 * reference target that exists. Optional: a host without it keeps the old behaviour, where
 	 * whichever pass got there first created the record and the others hoped it had.
 	 */
-	ensureFileIndexRecord?(storagePath: string, meta?: { name?: string; mime?: string; size?: number }): Promise<any>;
+	ensureFileIndexRecord?(storagePath: string, meta?: { name?: string; mime?: string; size?: number }, accessGroup?: 'public' | 'authorized' | 'private'): Promise<any>;
+	/**
+	 * The access group a file's EXISTING "src::" record is at, or null when it has
+	 * none (never indexed). Read by the engine BEFORE it deletes that record for a
+	 * re-index or an overwrite: re-indexing a file is not a decision about who may
+	 * read it, so the file keeps its group, and it is then passed to
+	 * ensureFileIndexRecord as `accessGroup` and used for the indexing prompt
+	 * instead of asking uploadAccessGroup (which may prompt again, or apply a
+	 * changed project default and declassify a private file). Optional; a host
+	 * without it re-decides the group as before. Should reject (not answer null)
+	 * when the record could not be read, so a read failure never re-classifies.
+	 */
+	readFileAccessGroup?(storagePath: string): Promise<'public' | 'authorized' | 'private' | null>;
 	/**
 	 * The access group this file's records must be written at: the uploader's
 	 * choice, which is the project default or a per-upload answer.

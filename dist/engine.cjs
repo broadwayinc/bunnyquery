@@ -5537,6 +5537,105 @@ var _ChatSession = class _ChatSession {
     if (storagePath) delete this._indexClaims[this._indexClaimKey(storagePath)];
   }
   /**
+   * Index files that are ALREADY STORED again, without uploading anything: the
+   * Reindex answer of the "already uploaded" report, offered for the members a send
+   * skipped as duplicates (att.duplicates, see uploadSingleAttachment). The same
+   * steps the Files page's Reindex takes: claim the file (one already being indexed
+   * is left alone), keep its access group (host.readFileAccessGroup, read before the
+   * delete), clear the old index, re-create the file record, queue the first pass.
+   * Each file appears in the chat as a "Reindexing" row. Never rejects; resolves to
+   * the number of files queued.
+   */
+  reindexStoredFiles(list) {
+    var self = this;
+    var id = this.host.getIdentity();
+    var queued = 0;
+    if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return Promise.resolve(0);
+    var chain = Promise.resolve();
+    (list || []).forEach(function(d) {
+      if (!d || !d.storagePath) return;
+      var storagePath = d.storagePath;
+      var name = d.name || storagePath.split("/").filter(Boolean).pop() || storagePath;
+      var mime = d.mime || self.host.getMimeType(name) || void 0;
+      chain = chain.then(function() {
+        var claimed = false;
+        var url = "";
+        var group;
+        return self.claimIndexRun(storagePath).then(function(ok) {
+          claimed = ok;
+          if (!ok) return;
+          return Promise.resolve(self.host.getTemporaryUrl(storagePath)).then(function(u) {
+            url = typeof u === "string" ? u : u && u.url || "";
+            if (!url) return;
+            return typeof self.host.readFileAccessGroup === "function" ? Promise.resolve(self.host.readFileAccessGroup(storagePath)).then(function(g) {
+              group = g || void 0;
+            }) : void 0;
+          }).then(function() {
+            if (!url) return;
+            if (typeof self.host.deleteExistingFileRecord === "function") {
+              return Promise.resolve(self.host.deleteExistingFileRecord(storagePath)).catch(function() {
+              });
+            }
+          }).then(function() {
+            if (!url) return;
+            if (typeof self.host.ensureFileIndexRecord === "function") {
+              return Promise.resolve(self.host.ensureFileIndexRecord(storagePath, { name, mime, size: d.size }, group)).catch(function() {
+              });
+            }
+          }).then(function() {
+            if (!url || group || typeof self.host.uploadAccessGroup !== "function") return;
+            return Promise.resolve(self.host.uploadAccessGroup(storagePath)).then(function(g) {
+              group = g || void 0;
+            }).catch(function() {
+            });
+          }).then(function() {
+            if (!url) {
+              self.releaseIndexRun(storagePath);
+              return;
+            }
+            return self.trackIndexDispatch(notifyAgentSaveAttachment({
+              platform: id.platform,
+              model: id.model,
+              service: id.projectId,
+              publicProjectId: id.publicProjectId,
+              owner: id.owner,
+              userId: id.userId || id.projectId,
+              serviceName: id.serviceName,
+              serviceDescription: id.serviceDescription,
+              attachment: { name, storagePath, mime, size: d.size, url, accessGroup: group }
+            })).then(function(ack) {
+              if (ack && typeof ack.id === "string") {
+                queued += 1;
+                self.bgTaskQueue.push({
+                  projectId: id.projectId,
+                  platform: id.platform,
+                  id: ack.id,
+                  filename: name,
+                  storagePath,
+                  isReindex: true,
+                  mime,
+                  size: d.size,
+                  status: ack.status === "running" ? "running" : "pending",
+                  poll: ack.poll
+                });
+                self.drainBgTaskQueue();
+              } else {
+                self.releaseIndexRun(storagePath);
+              }
+            });
+          });
+        }).catch(function(err) {
+          console.error("[chat-engine] reindex of a stored file failed", storagePath, err);
+          if (claimed) self.releaseIndexRun(storagePath);
+        });
+      });
+    });
+    return chain.then(function() {
+      self.drainBgTaskQueue();
+      return queued;
+    });
+  }
+  /**
    * The same question, asked of the SERVER when this page cannot answer it.
    *
    * hasLiveIndexRun only knows what this page did. That is not enough for the
@@ -10091,6 +10190,7 @@ var _ChatSession = class _ChatSession {
     var anyIndexFailed = false;
     var reusedCount = 0;
     att.reused = false;
+    delete att.duplicates;
     var chain = Promise.resolve();
     var findDuplicate = function(member) {
       if (typeof self.host.findDuplicateUpload !== "function") return Promise.resolve(null);
@@ -10159,6 +10259,14 @@ var _ChatSession = class _ChatSession {
           if (skipped) return;
           if (duplicateOf) {
             urls.push({ name: member.relPath, url, storagePath: duplicateOf });
+            if (!att.duplicates) att.duplicates = [];
+            att.duplicates.push({
+              label: member.relPath,
+              storagePath: duplicateOf,
+              name: member.file.name,
+              size: member.file.size,
+              mime: member.file.type || self.host.getMimeType(member.file.name) || void 0
+            });
             reusedCount += 1;
             if (att.kind !== "folder") {
               att.uploadedUrl = url;
@@ -10175,16 +10283,26 @@ var _ChatSession = class _ChatSession {
           }
           var mime = member.file.type || self.host.getMimeType(member.file.name);
           var alreadyIndexing = false;
+          var existingGroup = null;
           var preIndex = self.claimIndexRun(member.storagePath).then(function(claimed) {
             alreadyIndexing = !claimed;
             if (alreadyIndexing) {
               console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
               return;
             }
-            if (existedBefore && typeof self.host.deleteExistingFileRecord === "function") {
-              return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
-              });
-            }
+            if (!existedBefore) return;
+            var readGroup = typeof self.host.readFileAccessGroup === "function" ? Promise.resolve(self.host.readFileAccessGroup(member.storagePath)).then(function(g) {
+              existingGroup = g || null;
+            }, function(err) {
+              self.releaseIndexRun(member.storagePath);
+              throw err;
+            }) : Promise.resolve();
+            return readGroup.then(function() {
+              if (typeof self.host.deleteExistingFileRecord === "function") {
+                return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+                });
+              }
+            });
           });
           preIndex = preIndex.then(function() {
             if (alreadyIndexing) return;
@@ -10193,12 +10311,16 @@ var _ChatSession = class _ChatSession {
               name: member.file.name,
               mime: mime || void 0,
               size: member.file.size
-            })).catch(function() {
+            }, existingGroup || void 0)).catch(function() {
             });
           });
           var accessGroup;
           preIndex = preIndex.then(function() {
             if (alreadyIndexing) return;
+            if (existingGroup) {
+              accessGroup = existingGroup;
+              return;
+            }
             if (typeof self.host.uploadAccessGroup !== "function") return;
             return Promise.resolve(self.host.uploadAccessGroup(member.storagePath)).then(function(g) {
               accessGroup = g || void 0;
