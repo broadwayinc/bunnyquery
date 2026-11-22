@@ -25,6 +25,22 @@ A few notes on how to read this:
 
 ---
 
+## 1.19.1 (2026-11-22, not yet published)
+
+Fixes to the indexing rows, and file uploads for users who are not the project owner. 1.18.0 and 1.19.0 have no entries here.
+
+### Engine
+
+- **Uploads by users other than the project owner index again.** skapi lets only the owner read a stored file that has no file record yet, and the engine read the file's link before creating that record, so for anyone else the upload failed with "No access to this file." When the link is refused, the engine now creates the file record first (as the uploader, at the group they chose) and asks again.
+- **A row says "Queued" only before its file's first pass finishes.** Between two passes of one file the queue can still list the pass that just ended, and the row read "Queued" next to pages already saved.
+- **Rows when more than 20 passes wait in the queue.** The queue check reads 20 running and 20 waiting passes. A list the server marks as not ended now counts as cut off even when it is shorter than 20. A file whose run is open and that is not in the complete running list reads "Queued" instead of "Fetching status". A file seen leaving the queue stays "Indexed" when a later check comes back cut off. A file just sent reads "Queued" while another file is running.
+- **Page progress** ("9 of 40 pages") is found by the row's key or file name when the row has no storage path yet, so it no longer drops out between passes.
+
+### Widget
+
+- The same rows through the engine.
+- Also in this release, from a commit after the 1.19.0 publish (46b6545): retrying a file whose indexing failed, upload error summaries, the "Preparing files..." loader on drop, link refresh feedback and animated dots while a reply is generated.
+
 ## 1.17.0 (2026-10-26, not yet published)
 
 The chat prompt no longer sends spreadsheet numbers to `queryGrid`. It now gives the agent a search path through the database (tables, then indexes and tags, then records, each searched by beginning and by ending when the exact name is unknown) and computes figures from the detail rows of the indexed records, with the roll-up sheets and total rows excluded. Pairs with the MCP server dropping `queryGrid` from the chat tool profile.
