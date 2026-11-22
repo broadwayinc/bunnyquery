@@ -195,6 +195,311 @@ declare function findAttachmentParser(name: string, mime?: string): AttachmentPa
 declare function parseAttachmentContent(file: File, name: string, mime?: string): Promise<string | null>;
 
 /**
+ * The project's BunnyQuery settings, held as a record in the project's own
+ * database rather than on the skapi service record.
+ *
+ * WHY A RECORD. The upload access group used to live on the service record as
+ * `default_access_group`, which was ALSO the skapi SDK's project-wide default
+ * for `table.access_group`. One field meant two things: "what BunnyQuery indexes
+ * new files at" and "what every SDK record call on this project defaults to".
+ * That coupling is gone. The SDK no longer has a project default at all, so this
+ * setting needs a home of its own, and a plain public record in the customer's
+ * own project is one every client can already reach with the calls it has.
+ *
+ * SHAPE. One record per project, holding an OBJECT rather than a single value:
+ *
+ *     unique_id: 'bq::settings'
+ *     table:     { name: '__SETTINGS__', access_group: 'public' }
+ *     data:      { upload_access_group: 'authorized' }
+ *
+ * One record and one fetch covers every present and future project setting. A
+ * second setting is a new key, not a new record, so the "wait for settings
+ * before the first upload" hand-off below never has to become several waits.
+ *
+ * WHY PUBLIC. The widget reads this, and the widget frequently runs before there
+ * is any session. Group 0 is the only group an unauthenticated caller is served
+ * (`check_rec_access` returns immediately for "00" and refuses the rest). Note
+ * this is NOT sufficient on its own: skapi's `require_login` gate refuses ALL
+ * database reads from a signed-out visitor, and it defaults to true, so on most
+ * projects a signed-out widget still cannot read this and falls back to the
+ * default. That is survivable because the only thing a signed-out visitor could
+ * do with the value is upload, which they cannot do either.
+ *
+ * WHY THE VALUE MATTERS. The file BYTES are not what the access group controls.
+ * BunnyQuery uploads to db storage, whose object key carries no access group and
+ * whose read path performs no access check. What carries the group is the
+ * RECORDS: the `src::` file record in `file_summaries`, the `run::`/`done::`
+ * markers in `__INDEXING__`, and every content record the indexing agent
+ * extracts. Those are what a chat answers from, so those are what decide who the
+ * file is visible to. The same value is also handed to the chat system prompt as
+ * `indexAccessGroup`, because a record written under a different group is in a
+ * different table and never comes back with the rest of the file.
+ *
+ * TRANSPORT-FREE, like the rest of the engine. The store never imports a skapi
+ * instance; the consumer injects a reader. See configureProjectSettings.
+ */
+/** The access groups a BunnyQuery upload may be recorded at. */
+type UploadAccessGroup = 'public' | 'authorized' | 'private';
+declare const UPLOAD_ACCESS_GROUPS: UploadAccessGroup[];
+/**
+ * What the project's upload-access setting may be: one of the three groups the
+ * dashboard offers, or 'ask' to be prompted per upload.
+ *
+ * `'admin'` (99) is deliberately not offered: a file only a master can read is
+ * indistinguishable from one that failed to upload, and no dashboard control
+ * would produce it.
+ */
+type ProjectAccessSetting = UploadAccessGroup | 'ask';
+/**
+ * `authorized` is the default because it is what every record written before
+ * this setting existed was hardcoded to. A project that never opens the setting
+ * keeps exactly the visibility it already had. It is also what the abandoned
+ * `default_access_group` service field was seeded to at project creation, so a
+ * project carrying that old value reads the same before and after the move.
+ */
+declare const DEFAULT_UPLOAD_ACCESS_GROUP: UploadAccessGroup;
+/** Where the settings record lives. Shared so no client re-derives it. */
+declare const PROJECT_SETTINGS_TABLE = "__SETTINGS__";
+declare const PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
+declare const PROJECT_SETTINGS_ACCESS_GROUP = "public";
+declare const UPLOAD_ACCESS_LABELS: Record<UploadAccessGroup, string>;
+declare const UPLOAD_ACCESS_HINTS: Record<UploadAccessGroup, string>;
+/** Menu/modal option list, in the order they should be shown. */
+declare const UPLOAD_ACCESS_OPTIONS: {
+    value: UploadAccessGroup;
+    label: string;
+    hint: string;
+}[];
+/** The settings record's `data`. Open-ended: future settings are new keys. */
+type ProjectSettingsData = {
+    upload_access_group?: unknown;
+    chat_greeting?: unknown;
+    web_access?: unknown;
+    skip_duplicate_files?: unknown;
+    answer_mode?: unknown;
+    [key: string]: unknown;
+};
+/**
+ * Whether a CHAT answer may reach the open web (Claude `web_fetch`, OpenAI
+ * `web_search`). Same record, its own `web_access` key.
+ *
+ * OFF BY DEFAULT, and the default is the point: customers reported answers that
+ * were not in their data, and an open web tool is one of the ways such an answer
+ * gets out. A project that never opens the setting answers from its files and
+ * database alone. Only the literal `true` turns it on: this record is public and
+ * a client must never read a value it did not write as permission.
+ *
+ * Resolution, applied by the engine where the chat request is built (config.ts
+ * resolveWebAccess): THIS SETTING IS THE CEILING and the host may only restrict.
+ *   effective = projectSetting && hostOption !== false
+ * A host's `webAccess: false` turns a project that is on off for its own page;
+ * a host's `true` on a project that is off has no effect, because the owner's
+ * switch is the one that lets an answer out onto the web. Indexing requests are
+ * not governed by this: an indexing pass keeps the tools it has today (see
+ * requests.ts notifyAgentSaveAttachment).
+ */
+declare const DEFAULT_WEB_ACCESS = false;
+/** Narrow a stored value to the switch: only `true` is on. */
+declare function normalizeWebAccess(value: any): boolean;
+/** The switch held in a settings-record `data`, false when unset. */
+declare function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * Whether an upload that is byte-for-byte the SAME FILE the signed-in user
+ * already has in this project (same name, same size, same uploader) is skipped:
+ * not uploaded again and not indexed again, with the chat turn using the stored
+ * copy. Same record, its own `skip_duplicate_files` key.
+ *
+ * ON BY DEFAULT: a second copy of a file costs a second indexing run, which is
+ * the single most expensive thing a project does, and answers from two copies
+ * of one document double every row. Only the literal `false` turns it off: this
+ * record is public and a client must never read a value it did not write.
+ *
+ * Resolution is the same ceiling rule as `web_access` (config.ts
+ * resolveSkipDuplicateFiles): effective = projectSetting && hostOption !== false.
+ * The host's `skipDuplicateFiles: false` lets its page re-upload duplicates on
+ * a project that skips them; a host's `true` on a project that turned it off has
+ * no effect.
+ */
+declare const DEFAULT_SKIP_DUPLICATE_FILES = true;
+/** Narrow a stored value to the switch: only the literal `false` is off. */
+declare function normalizeSkipDuplicateFiles(value: any): boolean;
+/** The switch held in a settings-record `data`, true when unset. */
+declare function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * How much the model thinks before a CHAT answer. Same record, its own
+ * `answer_mode` key. Optional, and absent on almost every project.
+ *
+ *   'standard'  the provider's own default. NOTHING is added to the request: a
+ *               project that never opens the setting sends byte for byte the
+ *               request it sent before the setting existed.
+ *   'fast'      effort "low": fewer reasoning tokens and fewer tool round trips,
+ *               so a simple question comes back sooner.
+ *   'thorough'  effort "high": more reasoning before the answer, for questions
+ *               that need several reads to get right.
+ *
+ * Only the literal 'fast' or 'thorough' changes anything. This record is public
+ * and a client must never act on a value it did not write, so every other value
+ * (absent, a typo, a number) reads as 'standard'.
+ *
+ * Applied where the chat request is built (config.ts resolveAnswerMode, then
+ * requests.ts chatEffortFields): OpenAI `reasoning.effort` and Claude
+ * `output_config.effort`, and only on models known to accept the field. A model
+ * that does not is sent no field at all, as if the mode were 'standard'.
+ * Indexing passes never read this setting.
+ */
+type AnswerMode = 'standard' | 'fast' | 'thorough';
+declare const ANSWER_MODES: AnswerMode[];
+declare const DEFAULT_ANSWER_MODE: AnswerMode;
+/** The setting's own name, for a settings page heading or row label. */
+declare const ANSWER_MODE_SETTING_LABEL = "Answer mode";
+declare const ANSWER_MODE_LABELS: Record<AnswerMode, string>;
+declare const ANSWER_MODE_HINTS: Record<AnswerMode, string>;
+/** Menu option list, in the order it should be shown. */
+declare const ANSWER_MODE_OPTIONS: {
+    value: AnswerMode;
+    label: string;
+    hint: string;
+}[];
+/** Narrow a stored value to a mode: only 'fast' and 'thorough' are not standard. */
+declare function normalizeAnswerMode(value: any): AnswerMode;
+/** The mode held in a settings-record `data`, 'standard' when unset. */
+declare function answerModeFrom(data: ProjectSettingsData | null | undefined): AnswerMode;
+/**
+ * Longest custom opening line the dashboard will store.
+ *
+ * The bubble is chrome, not content: it is painted before the conversation and
+ * cannot be scrolled past, so an essay here pushes the composer off a phone
+ * screen. It is ALSO handed to the model verbatim as "what you opened with"
+ * (buildChatSystemPrompt's `greeting`), so every turn of every chat pays for its
+ * length in tokens. Enforced where it is SAVED as well as where it is read, so a
+ * value written by something other than the settings page cannot bloat either.
+ */
+declare const CHAT_GREETING_MAX_LENGTH = 400;
+/**
+ * Narrow a stored greeting to a usable line: '' means "use the built-in".
+ *
+ * Anything that is not a string is unset rather than an error -- this record is
+ * public and a client must never break on a value it did not write.
+ */
+declare function normalizeChatGreeting(value: any): string;
+/** The project's custom opening line, or '' when it has never set one. */
+declare function chatGreetingFrom(data: ProjectSettingsData | null | undefined): string;
+/** Narrow an unknown stored value to a usable group, falling back to the default. */
+declare function normalizeUploadAccessGroup(value: any): UploadAccessGroup;
+/**
+ * The stored setting as written, or null when the project has never set one.
+ *
+ * Returns null rather than a default so callers can tell "unset" from "set to
+ * authorized". The settings page needs that distinction to decide what the
+ * control shows; upload paths do not and use uploadAccessGroupFrom instead.
+ */
+declare function normalizeProjectAccessSetting(value: any): ProjectAccessSetting | null;
+/** The setting held in a settings-record `data`, or null when unset. */
+declare function accessSettingFrom(data: ProjectSettingsData | null | undefined): ProjectAccessSetting | null;
+/** The group an upload lands in when the project is NOT set to 'ask'. */
+declare function uploadAccessGroupFrom(data: ProjectSettingsData | null | undefined): UploadAccessGroup;
+/** True when the project wants to be asked per upload rather than told once. */
+declare function asksUploadAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * Fetch one project's settings record. Resolves the record's `data`, or null
+ * when there is no record.
+ *
+ * MAY REJECT, and the store treats a rejection as "no record": a signed-out
+ * visitor on a `require_login` project gets REQUIRE_LOGIN here, which is a
+ * normal outcome and not an error the user should ever see.
+ */
+type ProjectSettingsReader = (service: string) => Promise<ProjectSettingsData | null>;
+declare function configureProjectSettings(fn: ProjectSettingsReader | null): void;
+/**
+ * Start the fetch and hand back the promise, deduping concurrent callers.
+ *
+ * Never rejects: a failed read settles as null, which every accessor reads as
+ * "unset" and answers with the default. A settings fetch must not be able to
+ * fail an upload.
+ */
+declare function loadProjectSettings(service: string): Promise<ProjectSettingsData | null>;
+/**
+ * Kick the fetch off without waiting for it. Call on chat/page open.
+ *
+ * Fire-and-forget by design: the page paints on the default and the first upload
+ * awaits the real value via readyProjectSettings. Nothing blocks on this.
+ */
+declare function primeProjectSettings(service: string): void;
+/**
+ * Await the settings for this project. What the FIRST upload calls.
+ *
+ * Cheap after the first call: a settled entry resolves immediately, and a
+ * primed-but-unsettled one joins the in-flight request rather than starting a
+ * second.
+ */
+declare function readyProjectSettings(service: string): Promise<ProjectSettingsData | null>;
+/**
+ * The cached data WITHOUT waiting, or null when nothing has settled yet.
+ *
+ * For synchronous readers (a template, a menu's current value). A caller that is
+ * about to WRITE an access group onto a record must use readyProjectSettings
+ * instead: answering from an unsettled cache is how a file lands in the wrong
+ * group on the first upload after a page load.
+ */
+declare function cachedProjectSettings(service: string): ProjectSettingsData | null;
+/** True once this project's settings have been fetched (whether or not one existed). */
+declare function projectSettingsSettled(service: string): boolean;
+/** Sync convenience: the project's setting as stored, or null when unset/unsettled. */
+declare function projectAccessSetting(service: string): ProjectAccessSetting | null;
+/** Sync convenience: the upload group, falling back to the default. */
+declare function projectUploadAccessGroup(service: string): UploadAccessGroup;
+/** Sync convenience: does this project want a per-upload prompt? */
+declare function projectAsksUploadAccess(service: string): boolean;
+/**
+ * Sync convenience: the project's custom opening line, '' when unset.
+ *
+ * Answers '' until the fetch settles, which is why both clients repaint the
+ * greeting once readyProjectSettings resolves: a cold cache would otherwise
+ * leave a project that HAS set a line showing the built-in one for the life of
+ * the page.
+ */
+declare function projectChatGreeting(service: string): string;
+/**
+ * Sync convenience: the project's web-access setting, false until the fetch
+ * settles or when the project never set it. The request builders prefer the
+ * awaiting form (config.ts resolveWebAccess) so the first turn after a page load
+ * reads the stored value rather than the cold-cache default.
+ */
+declare function projectWebAccess(service: string): boolean;
+/**
+ * Sync convenience: the project's skip-duplicates setting, true until the fetch
+ * settles or when the project never set it. The upload path prefers the
+ * awaiting form (config.ts resolveSkipDuplicateFiles).
+ */
+declare function projectSkipDuplicateFiles(service: string): boolean;
+/**
+ * Sync convenience: the project's answer mode, 'standard' until the fetch
+ * settles or when the project never set it. The request builders use the
+ * awaiting form (config.ts resolveAnswerMode) so the first turn after a page
+ * load reads the stored value.
+ */
+declare function projectAnswerMode(service: string): AnswerMode;
+/**
+ * Adopt a value the caller just WROTE, so the settings page reflects its own
+ * save without a re-fetch.
+ *
+ * Marks the entry settled: the writer knows the stored value better than a
+ * refetch would, and leaving it unsettled would send the next upload back to the
+ * network for a value already in hand.
+ */
+declare function setProjectSettings(service: string, data: ProjectSettingsData | null): void;
+/** Merge one key into the cached settings, preserving the rest. */
+declare function patchProjectSettings(service: string, patch: ProjectSettingsData): void;
+/**
+ * Drop cached settings. Pass a service to drop one, omit to drop all.
+ *
+ * An in-flight fetch is abandoned rather than cancelled: its `.then` checks that
+ * the entry it is writing into is still its own, so a late response cannot
+ * repopulate a cleared project.
+ */
+declare function clearProjectSettings(service?: string): void;
+
+/**
  * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
  *
  * Deliberately a flat snapshot rather than the SseParser itself: the hook is a
@@ -406,6 +711,20 @@ interface ChatEngineConfig {
      */
     skipDuplicateFiles?: boolean;
     /**
+     * Reuse the MCP tool listing OpenAI returned on an earlier CHAT turn of this page
+     * (OpenAI only). With it, the next chat request carries OpenAI's own
+     * `mcp_list_tools` item and OpenAI skips asking the MCP server for its tools again
+     * (four sequential requests, about 0.6 s before the model starts).
+     *
+     * OFF unless set to `true`. Leave it off until one real OpenAI chat on a dev project
+     * has answered with it on: an account that refuses the item fails one turn, after
+     * which reuse stays off for that project in this browser. Costs when on: each
+     * reused turn's request body, and so its stored history row, is about 31 to 34 KB
+     * larger (the tool list), which also comes back with every history page.
+     * Claude turns and indexing passes never use it. See requests.ts ChatTurnContext.
+     */
+    reuseMcpToolList?: boolean;
+    /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
      * sends the ASSEMBLED provider body, so history reads it exactly as it reads
@@ -527,6 +846,14 @@ declare function webAccessEnabled(service?: string): boolean;
  * value that may only restrict (see underCeiling).
  */
 declare function resolveWebAccess(service?: string, override?: boolean): Promise<boolean>;
+/**
+ * The project's answer mode for a chat turn, awaiting its settings record so the
+ * first turn after a page load reads the stored value (same reason as
+ * resolveWebAccess). Never rejects: a failed or impossible read settles as
+ * 'standard', which adds nothing to the request. There is no host option: the
+ * mode is the project owner's choice. See project_settings.ts AnswerMode.
+ */
+declare function resolveAnswerMode(service?: string): Promise<AnswerMode>;
 /**
  * The skip-duplicates switch for an upload, SYNCHRONOUSLY: the project's cached
  * `skip_duplicate_files` setting (on unless the owner turned it off), restricted
@@ -2351,6 +2678,14 @@ type ChatStreamWiring = {
     };
 };
 declare function chatStreamWiring(queue?: string): ChatStreamWiring;
+/**
+ * The body fields a CHAT turn's answer mode adds, for the one provider and model the turn
+ * runs on. An empty object, i.e. nothing at all, for 'standard' (the default) and for any
+ * model not known to accept the field, so a project that never set a mode sends the exact
+ * request it sent before the setting existed. OpenAI takes `reasoning: {effort}`, Claude
+ * takes `output_config: {effort}`. Never used by an indexing pass.
+ */
+declare function chatEffortFields(platform: 'claude' | 'openai', model: string | undefined, mode: AnswerMode | undefined): Record<string, any>;
 /** How a given model should be shown a rendered document. */
 type VisionProfile = {
     /** Per-image `detail` (OpenAI only). */
@@ -2426,6 +2761,34 @@ type CallClaudeWithMcpParams = {
 declare const POLL_INTERVAL = 3000;
 declare const STREAM_POLL_INTERVAL = 1000;
 declare const MAX_CONCURRENT_BG_POLLS = 6;
+/**
+ * What a chat turn hands the OpenAI request builder about itself, and what the builder
+ * writes back. Created per turn by ChatSession; a host that calls the builder directly
+ * and passes nothing gets exactly the request it always got.
+ */
+type ChatTurnContext = {
+    /**
+     * Reuse the MCP tool listing OpenAI returned on an earlier chat turn (OpenAI only).
+     * Every OpenAI turn otherwise starts with OpenAI asking our MCP server for its tools,
+     * four sequential requests (server/discover, initialize, notifications/initialized,
+     * tools/list), about 0.6 s before the model starts. OpenAI's docs: "As long as the
+     * mcp_list_tools item is present in the context of an API request, the API will not
+     * fetch a list of tools from the MCP server again at each turn."
+     */
+    reuseMcpToolList?: boolean;
+    /** Who the turn runs as. Part of the listing key: a different user can see a different list. */
+    userId?: string;
+    /** Written by the builder: the key this turn's listing is stored under. */
+    mcpToolsKey?: string;
+    /** Written by the builder: true when a stored listing rode in this turn's input. */
+    mcpToolsInjected?: boolean;
+    /** Written by the builder: the project the listing belongs to (for the per-project off verdict). */
+    mcpToolsService?: string;
+    /** Written by the builder: the id of the listing that rode in this turn's input. */
+    mcpToolsItemId?: string;
+    /** Set by ChatSession once the turn's outcome was applied, so a later handler cannot apply it twice. */
+    settled?: boolean;
+};
 declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, webAccess, }: CallClaudeWithMcpParams): Promise<any>;
 declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
     anonymous?: boolean;
@@ -2434,7 +2797,7 @@ declare function callClaudeWithPublicMcp(prompt: string, service: string, owner:
 declare function callOpenAIWithPublicMcp(prompt: string, service: string, owner: string, messages?: OpenAIMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
     anonymous?: boolean;
     publicProjectId?: string;
-}): Promise<any>;
+}, turn?: ChatTurnContext): Promise<any>;
 type AttachmentSaveInfo = {
     platform: 'claude' | 'openai';
     model?: string;
@@ -4838,6 +5201,21 @@ declare class ChatSession {
      * omits them.
      */
     private _callProviderFor;
+    /**
+     * A fresh per-send record for the request builder (see requests.ts ChatTurnContext).
+     * Chat turns only, and only OpenAI reuses a tool listing: Claude's MCP connector has no
+     * equivalent item, and indexing passes never come through here. Off unless the host
+     * set `reuseMcpToolList: true` in configureChatEngine.
+     */
+    private _newChatTurn;
+    /**
+     * What a settled chat turn means for the stored MCP tool listing: a failure drops it
+     * when the turn carried it (forgetMcpListToolsOnFailure decides whether reuse also
+     * stops); a good OpenAI body refreshes it. A stopped poll or a cancelled row says
+     * nothing either way. Applied once per turn: an exception thrown later by a UI
+     * handler on the same chain is not a provider failure.
+     */
+    private _settleChatTurnTools;
     dispatchAgentRequest(params: any): Promise<any>;
     /**
      * Put a turn on screen the INSTANT the user hits Send, before its attachments
@@ -5380,262 +5758,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-/**
- * The project's BunnyQuery settings, held as a record in the project's own
- * database rather than on the skapi service record.
- *
- * WHY A RECORD. The upload access group used to live on the service record as
- * `default_access_group`, which was ALSO the skapi SDK's project-wide default
- * for `table.access_group`. One field meant two things: "what BunnyQuery indexes
- * new files at" and "what every SDK record call on this project defaults to".
- * That coupling is gone. The SDK no longer has a project default at all, so this
- * setting needs a home of its own, and a plain public record in the customer's
- * own project is one every client can already reach with the calls it has.
- *
- * SHAPE. One record per project, holding an OBJECT rather than a single value:
- *
- *     unique_id: 'bq::settings'
- *     table:     { name: '__SETTINGS__', access_group: 'public' }
- *     data:      { upload_access_group: 'authorized' }
- *
- * One record and one fetch covers every present and future project setting. A
- * second setting is a new key, not a new record, so the "wait for settings
- * before the first upload" hand-off below never has to become several waits.
- *
- * WHY PUBLIC. The widget reads this, and the widget frequently runs before there
- * is any session. Group 0 is the only group an unauthenticated caller is served
- * (`check_rec_access` returns immediately for "00" and refuses the rest). Note
- * this is NOT sufficient on its own: skapi's `require_login` gate refuses ALL
- * database reads from a signed-out visitor, and it defaults to true, so on most
- * projects a signed-out widget still cannot read this and falls back to the
- * default. That is survivable because the only thing a signed-out visitor could
- * do with the value is upload, which they cannot do either.
- *
- * WHY THE VALUE MATTERS. The file BYTES are not what the access group controls.
- * BunnyQuery uploads to db storage, whose object key carries no access group and
- * whose read path performs no access check. What carries the group is the
- * RECORDS: the `src::` file record in `file_summaries`, the `run::`/`done::`
- * markers in `__INDEXING__`, and every content record the indexing agent
- * extracts. Those are what a chat answers from, so those are what decide who the
- * file is visible to. The same value is also handed to the chat system prompt as
- * `indexAccessGroup`, because a record written under a different group is in a
- * different table and never comes back with the rest of the file.
- *
- * TRANSPORT-FREE, like the rest of the engine. The store never imports a skapi
- * instance; the consumer injects a reader. See configureProjectSettings.
- */
-/** The access groups a BunnyQuery upload may be recorded at. */
-type UploadAccessGroup = 'public' | 'authorized' | 'private';
-declare const UPLOAD_ACCESS_GROUPS: UploadAccessGroup[];
-/**
- * What the project's upload-access setting may be: one of the three groups the
- * dashboard offers, or 'ask' to be prompted per upload.
- *
- * `'admin'` (99) is deliberately not offered: a file only a master can read is
- * indistinguishable from one that failed to upload, and no dashboard control
- * would produce it.
- */
-type ProjectAccessSetting = UploadAccessGroup | 'ask';
-/**
- * `authorized` is the default because it is what every record written before
- * this setting existed was hardcoded to. A project that never opens the setting
- * keeps exactly the visibility it already had. It is also what the abandoned
- * `default_access_group` service field was seeded to at project creation, so a
- * project carrying that old value reads the same before and after the move.
- */
-declare const DEFAULT_UPLOAD_ACCESS_GROUP: UploadAccessGroup;
-/** Where the settings record lives. Shared so no client re-derives it. */
-declare const PROJECT_SETTINGS_TABLE = "__SETTINGS__";
-declare const PROJECT_SETTINGS_UNIQUE_ID = "bq::settings";
-declare const PROJECT_SETTINGS_ACCESS_GROUP = "public";
-declare const UPLOAD_ACCESS_LABELS: Record<UploadAccessGroup, string>;
-declare const UPLOAD_ACCESS_HINTS: Record<UploadAccessGroup, string>;
-/** Menu/modal option list, in the order they should be shown. */
-declare const UPLOAD_ACCESS_OPTIONS: {
-    value: UploadAccessGroup;
-    label: string;
-    hint: string;
-}[];
-/** The settings record's `data`. Open-ended: future settings are new keys. */
-type ProjectSettingsData = {
-    upload_access_group?: unknown;
-    chat_greeting?: unknown;
-    web_access?: unknown;
-    skip_duplicate_files?: unknown;
-    [key: string]: unknown;
-};
-/**
- * Whether a CHAT answer may reach the open web (Claude `web_fetch`, OpenAI
- * `web_search`). Same record, its own `web_access` key.
- *
- * OFF BY DEFAULT, and the default is the point: customers reported answers that
- * were not in their data, and an open web tool is one of the ways such an answer
- * gets out. A project that never opens the setting answers from its files and
- * database alone. Only the literal `true` turns it on: this record is public and
- * a client must never read a value it did not write as permission.
- *
- * Resolution, applied by the engine where the chat request is built (config.ts
- * resolveWebAccess): THIS SETTING IS THE CEILING and the host may only restrict.
- *   effective = projectSetting && hostOption !== false
- * A host's `webAccess: false` turns a project that is on off for its own page;
- * a host's `true` on a project that is off has no effect, because the owner's
- * switch is the one that lets an answer out onto the web. Indexing requests are
- * not governed by this: an indexing pass keeps the tools it has today (see
- * requests.ts notifyAgentSaveAttachment).
- */
-declare const DEFAULT_WEB_ACCESS = false;
-/** Narrow a stored value to the switch: only `true` is on. */
-declare function normalizeWebAccess(value: any): boolean;
-/** The switch held in a settings-record `data`, false when unset. */
-declare function webAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
-/**
- * Whether an upload that is byte-for-byte the SAME FILE the signed-in user
- * already has in this project (same name, same size, same uploader) is skipped:
- * not uploaded again and not indexed again, with the chat turn using the stored
- * copy. Same record, its own `skip_duplicate_files` key.
- *
- * ON BY DEFAULT: a second copy of a file costs a second indexing run, which is
- * the single most expensive thing a project does, and answers from two copies
- * of one document double every row. Only the literal `false` turns it off: this
- * record is public and a client must never read a value it did not write.
- *
- * Resolution is the same ceiling rule as `web_access` (config.ts
- * resolveSkipDuplicateFiles): effective = projectSetting && hostOption !== false.
- * The host's `skipDuplicateFiles: false` lets its page re-upload duplicates on
- * a project that skips them; a host's `true` on a project that turned it off has
- * no effect.
- */
-declare const DEFAULT_SKIP_DUPLICATE_FILES = true;
-/** Narrow a stored value to the switch: only the literal `false` is off. */
-declare function normalizeSkipDuplicateFiles(value: any): boolean;
-/** The switch held in a settings-record `data`, true when unset. */
-declare function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean;
-/**
- * Longest custom opening line the dashboard will store.
- *
- * The bubble is chrome, not content: it is painted before the conversation and
- * cannot be scrolled past, so an essay here pushes the composer off a phone
- * screen. It is ALSO handed to the model verbatim as "what you opened with"
- * (buildChatSystemPrompt's `greeting`), so every turn of every chat pays for its
- * length in tokens. Enforced where it is SAVED as well as where it is read, so a
- * value written by something other than the settings page cannot bloat either.
- */
-declare const CHAT_GREETING_MAX_LENGTH = 400;
-/**
- * Narrow a stored greeting to a usable line: '' means "use the built-in".
- *
- * Anything that is not a string is unset rather than an error -- this record is
- * public and a client must never break on a value it did not write.
- */
-declare function normalizeChatGreeting(value: any): string;
-/** The project's custom opening line, or '' when it has never set one. */
-declare function chatGreetingFrom(data: ProjectSettingsData | null | undefined): string;
-/** Narrow an unknown stored value to a usable group, falling back to the default. */
-declare function normalizeUploadAccessGroup(value: any): UploadAccessGroup;
-/**
- * The stored setting as written, or null when the project has never set one.
- *
- * Returns null rather than a default so callers can tell "unset" from "set to
- * authorized". The settings page needs that distinction to decide what the
- * control shows; upload paths do not and use uploadAccessGroupFrom instead.
- */
-declare function normalizeProjectAccessSetting(value: any): ProjectAccessSetting | null;
-/** The setting held in a settings-record `data`, or null when unset. */
-declare function accessSettingFrom(data: ProjectSettingsData | null | undefined): ProjectAccessSetting | null;
-/** The group an upload lands in when the project is NOT set to 'ask'. */
-declare function uploadAccessGroupFrom(data: ProjectSettingsData | null | undefined): UploadAccessGroup;
-/** True when the project wants to be asked per upload rather than told once. */
-declare function asksUploadAccessFrom(data: ProjectSettingsData | null | undefined): boolean;
-/**
- * Fetch one project's settings record. Resolves the record's `data`, or null
- * when there is no record.
- *
- * MAY REJECT, and the store treats a rejection as "no record": a signed-out
- * visitor on a `require_login` project gets REQUIRE_LOGIN here, which is a
- * normal outcome and not an error the user should ever see.
- */
-type ProjectSettingsReader = (service: string) => Promise<ProjectSettingsData | null>;
-declare function configureProjectSettings(fn: ProjectSettingsReader | null): void;
-/**
- * Start the fetch and hand back the promise, deduping concurrent callers.
- *
- * Never rejects: a failed read settles as null, which every accessor reads as
- * "unset" and answers with the default. A settings fetch must not be able to
- * fail an upload.
- */
-declare function loadProjectSettings(service: string): Promise<ProjectSettingsData | null>;
-/**
- * Kick the fetch off without waiting for it. Call on chat/page open.
- *
- * Fire-and-forget by design: the page paints on the default and the first upload
- * awaits the real value via readyProjectSettings. Nothing blocks on this.
- */
-declare function primeProjectSettings(service: string): void;
-/**
- * Await the settings for this project. What the FIRST upload calls.
- *
- * Cheap after the first call: a settled entry resolves immediately, and a
- * primed-but-unsettled one joins the in-flight request rather than starting a
- * second.
- */
-declare function readyProjectSettings(service: string): Promise<ProjectSettingsData | null>;
-/**
- * The cached data WITHOUT waiting, or null when nothing has settled yet.
- *
- * For synchronous readers (a template, a menu's current value). A caller that is
- * about to WRITE an access group onto a record must use readyProjectSettings
- * instead: answering from an unsettled cache is how a file lands in the wrong
- * group on the first upload after a page load.
- */
-declare function cachedProjectSettings(service: string): ProjectSettingsData | null;
-/** True once this project's settings have been fetched (whether or not one existed). */
-declare function projectSettingsSettled(service: string): boolean;
-/** Sync convenience: the project's setting as stored, or null when unset/unsettled. */
-declare function projectAccessSetting(service: string): ProjectAccessSetting | null;
-/** Sync convenience: the upload group, falling back to the default. */
-declare function projectUploadAccessGroup(service: string): UploadAccessGroup;
-/** Sync convenience: does this project want a per-upload prompt? */
-declare function projectAsksUploadAccess(service: string): boolean;
-/**
- * Sync convenience: the project's custom opening line, '' when unset.
- *
- * Answers '' until the fetch settles, which is why both clients repaint the
- * greeting once readyProjectSettings resolves: a cold cache would otherwise
- * leave a project that HAS set a line showing the built-in one for the life of
- * the page.
- */
-declare function projectChatGreeting(service: string): string;
-/**
- * Sync convenience: the project's web-access setting, false until the fetch
- * settles or when the project never set it. The request builders prefer the
- * awaiting form (config.ts resolveWebAccess) so the first turn after a page load
- * reads the stored value rather than the cold-cache default.
- */
-declare function projectWebAccess(service: string): boolean;
-/**
- * Sync convenience: the project's skip-duplicates setting, true until the fetch
- * settles or when the project never set it. The upload path prefers the
- * awaiting form (config.ts resolveSkipDuplicateFiles).
- */
-declare function projectSkipDuplicateFiles(service: string): boolean;
-/**
- * Adopt a value the caller just WROTE, so the settings page reflects its own
- * save without a re-fetch.
- *
- * Marks the entry settled: the writer knows the stored value better than a
- * refetch would, and leaving it unsettled would send the next upload back to the
- * network for a value already in hand.
- */
-declare function setProjectSettings(service: string, data: ProjectSettingsData | null): void;
-/** Merge one key into the cached settings, preserving the rest. */
-declare function patchProjectSettings(service: string, patch: ProjectSettingsData): void;
-/**
- * Drop cached settings. Pass a service to drop one, omit to drop all.
- *
- * An in-flight fetch is abandoned rather than cancelled: its `.then` checks that
- * the entry it is writing into is still its own, so a late response cannot
- * repopulate a cleared project.
- */
-declare function clearProjectSettings(service?: string): void;
-
-export { type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, FINDINGS_TABLE, FINDING_ID_PREFIX, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SearchFinding, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, FINDINGS_TABLE, FINDING_ID_PREFIX, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SearchFinding, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

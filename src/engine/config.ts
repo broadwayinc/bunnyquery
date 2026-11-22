@@ -20,7 +20,7 @@
  */
 
 import { type AttachmentParser, registerAttachmentParser } from './attachment_parsers';
-import { cachedProjectSettings, loadProjectSettings, webAccessFrom, skipDuplicateFilesFrom } from './project_settings';
+import { cachedProjectSettings, loadProjectSettings, webAccessFrom, skipDuplicateFilesFrom, answerModeFrom, type AnswerMode } from './project_settings';
 
 /**
  * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
@@ -232,6 +232,20 @@ export interface ChatEngineConfig {
      * them; `true` or unset follows the project. See duplicates.ts for the check.
      */
     skipDuplicateFiles?: boolean;
+    /**
+     * Reuse the MCP tool listing OpenAI returned on an earlier CHAT turn of this page
+     * (OpenAI only). With it, the next chat request carries OpenAI's own
+     * `mcp_list_tools` item and OpenAI skips asking the MCP server for its tools again
+     * (four sequential requests, about 0.6 s before the model starts).
+     *
+     * OFF unless set to `true`. Leave it off until one real OpenAI chat on a dev project
+     * has answered with it on: an account that refuses the item fails one turn, after
+     * which reuse stays off for that project in this browser. Costs when on: each
+     * reused turn's request body, and so its stored history row, is about 31 to 34 KB
+     * larger (the tool list), which also comes back with every history page.
+     * Claude turns and indexing passes never use it. See requests.ts ChatTurnContext.
+     */
+    reuseMcpToolList?: boolean;
     /**
      * skapi.forwardRequestFinalize, bound to the consumer's skapi instance.
      * Stores the version of a streamed turn that history should keep (the engine
@@ -484,6 +498,18 @@ export function resolveWebAccess(service?: string, override?: boolean): Promise<
     return loadProjectSettings(service)
         .then(webAccessFrom, () => false)
         .then((setting) => underCeiling(setting, opt, override));
+}
+
+/**
+ * The project's answer mode for a chat turn, awaiting its settings record so the
+ * first turn after a page load reads the stored value (same reason as
+ * resolveWebAccess). Never rejects: a failed or impossible read settles as
+ * 'standard', which adds nothing to the request. There is no host option: the
+ * mode is the project owner's choice. See project_settings.ts AnswerMode.
+ */
+export function resolveAnswerMode(service?: string): Promise<AnswerMode> {
+    if (!service) return Promise.resolve(answerModeFrom(null));
+    return loadProjectSettings(service).then(answerModeFrom, () => answerModeFrom(null));
 }
 
 /**

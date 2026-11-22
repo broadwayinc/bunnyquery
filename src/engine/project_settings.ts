@@ -97,6 +97,7 @@ export type ProjectSettingsData = {
 	chat_greeting?: unknown;
 	web_access?: unknown;
 	skip_duplicate_files?: unknown;
+	answer_mode?: unknown;
 	[key: string]: unknown;
 };
 
@@ -158,6 +159,66 @@ export function normalizeSkipDuplicateFiles(value: any): boolean {
 /** The switch held in a settings-record `data`, true when unset. */
 export function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean {
 	return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
+}
+
+/**
+ * How much the model thinks before a CHAT answer. Same record, its own
+ * `answer_mode` key. Optional, and absent on almost every project.
+ *
+ *   'standard'  the provider's own default. NOTHING is added to the request: a
+ *               project that never opens the setting sends byte for byte the
+ *               request it sent before the setting existed.
+ *   'fast'      effort "low": fewer reasoning tokens and fewer tool round trips,
+ *               so a simple question comes back sooner.
+ *   'thorough'  effort "high": more reasoning before the answer, for questions
+ *               that need several reads to get right.
+ *
+ * Only the literal 'fast' or 'thorough' changes anything. This record is public
+ * and a client must never act on a value it did not write, so every other value
+ * (absent, a typo, a number) reads as 'standard'.
+ *
+ * Applied where the chat request is built (config.ts resolveAnswerMode, then
+ * requests.ts chatEffortFields): OpenAI `reasoning.effort` and Claude
+ * `output_config.effort`, and only on models known to accept the field. A model
+ * that does not is sent no field at all, as if the mode were 'standard'.
+ * Indexing passes never read this setting.
+ */
+export type AnswerMode = 'standard' | 'fast' | 'thorough';
+
+export const ANSWER_MODES: AnswerMode[] = ['standard', 'fast', 'thorough'];
+
+export const DEFAULT_ANSWER_MODE: AnswerMode = 'standard';
+
+/** The setting's own name, for a settings page heading or row label. */
+export const ANSWER_MODE_SETTING_LABEL = 'Answer mode';
+
+export const ANSWER_MODE_LABELS: Record<AnswerMode, string> = {
+	standard: 'Standard',
+	fast: 'Fast',
+	thorough: 'Thorough',
+};
+
+export const ANSWER_MODE_HINTS: Record<AnswerMode, string> = {
+	standard: 'The AI model decides how long to think. This is the default.',
+	fast: 'Shorter thinking for quicker answers. Best for simple questions.',
+	thorough: 'Longer thinking before answering. Slower, and uses more tokens.',
+};
+
+/** Menu option list, in the order it should be shown. */
+export const ANSWER_MODE_OPTIONS = ANSWER_MODES.map((value) => ({
+	value,
+	label: ANSWER_MODE_LABELS[value],
+	hint: ANSWER_MODE_HINTS[value],
+}));
+
+/** Narrow a stored value to a mode: only 'fast' and 'thorough' are not standard. */
+export function normalizeAnswerMode(value: any): AnswerMode {
+	return value === 'fast' || value === 'thorough' ? value : DEFAULT_ANSWER_MODE;
+}
+
+/** The mode held in a settings-record `data`, 'standard' when unset. */
+export function answerModeFrom(data: ProjectSettingsData | null | undefined): AnswerMode {
+	return normalizeAnswerMode(data ? data.answer_mode : undefined);
 }
 
 /**
@@ -393,6 +454,16 @@ export function projectWebAccess(service: string): boolean {
  */
 export function projectSkipDuplicateFiles(service: string): boolean {
 	return skipDuplicateFilesFrom(cachedProjectSettings(service));
+}
+
+/**
+ * Sync convenience: the project's answer mode, 'standard' until the fetch
+ * settles or when the project never set it. The request builders use the
+ * awaiting form (config.ts resolveAnswerMode) so the first turn after a page
+ * load reads the stored value.
+ */
+export function projectAnswerMode(service: string): AnswerMode {
+	return answerModeFrom(cachedProjectSettings(service));
 }
 
 /**

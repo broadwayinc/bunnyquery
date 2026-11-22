@@ -37,6 +37,9 @@ import {
 	ANTHROPIC_MESSAGES_API_URL,
 	OPENAI_RESPONSES_API_URL,
 	upsertIndexRunRecordSafe,
+	rememberMcpListTools,
+	forgetMcpListToolsOnFailure,
+	type ChatTurnContext,
 	type IndexRunStatus,
 	type IndexRunPatch,
 	type BgTaskEntry,
@@ -2807,7 +2810,7 @@ export class ChatSession {
 	 * one it was composed for. Falls back to the live read only when a caller
 	 * omits them.
 	 */
-	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any, projectId?: string, owner?: string) {
+	private _callProviderFor(platform: string, prompt: string, messages: any, system: string, model: string | undefined, userId: string, extractContent: any, fileUrls?: any, projectId?: string, owner?: string, turn?: ChatTurnContext) {
 		if (projectId === undefined || owner === undefined) {
 			var id = this.host.getIdentity();
 			if (projectId === undefined) projectId = id.projectId;
@@ -2821,9 +2824,39 @@ export class ChatSession {
 		// read-only and public-records-only whoever calls it.
 		var liveId = this.host.getIdentity();
 		var mcpScope = { anonymous: liveId.anonymous, publicProjectId: liveId.publicProjectId };
+		// The tool-listing key's user half comes from the same live read, because the
+		// listing belongs to whoever the MCP endpoint authenticates as on THIS send.
+		if (turn) turn.userId = liveId.anonymous ? '' : (liveId.userId || '');
 		return platform === 'openai'
-			? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, undefined, undefined, mcpScope)
+			? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, undefined, undefined, mcpScope, turn)
 			: callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, undefined, undefined, mcpScope);
+	}
+
+	/**
+	 * A fresh per-send record for the request builder (see requests.ts ChatTurnContext).
+	 * Chat turns only, and only OpenAI reuses a tool listing: Claude's MCP connector has no
+	 * equivalent item, and indexing passes never come through here. Off unless the host
+	 * set `reuseMcpToolList: true` in configureChatEngine.
+	 */
+	private _newChatTurn(platform: string): ChatTurnContext {
+		var on = false;
+		try { on = chatEngineConfig().reuseMcpToolList === true; } catch (_) { on = false; }
+		return { reuseMcpToolList: platform === 'openai' && on };
+	}
+
+	/**
+	 * What a settled chat turn means for the stored MCP tool listing: a failure drops it
+	 * when the turn carried it (forgetMcpListToolsOnFailure decides whether reuse also
+	 * stops); a good OpenAI body refreshes it. A stopped poll or a cancelled row says
+	 * nothing either way. Applied once per turn: an exception thrown later by a UI
+	 * handler on the same chain is not a provider failure.
+	 */
+	private _settleChatTurnTools(turn: ChatTurnContext | undefined, response: any, failed?: boolean): void {
+		if (!turn || turn.settled) return;
+		turn.settled = true;
+		if (failed || isErrorResponseBody(response)) { forgetMcpListToolsOnFailure(turn, response); return; }
+		if (isPollStopped(response) || this._isCancelledPollResult(response)) return;
+		rememberMcpListTools(turn, response);
 	}
 
 	dispatchAgentRequest(params: any) {
@@ -2835,9 +2868,13 @@ export class ChatSession {
 		// stops covering an item once pendingAgentRequests clears — e.g. a queued
 		// message still in flight after the immediate one resolved.)
 		var dispatchItemId: string | undefined;
+		// The builder record of the LATEST send: an auth-refresh retry re-enters
+		// sendAndPoll and gets a new one, and only the send that settles counts.
+		var turn: ChatTurnContext | undefined;
 		var sendAndPoll = function () {
+			turn = self._newChatTurn(params.aiPlatform);
 			return Promise.resolve(
-				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner)
+				self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner, turn)
 			).then(function (initial: any) {
 				if (initial && initial.poll && (initial.status === 'pending' || initial.status === 'running')) {
 					if (initial.id) {
@@ -2883,6 +2920,7 @@ export class ChatSession {
 				// Read as a provider body, both extract to nothing, and the turn was
 				// stamped "No text response received from AI provider." and the cache
 				// kept that as the answer to a question the user had stopped waiting on.
+				self._settleChatTurnTools(turn, response);
 				if (isPollStopped(response) || self._isCancelledPollResult(response)) return { content: '', isError: false, cancelled: true };
 				if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
 				var answer = (params.aiPlatform === 'openai' ? extractOpenAIText(response) : extractClaudeText(response));
@@ -2891,7 +2929,7 @@ export class ChatSession {
 				// streamed turn's `response` is already the assembled body here).
 				return { content: answer || 'No text response received from AI provider.', isError: false, retrieval: extractRetrievalNote(response, answer), body: response };
 			})
-			.catch(function (err: any) { return { content: getErrorMessage(err), isError: true }; })
+			.catch(function (err: any) { self._settleChatTurnTools(turn, err, true); return { content: getErrorMessage(err), isError: true }; })
 			.then(function (result: any) {
 				// Land the resolved reply in the shared history cache. This runs
 				// independently of the view lifecycle, so a reply is captured even
@@ -3366,7 +3404,8 @@ export class ChatSession {
 
 			var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
 			var capturedQueuedLid = queuedBubble._localId;
-			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner))
+			var queuedTurn = this._newChatTurn(aiPlatform);
+			Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner, queuedTurn))
 				.then(function (result: any) {
 					// Only ack a bubble that belongs to THIS chat — the search is
 					// positional, so on another project it would stamp this turn's
@@ -3406,12 +3445,13 @@ export class ChatSession {
 						});
 						if (serverId) self._trackPoll(serverId, 'fg', qp);
 						return qp
-							.then(function (res: any) { if (isPollStopped(res)) return; return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
-							.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey); });
+							.then(function (res: any) { self._settleChatTurnTools(queuedTurn, res); if (isPollStopped(res)) return; return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey); })
+							.catch(function (err: any) { self._settleChatTurnTools(queuedTurn, err, true); return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey); });
 					}
+					self._settleChatTurnTools(queuedTurn, result);
 					return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
 				})
-				.catch(function (err: any) { return self.onQueuedSendError(capturedComposed, err, undefined, capturedKey); });
+				.catch(function (err: any) { self._settleChatTurnTools(queuedTurn, err, true); return self.onQueuedSendError(capturedComposed, err, undefined, capturedKey); });
 			return;
 		}
 
@@ -3470,8 +3510,17 @@ export class ChatSession {
 		// end of the list once a message sent after it (while its files uploaded)
 		// has already been answered — and a history that ends on an assistant turn
 		// hits exactly the `last.role !== 'user'` bail described above.
+		//
+		// The bubble is excluded by its _localId, NOT by `m === immediateUser`. A host may
+		// hold the state as a Vue reactive() (agent.vue does), and then every element the
+		// filter sees is a reactive PROXY of the object pushed above, never the object
+		// itself, so the identity test never matched: the bubble passed the filter (it has
+		// none of the pending flags) and the push below added the same message again. Every
+		// immediate send from bunnyquery.com went out with the question twice at the end of
+		// `input` / `messages`. The widget's plain state was never affected.
+		var immediateUserLid = immediateUser._localId;
 		var historyForLlm = this.state.messages.filter(function (m) {
-			if (m === immediateUser) return false;
+			if (m === immediateUser || (immediateUserLid && m && m._localId === immediateUserLid)) return false;
 			return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder &&
 				!m.isCancelled && !m.isBackgroundTask && !m.isError;
 		});
@@ -3480,7 +3529,7 @@ export class ChatSession {
 			platform: aiPlatform, model: aiModel, systemPrompt: systemPrompt, projectId: id.projectId,
 			history: historyForLlm,
 		});
-		var immediateUserLid = immediateUser._localId, immediatePlaceholderLid = immediatePlaceholder._localId;
+		var immediatePlaceholderLid = immediatePlaceholder._localId;
 		var run = this.dispatchAgentRequest({
 			key: key, projectId: id.projectId, owner: id.owner, aiPlatform: aiPlatform, aiModel: aiModel,
 			systemPrompt: systemPrompt, text: composed, boundedMessages: bounded.messages, userId: chatQueue,

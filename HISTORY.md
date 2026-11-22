@@ -5,8 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.17.0**. The latest version on npm
-  when this was written is 1.16.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.19.2**. The latest version on npm
+  when this was written is 1.19.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -25,7 +25,22 @@ A few notes on how to read this:
 
 ---
 
-## 1.19.1 (2026-11-22, not yet published)
+## 1.19.2 (2026-11-22, not yet published)
+
+Chat turns: the question is sent once, OpenAI turns skip the MCP tool handshake, and an optional per-project answer mode.
+
+### Engine
+
+- **The latest question is no longer sent twice.** On bunnyquery.com every immediate send ended its `input` (OpenAI) or `messages` (Claude) with the user's message two times. The engine left the new bubble out of the history by comparing objects, and agent.vue holds the chat state in a Vue `reactive()`, so the history saw a proxy of the bubble that never compared equal and kept it, then the engine appended the message again. The bubble is now left out by its local id. The widget's plain state was never affected, and queued and off-screen sends built their history before adding the bubble.
+- **OpenAI chat turns can reuse the MCP tool listing (off by default).** With `reuseMcpToolList: true` in `configureChatEngine`, `ChatSession` keeps the `mcp_list_tools` item an OpenAI chat response returned and puts it in the next turn's `input` after the system message, so OpenAI does not ask the MCP server for its tools again (four requests, about 0.6 s per turn). Off unless the host sets it, because no real OpenAI request has carried the item yet: turn it on after one live chat on a dev project answers with it. Kept in memory per exact MCP server URL (endpoint, `profile`, `ctx`), signed in or anonymous, project and user; a reload starts empty. A turn that carried the item and failed always drops the entry and is not retried (its error shows as usual). If the error names the item, reuse stays off for that project in this browser (localStorage); any other malformed-request error (400, 422, `invalid_request_error`) turns it off for the page; a rate limit, provider 5xx or network error drops only the entry. A listing that contains `$CLIENT_SECRET`, `$ACCESS_TOKEN` or `$ID_TOKEN` is never stored, since the server's enqueue step substitutes those literals. Known cost when on: each reused turn's request body and stored history row carries the tool list (about 31 to 34 KB for the chat profile), which also comes back with every history page. Claude turns and indexing passes are unchanged, and so is a direct `callOpenAIWithPublicMcp` call that passes no `turn` (new last argument, `ChatTurnContext`).
+- **Answer mode** (`answer_mode` in the project's `bq::settings` record): `'fast'` sends effort `low`, `'thorough'` sends effort `high` (OpenAI `reasoning.effort`, Claude `output_config.effort`), on chat turns only and only to models known to accept the field (OpenAI gpt-5.4 and newer; Claude Opus 4.5 and newer, Sonnet 4.6 and newer, Haiku 5.5 and newer, Fable, Mythos). Absent or any other value is Standard and the request is unchanged. Read with the same awaited settings fetch as `web_access`, so the first turn after a page load uses the stored value. New exports: `ANSWER_MODES`, `DEFAULT_ANSWER_MODE`, `ANSWER_MODE_SETTING_LABEL`, `ANSWER_MODE_LABELS`, `ANSWER_MODE_HINTS`, `ANSWER_MODE_OPTIONS`, `normalizeAnswerMode`, `answerModeFrom`, `projectAnswerMode`, `resolveAnswerMode`, `chatEffortFields`, and the types `AnswerMode` and `ChatTurnContext`.
+- **Chat prompt.** The access-group rule no longer contradicts itself on projects that index at `"authorized"` (the default): it now says the index and tag auto-fill happens to match that group, while a plain table query is not auto-filled, and keeps the "comes back empty" warning for other groups. Rules the chat tool descriptions already state (the searchText steps, paging and fetch_all, the db: link format, readFileContent pictures and paging, export links, the gte/lte search mechanics) were removed from the prompt, about 3.6k characters shorter; the BunnyQuery-only rules stay, including listing files with getUniqueId `"src::"` and condition `gte`, and skipping the table-name search when getTables returned the whole list. The Settings sentence names Answer mode. `buildChatSystemPrompt`'s signature is unchanged.
+
+### Widget
+
+- The same changes through the engine (tool-list reuse only when the embedder sets `reuseMcpToolList: true`). The widget never sent the question twice.
+
+## 1.19.1 (2026-11-22)
 
 Fixes to the indexing rows, and file uploads for users who are not the project owner. 1.18.0 and 1.19.0 have no entries here.
 

@@ -5994,6 +5994,10 @@ import {
             // false here restricts below it for this page, true has no effect on
             // a project that turned it off.
             skipDuplicateFiles: null,
+            // Reuse the MCP tool listing OpenAI returned on an earlier chat turn, so
+            // OpenAI skips fetching it again (about 0.6 s per turn). Off unless true.
+            // See the engine's configureChatEngine `reuseMcpToolList`.
+            reuseMcpToolList: false,
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
             windowedIndexing: true,
@@ -6183,6 +6187,8 @@ import {
             // Skip duplicate uploads. Same hand-over rule: only a pinned boolean is
             // passed, and the project's setting is the ceiling the engine applies.
             skipDuplicateFiles: typeof S.opts.skipDuplicateFiles === "boolean" ? S.opts.skipDuplicateFiles : undefined,
+            // OpenAI MCP tool-list reuse across chat turns: only an explicit true.
+            reuseMcpToolList: S.opts.reuseMcpToolList === true,
             // ---- live streaming (mirrored in agent.vue's ai_agent.ts) --------
             // Streaming itself is not passed: the engine streams whenever the two
             // hooks below are handed over, which skapiEngineTransport does only when

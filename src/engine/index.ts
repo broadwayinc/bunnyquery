@@ -34,6 +34,10 @@ export {
 	// template; the awaiting form is what the request builders use.
 	webAccessEnabled,
 	resolveWebAccess,
+	// The project's chat answer mode ('standard' | 'fast' | 'thorough'), awaited the
+	// same way. What the request builders read; exported for a host that wants to
+	// show the mode a turn will use.
+	resolveAnswerMode,
 	// Same ceiling rule for the upload path's skip-duplicates switch: the project's
 	// `skip_duplicate_files` setting (on by default), restricted by a host's
 	// `skipDuplicateFiles: false`.
@@ -261,6 +265,10 @@ export {
 	callClaudeWithMcp,
 	callClaudeWithPublicMcp,
 	callOpenAIWithPublicMcp,
+	// The answer mode's request fields for one provider and model: {} for 'standard'
+	// and for a model that does not take effort, else reasoning / output_config.
+	chatEffortFields,
+	type ChatTurnContext,
 	notifyAgentSaveAttachment,
 	listClaudeModels,
 	listOpenAIModels,
@@ -320,6 +328,16 @@ export {
 	normalizeSkipDuplicateFiles,
 	skipDuplicateFilesFrom,
 	projectSkipDuplicateFiles,
+	// chat answer mode (same record, its own `answer_mode` key, standard by default)
+	ANSWER_MODES,
+	DEFAULT_ANSWER_MODE,
+	ANSWER_MODE_SETTING_LABEL,
+	ANSWER_MODE_LABELS,
+	ANSWER_MODE_HINTS,
+	ANSWER_MODE_OPTIONS,
+	normalizeAnswerMode,
+	answerModeFrom,
+	projectAnswerMode,
 	// pure readers over a settings `data` object
 	normalizeUploadAccessGroup,
 	normalizeProjectAccessSetting,
@@ -344,4 +362,5 @@ export {
 	type ProjectAccessSetting,
 	type ProjectSettingsData,
 	type ProjectSettingsReader,
+	type AnswerMode,
 } from './project_settings';

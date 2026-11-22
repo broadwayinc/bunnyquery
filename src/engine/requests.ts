@@ -14,7 +14,9 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess, resolveAnswerMode } from './config';
+import { type AnswerMode } from './project_settings';
+import { csrEnvelopeError } from './errors';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens, getModelContextWindow } from './budget';
@@ -335,14 +337,67 @@ const isOpenAINano = (model?: string) => {
 
 	// Family floor, same shape as getOpenAIImageDetail's. "Contains nano" alone also matches
 	// gpt-4.1-nano and anything else a project might name, and these are body fields an older
-	// model REJECTS rather than ignores: one 400 with no retry kills every indexing pass. Only
-	// gpt-5.4 and newer are known to take `text.verbosity` and `reasoning.effort`.
+	// model REJECTS rather than ignores: one 400 with no retry kills every indexing pass.
+	return openAITakesReasoningEffort(normalized);
+};
+
+/**
+ * The family floor for `text.verbosity` and `reasoning.effort` on OpenAI: only gpt-5.4 and
+ * newer are known to take them. Shared by the indexing knob above and the chat answer mode
+ * (chatEffortFields), because an older model REJECTS these fields rather than ignoring them.
+ * Anything that does not parse as gpt-<major>[.<minor>][-variant] answers false.
+ */
+const openAITakesReasoningEffort = (model?: string) => {
+	const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
 	const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
 	if (!match) return false;
 	const major = Number(match[1]);
 	const minor = match[2] === undefined ? null : Number(match[2]);
 	return major > 5 || (major === 5 && minor !== null && minor >= 4);
 };
+
+/**
+ * True for the Claude models known to take `output_config.effort` (GA, no beta header):
+ * Opus 4.5 and newer, the 4.6 and newer family (Sonnet 4.6, Opus 4.6 to 4.8), Sonnet 5.x,
+ * Opus 5.x, Haiku 5.5 and newer, and every Fable and Mythos model. The field is an ERROR on
+ * Haiku 4.5, Sonnet 4.5 and older, so those, and any id that does not parse, answer false.
+ * A dated snapshot ("claude-opus-4-5-20251101") reads as its base model.
+ */
+const claudeTakesEffort = (model?: string) => {
+	const normalized = (model || DEFAULT_CLAUDE_MODEL).trim().toLowerCase().replace(/\[1m\]$/, '');
+	const match = normalized.match(/^claude-([a-z]+)(?:-(\d{1,2}))?(?:-(\d{1,2}))?(?:-\d{8})?$/);
+	if (!match) return false;
+	const family = match[1];
+	if (family === 'fable' || family === 'mythos') return true;
+	if (match[2] === undefined) return false;
+	const major = Number(match[2]);
+	const minor = match[3] === undefined ? 0 : Number(match[3]);
+	if (family === 'opus') return major > 4 || (major === 4 && minor >= 5);
+	if (family === 'sonnet') return major > 4 || (major === 4 && minor >= 6);
+	if (family === 'haiku') return major > 5 || (major === 5 && minor >= 5);
+	return false;
+};
+
+/** The effort a chat answer mode asks for; null for 'standard' (send nothing). */
+const ANSWER_MODE_EFFORT: Record<AnswerMode, 'low' | 'high' | null> = {
+	standard: null,
+	fast: 'low',
+	thorough: 'high',
+};
+
+/**
+ * The body fields a CHAT turn's answer mode adds, for the one provider and model the turn
+ * runs on. An empty object, i.e. nothing at all, for 'standard' (the default) and for any
+ * model not known to accept the field, so a project that never set a mode sends the exact
+ * request it sent before the setting existed. OpenAI takes `reasoning: {effort}`, Claude
+ * takes `output_config: {effort}`. Never used by an indexing pass.
+ */
+export function chatEffortFields(platform: 'claude' | 'openai', model: string | undefined, mode: AnswerMode | undefined): Record<string, any> {
+	const effort = mode ? ANSWER_MODE_EFFORT[mode] : null;
+	if (!effort) return {};
+	if (platform === 'openai') return openAITakesReasoningEffort(model) ? { reasoning: { effort } } : {};
+	return claudeTakesEffort(model) ? { output_config: { effort } } : {};
+}
 
 /**
  * The indexing-only body knobs, for the ONE tier that needs them: gpt-5.4-nano.
@@ -685,6 +740,159 @@ export const STREAM_POLL_INTERVAL = 1000;
 //
 // FOREGROUND polls (a reply the user is actively waiting on) are never capped.
 export const MAX_CONCURRENT_BG_POLLS = 6;
+
+/**
+ * What a chat turn hands the OpenAI request builder about itself, and what the builder
+ * writes back. Created per turn by ChatSession; a host that calls the builder directly
+ * and passes nothing gets exactly the request it always got.
+ */
+export type ChatTurnContext = {
+	/**
+	 * Reuse the MCP tool listing OpenAI returned on an earlier chat turn (OpenAI only).
+	 * Every OpenAI turn otherwise starts with OpenAI asking our MCP server for its tools,
+	 * four sequential requests (server/discover, initialize, notifications/initialized,
+	 * tools/list), about 0.6 s before the model starts. OpenAI's docs: "As long as the
+	 * mcp_list_tools item is present in the context of an API request, the API will not
+	 * fetch a list of tools from the MCP server again at each turn."
+	 */
+	reuseMcpToolList?: boolean;
+	/** Who the turn runs as. Part of the listing key: a different user can see a different list. */
+	userId?: string;
+	/** Written by the builder: the key this turn's listing is stored under. */
+	mcpToolsKey?: string;
+	/** Written by the builder: true when a stored listing rode in this turn's input. */
+	mcpToolsInjected?: boolean;
+	/** Written by the builder: the project the listing belongs to (for the per-project off verdict). */
+	mcpToolsService?: string;
+	/** Written by the builder: the id of the listing that rode in this turn's input. */
+	mcpToolsItemId?: string;
+	/** Set by ChatSession once the turn's outcome was applied, so a later handler cannot apply it twice. */
+	settled?: boolean;
+};
+
+type McpListToolsItem = { type: 'mcp_list_tools'; id: string; server_label: string; tools: any[] };
+
+/**
+ * The last good `mcp_list_tools` output item per listing key, for this page's lifetime.
+ * Memory only: a reload starts empty and its first turn lets OpenAI fetch the list.
+ *
+ * The key is everything that can change what tools/list answers: the exact server_url
+ * (endpoint, `profile` and `ctx`), signed in or anonymous, the project, and the user.
+ */
+const mcpListToolsCache = new Map<string, McpListToolsItem>();
+/**
+ * Set once a turn that carried a stored listing was refused as a malformed request
+ * (see forgetMcpListToolsOnFailure). From then on this page never injects one again.
+ */
+let mcpListToolsReuseOff = false;
+
+/**
+ * Per project, in this browser: OpenAI refused the injected item itself. Kept in
+ * localStorage so an account that will not take the item (for example one with zero
+ * data retention) costs one failed turn per browser, not one per page load. Wrapped in
+ * try/catch everywhere: storage can be missing or blocked, and then the verdict simply
+ * lasts for this page (mcpListToolsReuseOff).
+ */
+const MCP_LIST_TOOLS_OFF_PREFIX = 'bunnyquery:mcp-list-tools-off:';
+
+function mcpListToolsOffStored(service: string): boolean {
+	try {
+		return typeof localStorage !== 'undefined' && !!localStorage.getItem(MCP_LIST_TOOLS_OFF_PREFIX + service);
+	} catch (_) {
+		return false;
+	}
+}
+
+function storeMcpListToolsOff(service: string | undefined): void {
+	if (!service) return;
+	try {
+		if (typeof localStorage !== 'undefined') localStorage.setItem(MCP_LIST_TOOLS_OFF_PREFIX + service, String(Date.now()));
+	} catch (_) {
+		// Storage blocked: the page-level flag still holds for this page.
+	}
+}
+
+/**
+ * The server's enqueue step replaces these literals in every string of the request
+ * data with the project's secret or the caller's tokens. Before tool-list reuse, tool
+ * descriptions never passed through that step (OpenAI fetched them itself). A listing
+ * that mentions one of them is therefore never stored, so it can never be injected.
+ * Chat-profile tool text should not contain them in the first place.
+ */
+const SERVER_PLACEHOLDERS = ['$CLIENT_SECRET', '$ACCESS_TOKEN', '$ID_TOKEN'];
+
+function failureText(failure: any): string {
+	const env = csrEnvelopeError(failure);
+	const f = env !== undefined ? env : failure;
+	if (f == null) return '';
+	if (typeof f === 'string') return f.toLowerCase();
+	let text = '';
+	try { text = JSON.stringify(f) || ''; } catch (_) { text = ''; }
+	if (typeof f.message === 'string') text += ' ' + f.message;
+	return text.toLowerCase();
+}
+
+function failureStatus(failure: any): number | undefined {
+	const env = csrEnvelopeError(failure);
+	const f = env !== undefined ? env : failure;
+	if (!f || typeof f !== 'object') return undefined;
+	const v = typeof f.status_code === 'number' ? f.status_code : typeof f.status === 'number' ? f.status : undefined;
+	return v;
+}
+
+function mcpListToolsKey(serverUrl: string, anonymous: boolean | undefined, service: string, publicProjectId: string | undefined, userId: string | undefined): string {
+	return JSON.stringify([serverUrl, anonymous ? 'anonymous' : 'signed-in', service, publicProjectId || '', userId || '']);
+}
+
+/**
+ * Keep the listing a settled OpenAI chat turn returned, under the key its request was
+ * built with. Only an item from our own server (server_label === MCP_NAME) that carries
+ * no error and a tools array is kept, and it is kept exactly as received. A body with no
+ * such item (an error, or a turn that already carried the stored item, which OpenAI then
+ * does not list again) leaves the stored entry as it is.
+ */
+export function rememberMcpListTools(turn: ChatTurnContext | undefined, body: any): void {
+	if (!turn || !turn.mcpToolsKey || mcpListToolsReuseOff) return;
+	const output = body && Array.isArray(body.output) ? body.output : null;
+	if (!output) return;
+	for (let i = output.length - 1; i >= 0; i--) {
+		const item = output[i];
+		if (!item || item.type !== 'mcp_list_tools' || item.server_label !== MCP_NAME) continue;
+		if (item.error || typeof item.id !== 'string' || !item.id || !Array.isArray(item.tools)) continue;
+		let toolsText = '';
+		try { toolsText = JSON.stringify(item.tools); } catch (_) { return; }
+		if (SERVER_PLACEHOLDERS.some((ph) => toolsText.indexOf(ph) !== -1)) return;
+		mcpListToolsCache.set(turn.mcpToolsKey, { type: 'mcp_list_tools', id: item.id, server_label: item.server_label, tools: item.tools });
+		return;
+	}
+}
+
+/**
+ * A chat turn failed. If it carried a stored listing, that entry is always dropped, so
+ * the next message goes out the way it did before reuse existed (OpenAI fetches the list
+ * itself) and a good answer stores a fresh one. How far the verdict reaches depends on
+ * the failure:
+ * - the error names the item (`mcp_list_tools` or the injected id): reuse stays off for
+ *   this project in this browser (localStorage) and for this page;
+ * - any other malformed-request refusal (HTTP 400 / 422, `invalid_request_error`):
+ *   reuse stays off for this page;
+ * - anything else (rate limit, provider 5xx, network, a timeout): only the entry goes.
+ * The failed turn itself is not retried: its error shows like any other provider error.
+ */
+export function forgetMcpListToolsOnFailure(turn: ChatTurnContext | undefined, failure?: any): void {
+	if (!turn || !turn.mcpToolsInjected) return;
+	if (turn.mcpToolsKey) mcpListToolsCache.delete(turn.mcpToolsKey);
+	const text = failureText(failure);
+	const status = failureStatus(failure);
+	const namesItem = text.indexOf('mcp_list_tools') !== -1 || (!!turn.mcpToolsItemId && text.indexOf(turn.mcpToolsItemId.toLowerCase()) !== -1);
+	if (namesItem) {
+		mcpListToolsReuseOff = true;
+		storeMcpListToolsOff(turn.mcpToolsService);
+		return;
+	}
+	if (status === 400 || status === 422 || text.indexOf('invalid_request_error') !== -1) mcpListToolsReuseOff = true;
+}
+
 export async function callClaudeWithMcp({
 	prompt,
 	messages,
@@ -703,6 +911,10 @@ export async function callClaudeWithMcp({
 	// builder directly gets the same switch: the project's setting is the ceiling,
 	// and an explicit `false` (here or in the config) restricts below it.
 	const web = await resolveWebAccess(service, typeof webAccess === 'boolean' ? webAccess : undefined);
+	// The project's answer mode. Empty (no field at all) for 'standard' and for a model
+	// that does not take `output_config.effort`. Same store as the web switch above, so
+	// this joins the read that already settled rather than starting a second one.
+	const effortFields = chatEffortFields('claude', model, await resolveAnswerMode(service));
 	const mcpServerDefinition: Record<string, any> = {
 		type: 'url',
 		name: mcpServer.name,
@@ -738,6 +950,8 @@ export async function callClaudeWithMcp({
 		data: {
 			model,
 			max_tokens: maxTokens,
+			// `output_config: {effort}` for a fast or thorough project, nothing otherwise.
+			...effortFields,
 			// Top level beside model/messages/mcp_servers, which is where the
 			// Messages API takes it.
 			...stream.body,
@@ -840,13 +1054,34 @@ export async function callOpenAIWithPublicMcp(
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
 	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
+	turn?: ChatTurnContext,
 ) {
 	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	const resolvedModel = model || DEFAULT_OPENAI_MODEL;
 	const imageDetail = getOpenAIImageDetail(resolvedModel);
+	const serverUrl = mcpChatUrl(endpoint.url, 'openai', resolvedModel);
 	// The project's web switch: host option, then the `web_access` setting, then
 	// off. Awaited so the first turn after a page load reads the stored value.
 	const web = await resolveWebAccess(service);
+	// The project's answer mode, from the same settled read. Empty (no `reasoning`
+	// key at all) for 'standard' and for a model older than gpt-5.4.
+	const effortFields = chatEffortFields('openai', resolvedModel, await resolveAnswerMode(service));
+	// The tool listing an earlier chat turn got for this exact server_url, user and
+	// project, if the caller opted in. See ChatTurnContext.
+	let listedTools: McpListToolsItem | undefined;
+	if (turn) {
+		turn.mcpToolsKey = undefined;
+		turn.mcpToolsInjected = false;
+		turn.mcpToolsService = undefined;
+		turn.mcpToolsItemId = undefined;
+		if (turn.reuseMcpToolList && !mcpListToolsReuseOff && !mcpListToolsOffStored(service)) {
+			turn.mcpToolsKey = mcpListToolsKey(serverUrl, mcpScope?.anonymous, service, mcpScope?.publicProjectId, turn.userId);
+			turn.mcpToolsService = service;
+			listedTools = mcpListToolsCache.get(turn.mcpToolsKey);
+			turn.mcpToolsInjected = !!listedTools;
+			if (listedTools) turn.mcpToolsItemId = listedTools.id;
+		}
+	}
 	const messageList =
 		messages && messages.length
 			? prepareOpenAIMessages(messages, imageDetail)
@@ -865,6 +1100,14 @@ export async function callOpenAIWithPublicMcp(
 					content: system,
 				},
 			]
+			: []),
+		// Right after the system message, exactly as OpenAI returned it, so OpenAI
+		// skips asking the MCP server for its tools again. Absent unless stored.
+		// This item passes through the server's $CLIENT_SECRET / $ACCESS_TOKEN /
+		// $ID_TOKEN substitution; rememberMcpListTools never stores a listing that
+		// contains one of those literals.
+		...(listedTools
+			? [{ type: listedTools.type, id: listedTools.id, server_label: listedTools.server_label, tools: listedTools.tools }]
 			: []),
 		...messageList.map((m) => ({
 			role: m.role,
@@ -891,6 +1134,8 @@ export async function callOpenAIWithPublicMcp(
 		data: {
 			model: resolvedModel,
 			max_output_tokens: getMaxOutputTokens('openai', resolvedModel),
+			// `reasoning: {effort}` for a fast or thorough project, nothing otherwise.
+			...effortFields,
 			// Top level beside model/input/tools, which is where the Responses API
 			// takes it.
 			...stream.body,
@@ -905,7 +1150,7 @@ export async function callOpenAIWithPublicMcp(
 				{
 					type: 'mcp',
 					server_label: MCP_NAME,
-					server_url: mcpChatUrl(endpoint.url, 'openai', resolvedModel),
+					server_url: serverUrl,
 					require_approval: 'never',
 					// No `headers` at all for an anonymous turn: `Bearer ` with an
 					// empty token is a credential the MCP server rejects, and the

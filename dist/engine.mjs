@@ -78,6 +78,30 @@ function normalizeSkipDuplicateFiles(value) {
 function skipDuplicateFilesFrom(data) {
   return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
 }
+var ANSWER_MODES = ["standard", "fast", "thorough"];
+var DEFAULT_ANSWER_MODE = "standard";
+var ANSWER_MODE_SETTING_LABEL = "Answer mode";
+var ANSWER_MODE_LABELS = {
+  standard: "Standard",
+  fast: "Fast",
+  thorough: "Thorough"
+};
+var ANSWER_MODE_HINTS = {
+  standard: "The AI model decides how long to think. This is the default.",
+  fast: "Shorter thinking for quicker answers. Best for simple questions.",
+  thorough: "Longer thinking before answering. Slower, and uses more tokens."
+};
+var ANSWER_MODE_OPTIONS = ANSWER_MODES.map((value) => ({
+  value,
+  label: ANSWER_MODE_LABELS[value],
+  hint: ANSWER_MODE_HINTS[value]
+}));
+function normalizeAnswerMode(value) {
+  return value === "fast" || value === "thorough" ? value : DEFAULT_ANSWER_MODE;
+}
+function answerModeFrom(data) {
+  return normalizeAnswerMode(data ? data.answer_mode : void 0);
+}
 var CHAT_GREETING_MAX_LENGTH = 400;
 function normalizeChatGreeting(value) {
   if (typeof value !== "string") return "";
@@ -167,6 +191,9 @@ function projectWebAccess(service) {
 function projectSkipDuplicateFiles(service) {
   return skipDuplicateFilesFrom(cachedProjectSettings(service));
 }
+function projectAnswerMode(service) {
+  return answerModeFrom(cachedProjectSettings(service));
+}
 function setProjectSettings(service, data) {
   if (!service) return;
   cache.set(service, { data: data || null, settled: true, inflight: null });
@@ -248,6 +275,10 @@ function resolveWebAccess(service, override) {
   const opt = _config ? _config.webAccess : void 0;
   if (!service) return Promise.resolve(underCeiling(webAccessFrom(null), opt, override));
   return loadProjectSettings(service).then(webAccessFrom, () => false).then((setting) => underCeiling(setting, opt, override));
+}
+function resolveAnswerMode(service) {
+  if (!service) return Promise.resolve(answerModeFrom(null));
+  return loadProjectSettings(service).then(answerModeFrom, () => answerModeFrom(null));
 }
 function skipDuplicateFilesEnabled(service) {
   const opt = _config ? _config.skipDuplicateFiles : void 0;
@@ -807,38 +838,44 @@ function buildChatSystemPrompt(params) {
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
-  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise with getUniqueId using unique_id "src::" and condition "gte" (narrow it by the name the user used; condition "lte" with the file name alone finds it in any folder). THEN FIND THE PAGE: call searchText with the file's path and the words the user asked about; it returns the file, the page and the matching excerpt. When the user did not name a file ("find a file that contains X"), call searchText WITHOUT path: it narrows by itself. It first searches every file whose name matches: while quick_complete is false, keep its hits and call again with next_cursor without answering yet. When quick_complete is true, give the quick results, then ALWAYS ask the user once whether they want all files searched too, since they may be looking for something else, and only if they say yes call searchText again with cursor = full_scan_cursor (it leaves out the files already searched). With no quick match it searches every other file itself: follow next_cursor until search_complete is true, and once its hits answer the question, answer and ask the user before reading the rest. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. If searchText answers no_page_text, the file was indexed before page text existed: read it with readFileContent instead, paging with the cursor until END OF FILE, and cite the file. When searchText and the file's records come back empty over files that HAVE page text, say that the data does not have it and name the files and the terms you searched. Never fill the gap from your general knowledge, and never from the web${webAccess ? ` without saying so. WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content. This is the one exception to the four sources named above.` : `: this chat has no web tool.`}`;
+  const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
+  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used. THEN FIND THE PAGE with searchText: with the file's path when the user named a file, without a path when they did not ("find a file that contains X"), and follow its description's steps to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name.`;
+  const groupIsAuthorized = indexGroupLiteral === '"authorized"' || indexGroupLiteral === "1";
+  const groupIsPublic = indexGroupLiteral === '"public"' || indexGroupLiteral === "0";
+  const accessGroupRule = `THIS PROJECT INDEXES AT access_group ${indexGroupLiteral}: pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name, whether it filters by index, by tag or by nothing. ${groupIsAuthorized ? `Do not rely on the defaults: an index or tag query sent with table_name but no group is auto-filled with "authorized", which happens to be this project's group, but a plain table query is not auto-filled at all.` : `Do not rely on the defaults: an index or tag query sent with table_name but no group is auto-filled with "authorized", which is NOT this project's group, so it would search a group this project's data is not in and come back empty.`} Leaving access_group off a table query does NOT mean "all groups": only the project's owner is answered across every group, and any other user is answered from access_group 0 (public) alone${groupIsPublic ? "" : `, so a table indexed at ${indexGroupLiteral} comes back empty with its records sitting right there`}. Files uploaded before the project's setting changed may sit at another group, so when a table query comes back empty, retry it in the other groups among 0, 1 and "private" before concluding there is nothing. An index or tag filter matches inside ONE table and needs table_name: without it the call FAILS with an error, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them; adding table_name narrows it to that table, and access_group WITHOUT table_name fails with '"table" is required'.`;
   let systemPrompt = `
 You are a dedicated assistant for the project ID: "${projectId}".
 Scope: Only answer questions about this project and its data. Do not answer questions about other projects or topics unrelated to this project. When the user refers to "my database", "my data", or "my files", treat those as references to this project's database and file storage. The ONE exception is BunnyQuery itself - what this app is, what it can do, and how to use it - which is always in scope: answer it from the "About BunnyQuery" section at the end of this prompt.
 Knowledge lookup: Before saying you don't know or that something isn't in the chat history, ALWAYS query this project's database through the available MCP tools to look for the answer. The user's data is the source of truth - the chat transcript is not. Only respond with "I don't know" or "I couldn't find that" after you have actually searched the project's data and come back empty.
 ${groundingRules}
+${webRule}
 SAVED FINDINGS FIRST: where an earlier search found an answer is saved in table "search_findings" (one record per file page; its tags are the key words of the question that led there and of the search terms, stored lowercase without spaces). Before any other search, call getRecords with table_name "search_findings", access_group ${indexGroupLiteral} and tags set to ONE specific key word of the question (a name or a term, in the user's words; when nothing comes back, try one more word, or the word in the documents' language). A finding gives data.path and data.page: read THAT page (searchText with that path and the question's words) and answer from the page itself, quoting and citing it as usual. A finding is only a pointer, never the answer: when its page does not answer the question, or nothing is found, search as below.
-FINDING THE DATA: the database is the way in, for every kind of file. Step 1, getTables (one page). ONLY when the list runs past that page (end_of_list false), search the table names with the words the user used, BOTH ways: condition "gte" (begins with) and condition "lte" (ends with), instead of listing them all. When the list is complete, never search table names: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Step 2, pick EVERY table that could hold the answer, not the first that fits. Step 3, in each of those tables, getIndexes and getTags (one page each, never fetch_all) to learn the exact index names and tag values; when that page does not show the name or the list runs past it, search both ways with the user's words: getTags with table_name and condition "gte", and again with "lte"; getIndexes with order {by: "index_name", value: <the words>, condition: "gte"} and again with "lte". Name and tag lists can be millions of characters long and are never read whole. Never call getTags with neither table_name nor tag: that lists every tag of every table. Step 4, getRecords in that table and group with the selector that matched: an index (string values take "gte" for begins with and "lte" for ends with), one exact tag, or no selector for the whole table, always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>". TAGS are stored lowercase without spaces or punctuation, plus one tag per word: search a tag as one word ("leak") or as the joined phrase ("oilleak"); the server also normalizes the tag you send. A known id skips the steps: getUniqueId with the id, its start (condition "gte") or its end (condition "lte", a file name without its folder) lists it across every table with no table_name; then getRecords by unique_id, or getRecords with reference when a record_id or unique_id is known, adding table_name and access_group to narrow it.
-NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and never from a guess. Each row of each sheet is one record in its table: reference "src::<path>", unique_id "row::<path>#<sheet>#R<n>", the cells by header name, plus "_sheet", "_row", "_grain" ("detail" or "summary") and, on a total or preamble row, "_row_type". Its tags carry the file name, the sheet, the grain and up to four key values of the row (a name, a code), so getRecords with one exact tag selects every row about that thing across all the files in the table. Workbooks state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that re-total it, plus a summary. Use rows whose "_grain" is "detail" and whose "_row_type" is not "total", pick ONE sheet per file and say which, and never add a sheet to its summary. Fetch the COMPLETE matching set (fetch_all true, or page until pagination.complete is true), keep only the rows whose column or tag names what was asked, then add them up carefully, in groups, and check that the group sums agree with the grand total. Quote the row count, the sheet(s) and the file(s) the figure was made from and label it as calculated.
+FINDING THE DATA: the database is the way in, for every kind of file. Follow the search path in getTables' description, with one exception for this project: when getTables' one page is the whole list (end_of_list true), skip its table-name search even when no name fits: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Pick EVERY table that could hold the answer, not the first that fits. Read getIndexes and getTags one page each, never with fetch_all: name and tag lists can be millions of characters long and are never read whole, so when the name is not on that page, search for it with the user's words as their descriptions say. Never call getTags with neither table_name nor tag: that lists every tag of every table. Then getRecords in that table and group with the selector that matched (an index, one exact tag, or none for the whole table), always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>". Every stored file has a record whose unique_id is "src::<its storage path>", so getUniqueId with unique_id "src::" and condition "gte" lists every file across every table (add the start of a path to narrow it; condition "lte" with a file name alone finds it in any folder). TAGS are stored lowercase without spaces or punctuation, plus one tag per word: search a tag as one word ("leak") or as the joined phrase ("oilleak"); the server also normalizes the tag you send.
+NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and never from a guess. Each row of each sheet is one record in its table: reference "src::<path>", unique_id "row::<path>#<sheet>#R<n>", the cells by header name, plus "_sheet", "_row", "_grain" ("detail" or "summary") and, on a total or preamble row, "_row_type". Its tags carry the file name, the sheet, the grain and up to four key values of the row (a name, a code), so getRecords with one exact tag selects every row about that thing across all the files in the table. Workbooks state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that re-total it, plus a summary. Use rows whose "_grain" is "detail" and whose "_row_type" is not "total", pick ONE sheet per file and say which, and never add a sheet to its summary. Fetch the COMPLETE matching set, keep only the rows whose column or tag names what was asked, then add them up carefully, in groups, and check that the group sums agree with the grand total. Quote the row count, the sheet(s) and the file(s) the figure was made from and label it as calculated.
 A FILE TOTAL IS NOT A ROW'S TOTAL. The biggest number on a summary sheet is the whole file, not the thing that was asked about. Before quoting any figure, check it is scoped to what the question named: filter by the column that identifies it and report how many rows matched.
 ${documentRules}
-Complete answers over stored data: The database holds one record per spreadsheet row, and each uploaded file becomes many records. ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. An index or tag filter matches inside ONE table only and requires table_name: on getRecords, an index or tag sent with table_name but no access_group is auto-filled with access_group "authorized", but THIS project indexes at access_group ${indexGroupLiteral}, so pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name here, index or tag or plain - the auto-fill would search a group this project's data is not in and come back empty, and leaving access_group off a plain table query does NOT mean "all groups": unless you are the project's owner the server reads a table with no group as access_group 0 (public only), so a table indexed at ${indexGroupLiteral} comes back empty with its records sitting right there. Files uploaded before the project's setting changed may sit at another group, so when a scoped query comes back empty, retry it across the other groups (0, 1, "private") before concluding there is nothing, while an index or tag WITHOUT table_name FAILS with an error instead of answering, so read the error rather than guessing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them. Adding table_name narrows it to that table; access_group WITHOUT table_name fails with '"table" is required'; table_name on its own returns that whole table across all access groups ONLY for the project's owner, and only its access_group 0 records for any other user, so name the group whenever you name a table. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set before answering. Query with fetch_all set to true, or page through getToolResponsePage until pagination.complete is true, across EVERY table and EVERY relevant file. A single default query returns only the first page (about 50 records). That is a SAMPLE. Never treat it as the whole dataset. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
-Never assert absence from a partial read. Do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty. If you have not finished scanning every relevant table and file, keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking.
-Embedded values: a search term is often stored inside a larger string. A merchant "BAKSA" appears as "DNH*BAKSA#4070277042", and a card as "5860****5173". Server-side index filters match only exact values, leading prefixes, or trailing suffixes, and tag filters only EXACT whole-tag values - never a partial or interior substring - so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete. Fetch the full set with fetch_all and match the substring yourself.
+Complete answers over stored data: each uploaded file becomes many records, and ONE file is routinely SPLIT ACROSS SEVERAL TABLES - a summary row in one table, its page or row content in another, its extracted photos and other media in "__MEDIA__", and the indexer often invents a differently-named table on each pass. For anything NOT scoped to a single file, call getTables FIRST, run the query once per table that could hold the answer, and combine the results.
+${accessGroupRule}
+For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), you MUST read the COMPLETE matching set across EVERY table and EVERY relevant file before answering: one page is only a sample. Never assert absence from a partial read: do not say "there is no X", "none", "not found", or "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4" until a complete scan has come back empty, and keep querying instead of guessing. A confident "no" that later turns out wrong is worse than telling the user you are still checking. If you already answered from one table and then realise another table holds more, do not simply apologise: re-run the sweep and give the complete answer.
+Embedded values: a search term is often stored inside a larger string. A merchant "BAKSA" appears as "DNH*BAKSA#4070277042", and a card as "5860****5173". Index and tag filters never match an interior substring, so filtering on such a field silently drops rows. When the value you are looking for may be embedded, do not trust a narrow filter to be complete: fetch the full set with fetch_all and match the substring yourself.
 File attachments: When a user message contains an "Attached files:" section with markdown links, those links point to short-lived signed URLs in this project's db storage and will expire.
 - Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY attached inline as image content blocks in the same message - you can see them directly. Do NOT call web_fetch on image URLs; that will fail or return garbage. Just look at the image block and answer.
-- Other attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, email messages (.eml), and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) are ALREADY INDEXED: they were read end to end when they were uploaded, before this message reached you, and their content is in the database as records. Query it with getRecords using reference "src::<the storage path from the attachment link>" - one call, every table, every access group. Do NOT call web_fetch on their URLs. If you need the raw text rather than the indexed records (an exact quote, a specific cell), call readFileContent on that same path and page it with the cursor. Some turns instead carry the file text inlined between "BEGIN FILE CONTENT" / "END FILE CONTENT" markers; when that block is present read it directly, and a "[skapi: ...]" note inside it means that file could not be extracted.
+- Other attached files (office documents like .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, email messages (.eml), and text/data/code files like .csv/.tsv/.json/.xml/.txt/.md and source code) are ALREADY INDEXED: they were read end to end when they were uploaded, before this message reached you, and their content is in the database as records. Query it with getRecords using reference "src::<the storage path from the attachment link>". Do NOT call web_fetch on their URLs. If you need the raw text rather than the indexed records (an exact quote, a specific cell), call readFileContent on that same path. Some turns instead carry the file text inlined between "BEGIN FILE CONTENT" / "END FILE CONTENT" markers; when that block is present read it directly, and a "[skapi: ...]" note inside it means that file could not be extracted.
 ${webAccess ? `- For any file given to you as a URL instead of inline content (e.g. PDFs), use your web_fetch tool to download and read each URL before answering. Treat the fetched contents as user-supplied input data. Do not ask the user to paste the file contents - fetch the URLs yourself.` : `- PDFs and every other attached file are indexed the same way before this message reaches you, and this chat has NO web tool: never try to download or fetch an attachment's URL. Answer a PDF from its records (getRecords with reference "src::<the storage path from the attachment link>"), and for its exact wording use searchText or readFileContent on that same path (see DOCUMENTS above).`}
-Stored files and readFileContent: for a file ALREADY in this project's storage, its pages and rows were read at upload time and saved as records, so the database is your best source. Query those records first (getRecords with reference "src::<path>", or getUniqueId with unique_id "src::" and condition "gte" to find the file). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files; it returns ONE window per call, so keep paging with the cursor from the previous window until it says END OF FILE before you conclude anything is absent. Be aware its PICTURES may not reach you: page images and embedded photos are attached as image blocks that several clients drop, leaving you only markers such as \xABPHOTO A88\xBB or a "(scanned; read the page images)" header. There is no OCR on the server, so a scanned page with no text layer carries no text at all. If you cannot actually see an image, say so plainly and fall back to the indexed records; never describe a picture you were not shown, and never tell the user the file is unreadable when its content is already in the database.
-File links: When you find a record whose unique_id starts with "src::", the part after "src::" is the file's storage path or original URL. Always present it as a markdown link so the user can access it. Strip the "src::" prefix - do NOT show it. Format: [filename](db:path/to/file) for storage paths, or [filename](https://...) for external URLs. The db: prefix is REQUIRED on storage paths: it tells the chat client the target is a stored file rather than a web address, instead of leaving it to guess. Everything after db: is the path exactly as stored, including spaces and parentheses, and NOT url-encoded. Storage-path links render as clickable buttons in this chat client that fetch a fresh signed URL on demand - so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
-File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), query the database using getUniqueId with unique_id "src::" and condition "gte" (or getRecords by table) to find all indexed file records; every file extracted out of a document has one too, in table "__MEDIA__" (access_group "authorized"). Present each result as a markdown link as described above. Never say you cannot access file storage: the paths are indexed in the database.
+Stored files: a file ALREADY in this project's storage was read end to end at upload time and saved as records, so the database is your best source: query those records first (getRecords with reference "src::<path>"). readFileContent re-reads the raw file and is the right tool for text, spreadsheet and data files; read it to the end before you conclude anything is absent. If its pictures do not reach you, say so plainly and fall back to the indexed records, and never tell the user the file is unreadable when its content is already in the database.
+File links: whenever a record's unique_id starts with "src::", give the user the file as a markdown link in the format getRecords' description sets ([filename](db:path/to/file) for a stored path, without the "src::" prefix; an external URL as itself). In this chat client a db: link renders as a clickable button that fetches a fresh signed URL on demand, so even if a previously shared URL has expired, give the user the storage-path link instead of saying the file is unavailable. Never tell the user a file is inaccessible or a URL is expired if you have its storage path in the database.
+File lookup: When the user asks to see, list, or show files (e.g. "show me uploaded files", "list my images", "show me the reference video"), list the file records with getUniqueId on "src::" and condition "gte" (see WHERE INDEXED CONTENT LIVES), or getRecords by table; every file extracted out of a document has one too, in table "__MEDIA__" (access_group "authorized"). Present each result as a link as described above. Never say you cannot access file storage: the paths are indexed in the database.
 Showing images: "show me the photo", "\uBCF4\uC5EC\uC918", "display it" is a request for the file's LINK, nothing more. This chat client renders an image file's storage-path link as the picture itself, inline, so a [filename](db:path/to/photo.jpg) link IS the image on screen. Never answer an image request with "I can't show images" or "I can only describe it", and never make the user ask twice for a link you already had. If you have the path, give the link and let the client paint it. The same is true of any file the user asks to see: the link is the answer. Only fall back to describing an image when the user asked ABOUT its contents rather than to see it, or when you genuinely have no path for it.
 Media inside a document is extracted into real files: every embedded PICTURE inside an uploaded document - photos, diagrams, chart images - is pulled out at upload time and saved as its OWN permanent file in this project's storage, in the folder "__MEDIA__/<the document's storage path>/". Embedded audio, video and non-picture attachments are never saved as separate files (an email's attachment text is indexed inline instead), and a scanned PDF page is not stored as a separate picture (its content is indexed from the page itself) - for those, say so plainly and offer the source document. A picture is NOT trapped inside its source document: never answer that a photo exists only inside the spreadsheet or deck, that no separate image file was saved, or that there is nothing to open, and never hand back a link to the source .xlsx or .pdf when the user asked for a picture inside it.
 Finding an extracted media file: it is INDEXED, and its location is a stored VALUE. Get it by QUERYING, never by constructing a filename.
 RECOGNISE IT BY THE VALUE, NOT THE FIELD NAME. Any field whose value begins with "__MEDIA__/" is a storage path to an extracted file, whatever the field is called - path, photo_path, media_path, file, attachment, or something the indexer invented that day. A record's unique_id beginning "src::__MEDIA__/" marks it as a media record too.
-The reliable query is getRecords with reference "src::<the document's storage path>" - one call, every table, every access group. Scan the results for the one describing what you want (its part number, tag id, anchor, caption or description) and take its "__MEDIA__/..." value. Never let a table guess be the reason you report a file as missing.
+The reliable query is getRecords with reference "src::<the document's storage path>". Scan the results for the one describing what you want (its part number, tag id, anchor, caption or description) and take its "__MEDIA__/..." value. Never let a table guess be the reason you report a file as missing.
 Link it VERBATIM as [caption](db:<the path>). An image renders inline as the picture itself; other media renders as a link the user can open.
 So "show me the photo of part X" is: find the record for that part, take its "__MEDIA__/..." value, link it.
 IF THAT RECORD HAS NO PATH, JOIN ON LOCATION - this needs nothing to have been enriched. Every media record carries data.anchor (the cell or page it was embedded at), plus data.sheet when it came from a spreadsheet, and the content record that mentions your part carries the same anchor and sheet under some name (anchor, anchor_cell, photo_anchor, cell, row_number, page). So: read the anchor and sheet off the content record, query getRecords with reference "src::<the document>", and take the media record whose data.anchor, data.also_at or tags match the anchor, using data.sheet too when both records carry one. Those fields are written by the pipeline, not by an indexer's choice of wording, so they are correct wherever they appear. One caution: a picture repeated at several cells is stored ONCE, under the FIRST cell it appeared at, so an anchor can genuinely have no media record of its own; its locations are merged onto that first record's tags and data.also_at. Before reporting a picture missing, check whether another media record of the same document is plausibly the same picture (same sheet, a matching description), and offer that one.
-THIS IS NOT ONLY ABOUT SPREADSHEET PHOTOS. Treat "show me the diagram in that deck" or "the picture in that PDF" exactly like a photo request: query for the media record, never reconstruct a filename. For embedded video, audio or a non-picture attachment there is no extracted file: say so plainly and offer the source document.
+THIS IS NOT ONLY ABOUT SPREADSHEET PHOTOS. Treat "show me the diagram in that deck" or "the picture in that PDF" exactly like a photo request: query for the media record, never reconstruct a filename.
 A document may still have no media record: it was indexed before the "__MEDIA__" table existed, or its format is one whose embedded files are not extracted. Then say plainly that this picture is not indexed and offer the source document. One missing record is never evidence that media is not stored.
-File generation: When the user asks for DATABASE records as a file (CSV, spreadsheet, export, download), call exportRecordsToFile: it writes the rows on the server, keeps them out of your context, and returns a download_url you paste as the link. Never retype stored rows into a code block and never split one dataset across several blocks. For a file you are authoring yourself, or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown, put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only - never base64 or any other encoding. Example for CSV:
+File generation: When the user asks for DATABASE records as a file (CSV, spreadsheet, export, download), call exportRecordsToFile and hand over its link the way its description says. Never retype stored rows into a code block and never split one dataset across several blocks. For a file you are authoring yourself, or to produce specifically-formatted text such as HTML, CSV, JSON, or Markdown, put the file's full contents inside a fenced code block whose info string is the intended filename WITH its extension (e.g. report.csv), NOT a language name like "csv". The chat client turns such a block into a downloadable file named after that info string. Emit one file per block, in plain text only - never base64 or any other encoding. Example for CSV:
 \`\`\`filename.csv
 item,qty,total
 Carrots,55,$38.50
@@ -851,7 +888,7 @@ About BunnyQuery (this app - questions about it are in scope):
 You are the assistant inside BunnyQuery, an AI assistant for the user's own business data. Instead of digging through folders, dashboards and files, the user uploads their documents, spreadsheets, images, notes and records, BunnyQuery indexes them into this project's database, and you answer questions, write reports and summarize from THAT data rather than from the open internet. Each project has its own data, its own AI platform (ChatGPT or Claude, powered by the project owner's own API key) and its own base prompt. BunnyQuery is built on Skapi (www.skapi.com), so the same project database is also reachable over MCP from any MCP-compatible AI client (mcp.broadwayinc.computer), and this chat can be embedded in a website as a widget with one script tag. Answer product questions from the facts in this section. If you are asked something about BunnyQuery that is NOT stated here - pricing, plan limits, a roadmap, a feature you cannot see - say you are not certain and point the user at the project owner or the BunnyQuery site, rather than inventing it.
 How data gets in: ${canUpload === false ? `this user CANNOT upload in this session (they are not signed in, or the project's database is frozen for non-admins), and the attach affordances are hidden from them. Never instruct them to attach, drag in or upload a file, and never blame a missing answer on them not having uploaded it. Answer from what is already indexed, and when something genuinely is not in the project, say so and suggest asking the project's owner to add it.` : `the user attaches files to a chat message with the paperclip button in the composer, or drags and drops them onto the chat (whole folders work; up to 20 files per message). Uploaded files land in this project's file storage and are indexed automatically: read end to end and turned into database records. "Indexed" means exactly that, and it is why you can only answer from a file once its indexing has finished. While a file indexes, the chat shows a status row for it: yellow while it is working, green when it is indexed, red if it failed. A large file is indexed in windows over several passes, which takes longer; indexing runs on the server, so it keeps going if the user closes the page and the row is still there when they come back. The user can also paste plain text straight into the chat and ask you to save it - store it with the postRecords tool. BunnyQuery reads over 50 formats: office documents (.docx, .xlsx, .pptx, .hwp, .hwpx, .odt, .ods, .odp, .epub), email (.eml), PDFs, images, .csv/.tsv, .json, .xml, .html, .txt/.md and source code. Images and scanned PDFs are read with vision at index time.`}
 Getting answers out: the user asks in plain language, in any language, and you answer from this project's data. You can also produce reports and downloadable files (CSV and the rest) as described in the File generation rules above, and any stored file can be handed back as a link, with images rendering inline in the chat.${client === "console" ? `
-Where things are in the BunnyQuery console (this user is in it, at bunnyquery.com): the left nav has "Query" (this chat), "Files" (browse this project's stored files, upload more, and see which are indexed), "Collaborators" (invite teammates or clients so they can ask questions themselves) and "Settings" (the AI platform, model and API key, the project's description / base prompt, which is added to your instructions, and the Freeze Database switch that blocks writes). Plans and billing live on the project's Subscription page - send the user there rather than quoting prices, which you do not know.` : ""}${client === "widget" ? `
+Where things are in the BunnyQuery console (this user is in it, at bunnyquery.com): the left nav has "Query" (this chat), "Files" (browse this project's stored files, upload more, and see which are indexed), "Collaborators" (invite teammates or clients so they can ask questions themselves) and "Settings" (the AI platform, model and API key, the project's description / base prompt, which is added to your instructions, the Answer mode (Standard, Fast or Thorough: how quickly or how deeply you work on each answer), and the Freeze Database switch that blocks writes). Plans and billing live on the project's Subscription page - send the user there rather than quoting prices, which you do not know.` : ""}${client === "widget" ? `
 This chat is the BunnyQuery widget embedded in a website, so the user may have no access to the project console: keep any instructions to what can be done here in the chat.` : ""}`;
   if (greeting) {
     systemPrompt += `
@@ -1033,6 +1070,165 @@ Records for the earlier windows/pages of this file are ALREADY saved (they refer
  - Spreadsheet: the cursor is "<sheetIndex>:<nextRow>" (0-based sheet index, 1-based row). If you saved up to row R of sheet S, use cursor="S:R+1".
  - Text: the cursor is the character offset already read.
 Index the REMAINING windows - one record per row/item, looking at any page images or embedded photos - saving as you go until readFileContent reports END OF FILE. A \xABPHOTO <cell>\xBB marker in a window marks an embedded picture whose extracted file already has a record in table "__MEDIA__": find it with getRecords reference "src::" + the storage path above and match the cell against data.anchor or tags (a repeated picture is stored under its first anchor only), then enrich it with updateRecords. Never create a photo record of your own and never construct a path for one. Do NOT re-save windows that are already saved. Set every record's reference to exactly "src::" + the storage path above (no sheet, window or summary suffix added). That file record already exists, so do NOT post it; enrich it with updateRecords. When the ENTIRE file is finally indexed, end your message with the token INDEXING_COMPLETE.`;
+}
+
+// src/engine/errors.ts
+var STATUS_MESSAGE = {
+  "408": "The AI provider timed out before it started.",
+  "409": "The AI provider rejected the request as conflicting.",
+  "413": "The request was too large for the AI provider.",
+  "429": "The AI provider is rate limiting requests right now.",
+  "500": "The AI provider hit an internal error.",
+  "502": "The AI provider is temporarily unreachable.",
+  "503": "The AI provider is temporarily unavailable.",
+  "504": "The AI provider timed out."
+};
+function isTransientStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+function isCsrStatusEnvelope(res) {
+  return !!res && typeof res === "object" && !Array.isArray(res) && typeof res.status === "string" && typeof res.id === "string" && "in_queue" in res;
+}
+function csrEnvelopeError(input) {
+  if (!isCsrStatusEnvelope(input)) return void 0;
+  if (input.status !== "failed") return void 0;
+  return input.error != null ? input.error : { message: "The AI provider request failed." };
+}
+function getErrorMessage(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  if (!input) return "Something went wrong.";
+  if (typeof input === "string") return input;
+  if (input.error && input.error.message) return input.error.message;
+  if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
+  if (input.body && typeof input.body.message === "string") return input.body.message;
+  if (input.message) return input.message;
+  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : 0;
+  if (status) {
+    var text = STATUS_MESSAGE[String(status)] || (status >= 500 ? "The AI provider returned a server error." : "The AI provider rejected the request.");
+    return text + " (error " + status + ")" + (isTransientStatus(status) ? " This is usually temporary, please try again." : "");
+  }
+  return "Something went wrong.";
+}
+function isRetriedFailure(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  return !!input && typeof input === "object" && input.retried === true;
+}
+function isErrorResponseBody(response) {
+  var envErr = csrEnvelopeError(response);
+  if (envErr !== void 0) response = envErr;
+  if (!response || typeof response !== "object") return envErr !== void 0;
+  if (typeof response.status_code === "number" && response.status_code >= 400) return true;
+  if (response.type === "error") return true;
+  if (response.error && (response.error.message || response.error.type)) return true;
+  var body = response.body;
+  if (body && typeof body === "object") {
+    if (body.type === "error") return true;
+    if (body.error && (body.error.message || body.error.type)) return true;
+  }
+  if (typeof response.message === "string" && response.message.length) {
+    var hasClaude = Array.isArray(response.content);
+    var hasOpenAI = typeof response.output_text === "string" || Array.isArray(response.output) || Array.isArray(response.choices);
+    if (!hasClaude && !hasOpenAI) return true;
+  }
+  return false;
+}
+function isNonRetryableRequestError(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  if (!input || typeof input !== "object") return false;
+  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
+  var param = void 0;
+  var blobs = [];
+  var sources = [input.error, input.body && input.body.error, input.body, input];
+  for (var i = 0; i < sources.length; i++) {
+    var e = sources[i];
+    if (!e) continue;
+    if (typeof e === "string") {
+      blobs.push(e);
+      continue;
+    }
+    if (typeof e !== "object") continue;
+    if (param === void 0 && e.param != null) param = e.param;
+    if (typeof e.code === "string") blobs.push(e.code);
+    if (typeof e.type === "string") blobs.push(e.type);
+    if (typeof e.message === "string") blobs.push(e.message);
+  }
+  var hay = blobs.join(" | ").toLowerCase();
+  if (hay.indexOf("unknown_parameter") !== -1 || hay.indexOf("unknown parameter") !== -1 || hay.indexOf("unsupported_parameter") !== -1 || hay.indexOf("unsupported parameter") !== -1) {
+    return true;
+  }
+  var isClientReqStatus = status === 400 || status === 422;
+  if (isClientReqStatus && param != null && param !== "") return true;
+  if (isClientReqStatus && hay.indexOf("invalid_request") !== -1 && (hay.indexOf("parameter") !== -1 || hay.indexOf("param") !== -1)) {
+    return true;
+  }
+  return false;
+}
+function isAuthExpiredError(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  if (!input) return false;
+  var blobs = [];
+  var push = function(v) {
+    if (typeof v === "string" && v) blobs.push(v);
+  };
+  if (typeof input === "string") push(input);
+  else {
+    push(input.message);
+    push(input.code);
+    if (input.error) {
+      push(input.error.message);
+      push(input.error.code);
+      push(input.error.type);
+    }
+    if (input.body) {
+      push(input.body.message);
+      if (input.body.error) {
+        push(input.body.error.message);
+        push(input.body.error.code);
+        push(input.body.error.type);
+      }
+    }
+    if (typeof input.status === "number" && input.status === 401) return true;
+    if (typeof input.status_code === "number" && input.status_code === 401) return true;
+  }
+  var hay = blobs.join(" | ").toLowerCase();
+  if (!hay) return false;
+  return hay.indexOf("token has expired") !== -1 || hay.indexOf("token is expired") !== -1 || hay.indexOf("expired_token") !== -1 || hay.indexOf("invalid_token") !== -1 || hay.indexOf("unauthorized") !== -1 || hay.indexOf("not authorized") !== -1 || hay.indexOf("invalid_request") !== -1 && hay.indexOf("token") !== -1;
+}
+function isProviderApiKeyError(input) {
+  var envErr = csrEnvelopeError(input);
+  if (envErr !== void 0) input = envErr;
+  if (!input) return false;
+  var blobs = [];
+  var push = function(v) {
+    if (typeof v === "string" && v) blobs.push(v);
+  };
+  if (typeof input === "string") push(input);
+  else {
+    push(input.message);
+    push(input.code);
+    push(input.type);
+    if (input.error) {
+      push(input.error.message);
+      push(input.error.code);
+      push(input.error.type);
+    }
+    if (input.body) {
+      push(input.body.message);
+      push(input.body.type);
+      if (input.body.error) {
+        push(input.body.error.message);
+        push(input.body.error.code);
+        push(input.body.error.type);
+      }
+    }
+  }
+  var hay = blobs.join(" | ").toLowerCase();
+  if (!hay) return false;
+  return hay.indexOf("authentication_error") !== -1 || hay.indexOf("invalid_api_key") !== -1 || hay.indexOf("invalid x-api-key") !== -1 || hay.indexOf("incorrect api key") !== -1 || hay.indexOf("invalid api key") !== -1 || hay.indexOf("no api key provided") !== -1;
 }
 
 // src/engine/links.ts
@@ -1899,12 +2095,41 @@ var OLDEST_NANO_REASONING_EFFORT = "high";
 var isOpenAINano = (model) => {
   const normalized = (model).trim().toLowerCase();
   if (!/(^|-)nano(-|$)/.test(normalized)) return false;
+  return openAITakesReasoningEffort(normalized);
+};
+var openAITakesReasoningEffort = (model) => {
+  const normalized = (model || DEFAULT_OPENAI_MODEL).trim().toLowerCase();
   const match = normalized.match(/^gpt-(\d+)(?:\.(\d+))?(-[a-z0-9.\-]+)?$/);
   if (!match) return false;
   const major = Number(match[1]);
   const minor = match[2] === void 0 ? null : Number(match[2]);
   return major > 5 || major === 5 && minor !== null && minor >= 4;
 };
+var claudeTakesEffort = (model) => {
+  const normalized = (model || DEFAULT_CLAUDE_MODEL).trim().toLowerCase().replace(/\[1m\]$/, "");
+  const match = normalized.match(/^claude-([a-z]+)(?:-(\d{1,2}))?(?:-(\d{1,2}))?(?:-\d{8})?$/);
+  if (!match) return false;
+  const family = match[1];
+  if (family === "fable" || family === "mythos") return true;
+  if (match[2] === void 0) return false;
+  const major = Number(match[2]);
+  const minor = match[3] === void 0 ? 0 : Number(match[3]);
+  if (family === "opus") return major > 4 || major === 4 && minor >= 5;
+  if (family === "sonnet") return major > 4 || major === 4 && minor >= 6;
+  if (family === "haiku") return major > 5 || major === 5 && minor >= 5;
+  return false;
+};
+var ANSWER_MODE_EFFORT = {
+  standard: null,
+  fast: "low",
+  thorough: "high"
+};
+function chatEffortFields(platform, model, mode) {
+  const effort = mode ? ANSWER_MODE_EFFORT[mode] : null;
+  if (!effort) return {};
+  if (platform === "openai") return openAITakesReasoningEffort(model) ? { reasoning: { effort } } : {};
+  return claudeTakesEffort(model) ? { output_config: { effort } } : {};
+}
 var variantIndexingOptions = (model) => {
   if (!isOpenAINano(model) || !isOldestNano(model)) return {};
   return {
@@ -2041,6 +2266,80 @@ function applyHistoryCacheBreakpoint(messages) {
 var POLL_INTERVAL = 3e3;
 var STREAM_POLL_INTERVAL = 1e3;
 var MAX_CONCURRENT_BG_POLLS = 6;
+var mcpListToolsCache = /* @__PURE__ */ new Map();
+var mcpListToolsReuseOff = false;
+var MCP_LIST_TOOLS_OFF_PREFIX = "bunnyquery:mcp-list-tools-off:";
+function mcpListToolsOffStored(service) {
+  try {
+    return typeof localStorage !== "undefined" && !!localStorage.getItem(MCP_LIST_TOOLS_OFF_PREFIX + service);
+  } catch (_) {
+    return false;
+  }
+}
+function storeMcpListToolsOff(service) {
+  if (!service) return;
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(MCP_LIST_TOOLS_OFF_PREFIX + service, String(Date.now()));
+  } catch (_) {
+  }
+}
+var SERVER_PLACEHOLDERS = ["$CLIENT_SECRET", "$ACCESS_TOKEN", "$ID_TOKEN"];
+function failureText(failure) {
+  const env = csrEnvelopeError(failure);
+  const f = env !== void 0 ? env : failure;
+  if (f == null) return "";
+  if (typeof f === "string") return f.toLowerCase();
+  let text = "";
+  try {
+    text = JSON.stringify(f) || "";
+  } catch (_) {
+    text = "";
+  }
+  if (typeof f.message === "string") text += " " + f.message;
+  return text.toLowerCase();
+}
+function failureStatus(failure) {
+  const env = csrEnvelopeError(failure);
+  const f = env !== void 0 ? env : failure;
+  if (!f || typeof f !== "object") return void 0;
+  const v = typeof f.status_code === "number" ? f.status_code : typeof f.status === "number" ? f.status : void 0;
+  return v;
+}
+function mcpListToolsKey(serverUrl, anonymous, service, publicProjectId, userId) {
+  return JSON.stringify([serverUrl, anonymous ? "anonymous" : "signed-in", service, publicProjectId || "", userId || ""]);
+}
+function rememberMcpListTools(turn, body) {
+  if (!turn || !turn.mcpToolsKey || mcpListToolsReuseOff) return;
+  const output = body && Array.isArray(body.output) ? body.output : null;
+  if (!output) return;
+  for (let i = output.length - 1; i >= 0; i--) {
+    const item = output[i];
+    if (!item || item.type !== "mcp_list_tools" || item.server_label !== MCP_NAME) continue;
+    if (item.error || typeof item.id !== "string" || !item.id || !Array.isArray(item.tools)) continue;
+    let toolsText = "";
+    try {
+      toolsText = JSON.stringify(item.tools);
+    } catch (_) {
+      return;
+    }
+    if (SERVER_PLACEHOLDERS.some((ph) => toolsText.indexOf(ph) !== -1)) return;
+    mcpListToolsCache.set(turn.mcpToolsKey, { type: "mcp_list_tools", id: item.id, server_label: item.server_label, tools: item.tools });
+    return;
+  }
+}
+function forgetMcpListToolsOnFailure(turn, failure) {
+  if (!turn || !turn.mcpToolsInjected) return;
+  if (turn.mcpToolsKey) mcpListToolsCache.delete(turn.mcpToolsKey);
+  const text = failureText(failure);
+  const status = failureStatus(failure);
+  const namesItem = text.indexOf("mcp_list_tools") !== -1 || !!turn.mcpToolsItemId && text.indexOf(turn.mcpToolsItemId.toLowerCase()) !== -1;
+  if (namesItem) {
+    mcpListToolsReuseOff = true;
+    storeMcpListToolsOff(turn.mcpToolsService);
+    return;
+  }
+  if (status === 400 || status === 422 || text.indexOf("invalid_request_error") !== -1) mcpListToolsReuseOff = true;
+}
 async function callClaudeWithMcp({
   prompt,
   messages,
@@ -2056,6 +2355,7 @@ async function callClaudeWithMcp({
   webAccess
 }) {
   const web = await resolveWebAccess(service, typeof webAccess === "boolean" ? webAccess : void 0);
+  const effortFields = chatEffortFields("claude", model, await resolveAnswerMode(service));
   const mcpServerDefinition = {
     type: "url",
     name: mcpServer.name,
@@ -2083,6 +2383,8 @@ async function callClaudeWithMcp({
     data: {
       model,
       max_tokens: maxTokens,
+      // `output_config: {effort}` for a fast or thorough project, nothing otherwise.
+      ...effortFields,
       // Top level beside model/messages/mcp_servers, which is where the
       // Messages API takes it.
       ...stream.body,
@@ -2143,11 +2445,27 @@ async function callClaudeWithPublicMcp(prompt, service, owner, messages, system,
       authorizationToken: endpoint.token
     }});
 }
-async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope, turn) {
   const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
   const resolvedModel = model || DEFAULT_OPENAI_MODEL;
   const imageDetail = getOpenAIImageDetail(resolvedModel);
+  const serverUrl = mcpChatUrl(endpoint.url, "openai", resolvedModel);
   const web = await resolveWebAccess(service);
+  const effortFields = chatEffortFields("openai", resolvedModel, await resolveAnswerMode(service));
+  let listedTools;
+  if (turn) {
+    turn.mcpToolsKey = void 0;
+    turn.mcpToolsInjected = false;
+    turn.mcpToolsService = void 0;
+    turn.mcpToolsItemId = void 0;
+    if (turn.reuseMcpToolList && !mcpListToolsReuseOff && !mcpListToolsOffStored(service)) {
+      turn.mcpToolsKey = mcpListToolsKey(serverUrl, mcpScope?.anonymous, service, mcpScope?.publicProjectId, turn.userId);
+      turn.mcpToolsService = service;
+      listedTools = mcpListToolsCache.get(turn.mcpToolsKey);
+      turn.mcpToolsInjected = !!listedTools;
+      if (listedTools) turn.mcpToolsItemId = listedTools.id;
+    }
+  }
   const messageList = messages && messages.length ? prepareOpenAIMessages(messages, imageDetail) : [
     {
       role: "user",
@@ -2161,6 +2479,12 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
         content: system
       }
     ] : [],
+    // Right after the system message, exactly as OpenAI returned it, so OpenAI
+    // skips asking the MCP server for its tools again. Absent unless stored.
+    // This item passes through the server's $CLIENT_SECRET / $ACCESS_TOKEN /
+    // $ID_TOKEN substitution; rememberMcpListTools never stores a listing that
+    // contains one of those literals.
+    ...listedTools ? [{ type: listedTools.type, id: listedTools.id, server_label: listedTools.server_label, tools: listedTools.tools }] : [],
     ...messageList.map((m) => ({
       role: m.role,
       content: m.content
@@ -2183,6 +2507,8 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
     data: {
       model: resolvedModel,
       max_output_tokens: getMaxOutputTokens("openai", resolvedModel),
+      // `reasoning: {effort}` for a fast or thorough project, nothing otherwise.
+      ...effortFields,
       // Top level beside model/input/tools, which is where the Responses API
       // takes it.
       ...stream.body,
@@ -2193,7 +2519,7 @@ async function callOpenAIWithPublicMcp(prompt, service, owner, messages, system,
         {
           type: "mcp",
           server_label: MCP_NAME,
-          server_url: mcpChatUrl(endpoint.url, "openai", resolvedModel),
+          server_url: serverUrl,
           require_approval: "never",
           // No `headers` at all for an anonymous turn: `Bearer ` with an
           // empty token is a credential the MCP server rejects, and the
@@ -3147,165 +3473,6 @@ function buildChatGreeting(params) {
   const lead = params.canUpload === false ? "Hi! Ask me anything about the data in your project" : "Hi! Start by attaching the files related to your project";
   const tail = params.canUpload === false ? "." : ", or pasting plain text into the chat. Once they are indexed, ask me anything about that data.";
   return { lead, name, tail, text: lead + (name ? " " + name : "") + tail };
-}
-
-// src/engine/errors.ts
-var STATUS_MESSAGE = {
-  "408": "The AI provider timed out before it started.",
-  "409": "The AI provider rejected the request as conflicting.",
-  "413": "The request was too large for the AI provider.",
-  "429": "The AI provider is rate limiting requests right now.",
-  "500": "The AI provider hit an internal error.",
-  "502": "The AI provider is temporarily unreachable.",
-  "503": "The AI provider is temporarily unavailable.",
-  "504": "The AI provider timed out."
-};
-function isTransientStatus(status) {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
-}
-function isCsrStatusEnvelope(res) {
-  return !!res && typeof res === "object" && !Array.isArray(res) && typeof res.status === "string" && typeof res.id === "string" && "in_queue" in res;
-}
-function csrEnvelopeError(input) {
-  if (!isCsrStatusEnvelope(input)) return void 0;
-  if (input.status !== "failed") return void 0;
-  return input.error != null ? input.error : { message: "The AI provider request failed." };
-}
-function getErrorMessage(input) {
-  var envErr = csrEnvelopeError(input);
-  if (envErr !== void 0) input = envErr;
-  if (!input) return "Something went wrong.";
-  if (typeof input === "string") return input;
-  if (input.error && input.error.message) return input.error.message;
-  if (input.body && input.body.error && input.body.error.message) return input.body.error.message;
-  if (input.body && typeof input.body.message === "string") return input.body.message;
-  if (input.message) return input.message;
-  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : 0;
-  if (status) {
-    var text = STATUS_MESSAGE[String(status)] || (status >= 500 ? "The AI provider returned a server error." : "The AI provider rejected the request.");
-    return text + " (error " + status + ")" + (isTransientStatus(status) ? " This is usually temporary, please try again." : "");
-  }
-  return "Something went wrong.";
-}
-function isRetriedFailure(input) {
-  var envErr = csrEnvelopeError(input);
-  if (envErr !== void 0) input = envErr;
-  return !!input && typeof input === "object" && input.retried === true;
-}
-function isErrorResponseBody(response) {
-  var envErr = csrEnvelopeError(response);
-  if (envErr !== void 0) response = envErr;
-  if (!response || typeof response !== "object") return envErr !== void 0;
-  if (typeof response.status_code === "number" && response.status_code >= 400) return true;
-  if (response.type === "error") return true;
-  if (response.error && (response.error.message || response.error.type)) return true;
-  var body = response.body;
-  if (body && typeof body === "object") {
-    if (body.type === "error") return true;
-    if (body.error && (body.error.message || body.error.type)) return true;
-  }
-  if (typeof response.message === "string" && response.message.length) {
-    var hasClaude = Array.isArray(response.content);
-    var hasOpenAI = typeof response.output_text === "string" || Array.isArray(response.output) || Array.isArray(response.choices);
-    if (!hasClaude && !hasOpenAI) return true;
-  }
-  return false;
-}
-function isNonRetryableRequestError(input) {
-  var envErr = csrEnvelopeError(input);
-  if (envErr !== void 0) input = envErr;
-  if (!input || typeof input !== "object") return false;
-  var status = typeof input.status_code === "number" ? input.status_code : typeof input.status === "number" ? input.status : void 0;
-  var param = void 0;
-  var blobs = [];
-  var sources = [input.error, input.body && input.body.error, input.body, input];
-  for (var i = 0; i < sources.length; i++) {
-    var e = sources[i];
-    if (!e) continue;
-    if (typeof e === "string") {
-      blobs.push(e);
-      continue;
-    }
-    if (typeof e !== "object") continue;
-    if (param === void 0 && e.param != null) param = e.param;
-    if (typeof e.code === "string") blobs.push(e.code);
-    if (typeof e.type === "string") blobs.push(e.type);
-    if (typeof e.message === "string") blobs.push(e.message);
-  }
-  var hay = blobs.join(" | ").toLowerCase();
-  if (hay.indexOf("unknown_parameter") !== -1 || hay.indexOf("unknown parameter") !== -1 || hay.indexOf("unsupported_parameter") !== -1 || hay.indexOf("unsupported parameter") !== -1) {
-    return true;
-  }
-  var isClientReqStatus = status === 400 || status === 422;
-  if (isClientReqStatus && param != null && param !== "") return true;
-  if (isClientReqStatus && hay.indexOf("invalid_request") !== -1 && (hay.indexOf("parameter") !== -1 || hay.indexOf("param") !== -1)) {
-    return true;
-  }
-  return false;
-}
-function isAuthExpiredError(input) {
-  var envErr = csrEnvelopeError(input);
-  if (envErr !== void 0) input = envErr;
-  if (!input) return false;
-  var blobs = [];
-  var push = function(v) {
-    if (typeof v === "string" && v) blobs.push(v);
-  };
-  if (typeof input === "string") push(input);
-  else {
-    push(input.message);
-    push(input.code);
-    if (input.error) {
-      push(input.error.message);
-      push(input.error.code);
-      push(input.error.type);
-    }
-    if (input.body) {
-      push(input.body.message);
-      if (input.body.error) {
-        push(input.body.error.message);
-        push(input.body.error.code);
-        push(input.body.error.type);
-      }
-    }
-    if (typeof input.status === "number" && input.status === 401) return true;
-    if (typeof input.status_code === "number" && input.status_code === 401) return true;
-  }
-  var hay = blobs.join(" | ").toLowerCase();
-  if (!hay) return false;
-  return hay.indexOf("token has expired") !== -1 || hay.indexOf("token is expired") !== -1 || hay.indexOf("expired_token") !== -1 || hay.indexOf("invalid_token") !== -1 || hay.indexOf("unauthorized") !== -1 || hay.indexOf("not authorized") !== -1 || hay.indexOf("invalid_request") !== -1 && hay.indexOf("token") !== -1;
-}
-function isProviderApiKeyError(input) {
-  var envErr = csrEnvelopeError(input);
-  if (envErr !== void 0) input = envErr;
-  if (!input) return false;
-  var blobs = [];
-  var push = function(v) {
-    if (typeof v === "string" && v) blobs.push(v);
-  };
-  if (typeof input === "string") push(input);
-  else {
-    push(input.message);
-    push(input.code);
-    push(input.type);
-    if (input.error) {
-      push(input.error.message);
-      push(input.error.code);
-      push(input.error.type);
-    }
-    if (input.body) {
-      push(input.body.message);
-      push(input.body.type);
-      if (input.body.error) {
-        push(input.body.error.message);
-        push(input.body.error.code);
-        push(input.body.error.type);
-      }
-    }
-  }
-  var hay = blobs.join(" | ").toLowerCase();
-  if (!hay) return false;
-  return hay.indexOf("authentication_error") !== -1 || hay.indexOf("invalid_api_key") !== -1 || hay.indexOf("invalid x-api-key") !== -1 || hay.indexOf("incorrect api key") !== -1 || hay.indexOf("invalid api key") !== -1 || hay.indexOf("no api key provided") !== -1;
 }
 
 // src/engine/citations.ts
@@ -7072,7 +7239,7 @@ var _ChatSession = class _ChatSession {
    * one it was composed for. Falls back to the live read only when a caller
    * omits them.
    */
-  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, projectId, owner) {
+  _callProviderFor(platform, prompt, messages, system, model, userId, extractContent, fileUrls, projectId, owner, turn) {
     if (projectId === void 0 || owner === void 0) {
       var id = this.host.getIdentity();
       if (projectId === void 0) projectId = id.projectId;
@@ -7080,14 +7247,49 @@ var _ChatSession = class _ChatSession {
     }
     var liveId = this.host.getIdentity();
     var mcpScope = { anonymous: liveId.anonymous, publicProjectId: liveId.publicProjectId };
-    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope);
+    if (turn) turn.userId = liveId.anonymous ? "" : liveId.userId || "";
+    return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope, turn) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope);
+  }
+  /**
+   * A fresh per-send record for the request builder (see requests.ts ChatTurnContext).
+   * Chat turns only, and only OpenAI reuses a tool listing: Claude's MCP connector has no
+   * equivalent item, and indexing passes never come through here. Off unless the host
+   * set `reuseMcpToolList: true` in configureChatEngine.
+   */
+  _newChatTurn(platform) {
+    var on = false;
+    try {
+      on = chatEngineConfig().reuseMcpToolList === true;
+    } catch (_) {
+      on = false;
+    }
+    return { reuseMcpToolList: platform === "openai" && on };
+  }
+  /**
+   * What a settled chat turn means for the stored MCP tool listing: a failure drops it
+   * when the turn carried it (forgetMcpListToolsOnFailure decides whether reuse also
+   * stops); a good OpenAI body refreshes it. A stopped poll or a cancelled row says
+   * nothing either way. Applied once per turn: an exception thrown later by a UI
+   * handler on the same chain is not a provider failure.
+   */
+  _settleChatTurnTools(turn, response, failed) {
+    if (!turn || turn.settled) return;
+    turn.settled = true;
+    if (failed || isErrorResponseBody(response)) {
+      forgetMcpListToolsOnFailure(turn, response);
+      return;
+    }
+    if (isPollStopped(response) || this._isCancelledPollResult(response)) return;
+    rememberMcpListTools(turn, response);
   }
   dispatchAgentRequest(params) {
     var self = this;
     var dispatchItemId;
+    var turn;
     var sendAndPoll = function() {
+      turn = self._newChatTurn(params.aiPlatform);
       return Promise.resolve(
-        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner)
+        self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner, turn)
       ).then(function(initial) {
         if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
           if (initial.id) {
@@ -7116,12 +7318,14 @@ var _ChatSession = class _ChatSession {
       }
       return response;
     }).then(function(response) {
+      self._settleChatTurnTools(turn, response);
       if (isPollStopped(response) || self._isCancelledPollResult(response)) return { content: "", isError: false, cancelled: true };
       if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
       var answer = params.aiPlatform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
       answer = (answer || "").trim();
       return { content: answer || "No text response received from AI provider.", isError: false, retrieval: extractRetrievalNote(response, answer), body: response };
     }).catch(function(err) {
+      self._settleChatTurnTools(turn, err, true);
       return { content: getErrorMessage(err), isError: true };
     }).then(function(result) {
       delete self.pendingAgentRequests[params.key];
@@ -7526,7 +7730,8 @@ var _ChatSession = class _ChatSession {
       this.scrollForDispatch(stageId);
       var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
       var capturedQueuedLid = queuedBubble._localId;
-      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner)).then(function(result) {
+      var queuedTurn = this._newChatTurn(aiPlatform);
+      Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner, queuedTurn)).then(function(result) {
         var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
           return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
         });
@@ -7547,14 +7752,18 @@ var _ChatSession = class _ChatSession {
           });
           if (serverId) self._trackPoll(serverId, "fg", qp);
           return qp.then(function(res) {
+            self._settleChatTurnTools(queuedTurn, res);
             if (isPollStopped(res)) return;
             return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey);
           }).catch(function(err) {
+            self._settleChatTurnTools(queuedTurn, err, true);
             return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey);
           });
         }
+        self._settleChatTurnTools(queuedTurn, result);
         return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
       }).catch(function(err) {
+        self._settleChatTurnTools(queuedTurn, err, true);
         return self.onQueuedSendError(capturedComposed, err, void 0, capturedKey);
       });
       return;
@@ -7575,8 +7784,9 @@ var _ChatSession = class _ChatSession {
     this.updateHistoryCache();
     this.state.sending = true;
     this.scrollForDispatch(stageId);
+    var immediateUserLid = immediateUser._localId;
     var historyForLlm = this.state.messages.filter(function(m) {
-      if (m === immediateUser) return false;
+      if (m === immediateUser || immediateUserLid && m && m._localId === immediateUserLid) return false;
       return !m.isPending && !m.isPendingQueued && !m.isPendingInProcess && !m.isPendingOlder && !m.isCancelled && !m.isBackgroundTask && !m.isError;
     });
     historyForLlm.push({ role: "user", content: llmComposed });
@@ -7587,7 +7797,7 @@ var _ChatSession = class _ChatSession {
       projectId: id.projectId,
       history: historyForLlm
     });
-    var immediateUserLid = immediateUser._localId, immediatePlaceholderLid = immediatePlaceholder._localId;
+    var immediatePlaceholderLid = immediatePlaceholder._localId;
     var run = this.dispatchAgentRequest({
       key,
       projectId: id.projectId,
@@ -10560,6 +10770,6 @@ var _ChatSession = class _ChatSession {
 _ChatSession.RUN_PASS_PAGE = 10;
 var ChatSession = _ChatSession;
 
-export { BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, FINDINGS_TABLE, FINDING_ID_PREFIX, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, FINDINGS_TABLE, FINDING_ID_PREFIX, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map
