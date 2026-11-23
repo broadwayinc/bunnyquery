@@ -14,7 +14,7 @@
  */
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
-import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess, resolveAnswerMode } from './config';
+import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess, resolveAnswerMode, statusPushEnabled } from './config';
 import { type AnswerMode } from './project_settings';
 import { csrEnvelopeError } from './errors';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
@@ -1440,6 +1440,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			service,
 			owner,
 			...pollOpt(),
+			// Status push for this pass and the continuations the worker queues from it
+			// (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
+			...(statusPushEnabled() ? { notify: true } : {}),
 			url: OPENAI_RESPONSES_API_URL,
 			method: 'POST',
 			headers: {
@@ -1485,6 +1488,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		service,
 		owner,
 		...pollOpt(),
+		// Status push for this pass and the continuations the worker queues from it
+		// (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
+		...(statusPushEnabled() ? { notify: true } : {}),
 		url: ANTHROPIC_MESSAGES_API_URL,
 		method: 'POST',
 		headers: {
@@ -1790,7 +1796,7 @@ export type BgTaskEntry = {
 	// REQUEST rather than the response: `executed` is when the worker began
 	// running it, which rides on a running poll tick's status envelope and is
 	// therefore free to a caller already polling.
-	poll: ((opts: { latency: number; onResponse?: (res: any, meta?: { executed?: number }) => void }) => Promise<any>) | undefined;
+	poll: ((opts: { latency: number; notify?: boolean; onResponse?: (res: any, meta?: { executed?: number }) => void }) => Promise<any>) | undefined;
 	/** How many CONTINUE passes have already run for this file (resume-across-passes). */
 	resumePass?: number;
 	/** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).

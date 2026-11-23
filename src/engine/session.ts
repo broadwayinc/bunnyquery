@@ -45,7 +45,7 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream, resolveSkipDuplicateFiles } from './config';
+import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream, resolveSkipDuplicateFiles, statusPushEnabled, statusPushLive } from './config';
 // The wire-format knowledge. skapi relays the provider's bytes without reading them,
 // so the session hands them straight to this parser and never inspects a frame itself.
 import { createSseParser, type SseParser } from './sse';
@@ -53,6 +53,7 @@ import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, ge
 import { buildBoundedChatMessages } from './budget';
 import { extractRetrievalNote, type RetrievalNote } from './retrieval_memory';
 import { findingsForTurn } from './findings';
+import { retrievalNoteOfAnswer, answerUsedNoDataTool } from './citations';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
 import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage } from './history';
@@ -99,6 +100,15 @@ const RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1000;
 // it ended (3.5 min on a 110-page PDF, nine passes done meanwhile). One look is the two
 // status queries (running, pending); it stops by itself when nothing is tracked.
 const ADOPT_TICK_MS = 10 * 1000;
+/** The queue check's interval while request status frames are arriving (statusPush). */
+const STATUS_PUSH_ADOPT_TICK_MS = 60 * 1000;
+/** Several reasons to catch up at once (tab shown, socket back, network back) run one. */
+const CATCH_UP_MIN_GAP_MS = 2000;
+/** The return watch: how often it looks, and the gap that means the computer slept. */
+const RETURN_WATCH_MS = 15 * 1000;
+const RETURN_WATCH_SLEEP_GAP_MS = 45 * 1000;
+/** Frame-driven queue checks run at most this often (status push). */
+const STATUS_NUDGE_MIN_GAP_MS = 2000;
 
 // awaitIndexingDrained: how often it re-asks the background-indexing queue, and
 // how many consecutive empty answers it needs before believing the chains are
@@ -579,6 +589,23 @@ export function requestIdTimeMs(rid: string): number {
 	return Math.floor(v / 2 / 1e6);
 }
 
+/** The visible message the "Wrong answer?" button sends. The chat prompt's WRONG ANSWER rule reacts to it. */
+export var WRONG_ANSWER_MESSAGE = 'This answer seems wrong. Please check it again against the documents.';
+/** The button's label, shared so the two clients word it the same. */
+export var WRONG_ANSWER_LABEL = 'Wrong answer?';
+
+/**
+ * True when a bubble gets the "Wrong answer?" button: a settled chat answer that
+ * read project data (a retrieval note that is not the no-source mark). Both
+ * clients gate through ChatSession.canReportWrongAnswer, which also keeps it to
+ * the latest answer, and
+ * ChatSession.wrongAnswerReported says whether it was used.
+ */
+export function canReportWrongAnswer(msg: ChatMessage | null | undefined): boolean {
+	var note = retrievalNoteOfAnswer(msg);
+	return !!note && !answerUsedNoDataTool(note) && !(msg as any).isCancelled;
+}
+
 export class ChatSession {
 	host: ChatHost;
 	state: ChatState;
@@ -622,6 +649,9 @@ export class ChatSession {
 	 *  settleDeadStagedMessages). Today the cache dies with the page too and every
 	 *  restored stage is live; this stays correct if that ever changes. */
 	private _liveStages: { [stageId: string]: boolean };
+	/** Answers whose "Wrong answer?" was already sent, by server id (else local id),
+	 *  so a history refetch that rebuilds the bubble does not offer it again. */
+	private _wrongReported: { [msgKey: string]: boolean };
 	/** Files the SERVER currently has unresolved indexing work for, by the same key
 	 *  a collapsed row uses (storage path, else filename), and whether we have asked
 	 *  even once for this chat.
@@ -689,6 +719,7 @@ export class ChatSession {
 		this.historyItemPolls = new Map();
 		this._pauseReasons = new Set();
 		this._resuming = false;
+		this._wrongReported = {};
 		this._lidSeq = 0;
 		this._stageSeq = 0;
 		this._uploadBatches = 0;
@@ -2502,13 +2533,12 @@ export class ChatSession {
 		return Promise.resolve()
 			.then(function () {
 				self.drainBgTaskQueue();
-				// History is loaded ONCE (owner, 2026-11-20): coming back to the tab does not
-				// refetch it. What changed while away arrives the way it would have live:
-				// replies through their polls (foreground polls never paused), indexing
-				// passes through the queue check that drainBgTaskQueue restarts. Only a
-				// waiting bubble left with nothing to settle it needs the first page again.
-				if (self.needsHistoryRefetch()) return self.loadHistory(false, self.state.gateRefreshToken);
-				self.refreshLiveIndexState();
+				// EVERY return re-reads the first page (owner, 2026-11-23: "when the user is
+				// away and comes back it should always have all the chat, no missing"). This
+				// replaces the 2026-11-20 rule that loaded history once and relied on polls
+				// alone: a poll that was stopped, throttled or lost while the tab slept had
+				// nothing behind it. See catchUpHistory.
+				return self.catchUpHistory();
 			})
 			.catch(function (e: any) { console.error('[chat-engine] resume polling failed', e); })
 			.then(function () { self._resuming = false; });
@@ -4003,6 +4033,63 @@ export class ChatSession {
 		});
 	}
 
+	/** The button's label and the message it sends, read off the session so the
+	 *  clients need no extra import. */
+	readonly wrongAnswerLabel: string = WRONG_ANSWER_LABEL;
+	readonly wrongAnswerMessage: string = WRONG_ANSWER_MESSAGE;
+
+	/**
+	 * Does this bubble get the "Wrong answer?" button: the free function's gate,
+	 * and only on the latest answer, because the message it sends names no answer
+	 * and the model reads it right after the last one. An answer already reported
+	 * keeps its (disabled) button after the complaint turn lands below it.
+	 */
+	canReportWrongAnswer(msg: ChatMessage): boolean {
+		if (!canReportWrongAnswer(msg)) return false;
+		return this.wrongAnswerReported(msg) || this._isLatestAnswer(msg);
+	}
+
+	/** True when no chat turn follows `msg` in state.messages. Indexing rows and
+	 *  cancelled turns do not count (neither reaches the model's history). Matched
+	 *  by identity or by item id, since agent.vue hands in reactive proxies. */
+	private _isLatestAnswer(msg: ChatMessage): boolean {
+		var list = this.state.messages || [];
+		var sid = msg._serverItemId, lid = msg._localId;
+		for (var i = list.length - 1; i >= 0; i--) {
+			var m = list[i];
+			if (!m) continue;
+			if (m === msg || (m.role === 'assistant' && ((sid && m._serverItemId === sid) || (lid && m._localId === lid)))) return true;
+			if (m.isBackgroundTask || m.isCancelled) continue;
+			return false;
+		}
+		return false;
+	}
+
+	/** True once this answer's "Wrong answer?" was sent (one click per answer). */
+	wrongAnswerReported(msg: ChatMessage): boolean {
+		if (!msg) return false;
+		if ((msg as any)._wrongReported) return true;
+		var key = msg._serverItemId || msg._localId;
+		return !!key && !!this._wrongReported[key];
+	}
+
+	/**
+	 * The "Wrong answer?" button: sends WRONG_ANSWER_MESSAGE as an ordinary visible
+	 * user turn through dispatchComposedMessage, so it reads the same after a reload
+	 * and both clients behave alike. The answer is marked first, so the button goes
+	 * disabled at once. False when the bubble does not qualify or was already used.
+	 * `pinned` is the caller's usual pinned identity and prompt (agent.vue pins them).
+	 */
+	reportWrongAnswer(msg: ChatMessage, pinned?: PinnedDispatchContext): boolean {
+		if (this.wrongAnswerReported(msg) || !this.canReportWrongAnswer(msg)) return false;
+		(msg as any)._wrongReported = true;
+		var key = msg._serverItemId || msg._localId;
+		if (key) this._wrongReported[key] = true;
+		this.host.notify();
+		this.dispatchComposedMessage(WRONG_ANSWER_MESSAGE, false, undefined, undefined, undefined, pinned);
+		return true;
+	}
+
 	/**
 	 * Stop waiting for the reply to the chat turn that is running now, and move on.
 	 *
@@ -5061,6 +5148,168 @@ export class ChatSession {
 	/** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
 	 *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
 	 *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+	// ── RETURN CATCH-UP + REQUEST STATUS PUSH (owner, 2026-11-23) ──────────────
+	// The rule: when the user comes back to the chat (the tab shown again, the computer
+	// awake again, the network or the websocket back), the chat is re-read from the
+	// server, so nothing that happened while they were away is missing. The re-read is
+	// loadHistory's own first-page refresh, the one every mount runs: it keeps older pages
+	// the user loaded, keeps a send still in flight, never lets an empty answer replace a
+	// known one, re-attaches polls to whatever is still waiting, and reads back a streamed
+	// answer nobody finalized. Status frames (statusPush) only make things faster; they
+	// never decide anything on screen.
+
+	private _catchUpAt = 0;
+	private _catchUpTimer: any = null;
+	private _returnWatchTimer: any = null;
+	private _returnWatchAt = 0;
+	private _returnListeners = false;
+	private _statusUnsub: (() => void) | null = null;
+	private _statusNudgeTimer: any = null;
+	private _statusNudgeAt = 0;
+	private _statusSeenConnect = false;
+
+	/**
+	 * Re-read the chat from the server now (see the rule above). Safe to call from any
+	 * number of triggers at once: calls within CATCH_UP_MIN_GAP_MS of the last one run
+	 * once, at the end of the gap. Nothing happens while no chat view is mounted (the
+	 * mount loads the chat anyway) or while background polling is paused (the tab is
+	 * hidden: showing it calls this again).
+	 */
+	catchUpHistory(): Promise<void> {
+		var self = this;
+		var id = this.host.getIdentity();
+		if (!id.projectId || id.platform === 'none') return Promise.resolve();
+		if (!this.host.isViewMounted || !this.host.isViewMounted() || this.isPollingPaused()) return Promise.resolve();
+		this._ensureReturnWatch();
+		var wait = this._catchUpAt + CATCH_UP_MIN_GAP_MS - Date.now();
+		if (wait > 0) {
+			if (!this._catchUpTimer) {
+				this._catchUpTimer = setTimeout(function () {
+					self._catchUpTimer = null;
+					self.catchUpHistory();
+				}, wait);
+			}
+			return Promise.resolve();
+		}
+		this._catchUpAt = Date.now();
+		// loadHistory's first-page path ends with refreshLiveIndexState, so indexing rows
+		// are re-asked as well.
+		return this.loadHistory(false, this.state.gateRefreshToken).catch(function (e: any) {
+			console.error('[chat-engine] catch-up failed', e);
+		});
+	}
+
+	/**
+	 * Watch for the moments the user comes back without the tab being hidden first: the
+	 * computer waking from sleep (the timer finds a gap far longer than its interval),
+	 * the network coming back, a page restored from the back-forward cache. Also starts
+	 * the status push listener. Runs while a chat view is mounted and stops itself when
+	 * none is.
+	 */
+	private _ensureReturnWatch(): void {
+		var self = this;
+		if (typeof window === 'undefined') return;
+		if (!this._returnListeners) {
+			this._returnListeners = true;
+			var onBack = function () {
+				if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+				self.catchUpHistory();
+			};
+			window.addEventListener('online', onBack);
+			window.addEventListener('pageshow', function (ev: any) { if (ev && ev.persisted) onBack(); });
+		}
+		this._startStatusPush();
+		if (this._returnWatchTimer) return;
+		this._returnWatchAt = Date.now();
+		var look = function () {
+			self._returnWatchTimer = null;
+			if (!self.host.isViewMounted || !self.host.isViewMounted()) {
+				self._stopStatusPush();
+				return;
+			}
+			var now = Date.now();
+			var gap = now - self._returnWatchAt;
+			self._returnWatchAt = now;
+			// A hidden tab's timers are slowed too, so only a gap seen while VISIBLE is a
+			// wake from sleep; a hidden tab catches up when it is shown (resumePolling).
+			if (gap > RETURN_WATCH_SLEEP_GAP_MS && (typeof document === 'undefined' || document.visibilityState !== 'hidden')) {
+				self.catchUpHistory();
+			}
+			self._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
+		};
+		this._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
+	}
+
+	/** Listen to request status frames while a chat view is mounted (statusPush on). */
+	private _startStatusPush(): void {
+		if (this._statusUnsub || !statusPushEnabled()) return;
+		var self = this;
+		// The first 'connected' is the socket this subscription found or opened, right
+		// after the view loaded the chat itself: nothing can have been missed yet.
+		this._statusSeenConnect = false;
+		try {
+			var unsub = chatEngineConfig().onRequestStatus!(function (ev: any) { self._onRequestStatus(ev); });
+			this._statusUnsub = typeof unsub === 'function' ? unsub : function () { };
+		} catch (e) {
+			this._statusUnsub = null;
+		}
+	}
+
+	private _stopStatusPush(): void {
+		var unsub = this._statusUnsub;
+		this._statusUnsub = null;
+		if (this._statusNudgeTimer) { clearTimeout(this._statusNudgeTimer); this._statusNudgeTimer = null; }
+		if (unsub) {
+			try { unsub(); } catch (e) { /* best effort */ }
+		}
+	}
+
+	/**
+	 * One status frame event. 'connected' (first connection, and every reconnect after a
+	 * drop, a sleep or the planned renewal) catches up, because frames sent while the
+	 * socket was down are lost. A status change of an indexing pass this page does not
+	 * poll runs the queue check now instead of at its next heartbeat; a pass that IS polled
+	 * was already woken by skapi-js itself. Chat turns are left to their own polls.
+	 */
+	private _onRequestStatus(ev: any): void {
+		if (!ev || !this.host.isViewMounted()) return;
+		if (ev.type === 'connected') {
+			if (!this._statusSeenConnect) { this._statusSeenConnect = true; return; }
+			if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+			this.catchUpHistory();
+			return;
+		}
+		if (ev.type !== 'status' || typeof ev.id !== 'string') return;
+		if (!ev.queue || !isBgIndexingQueue(ev.queue)) return;
+		if (this.historyItemPolls.has(ev.id)) return;
+		var tracked = false;
+		for (var i = 0; i < this.bgTaskQueue.length; i++) {
+			var e = this.bgTaskQueue[i];
+			if (e && e.id === ev.id) { tracked = !e.byListing; break; }
+		}
+		if (tracked) return;
+		this._nudgeQueueCheck();
+	}
+
+	/** Run the queue check (adopt, settle by listing, page progress) now, at most once per
+	 *  STATUS_NUDGE_MIN_GAP_MS, then let the heartbeat carry on. */
+	private _nudgeQueueCheck(): void {
+		var self = this;
+		if (this._statusNudgeTimer) return;
+		var wait = Math.max(0, this._statusNudgeAt + STATUS_NUDGE_MIN_GAP_MS - Date.now());
+		this._statusNudgeTimer = setTimeout(function () {
+			self._statusNudgeTimer = null;
+			self._statusNudgeAt = Date.now();
+			var id = self.host.getIdentity();
+			if (!id.projectId || (id.platform !== 'claude' && id.platform !== 'openai')) return;
+			if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+			self._adoptWorkerIndexingPasses(0, false, true);
+			self._settleByListing();
+			self._refreshPageProgress();
+			self._ensureAdoptTick();
+		}, wait);
+	}
+
 	private _ensureAdoptTick(): void {
 		if (this._adoptTickTimer) return;
 		var self = this;
@@ -5078,7 +5327,9 @@ export class ChatSession {
 			self._settleByListing();
 			self._refreshPageProgress();
 			self._ensureAdoptTick();
-		}, ADOPT_TICK_MS);
+			// While status frames are arriving the queue check is a heartbeat only: a frame
+			// about a pass this page does not follow yet runs it at once (_onRequestStatus).
+		}, statusPushLive() ? STATUS_PUSH_ADOPT_TICK_MS : ADOPT_TICK_MS);
 	}
 
 	/** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
@@ -5780,6 +6031,8 @@ export class ChatSession {
 		var id = this.host.getIdentity();
 		var svcId = id.projectId, plat = id.platform;
 		if (!svcId || plat === 'none' || !this.host.isViewMounted()) return;
+		// A chat view is up: watch for the user coming back (see catchUpHistory).
+		this._ensureReturnWatch();
 		// Before anything is surfaced: drop continuations of files the user stopped
 		// (and let a fresh first pass lift the stop), then cancel any worker-queued
 		// pass of a stopped file that reached the chat through history.
@@ -5916,6 +6169,11 @@ export class ChatSession {
 				var executedAt: number | undefined;
 				var bp = entry.poll({
 					latency: POLL_INTERVAL,
+					// Status push (statusPushEnabled): a pass adopted from a listing is polled
+					// slowly while frames arrive, like one this page dispatched. A dispatch
+					// reply's poll decides that from the server's acknowledgement and
+					// ignores this key.
+					notify: statusPushEnabled(),
 					onResponse: function (_res: any, meta: any) {
 						if (meta && typeof meta.executed === 'number' && meta.executed > 0) executedAt = meta.executed;
 					},
@@ -6780,7 +7038,7 @@ export class ChatSession {
 						},
 					};
 					var pp = isBg
-						? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts))
+						? item.poll(Object.assign({ latency: POLL_INTERVAL, notify: statusPushEnabled() }, pollOpts))
 						// Pinned to the chat this LOAD is for, snapshotted at its start
 						// (loadKey/platform/projectId/owner), never a live read: a load can
 						// still be attaching polls after the user has moved on, and a stream

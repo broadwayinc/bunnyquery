@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.19.3**. The latest version on npm
+- **Published vs built.** The source tree is at **1.20.0**. The latest version on npm
   when this was written is 1.19.2. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,35 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## Unreleased (book search, 2026-11-23)
+
+A "Wrong answer?" button under answers that read data, and chat prompt rules for searching long files by chapter and for checking a disputed answer. Needs an MCP with the book-search tools (searchText `page_from`, `page_to` and `question`, getFileOutline's `outline`, `correctSearchLink`).
+
+### Engine
+
+- **"Wrong answer?"** `ChatSession.reportWrongAnswer(msg, pinned?)` sends the visible user message "This answer seems wrong. Please check it again against the documents." through `dispatchComposedMessage`, so it is an ordinary turn and reads the same after a reload. `ChatSession.canReportWrongAnswer(msg)` is the gate both clients use (a settled answer with a retrieval note that is not the no-source mark, not cancelled, and the latest answer: no chat turn below it, since the message names no answer; an answer already reported keeps its disabled button), and `wrongAnswerReported(msg)` makes it one click per answer, also across a history refetch in the same page. `wrongAnswerLabel` and `wrongAnswerMessage` carry the words. `WRONG_ANSWER_MESSAGE`, `WRONG_ANSWER_LABEL` and `canReportWrongAnswer` are exported from the session module.
+- **Chat prompt, DOCUMENTS.** For a long file (a manual, a book) the agent calls getFileOutline first and searches the chapter with searchText `page_from` and `page_to`, and passes searchText `question` only for a question about the documents (in the user's own words, without names or personal details that are not about the documents), which the MCP uses to learn which page answered it. The learned terms land in records other users of the file's group can read, so the owner still has to decide how much of a question is stored.
+- **Chat prompt, WRONG ANSWER.** When the user says an answer is wrong, or presses the button, the agent re-reads the cited pages and searches again with searchText `question` set to the original question, never the complaint, then does exactly one of: corrects the answer only; corrects it and calls `correctSearchLink` (when it has that tool); or keeps it and quotes the supporting text. `correctSearchLink` only with the page and an exact quote that prove it, never on the user's word alone. SAVED FINDINGS FIRST is unchanged.
+
+### Widget
+
+- The "Wrong answer?" button under the citations (`.bq-wrong-answer-btn` in `chat.css`, a small muted text button), disabled once sent. Mirrored in `agent.vue`.
+- The File already exists dialog and the skipped-duplicates Reindex now say: "Re-indexing also removes everything search has learned about this file from people's questions and corrections."
+
+## 1.20.0 (2026-11-23, not yet published)
+
+Coming back to the chat always re-reads it, and indexing status can arrive over the websocket instead of being polled.
+
+### Engine
+
+- **Every return re-reads the chat.** When the tab is shown again (`resumePolling`), the computer wakes from sleep with the tab open, the network comes back, a page is restored from the back-forward cache, or the status websocket reconnects, `ChatSession.catchUpHistory()` runs the same first-page refresh a mount runs (`loadHistory(false)`): older pages stay, a send in flight is kept, an empty answer never replaces a known one, waiting items get their polls back, and a streamed answer nobody finalized is read back. Several reasons at once run one refresh (2 s apart). This replaces the 1.19.0 rule that loaded history once and relied on polls alone after a return.
+- **Request status push (off by default).** With `statusPush: true` and `onRequestStatus` / `isRequestStatusLive` from skapi-js 2.5.0 in `configureChatEngine`, indexing passes are dispatched with `notify: true` and their polls read the row once a minute while status messages arrive, and at once when one names them. A message about a pass the page does not follow yet runs the queue check at once (at most every 2 s), and the 10 s queue check becomes once a minute while messages arrive. The checks that decide a file has finished (the 0/2/6 s look after a pass, and the wait before an answer that needs the files) are unchanged. With an older skapi-js, an older backend, or no socket, nothing changes. New exports: `statusPushEnabled`, `statusPushLive`.
+
+### Widget
+
+- The return re-read above, through the engine.
+- **`statusPush` option**, off by default because it keeps a websocket open on the host page's skapi instance. Needs skapi-js 2.5.0 or newer on the page.
 
 ## 1.19.3 (2026-11-23, not yet published)
 

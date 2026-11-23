@@ -4145,6 +4145,22 @@ import {
                     bubble.appendChild(citeRow);
                 }
                 if (answerUsedNoDataTool(citeNote)) bubble.appendChild(h("span", { class: "bq-no-source-note", text: NO_DATA_TOOL_MARK }));
+                // "Wrong answer?" (latest answer only, the engine gates it): sends the
+                // engine's visible follow-up through the normal send path (settings
+                // first, as sendMessage does). One click per answer: the engine marks
+                // it, so the rebuilt bubble is disabled.
+                // Mirrored in agent.vue.
+                if (session.canReportWrongAnswer(msg)) {
+                    var wrongSent = session.wrongAnswerReported(msg);
+                    var wrongBtn = h("button", { class: "bq-wrong-answer-btn", type: "button", text: session.wrongAnswerLabel });
+                    if (wrongSent) wrongBtn.disabled = true;
+                    else wrongBtn.addEventListener("click", function (e) {
+                        e.stopPropagation();
+                        wrongBtn.disabled = true;
+                        readyProjectSettings(S.projectId).then(function () { session.reportWrongAnswer(msg); });
+                    });
+                    bubble.appendChild(wrongBtn);
+                }
             }
             // Order matters: a staged turn carries isPendingQueued the whole way
             // through, so the two attachment phases have to be tested first.
@@ -5684,6 +5700,7 @@ import {
                     h("div", { class: "bq-modal-delete-header" }, h("span", { text: "File already exists" })),
                     h("p", { class: "bq-modal-desc" },
                         "A file named “" + filename + "” already exists. Skip it, keep the existing file and just reindex it, or overwrite it completely?"),
+                    h("p", { class: "bq-modal-desc", text: "Re-indexing also removes everything search has learned about this file from people's questions and corrections." }),
                     applyLabel,
                     h("div", { class: "bq-modal-btns" },
                         h("button", { class: "btn btn--outline", type: "button", onclick: function () { chooseOverwrite("skip"); } }, "Skip"),
@@ -5732,7 +5749,7 @@ import {
                         h("p", { class: "bq-upload-error-heading", text: "already uploaded (same name and size)" }),
                         h("ul", { class: "bq-upload-error-files" },
                             duplicates.map(function (d) { return h("li", { text: d.label, translate: "no" }); })))));
-                body.push(h("p", { class: "bq-modal-desc", text: "To index the stored copies again, choose Reindex. To upload such files again instead, turn off \"Skip duplicate files\" in the project settings." }));
+                body.push(h("p", { class: "bq-modal-desc", text: "To index the stored copies again, choose Reindex. Re-indexing also removes everything search has learned about this file from people's questions and corrections. To upload such files again instead, turn off \"Skip duplicate files\" in the project settings." }));
                 reindexBtn = h("button", { class: "btn", type: "button", onclick: function () {
                     if (reindexing) return;
                     reindexing = true;
@@ -6015,6 +6032,13 @@ import {
             // cannot. Before 1.16.0 this key meant "stream at all" and the socket was
             // `liveStreamingRealtime`; that name is now ignored.
             liveStreaming: false,
+            // Request STATUS PUSH (engine ChatEngineConfig.statusPush): indexing passes are
+            // dispatched with `notify`, their polls slow down to a heartbeat while status
+            // frames arrive on skapi's websocket, and the chat catches up when the socket
+            // comes back. OFF unless the embedder asks, for the same reason as
+            // `liveStreaming`: it keeps a websocket open on the host page's skapi instance.
+            // Needs skapi-js 2.5.0 or newer on the page; an older one leaves it off.
+            statusPush: false,
         }, opts || {});
         S.mountEl = mountEl;
 
@@ -6196,6 +6220,12 @@ import {
             // is the engine's socket-delivery key. ANDed with canStream so a page whose
             // SDK cannot stream never asks for a socket on a buffered reply.
             liveStreaming: canStream && S.opts.liveStreaming === true,
+            // ---- request status push (mirrored in agent.vue's ai_agent.ts) ----
+            // Only an explicit true, and only when the page's skapi-js has the hooks
+            // (2.5.0 or newer); the engine then does nothing different without them.
+            statusPush: S.opts.statusPush === true && !!S.skapi && typeof S.skapi.onRequestStatus === "function",
+            onRequestStatus: S.skapi && typeof S.skapi.onRequestStatus === "function" ? S.skapi.onRequestStatus.bind(S.skapi) : undefined,
+            isRequestStatusLive: S.skapi && typeof S.skapi.isRequestStatusLive === "function" ? S.skapi.isRequestStatusLive.bind(S.skapi) : undefined,
             // The transport: dispatch and history, plus the finalize hook that stores
             // a streamed turn's kept version and the chunk reader that is the second
             // half of the durability guarantee. The two optional hooks are handed

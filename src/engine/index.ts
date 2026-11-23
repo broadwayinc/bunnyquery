@@ -43,6 +43,10 @@ export {
 	// `skipDuplicateFiles: false`.
 	skipDuplicateFilesEnabled,
 	resolveSkipDuplicateFiles,
+	// Request status push (ChatEngineConfig.statusPush): whether the host turned it on,
+	// and whether status messages are arriving right now.
+	statusPushEnabled,
+	statusPushLive,
 } from './config';
 
 // "Has this user already uploaded this file here?", answered from the `src::` file

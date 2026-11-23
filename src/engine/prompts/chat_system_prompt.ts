@@ -129,8 +129,17 @@ These three rules govern every claim about the project's data. They do not limit
 	// reads on every step. That description must stay self-sufficient for
 	// third-party MCP clients, so the duplicate is removed HERE and the prompt only
 	// points at it. What stays is what no tool text says: quote and cite.
+	//
+	// Book search (2026-11-23): a long file is searched by chapter (getFileOutline,
+	// then searchText page_from/page_to), searchText gets the user's own question
+	// only for a document question (it ends up in shared learned tags), a re-search
+	// after a complaint passes the original question, never the complaint, and
+	// WRONG ANSWER is what the "Wrong answer?" button (and a user saying so)
+	// triggers: check again, then one of three outcomes, and a learned link
+	// changes only on proof (correctSearchLink with page and exact quote).
 	const documentRules =
-`DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used. THEN FIND THE PAGE with searchText: with the file's path when the user named a file, without a path when they did not ("find a file that contains X"), and follow its description's steps to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name.`;
+`DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used. THEN FIND THE PAGE with searchText: with the file's path when the user named a file, without a path when they did not ("find a file that contains X"), and follow its description's steps to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name. For a long file (a manual, a book), call getFileOutline first and search the chapter that fits with searchText page_from and page_to. When the user asks about the content of the documents, pass searchText "question": that question in the user's own words, without names or personal details that are not about the documents. Leave "question" out for anything else.
+WRONG ANSWER: when the user says an answer is wrong (or sends "This answer seems wrong. Please check it again against the documents."), re-read the pages you cited and search again, passing searchText "question" = the user's ORIGINAL question that the disputed answer answered, never the complaint message itself. Then do exactly one of: correct the answer only; correct the answer and call correctSearchLink (when it is among your tools); or keep the answer and quote the text that supports it. Call correctSearchLink only with the page and an exact quote that prove it, and never change data on the user's word alone.`;
 
 	// ---- Access group -----------------------------------------------------
 	// Trimmed 2026-11-23: the server's default-filling (an index or tag query auto-filled with

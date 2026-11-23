@@ -683,6 +683,27 @@ interface ChatEngineConfig {
      */
     liveStreaming?: boolean;
     /**
+     * Request STATUS PUSH over skapi's websocket (skapi-js 2.5.0 or newer, plus the
+     * backend that knows `notify`). Indexing passes are dispatched with `notify: true`,
+     * their polls then read the row once a minute instead of every few seconds while
+     * status frames are arriving, and read it at once when a frame names them. The
+     * engine also listens with `onRequestStatus` while a chat view is open: a frame for
+     * a pass it holds nothing for picks that pass up, and a (re)connected socket runs
+     * the return catch-up (ChatSession.catchUpHistory), since frames sent while it was
+     * down are lost.
+     *
+     * Off by default for the same reason as `liveStreaming`: it keeps a websocket open
+     * on the host's skapi instance. The dashboard owns its instance and opts in; the
+     * widget leaves it to the embedder. Needs `onRequestStatus` below too: without it,
+     * or on an older skapi-js, nothing changes. Every frame is a hint: polls and
+     * listings still decide every status on screen.
+     */
+    statusPush?: boolean;
+    /** skapi.onRequestStatus, bound to the consumer's skapi instance (skapi-js 2.5.0+). */
+    onRequestStatus?: (callback: (event: any) => void) => () => void;
+    /** skapi.isRequestStatusLive, bound to the consumer's skapi instance (skapi-js 2.5.0+). */
+    isRequestStatusLive?: () => boolean;
+    /**
      * Whether a CHAT answer may reach the open web: Claude's `web_fetch` and
      * OpenAI's `web_search` are attached to a chat request only when this
      * resolves to true.
@@ -829,6 +850,12 @@ interface ChatEngineConfig {
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
+/** True when the consumer has opted in to live streaming of chat turns. */
+/** Socket delivery of the stream: the host asked (`liveStreaming`) AND the turn streams. */
+/** Request status push is on: the host asked for it and handed over onRequestStatus. */
+declare function statusPushEnabled(): boolean;
+/** Status frames are arriving right now (false when status push is off). */
+declare function statusPushLive(): boolean;
 /**
  * The web switch for a chat turn, SYNCHRONOUSLY: the project's cached
  * `web_access` setting (off unless the owner turned it on), restricted by the
@@ -2971,6 +2998,7 @@ type BgTaskEntry = {
     status: 'running' | 'pending';
     poll: ((opts: {
         latency: number;
+        notify?: boolean;
         onResponse?: (res: any, meta?: {
             executed?: number;
         }) => void;
@@ -4531,6 +4559,9 @@ declare class ChatSession {
      *  settleDeadStagedMessages). Today the cache dies with the page too and every
      *  restored stage is live; this stays correct if that ever changes. */
     private _liveStages;
+    /** Answers whose "Wrong answer?" was already sent, by server id (else local id),
+     *  so a history refetch that rebuilds the bubble does not offer it again. */
+    private _wrongReported;
     /** Files the SERVER currently has unresolved indexing work for, by the same key
      *  a collapsed row uses (storage path, else filename), and whether we have asked
      *  even once for this chat.
@@ -5359,6 +5390,31 @@ declare class ChatSession {
     onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
     onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
+    /** The button's label and the message it sends, read off the session so the
+     *  clients need no extra import. */
+    readonly wrongAnswerLabel: string;
+    readonly wrongAnswerMessage: string;
+    /**
+     * Does this bubble get the "Wrong answer?" button: the free function's gate,
+     * and only on the latest answer, because the message it sends names no answer
+     * and the model reads it right after the last one. An answer already reported
+     * keeps its (disabled) button after the complaint turn lands below it.
+     */
+    canReportWrongAnswer(msg: ChatMessage): boolean;
+    /** True when no chat turn follows `msg` in state.messages. Indexing rows and
+     *  cancelled turns do not count (neither reaches the model's history). Matched
+     *  by identity or by item id, since agent.vue hands in reactive proxies. */
+    private _isLatestAnswer;
+    /** True once this answer's "Wrong answer?" was sent (one click per answer). */
+    wrongAnswerReported(msg: ChatMessage): boolean;
+    /**
+     * The "Wrong answer?" button: sends WRONG_ANSWER_MESSAGE as an ordinary visible
+     * user turn through dispatchComposedMessage, so it reads the same after a reload
+     * and both clients behave alike. The answer is marked first, so the button goes
+     * disabled at once. False when the bubble does not qualify or was already used.
+     * `pinned` is the caller's usual pinned identity and prompt (agent.vue pins them).
+     */
+    reportWrongAnswer(msg: ChatMessage, pinned?: PinnedDispatchContext): boolean;
     /**
      * Stop waiting for the reply to the chat turn that is running now, and move on.
      *
@@ -5597,6 +5653,45 @@ declare class ChatSession {
     /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
      *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
      *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+    private _catchUpAt;
+    private _catchUpTimer;
+    private _returnWatchTimer;
+    private _returnWatchAt;
+    private _returnListeners;
+    private _statusUnsub;
+    private _statusNudgeTimer;
+    private _statusNudgeAt;
+    private _statusSeenConnect;
+    /**
+     * Re-read the chat from the server now (see the rule above). Safe to call from any
+     * number of triggers at once: calls within CATCH_UP_MIN_GAP_MS of the last one run
+     * once, at the end of the gap. Nothing happens while no chat view is mounted (the
+     * mount loads the chat anyway) or while background polling is paused (the tab is
+     * hidden: showing it calls this again).
+     */
+    catchUpHistory(): Promise<void>;
+    /**
+     * Watch for the moments the user comes back without the tab being hidden first: the
+     * computer waking from sleep (the timer finds a gap far longer than its interval),
+     * the network coming back, a page restored from the back-forward cache. Also starts
+     * the status push listener. Runs while a chat view is mounted and stops itself when
+     * none is.
+     */
+    private _ensureReturnWatch;
+    /** Listen to request status frames while a chat view is mounted (statusPush on). */
+    private _startStatusPush;
+    private _stopStatusPush;
+    /**
+     * One status frame event. 'connected' (first connection, and every reconnect after a
+     * drop, a sleep or the planned renewal) catches up, because frames sent while the
+     * socket was down are lost. A status change of an indexing pass this page does not
+     * poll runs the queue check now instead of at its next heartbeat; a pass that IS polled
+     * was already woken by skapi-js itself. Chat turns are left to their own polls.
+     */
+    private _onRequestStatus;
+    /** Run the queue check (adopt, settle by listing, page progress) now, at most once per
+     *  STATUS_NUDGE_MIN_GAP_MS, then let the heartbeat carry on. */
+    private _nudgeQueueCheck;
     private _ensureAdoptTick;
     /** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
      *  live. Complete means both lists came back shorter than their limit, so a tracked pass
@@ -5758,4 +5853,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, FINDINGS_TABLE, FINDING_ID_PREFIX, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SearchFinding, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, FINDINGS_TABLE, FINDING_ID_PREFIX, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SearchFinding, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

@@ -28,7 +28,16 @@ release-by-release changelog is [HISTORY.md](HISTORY.md).
 - **Grounded answers**: the agent answers only from the project's data, says so when
   the data does not have it, and names the file and page an answer came from as
   citation chips under the reply. The open web is off unless the project's owner
-  turns it on (`webAccess`).
+  turns it on (`webAccess`). A long file (a manual, a book) is searched by chapter
+  from its contents list, and for a signed-in user the question goes along with the
+  search so the server learns which page answered it.
+- **"Wrong answer?"**: the latest answer that read data carries a small button that
+  sends "This answer seems wrong. Please check it again against the documents." as
+  an ordinary message, once per answer. The agent re-reads the cited pages and
+  searches again, then corrects the answer, or corrects it and records the right
+  page with an exact quote that proves it (signed-in users only), or keeps it and
+  quotes the supporting text. A user's word alone never changes what search has
+  learned.
 - **Authentication**: email/password login, optional signup, password change,
   email verification, account recovery, and "Sign in with Google".
 - **Conversation history**: paginated, with "Fetching history…" indicators on
@@ -161,6 +170,7 @@ Mounts the widget. Returns the `BunnyQuery` object.
 | `skipDuplicateFiles`     | `boolean` | `null`   | Whether a chat attachment the signed-in user **already uploaded** to this project (same stored file name, same size in bytes, same uploader, found from the file's `src::` record, and a stored copy that finished indexing or is still being indexed) is skipped: it is neither uploaded nor indexed again, the chip reads "already uploaded", and the message uses the stored copy's url. The project's **Skip duplicate files** setting (the `skip_duplicate_files` key of `bq::settings`, **on** unless the owner turned it off) is the **ceiling**, and this option may only restrict below it: `effective = projectSetting && skipDuplicateFiles !== false`. `null` or `true` follows the project; `false` lets this page re-upload duplicates; a value above the project setting has no effect. A stored copy whose indexing failed or was cancelled is not a duplicate, so the file uploads as usual. The check never blocks an upload: a failed lookup, or one slower than 15 seconds, uploads as usual. |
 | `reuseMcpToolList`       | `boolean` | `false`  | OpenAI chat turns only: reuse the MCP tool listing OpenAI returned on an earlier turn of this page, so OpenAI does not fetch it again (about 0.6 s per turn). Off unless `true`. Each reused turn's request and stored history row is about 31 to 34 KB larger. See `reuseMcpToolList` under `configureChatEngine`. |
 | `liveStreaming`          | `boolean` | `false`  | Deliver the streamed reply over skapi's websocket as well as the poll, so each piece lands the moment the server relays it instead of on the next one-second poll tick. Streaming itself is not an option: the widget streams every reply whenever the page's `skapi-js` can carry skapi's half of the stream flag (it checks for `forwardRequestStream` and `forwardRequestFinalize`), and otherwise warns once and buffers. Off unless you ask for it: skapi's `joinRealtime` **replaces** the connection's group, so for the length of a turn it takes the room out from under whatever else your app uses realtime for. Purely an accelerator; with it off the reply still streams, on the poll's cadence. Before 1.16.0 this key meant "stream at all" and the socket was `liveStreamingRealtime`; that name is now ignored. |
+| `statusPush`             | `boolean` | `false`  | Indexing status over skapi's websocket: each indexing pass asks the server for status messages, its poll then reads once a minute while they arrive and at once when one names it, and the chat re-reads its history when the socket reconnects. Off unless you ask for it, because it keeps a websocket open on your page's skapi instance (your own realtime callback never sees these messages). Needs skapi-js 2.5.0 or newer; with an older one it stays off. Purely an accelerator: every status on screen still comes from reading the request. |
 
 ### Rebranding the widget
 
@@ -369,7 +379,9 @@ Uploading over a file that already exists prompts for skip, "reindex only", or
 overwrite. Choosing either of the latter two deletes the file's existing
 `src::<path>` index record first, and the skapi backend cascades that delete to
 the record's reference-linked children, so re-indexing **replaces** the file's
-knowledge rather than duplicating it.
+knowledge rather than duplicating it. That includes the file's contents list, its
+search glossary and everything search has learned about it from people's
+questions and corrections, which the dialog says.
 
 ### Filenames
 
@@ -529,6 +541,9 @@ helpers. See the `.d.ts` shipped with `bunnyquery/engine`.
 | `forwardRequestStream`        | `function?` | `skapi.forwardRequestStream`, bound to your Skapi instance. The **second half of the durability guarantee**: a row that settles while no poll is attached (closed tab, discarded background tab, slept device) is never finalized, so its answer stays in the chunk store and its history row is terminal and empty. Given the request id this drains that turn's chunks in one pass; the engine parses them exactly as it parses a live stream and finalizes what it read, so each row is recovered at most once. Without it the engine mints no recovery marker at all, and without the pair the engine does not stream. |
 | `onLiveStreamUpdate`          | `function?` | Observation hook for a streaming turn (`{ serverItemId, ownerKey, phase, text, thinkingText, toolNames, complete, errored }`). The engine already paints the answer text itself, so this is only for affordances it does not decide the presentation of. Never throw from it. |
 | `liveStreaming`               | `boolean?` | Deliver streamed chunks over skapi's websocket as well. Off by default: `joinRealtime` replaces the connection's group for the length of a turn, so only a host that owns its skapi instance should opt in. Streaming itself has no key: the engine streams every chat turn whenever `forwardRequestFinalize` and `forwardRequestStream` are both handed over (`liveStreamingEnabled()`), and a host that wants buffered replies hands over neither. Before 1.16.0 this key meant "stream at all"; `liveStreamingRealtime` is now ignored. |
+| `statusPush`                  | `boolean?` | Request status push (skapi-js 2.5.0+, with `onRequestStatus` below). Indexing passes are dispatched with `notify: true`, their polls idle at a once-a-minute heartbeat while status messages arrive, a message about a pass the page does not follow runs the queue check, and a reconnect runs `catchUpHistory()`. Off by default: it keeps a websocket open on the host's skapi instance. |
+| `onRequestStatus`             | `function?` | `skapi.onRequestStatus`, bound to the host's skapi instance (skapi-js 2.5.0+). Required for `statusPush`. |
+| `isRequestStatusLive`         | `function?` | `skapi.isRequestStatusLive`, bound to the host's skapi instance (skapi-js 2.5.0+). |
 | `streamRecovery`              | `boolean?`  | Set `false` to force the read-back of already-streamed turns **off**, even though the chunk reader is injected. There is no need to set it to turn recovery on: injecting `forwardRequestStream` is what arms it. |
 | `mintIndexDoneMarker`         | `function?` | Write the durable "indexing finished" marker (`done::<path>`, reference `src::<path>`, table `__INDEXING__`) for the runs this client knows are complete. Best-effort, must never throw. Without it the engine falls back to inference. |
 | `upsertIndexRunRecord`        | `function?` | Create-or-update the per-file run record (`run::<path>`, reference `src::<path>`, table `__INDEXING__`), which is what lets chat rows and files-page badges paint without scanning background history. You implement the upsert (the records API has none) and the status precedence: `'working'` must never overwrite a terminal status. Without it the engine uses the legacy scan/probe path. |
@@ -599,6 +614,12 @@ widget rather than approximately:
   handed the pending assistant bubble, it cancels the running request on the
   server, marks the question cancelled and promotes the next queued message.
   `cancelQueuedMessage` does the same for a message still in the queue.
+- **`ChatSession.canReportWrongAnswer(msg)` / `reportWrongAnswer(msg, pinned?)`**
+  are the "Wrong answer?" button. The gate is a settled answer with a retrieval
+  note (not the no-source mark), not cancelled, and the latest answer; one that
+  was already reported keeps a disabled button (`wrongAnswerReported(msg)`).
+  `reportWrongAnswer` sends `wrongAnswerMessage` through `dispatchComposedMessage`,
+  so it is a normal visible turn; `wrongAnswerLabel` is the button's text.
 - **`resetFileIndexOnServer({ service, owner?, storagePath })`** clears a file's index on the MCP (`/internal/index-reset`: the file record and everything that cascades from it, the agent's per-window records, and the `done::`, `run::` and `prog::` markers) before a Reindex or an Overwrite, through the host's `forwardRequest` with `$ACCESS_TOKEN`. Resolves to the server's answer (including the old record's `access_group`), or `null` when the MCP could not be reached, in which case the caller clears the index itself.
 - **`findDuplicateUpload`** and the `configureProjectSettings` reader back the
   `skipDuplicateFiles` and `webAccess` switches; see the `configureChatEngine`

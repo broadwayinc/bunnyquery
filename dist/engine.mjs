@@ -255,6 +255,17 @@ function resolveForwardRequestStream() {
 function windowedIndexingEnabled() {
   return _config?.windowedIndexing === true;
 }
+function statusPushEnabled() {
+  return _config?.statusPush === true && typeof _config?.onRequestStatus === "function";
+}
+function statusPushLive() {
+  if (!statusPushEnabled() || typeof _config?.isRequestStatusLive !== "function") return false;
+  try {
+    return !!_config.isRequestStatusLive();
+  } catch (e) {
+    return false;
+  }
+}
 function liveStreamingSocketEnabled() {
   return liveStreamingEnabled() && _config?.liveStreaming === true;
 }
@@ -839,7 +850,8 @@ WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rul
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
   const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
-  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used. THEN FIND THE PAGE with searchText: with the file's path when the user named a file, without a path when they did not ("find a file that contains X"), and follow its description's steps to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name.`;
+  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): FIRST FIND THE FILE, with getFileOutline when you know its storage path, otherwise by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used. THEN FIND THE PAGE with searchText: with the file's path when the user named a file, without a path when they did not ("find a file that contains X"), and follow its description's steps to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name. For a long file (a manual, a book), call getFileOutline first and search the chapter that fits with searchText page_from and page_to. When the user asks about the content of the documents, pass searchText "question": that question in the user's own words, without names or personal details that are not about the documents. Leave "question" out for anything else.
+WRONG ANSWER: when the user says an answer is wrong (or sends "This answer seems wrong. Please check it again against the documents."), re-read the pages you cited and search again, passing searchText "question" = the user's ORIGINAL question that the disputed answer answered, never the complaint message itself. Then do exactly one of: correct the answer only; correct the answer and call correctSearchLink (when it is among your tools); or keep the answer and quote the text that supports it. Call correctSearchLink only with the page and an exact quote that prove it, and never change data on the user's word alone.`;
   const groupIsPublic = indexGroupLiteral === '"public"' || indexGroupLiteral === "0";
   const accessGroupRule = `THIS PROJECT INDEXES AT access_group ${indexGroupLiteral}: pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name, whether it filters by index, by tag or by nothing, and never rely on a default: a group left off is NOT "all groups", and any user but the project's owner is then answered from access_group 0 (public) alone${groupIsPublic ? "" : `, so a table indexed at ${indexGroupLiteral} would look empty with its records sitting right there`}. Files uploaded before the project's setting changed may sit at another group, so when a table query comes back empty, retry it in the other groups among 0, 1 and "private" before concluding there is nothing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them; adding table_name narrows it to that table, and access_group WITHOUT table_name fails.`;
   let systemPrompt = `
@@ -2638,6 +2650,9 @@ async function notifyAgentSaveAttachment(info) {
       service,
       owner,
       ...pollOpt(),
+      // Status push for this pass and the continuations the worker queues from it
+      // (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
+      ...statusPushEnabled() ? { notify: true } : {},
       url: OPENAI_RESPONSES_API_URL,
       method: "POST",
       headers: {
@@ -2682,6 +2697,9 @@ async function notifyAgentSaveAttachment(info) {
     service,
     owner,
     ...pollOpt(),
+    // Status push for this pass and the continuations the worker queues from it
+    // (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
+    ...statusPushEnabled() ? { notify: true } : {},
     url: ANTHROPIC_MESSAGES_API_URL,
     method: "POST",
     headers: {
@@ -5321,6 +5339,11 @@ var INDEX_DISPATCH_CLAIM_MS = 2 * 60 * 1e3;
 var WORKER_PASS_ADOPT_ATTEMPTS = [0, 2e3, 6e3];
 var RECENT_INDEX_PASS_EVIDENCE_MS = 10 * 60 * 1e3;
 var ADOPT_TICK_MS = 10 * 1e3;
+var STATUS_PUSH_ADOPT_TICK_MS = 60 * 1e3;
+var CATCH_UP_MIN_GAP_MS = 2e3;
+var RETURN_WATCH_MS = 15 * 1e3;
+var RETURN_WATCH_SLEEP_GAP_MS = 45 * 1e3;
+var STATUS_NUDGE_MIN_GAP_MS = 2e3;
 var EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
 var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
 var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -5462,6 +5485,12 @@ function requestIdTimeMs(rid) {
   }
   return Math.floor(v / 2 / 1e6);
 }
+var WRONG_ANSWER_MESSAGE = "This answer seems wrong. Please check it again against the documents.";
+var WRONG_ANSWER_LABEL = "Wrong answer?";
+function canReportWrongAnswer(msg) {
+  var note = retrievalNoteOfAnswer(msg);
+  return !!note && !answerUsedNoDataTool(note) && !msg.isCancelled;
+}
 var _ChatSession = class _ChatSession {
   constructor(host) {
     // --- live streaming ----------------------------------------------------
@@ -5511,6 +5540,10 @@ var _ChatSession = class _ChatSession {
     // bubble can never silently revert to its 200-char head.
     this._hydratedBodies = {};
     this._hydratingItems = {};
+    /** The button's label and the message it sends, read off the session so the
+     *  clients need no extra import. */
+    this.wrongAnswerLabel = WRONG_ANSWER_LABEL;
+    this.wrongAnswerMessage = WRONG_ANSWER_MESSAGE;
     this.typewriterQueue = Promise.resolve();
     /**
      * Pick up indexing passes the WORKER minted, which no client ever dispatched.
@@ -5547,6 +5580,27 @@ var _ChatSession = class _ChatSession {
      *  a reload starts without it and asks once, as before. */
     this._idleVerdictAt = {};
     this._adoptTickTimer = null;
+    /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
+     *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
+     *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+    // ── RETURN CATCH-UP + REQUEST STATUS PUSH (owner, 2026-11-23) ──────────────
+    // The rule: when the user comes back to the chat (the tab shown again, the computer
+    // awake again, the network or the websocket back), the chat is re-read from the
+    // server, so nothing that happened while they were away is missing. The re-read is
+    // loadHistory's own first-page refresh, the one every mount runs: it keeps older pages
+    // the user loaded, keeps a send still in flight, never lets an empty answer replace a
+    // known one, re-attaches polls to whatever is still waiting, and reads back a streamed
+    // answer nobody finalized. Status frames (statusPush) only make things faster; they
+    // never decide anything on screen.
+    this._catchUpAt = 0;
+    this._catchUpTimer = null;
+    this._returnWatchTimer = null;
+    this._returnWatchAt = 0;
+    this._returnListeners = false;
+    this._statusUnsub = null;
+    this._statusNudgeTimer = null;
+    this._statusNudgeAt = 0;
+    this._statusSeenConnect = false;
     /** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
      *  live. Complete means both lists came back shorter than their limit, so a tracked pass
      *  missing from it really has left the queue. */
@@ -5591,6 +5645,7 @@ var _ChatSession = class _ChatSession {
     this.historyItemPolls = /* @__PURE__ */ new Map();
     this._pauseReasons = /* @__PURE__ */ new Set();
     this._resuming = false;
+    this._wrongReported = {};
     this._lidSeq = 0;
     this._stageSeq = 0;
     this._uploadBatches = 0;
@@ -6985,8 +7040,7 @@ var _ChatSession = class _ChatSession {
     this._resuming = true;
     return Promise.resolve().then(function() {
       self.drainBgTaskQueue();
-      if (self.needsHistoryRefetch()) return self.loadHistory(false, self.state.gateRefreshToken);
-      self.refreshLiveIndexState();
+      return self.catchUpHistory();
     }).catch(function(e) {
       console.error("[chat-engine] resume polling failed", e);
     }).then(function() {
@@ -8218,6 +8272,54 @@ var _ChatSession = class _ChatSession {
     });
   }
   /**
+   * Does this bubble get the "Wrong answer?" button: the free function's gate,
+   * and only on the latest answer, because the message it sends names no answer
+   * and the model reads it right after the last one. An answer already reported
+   * keeps its (disabled) button after the complaint turn lands below it.
+   */
+  canReportWrongAnswer(msg) {
+    if (!canReportWrongAnswer(msg)) return false;
+    return this.wrongAnswerReported(msg) || this._isLatestAnswer(msg);
+  }
+  /** True when no chat turn follows `msg` in state.messages. Indexing rows and
+   *  cancelled turns do not count (neither reaches the model's history). Matched
+   *  by identity or by item id, since agent.vue hands in reactive proxies. */
+  _isLatestAnswer(msg) {
+    var list = this.state.messages || [];
+    var sid = msg._serverItemId, lid = msg._localId;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var m = list[i];
+      if (!m) continue;
+      if (m === msg || m.role === "assistant" && (sid && m._serverItemId === sid || lid && m._localId === lid)) return true;
+      if (m.isBackgroundTask || m.isCancelled) continue;
+      return false;
+    }
+    return false;
+  }
+  /** True once this answer's "Wrong answer?" was sent (one click per answer). */
+  wrongAnswerReported(msg) {
+    if (!msg) return false;
+    if (msg._wrongReported) return true;
+    var key = msg._serverItemId || msg._localId;
+    return !!key && !!this._wrongReported[key];
+  }
+  /**
+   * The "Wrong answer?" button: sends WRONG_ANSWER_MESSAGE as an ordinary visible
+   * user turn through dispatchComposedMessage, so it reads the same after a reload
+   * and both clients behave alike. The answer is marked first, so the button goes
+   * disabled at once. False when the bubble does not qualify or was already used.
+   * `pinned` is the caller's usual pinned identity and prompt (agent.vue pins them).
+   */
+  reportWrongAnswer(msg, pinned) {
+    if (this.wrongAnswerReported(msg) || !this.canReportWrongAnswer(msg)) return false;
+    msg._wrongReported = true;
+    var key = msg._serverItemId || msg._localId;
+    if (key) this._wrongReported[key] = true;
+    this.host.notify();
+    this.dispatchComposedMessage(WRONG_ANSWER_MESSAGE, false, void 0, void 0, void 0, pinned);
+    return true;
+  }
+  /**
    * Stop waiting for the reply to the chat turn that is running now, and move on.
    *
    * `msg` is the turn's pending ASSISTANT bubble (the dot-trail "Thinking"
@@ -9057,9 +9159,153 @@ var _ChatSession = class _ChatSession {
     });
     return found;
   }
-  /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
-   *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
-   *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
+  /**
+   * Re-read the chat from the server now (see the rule above). Safe to call from any
+   * number of triggers at once: calls within CATCH_UP_MIN_GAP_MS of the last one run
+   * once, at the end of the gap. Nothing happens while no chat view is mounted (the
+   * mount loads the chat anyway) or while background polling is paused (the tab is
+   * hidden: showing it calls this again).
+   */
+  catchUpHistory() {
+    var self = this;
+    var id = this.host.getIdentity();
+    if (!id.projectId || id.platform === "none") return Promise.resolve();
+    if (!this.host.isViewMounted || !this.host.isViewMounted() || this.isPollingPaused()) return Promise.resolve();
+    this._ensureReturnWatch();
+    var wait = this._catchUpAt + CATCH_UP_MIN_GAP_MS - Date.now();
+    if (wait > 0) {
+      if (!this._catchUpTimer) {
+        this._catchUpTimer = setTimeout(function() {
+          self._catchUpTimer = null;
+          self.catchUpHistory();
+        }, wait);
+      }
+      return Promise.resolve();
+    }
+    this._catchUpAt = Date.now();
+    return this.loadHistory(false, this.state.gateRefreshToken).catch(function(e) {
+      console.error("[chat-engine] catch-up failed", e);
+    });
+  }
+  /**
+   * Watch for the moments the user comes back without the tab being hidden first: the
+   * computer waking from sleep (the timer finds a gap far longer than its interval),
+   * the network coming back, a page restored from the back-forward cache. Also starts
+   * the status push listener. Runs while a chat view is mounted and stops itself when
+   * none is.
+   */
+  _ensureReturnWatch() {
+    var self = this;
+    if (typeof window === "undefined") return;
+    if (!this._returnListeners) {
+      this._returnListeners = true;
+      var onBack = function() {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        self.catchUpHistory();
+      };
+      window.addEventListener("online", onBack);
+      window.addEventListener("pageshow", function(ev) {
+        if (ev && ev.persisted) onBack();
+      });
+    }
+    this._startStatusPush();
+    if (this._returnWatchTimer) return;
+    this._returnWatchAt = Date.now();
+    var look = function() {
+      self._returnWatchTimer = null;
+      if (!self.host.isViewMounted || !self.host.isViewMounted()) {
+        self._stopStatusPush();
+        return;
+      }
+      var now = Date.now();
+      var gap = now - self._returnWatchAt;
+      self._returnWatchAt = now;
+      if (gap > RETURN_WATCH_SLEEP_GAP_MS && (typeof document === "undefined" || document.visibilityState !== "hidden")) {
+        self.catchUpHistory();
+      }
+      self._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
+    };
+    this._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
+  }
+  /** Listen to request status frames while a chat view is mounted (statusPush on). */
+  _startStatusPush() {
+    if (this._statusUnsub || !statusPushEnabled()) return;
+    var self = this;
+    this._statusSeenConnect = false;
+    try {
+      var unsub = chatEngineConfig().onRequestStatus(function(ev) {
+        self._onRequestStatus(ev);
+      });
+      this._statusUnsub = typeof unsub === "function" ? unsub : function() {
+      };
+    } catch (e) {
+      this._statusUnsub = null;
+    }
+  }
+  _stopStatusPush() {
+    var unsub = this._statusUnsub;
+    this._statusUnsub = null;
+    if (this._statusNudgeTimer) {
+      clearTimeout(this._statusNudgeTimer);
+      this._statusNudgeTimer = null;
+    }
+    if (unsub) {
+      try {
+        unsub();
+      } catch (e) {
+      }
+    }
+  }
+  /**
+   * One status frame event. 'connected' (first connection, and every reconnect after a
+   * drop, a sleep or the planned renewal) catches up, because frames sent while the
+   * socket was down are lost. A status change of an indexing pass this page does not
+   * poll runs the queue check now instead of at its next heartbeat; a pass that IS polled
+   * was already woken by skapi-js itself. Chat turns are left to their own polls.
+   */
+  _onRequestStatus(ev) {
+    if (!ev || !this.host.isViewMounted()) return;
+    if (ev.type === "connected") {
+      if (!this._statusSeenConnect) {
+        this._statusSeenConnect = true;
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      this.catchUpHistory();
+      return;
+    }
+    if (ev.type !== "status" || typeof ev.id !== "string") return;
+    if (!ev.queue || !isBgIndexingQueue(ev.queue)) return;
+    if (this.historyItemPolls.has(ev.id)) return;
+    var tracked = false;
+    for (var i = 0; i < this.bgTaskQueue.length; i++) {
+      var e = this.bgTaskQueue[i];
+      if (e && e.id === ev.id) {
+        tracked = !e.byListing;
+        break;
+      }
+    }
+    if (tracked) return;
+    this._nudgeQueueCheck();
+  }
+  /** Run the queue check (adopt, settle by listing, page progress) now, at most once per
+   *  STATUS_NUDGE_MIN_GAP_MS, then let the heartbeat carry on. */
+  _nudgeQueueCheck() {
+    var self = this;
+    if (this._statusNudgeTimer) return;
+    var wait = Math.max(0, this._statusNudgeAt + STATUS_NUDGE_MIN_GAP_MS - Date.now());
+    this._statusNudgeTimer = setTimeout(function() {
+      self._statusNudgeTimer = null;
+      self._statusNudgeAt = Date.now();
+      var id = self.host.getIdentity();
+      if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return;
+      if (self.isPollingPaused() || !self.host.isViewMounted()) return;
+      self._adoptWorkerIndexingPasses(0, false, true);
+      self._settleByListing();
+      self._refreshPageProgress();
+      self._ensureAdoptTick();
+    }, wait);
+  }
   _ensureAdoptTick() {
     if (this._adoptTickTimer) return;
     var self = this;
@@ -9080,7 +9326,7 @@ var _ChatSession = class _ChatSession {
       self._settleByListing();
       self._refreshPageProgress();
       self._ensureAdoptTick();
-    }, ADOPT_TICK_MS);
+    }, statusPushLive() ? STATUS_PUSH_ADOPT_TICK_MS : ADOPT_TICK_MS);
   }
   /**
    * Follow an indexing pass found in a loaded history page through the queue check
@@ -9696,6 +9942,7 @@ var _ChatSession = class _ChatSession {
     var id = this.host.getIdentity();
     var svcId = id.projectId, plat = id.platform;
     if (!svcId || plat === "none" || !this.host.isViewMounted()) return;
+    this._ensureReturnWatch();
     this._applyIndexCancellations();
     this._sweepCancelledIndexing();
     this._ensureAdoptTick();
@@ -9764,6 +10011,11 @@ var _ChatSession = class _ChatSession {
         var executedAt;
         var bp = entry2.poll({
           latency: POLL_INTERVAL,
+          // Status push (statusPushEnabled): a pass adopted from a listing is polled
+          // slowly while frames arrive, like one this page dispatched. A dispatch
+          // reply's poll decides that from the server's acknowledgement and
+          // ignores this key.
+          notify: statusPushEnabled(),
           onResponse: function(_res, meta) {
             if (meta && typeof meta.executed === "number" && meta.executed > 0) executedAt = meta.executed;
           }
@@ -10412,7 +10664,7 @@ var _ChatSession = class _ChatSession {
               }
             }
           };
-          var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts, {
+          var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL, notify: statusPushEnabled() }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts, {
             platform,
             projectId,
             owner,
@@ -10763,6 +11015,6 @@ var _ChatSession = class _ChatSession {
 _ChatSession.RUN_PASS_PAGE = 10;
 var ChatSession = _ChatSession;
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, FINDINGS_TABLE, FINDING_ID_PREFIX, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, FINDINGS_TABLE, FINDING_ID_PREFIX, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

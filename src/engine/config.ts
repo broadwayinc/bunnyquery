@@ -205,6 +205,27 @@ export interface ChatEngineConfig {
      */
     liveStreaming?: boolean;
     /**
+     * Request STATUS PUSH over skapi's websocket (skapi-js 2.5.0 or newer, plus the
+     * backend that knows `notify`). Indexing passes are dispatched with `notify: true`,
+     * their polls then read the row once a minute instead of every few seconds while
+     * status frames are arriving, and read it at once when a frame names them. The
+     * engine also listens with `onRequestStatus` while a chat view is open: a frame for
+     * a pass it holds nothing for picks that pass up, and a (re)connected socket runs
+     * the return catch-up (ChatSession.catchUpHistory), since frames sent while it was
+     * down are lost.
+     *
+     * Off by default for the same reason as `liveStreaming`: it keeps a websocket open
+     * on the host's skapi instance. The dashboard owns its instance and opts in; the
+     * widget leaves it to the embedder. Needs `onRequestStatus` below too: without it,
+     * or on an older skapi-js, nothing changes. Every frame is a hint: polls and
+     * listings still decide every status on screen.
+     */
+    statusPush?: boolean;
+    /** skapi.onRequestStatus, bound to the consumer's skapi instance (skapi-js 2.5.0+). */
+    onRequestStatus?: (callback: (event: any) => void) => () => void;
+    /** skapi.isRequestStatusLive, bound to the consumer's skapi instance (skapi-js 2.5.0+). */
+    isRequestStatusLive?: () => boolean;
+    /**
      * Whether a CHAT answer may reach the open web: Claude's `web_fetch` and
      * OpenAI's `web_search` are attached to a chat request only when this
      * resolves to true.
@@ -439,6 +460,21 @@ export function windowedIndexingEnabled(): boolean {
 
 /** True when the consumer has opted in to live streaming of chat turns. */
 /** Socket delivery of the stream: the host asked (`liveStreaming`) AND the turn streams. */
+/** Request status push is on: the host asked for it and handed over onRequestStatus. */
+export function statusPushEnabled(): boolean {
+    return _config?.statusPush === true && typeof _config?.onRequestStatus === 'function';
+}
+
+/** Status frames are arriving right now (false when status push is off). */
+export function statusPushLive(): boolean {
+    if (!statusPushEnabled() || typeof _config?.isRequestStatusLive !== 'function') return false;
+    try {
+        return !!_config.isRequestStatusLive();
+    } catch (e) {
+        return false;
+    }
+}
+
 export function liveStreamingSocketEnabled(): boolean {
     return liveStreamingEnabled() && _config?.liveStreaming === true;
 }
