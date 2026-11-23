@@ -492,7 +492,7 @@ configureChatEngine({
   forwardRequest: (form, opts) => skapi.forwardRequest(form, opts),
   forwardRequestHistory: (params, fetchOptions) =>
     skapi.forwardRequestHistory(params, fetchOptions),
-  mcpBaseUrl: 'https://mcp.broadwayinc.computer',
+  mcpBaseUrl: 'https://mcp.skapi.com',
   poll: 0, // see the note below
 });
 
@@ -617,7 +617,7 @@ never progress.
 ## OAuth & redirects
 
 BunnyQuery connects to your AI agent through an MCP OAuth server
-(`mcp.broadwayinc.computer` in production, `mcp-dev.broadwayinc.computer` when
+(`mcp.skapi.com` in production, `mcp-dev.broadwayinc.computer` when
 `dev: true`). After authorization, the OAuth server redirects back to **the current
 host page**: BunnyQuery reads the `?code=…&state=…` parameters, completes the
 exchange, and cleans them from the URL automatically. No dedicated callback page is

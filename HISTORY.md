@@ -5,8 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.19.2**. The latest version on npm
-  when this was written is 1.19.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.19.3**. The latest version on npm
+  when this was written is 1.19.2. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -25,7 +25,21 @@ A few notes on how to read this:
 
 ---
 
-## 1.19.2 (2026-11-22, not yet published)
+## 1.19.3 (2026-11-23, not yet published)
+
+The production MCP server moves to `mcp.skapi.com`, and the chat and indexing prompts are shorter.
+
+### Engine
+
+- **Chat prompt.** The access-group rule no longer explains how the server fills in a missing group (an index or tag query auto-filled with `"authorized"`, a plain table query not at all); it keeps only what that implies: pass the project's group on every query that names a table, a group left off is not "all groups", a non-owner is then answered from group 0 alone, an empty result is retried in the other groups, and reference alone spans every table and group. "An index or tag filter needs table_name" was removed, since getRecords' own description says it. The knowledge-lookup line is reworded: search the project's data before saying you don't know, because the data lives in the database, not in earlier chat messages.
+- **Indexing prompts.** The image line is shorter (look at the attached images, never fetch an image URL). The `readFileContent` window description now lists text as a character range instead of PDFs as page images. Page records are told to transcribe the text in photos and diagrams before describing them, and the orphan-record explanation was folded into the shorter "never post the file record" rule.
+
+### Widget
+
+- **Production MCP server is `https://mcp.skapi.com`** (was `https://mcp.broadwayinc.computer`). The dev host (`dev: true`) is unchanged, and `opts.mcpBaseUrl` still overrides both. The README's examples and OAuth section say the same.
+- The prompt changes above, through the engine.
+
+## 1.19.2 (2026-11-22)
 
 Chat turns: the question is sent once, OpenAI turns skip the MCP tool handshake, and an optional per-project answer mode.
 

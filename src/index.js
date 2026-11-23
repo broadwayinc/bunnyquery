@@ -157,11 +157,11 @@ import {
      * ======================================================================*/
 
     // MCP server (RFC 7591 dynamic registration + RFC 6749 auth-code + PKCE).
-    // OAuth endpoints live on the MCP server (mcp.broadwayinc.computer); the
+    // OAuth endpoints live on the MCP server (mcp.skapi.com); the
     // post-authorize redirect comes back to the CURRENT HOST PAGE (not a
     // bunnyquery.com page). Override the base via `opts.mcpBaseUrl`, or toggle
     // the dev host with `opts.dev`.
-    var MCP_PROD = "https://mcp.broadwayinc.computer";
+    var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
     var MCP_NAME = "BunnyQuery";
 
@@ -659,7 +659,7 @@ import {
      * ======================================================================*/
 
     function mcpBaseUrl() {
-        // The MCP OAuth server (defaults to mcp.broadwayinc.computer). The
+        // The MCP OAuth server (defaults to mcp.skapi.com). The
         // redirect_uri (mcpRedirectUri) still points back to the host page.
         return String(S.opts.mcpBaseUrl || (S.opts.dev ? MCP_DEV : MCP_PROD)).replace(/\/+$/, "");
     }
