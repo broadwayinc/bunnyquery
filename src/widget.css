@@ -691,6 +691,39 @@
     padding: 0;
 }
 
+/* "Reconnecting..." / "Sign in to see the latest answers." between the list and
+   the composer. The shared look (text size and colour) is .bq-chat-status in
+   styles/chat.css, which comes later in bunnyquery.css and wins over the plain
+   fallback here. Widget-only layout: zero height in flow, like the history bar
+   above, so the note coming and going never moves the list; its strip overlays
+   the bottom of the list instead. */
+.bq-chat-status {
+    font-size: 0.75rem;
+    color: var(--bq-muted);
+}
+.bq-chat > .bq-chat-status {
+    position: relative;
+    z-index: 2;
+    flex-shrink: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    overflow: visible;
+    pointer-events: none;
+}
+.bq-chat > .bq-chat-status[hidden] { display: none; }
+.bq-chat-status-inner {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 0.9rem 1.25rem 0.3rem;
+    text-align: center;
+    background: linear-gradient(to top, color-mix(in srgb, var(--bq-paper) 85%, transparent) 60%, transparent);
+}
+
 /* "admin hasn't set up the agent" / disabled overlay */
 .bq-disabled-overlay {
     position: absolute;
@@ -1079,6 +1112,7 @@
 @media (max-width: 600px) {
     /* .bq-meta { padding: 0.75rem; } */
     .bq-input-row { flex-direction: column; padding: 0.65rem 0.75rem 0.75rem; }
+    .bq-chat-status-inner { padding-left: 0.75rem; padding-right: 0.75rem; }
     .bq-input-wrap { width: 100%; flex: 0 0 auto; }
     .bq-input-row .btn { width: 100%; }
     /* `flex-basis: 100%` on these two means FULL WIDTH only while the row is a

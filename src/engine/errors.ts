@@ -278,3 +278,41 @@ export function isProviderApiKeyError(input: any): boolean {
 		hay.indexOf('invalid api key') !== -1 ||
 		hay.indexOf('no api key provided') !== -1;
 }
+
+/**
+ * The server's own "that request is gone" answer to a read of it (the row was removed:
+ * cancelled while queued, or cleaned up). A fact about the request, unlike every
+ * failure isTransportFailure covers.
+ */
+export function isNotExistsError(err: any): boolean {
+	return !!err && typeof err === 'object' && (err.code === 'NOT_EXISTS' || (!!err.body && err.body.code === 'NOT_EXISTS'));
+}
+
+// Codes skapi-js gives a request that failed ON THE WAY rather than because the server
+// said no (2.7.0 types them; older builds reject with bare strings, matched below).
+var TRANSPORT_FAILURE_CODES = ['NETWORK_ERROR', 'TIMEOUT', 'RATE_LIMITED', 'TOO_MANY_REQUESTS', 'SERVER_ERROR', 'ABORTED', 'TOKEN_REFRESH_FAILED'];
+
+/**
+ * True when a READ of a request failed on the way: no network, no answer in time, rate
+ * limited, a server fault (5xx), an aborted read. Such a failure says nothing about the
+ * request itself, which may be running or already answered, so a caller must never
+ * turn it into an error bubble or a failed run record (reconciler plan, section 3 item 4).
+ */
+export function isTransportFailure(err: any): boolean {
+	if (err === undefined || err === null) return true;
+	if (typeof err === 'string') {
+		var s = err.toLowerCase();
+		return s.indexOf('network') !== -1 || s.indexOf('abort') !== -1 || s.indexOf('too many') !== -1 ||
+			s.indexOf('timeout') !== -1 || s.indexOf('timed out') !== -1 || s.indexOf('no response for') !== -1;
+	}
+	if (typeof err !== 'object') return false;
+	if (typeof TypeError !== 'undefined' && err instanceof TypeError) return true; // fetch() on the way
+	var code = err.code !== undefined && err.code !== null ? String(err.code) : '';
+	if (TRANSPORT_FAILURE_CODES.indexOf(code) !== -1) return true;
+	if (code === '429' || /^5\d\d$/.test(code)) return true;
+	var status = typeof err.status === 'number' ? err.status : (typeof err.statusCode === 'number' ? err.statusCode : 0);
+	if (status === 429 || status >= 500) return true;
+	var msg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+	return msg.indexOf('network error') !== -1 || msg.indexOf('failed to fetch') !== -1 ||
+		msg.indexOf('no response for') !== -1 || msg.indexOf('timed out') !== -1 || msg === 'aborted';
+}

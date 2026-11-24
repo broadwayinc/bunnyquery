@@ -144,10 +144,10 @@ export interface ChatMessage {
 	/** PROTOCOL + PRESENTATIONAL: this bubble is being painted from a LIVE stream.
 	 *
 	 *  It sits alongside `isPending`, never instead of it. The bubble is still the
-	 *  turn's "Thinking..." placeholder as far as every queue mechanism is concerned
-	 *  (_ownThinkingIndex, resolveQueuedUserBubble, typewriteLatestReply and the
-	 *  stray-pending sweep all find their target by isPending), and clearing that flag
-	 *  to mean "it has text now" would strand the turn's real answer beside an orphan.
+	 *  turn's "Thinking..." placeholder as far as every settle is concerned (the apply
+	 *  funnel, ChatSession.applyTerminal, finds a turn's waiting bubble by its server id
+	 *  AND isPending), and clearing that flag to mean "it has text now" would make the
+	 *  turn read as already answered, so its real answer would be refused.
 	 *  What this adds is the one thing those mechanisms do not care about and the VIEW
 	 *  does: `content` is already worth rendering, so draw the text instead of the
 	 *  spinner.
@@ -253,6 +253,16 @@ export interface ChatMessage {
 	// ChatSession singleton, so without this a bubble is unattributable and an
 	// in-flight turn from project A gets rescued/cached into project B.
 	_ownerKey?: string;
+	/** The client reference the turn was sent with (reconciler plan, section 3 item 9). On
+	 *  the user bubble of a send; a send whose ack was lost is matched to its row by it. */
+	_cref?: string;
+	/** A send whose POST got no answer while the reconciler looks for its row by `_cref`:
+	 *  kept through history merges until its row is found or it is "Not sent". */
+	_unconfirmed?: boolean;
+	/** A send whose POST got no answer and whose row the server never showed: the reply
+	 *  bubble says "Not sent. Retry?" and ChatSession.retryNotSent(msg) sends it again.
+	 *  Never retried on its own. */
+	_notSent?: boolean;
 }
 
 export interface ChatState {
@@ -309,6 +319,28 @@ export interface ChatState {
 	 *  liveIndexKeys, so a reactive consumer re-renders the moment a stop is
 	 *  recorded — a stop with nothing left to cancel changes no message at all. */
 	stoppedIndexIds: { [serverItemId: string]: boolean };
+	/** The reconciler's last look failed on the way (network, timeout, 429, 5xx) and it is
+	 *  trying again with backoff. Nothing on screen was changed by the failure; a view may
+	 *  show a small "Reconnecting..." note while this is true. */
+	reconnecting?: boolean;
+	/** The reconciler's reads are refused for want of a sign-in. Looks resume on the next
+	 *  sign-in (ChatSession.noteSignedIn); a view may say "Sign in to see the latest
+	 *  answers" while this is true. */
+	signInNeeded?: boolean;
+	/** The background indexing queue of a project as the reconciler last read it, for a
+	 *  page that shows indexing state with or without a chat view (the dashboard's files
+	 *  page), by project id. Filled while someone watches it (ChatSession.watchIndexQueue).
+	 *  `keys` holds the storage paths and file names with a pass waiting or running;
+	 *  `checked` is false when the read came back cut off (absence then proves nothing);
+	 *  `at` is when the read ran (a re-served read keeps its time, so two different `at`
+	 *  values are two independent looks). */
+	indexQueues?: { [projectId: string]: IndexQueueSnapshot };
+}
+
+export interface IndexQueueSnapshot {
+	keys: { [fileKey: string]: true };
+	checked: boolean;
+	at: number;
 }
 
 export interface ChatHost {
@@ -357,6 +389,21 @@ export interface ChatHost {
 	formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean): string;
 	/** drainBgTaskQueue is a no-op until the chat view is mounted. */
 	isViewMounted(): boolean;
+	/**
+	 * Optional. Read the run:: records of these files again (reconciler plan, section 3
+	 * item 1). The engine follows a file whose record says 'working' (syncFileRuns) until
+	 * the record says it ended or a complete look at the queue finds no pass of it, and
+	 * asks for this every 30 seconds meanwhile, while the file is not seen live. The host
+	 * re-reads its records and hands the 'working' paths back through syncFileRuns.
+	 */
+	recheckFileRuns?(projectId: string, storagePaths: string[]): void;
+	/**
+	 * Optional. A provider answer (or a provider error) just settled a request of this
+	 * project, whichever path read it (a poll, a look, a stream). The host may judge the
+	 * project's API key from it (web-bunnyquery's "Your API key is invalid"). Called once
+	 * per request, after the bubble is written.
+	 */
+	onProviderAnswer?(projectId: string, platform: 'claude' | 'openai', result: any): void;
 
 	/** Clear-horizon timestamp (localStorage, per service#platform) — view-owned. */
 	getClearedAt(): number;

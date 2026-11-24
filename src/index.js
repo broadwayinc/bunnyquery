@@ -560,6 +560,19 @@ import {
             forwardRequestStream: canStream ? function (requestId, options) {
                 return S.skapi.forwardRequestStream(requestId, options);
             } : undefined,
+            // The reconciler's reads (skapi-js 2.7.0; agent.vue's ai_agent.ts same). With
+            // the first two the engine follows every waiting request with one batch read
+            // per look instead of a poll each; an embedder's older skapi-js hands over
+            // none of them and the widget keeps today's polls.
+            forwardRequestStatus: typeof S.skapi.forwardRequestStatus === "function" ? function (requests, opts) {
+                return S.skapi.forwardRequestStatus(requests, opts);
+            } : undefined,
+            forwardRequestRead: typeof S.skapi.forwardRequestRead === "function" ? function (params) {
+                return S.skapi.forwardRequestRead(params);
+            } : undefined,
+            forwardRequestQueueCounters: typeof S.skapi.forwardRequestQueueCounters === "function" ? function (queues, opts) {
+                return S.skapi.forwardRequestQueueCounters(queues, opts);
+            } : undefined,
         };
     }
 
@@ -1611,6 +1624,7 @@ import {
         if (!CS.messagesBox || !CS.chatEl || !CS.composerEl) return;
         CS.chatSettingsOpen = true;
         if (CS.settingsBtnEl) CS.settingsBtnEl.classList.add("is-active");
+        syncChatStatus();
         // remove the composer entirely so the settings panel fills the chat area
         if (CS.composerEl.parentNode === CS.chatEl) CS.chatEl.removeChild(CS.composerEl);
         renderAccount();
@@ -1917,6 +1931,7 @@ import {
         sendBtnEl: null,
         inputEl: null,            // .bq-input textarea
         chatEl: null,             // .bq-chat (for overflow height measurement)
+        chatStatusEl: null,       // .bq-chat-status ("Reconnecting..." / sign-in note)
         visibleAttachmentCount: Infinity, // how many chips fit before "...(x) more"
     };
     var aiChatHistoryCache = {};
@@ -2000,7 +2015,17 @@ import {
         formatIndexingLabel: function (name, mime, size, storagePath, reindex, continued) {
             return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
         },
-        isViewMounted: function () { return !!CS.messagesBox; },
+        // The chat's message list is in the page. CS.messagesBox stays set after the
+        // widget swaps the chat for another screen (sign-in, settings): the engine then
+        // must not load history or draw into a list nobody sees.
+        isViewMounted: function () { return !!CS.messagesBox && CS.messagesBox.isConnected !== false; },
+        // The reconciler asks for a fresh run:: sweep of files still 'working' while they
+        // are not seen live (every 30 s, no round limit); the sweep hands the working
+        // paths back through session.syncFileRuns (maybeArmStubRecheck).
+        recheckFileRuns: function (projectId) {
+            if (projectId !== S.projectId) return;
+            void refreshIndexMarkers(true);
+        },
         getClearedAt: function () { return getClearedAt(); },
         // attachment upload I/O (bunnyquery: get-signed-url + db CDN)
         uploadFile: function (a) { return uploadFileToDb(a.file, a.storagePath, a.onProgress, a.setAbort, a.checkExistence); },
@@ -2827,7 +2852,8 @@ import {
     // mintIndexDoneMarker hook decides when. Mirrors www's mintIndexDoneMarker;
     // the widget never wired the hook before, so its single-pass completions
     // relied on queue inference alone. Best-effort: "is already taken" is a
-    // redelivered settle, i.e. completion, not a failure.
+    // redelivered settle, i.e. completion, not a failure. Any other failure
+    // rejects, so the engine (which writes it under its settle lock) tries again.
     function mintIndexDoneMarkerDb(service, storagePath) {
         if (!service || !storagePath || !S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
         return Promise.resolve(S.skapi.postRecord(null, {
@@ -2840,6 +2866,7 @@ import {
             var msg = String((err && err.message) || err || "");
             if (msg.indexOf("is already taken") === -1) {
                 console.warn("[bunnyquery] mintIndexDoneMarker failed (non-fatal)", storagePath, msg);
+                throw err;
             }
         });
     }
@@ -2848,6 +2875,8 @@ import {
     // full contract. No native upsert exists: create, and on "is already taken"
     // fetch the record and re-post with its record_id, merging the patch over
     // the stored data. A 'working' write never overwrites a terminal status.
+    // A write that failed rejects (the engine's settle lock tries it again); a
+    // fire-and-forget caller catches it.
     function upsertIndexRunRecordDb(service, storagePath, patch) {
         if (!service || !storagePath || !patch || !patch.status) return Promise.resolve();
         if (!S.skapi || typeof S.skapi.postRecord !== "function") return Promise.resolve();
@@ -2909,6 +2938,7 @@ import {
                 return null;
             }).catch(function (err) {
                 console.warn("[bunnyquery] upsertIndexRunRecord update failed (non-fatal)", storagePath, String((err && err.message) || err || ""));
+                throw err;
             });
         }
         function createChain() {
@@ -2929,7 +2959,7 @@ import {
                             var msg2 = String((err2 && err2.message) || err2 || "");
                             if (msg2.indexOf("is already taken") === -1) {
                                 console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
-                                return null;
+                                throw err2;
                             }
                             return settleAsUpdate();
                         });
@@ -4169,6 +4199,17 @@ import {
             else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
             if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
             if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
+            // A send whose POST got no answer and whose row the server never showed
+            // ("Not sent. Retry?"): retried only when the user clicks. Mirrored in agent.vue.
+            if (msg._notSent && session.canRetryNotSent(msg)) {
+                var retryBtn = h("button", { class: "bq-wrong-answer-btn bq-retry-send-btn", type: "button", text: "Retry" });
+                retryBtn.addEventListener("click", function (e) {
+                    e.stopPropagation();
+                    retryBtn.disabled = true;
+                    session.retryNotSent(msg);
+                });
+                bubble.appendChild(retryBtn);
+            }
             // NEVER on a bubble that is still running, and streaming is what makes
             // that worth stating: a live turn now takes this branch WHILE it runs,
             // and a placeholder mapped from history carries the REQUEST time in _ts,
@@ -4348,56 +4389,30 @@ import {
         return p;
     }
     function invalidateIndexMarkerSweep() { markerSweep.at = 0; markerSweep.gen++; }
-    // Re-sweep cadence while a fresh 'working' run record has no live-queue
-    // confirmation: nothing else can ever settle its stub row in-session (no
-    // poll, no queue entry, no adoption). Matches the sweep TTL so each tick
-    // fetches at most one naturally-fresh sweep.
-    var STUB_RECHECK_MS = 30000;
-    var STUB_RECHECK_MAX_ROUNDS = 5;
-    var stubRecheckTimer = null;
-    var stubRecheckSig = "";
-    var stubRecheckRounds = 0;
     // True once the current project's sweep has answered (success or failure):
     // the empty-chat greeting holds on it (agent.vue markerSweepSettled same).
     var markerSweepSettled = false;
-    function armStubRecheck() {
-        if (stubRecheckTimer !== null) return;
-        stubRecheckTimer = setTimeout(function () {
-            stubRecheckTimer = null;
-            // A tick on a hidden tab defers; the visibility handler's resume
-            // path re-renders, which re-arms via maybeArmStubRecheck.
-            if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-            stubRecheckRounds++;
-            void refreshIndexMarkers();
-        }, STUB_RECHECK_MS);
-    }
     function maybeArmStubRecheck() {
+        // The engine's reconciler follows each 'working' run (reconciler plan, section 3
+        // item 1): it asks for a re-sweep through the host's recheckFileRuns every 30 s
+        // while the file is not seen live, with no fixed number of rounds, and drops the
+        // run when its record says it ended or a complete queue look finds no pass of it.
         try {
-            if (markerSweep.svc !== S.projectId) return;
-            var lk = (session && session.getLiveIndexState().keys) || {};
-            var sig = [];
+            if (markerSweep.svc !== S.projectId || !session) return;
+            var working = [];
+            // Who wrote each record, and its file name: a run of this user's own whose
+            // client-driven chain was lost (a reload) is closed by the engine when its queue
+            // goes idle (session.ts _flipIfChainLost).
+            var info = {};
             for (var pth in markerSweep.runs) {
                 var r = markerSweep.runs[pth];
-                // Unconfirmed 'working' records settle only through a fresh
-                // sweep — but a done:: marker already settles the row (the
-                // display's doneKeys disjunct), and live-confirmed ones ride
-                // the live-key drain edge instead.
-                if (!r || r.status !== "working" || lk[pth]) continue;
+                if (!r || r.status !== "working") continue;
                 var fn = r.filename || pth.split("/").pop() || pth;
                 if (markerSweep.done[pth] || markerSweep.done[fn]) continue;
-                sig.push(pth);
+                working.push(pth);
+                info[pth] = { owner: r.owner, filename: r.filename };
             }
-            if (!sig.length) {
-                stubRecheckSig = ""; stubRecheckRounds = 0;
-                if (stubRecheckTimer !== null) { clearTimeout(stubRecheckTimer); stubRecheckTimer = null; }
-                return;
-            }
-            var s = sig.sort().join("|");
-            if (s !== stubRecheckSig) { stubRecheckSig = s; stubRecheckRounds = 0; }
-            // Dead records: the same set has come back unchanged for several
-            // sweeps — stop hammering; any change to the set re-opens the loop.
-            if (stubRecheckRounds >= STUB_RECHECK_MAX_ROUNDS) return;
-            armStubRecheck();
+            session.syncFileRuns(S.projectId, working, info);
         } catch (e) { /* display-side best effort */ }
     }
     function refreshIndexMarkers(invalidate) {
@@ -5065,11 +5080,33 @@ import {
         }
     }
 
+    // The chat's connection note. Words match agent.vue. Sign-in first: while it is
+    // needed the looks wait for it, so "Reconnecting..." would not be true. Hidden
+    // while the settings panel covers the list.
+    function chatStatusText() {
+        if (session.state.signInNeeded) return "Sign in to see the latest answers.";
+        if (session.state.reconnecting) return "Reconnecting...";
+        return "";
+    }
+    function syncChatStatus() {
+        var el = CS.chatStatusEl;
+        if (!el) return;
+        var text = CS.chatSettingsOpen ? "" : chatStatusText();
+        if (el._bqText === text) return;
+        el._bqText = text;
+        clear(el);
+        if (text) el.appendChild(h("span", { class: "bq-chat-status-inner", text: text }));
+        el.hidden = !text;
+    }
+
     function renderMessages() {
         // Before the early returns below: a cleared history and an opened settings
         // panel both take the row (and its Stop) off screen while the confirm this
         // opened is still sitting on top of the widget.
         syncStopIndexModal();
+        // The engine's notify (this function) is also how a change of
+        // state.reconnecting / state.signInNeeded reaches the view.
+        syncChatStatus();
         // Live-key set shrinking = a run just ended, so a fresh done::/run::
         // marker may exist — re-sweep (agent.vue watches the same edge).
         var _lk = session.getLiveIndexState().keys || {};
@@ -5181,7 +5218,7 @@ import {
                         // without it is shown in BOTH chats, so a run finished under one
                         // model painted a green "Indexed" row into the other's.
                         if (S.aiPlatform === "claude" || S.aiPlatform === "openai") moPatch.platform = S.aiPlatform;
-                        void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
+                        upsertIndexRunRecordDb(S.projectId, mog.path, moPatch).catch(function () { /* logged; the next sweep writes it again */ });
                         // Patch the local sweep too, or its TTL-cached 'working'
                         // re-fires this block on every re-render (agent.vue same).
                         if (morec) morec.status = "done";
@@ -5336,7 +5373,7 @@ import {
         CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
         CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
-        CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null;
+        CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null; CS.chatStatusEl = null;
         CS.gateRefreshToken += 1;
         // Do NOT clear historyItemPolls here. Its entries track LIVE polls
         // (immediate dispatch / queued send / bg task / history poll), and every
@@ -5471,8 +5508,15 @@ import {
                 attachmentsRow,
                 h("div", { class: "bq-input-wrap" }, attachBtn, attachFileInput, input), sendBtn);
 
-            chatArea = h("div", { class: "bq-chat" }, box, composer);
+            // "Reconnecting..." / "Sign in to see the latest answers." (the engine's
+            // state.reconnecting / state.signInNeeded; agent.vue shows the same words).
+            // Between the list and the composer, zero height in flow: see widget.css.
+            var chatStatus = h("div", { class: "bq-chat-status", role: "status", "aria-live": "polite" });
+            chatStatus.hidden = true;
+            CS.chatStatusEl = chatStatus;
+            chatArea = h("div", { class: "bq-chat" }, box, chatStatus, composer);
             CS.chatEl = chatArea; CS.composerEl = composer;
+            syncChatStatus();
             // Fresh composer, empty input, no chips: Send starts disabled.
             updateComposerControls();
             if (!attachDisabled) setupDragAndDrop(chatArea);
@@ -5486,11 +5530,10 @@ import {
         // load markdown renderer, then show history
         loadMarked().then(function () {
             renderMessages();
-            // History is loaded ONCE per chat (owner, 2026-11-20). Drawing the chat view
-            // again (back from settings, a theme change) reuses what is in memory; what
-            // changed meanwhile arrives through the polls and the engine's queue check.
-            // The first page is fetched again only when a waiting bubble has nothing
-            // else to settle it.
+            // Opening the chat view is a return (owner, 2026-11-24): the first page is
+            // read and merged by id every time, so the chat is complete when the user
+            // comes back (back from settings, a theme change, sign out and in). What is
+            // in memory is drawn first, so nothing blinks while the page is on the way.
             var cacheKey = session.getHistoryCacheKey();
             var loaded = session.aiChatHistoryCache && session.aiChatHistoryCache[cacheKey];
             if (loaded) {
@@ -5517,11 +5560,13 @@ import {
                 renderMessages();
                 scrollToBottom();
             }
-            if (loaded && !session.needsHistoryRefetch()) {
-                session.drainBgTaskQueue();
-                session.refreshLiveIndexState();
-                return;
-            }
+            // A chat view opened: the reconciler reads every open item now (and restarts
+            // the reader of a turn still streaming), against the list just restored. Its
+            // look starts on the next turn of the event loop, after the load below has
+            // begun, and a 'view' look leaves the first page to that load (agent.vue:
+            // setChatHost, then loadChatHistory, the same pair). The load merges by id,
+            // keeps live local text, and drains the background queue when it lands.
+            session.noteViewOpened();
             return session.loadHistory(false, CS.gateRefreshToken);
         }).then(function () { schedulePendingPoll(); });
     }
@@ -5833,6 +5878,10 @@ import {
         // "anon". Ensure the profile is loaded before rendering the chat.
         return Promise.resolve()
             .then(function () { return S.user ? S.user : getProfile().then(function (u) { S.user = u; return u; }); })
+            .then(function (u) {
+                // Signed in (again): the reconciler's looks resume (state.signInNeeded).
+                if (u && session && session.noteSignedIn) session.noteSignedIn();
+            })
             .then(function () { return loadServiceInfo(); })
             // Keep the copy boot already loaded when this re-load comes back
             // empty (loadServiceInfo swallows its own errors and resolves null).
@@ -6112,42 +6161,6 @@ import {
         configureChatEngine(Object.assign({
             // Single-item csr-poll point lookup: how the engine hydrates a
             // compact history stub's real body when an indexing row expands.
-            // Saved search findings (engine findings.ts; agent.vue same): where a hard search
-            // found its answer, at the source file's own access group, one record per page.
-            saveSearchFinding: function (f) {
-                if (!S.skapi || typeof S.skapi.postRecord !== "function") return;
-                return S.skapi.getRecords({ service: f.service, unique_id: "src::" + f.storagePath })
-                    .then(function (found) {
-                        var src = found && found.list && found.list[0];
-                        var group = src && src.table ? src.table.access_group : undefined;
-                        if (group === undefined || group === null || group === "") return;
-                        return S.skapi.postRecord(f.data, {
-                            service: f.service,
-                            unique_id: f.uniqueId,
-                            table: { name: "search_findings", access_group: group },
-                            reference: "src::" + f.storagePath,
-                            tags: f.tags
-                        }).catch(function (err) {
-                            if (!/already taken|already exist/i.test(String((err && err.message) || err))) return;
-                            return S.skapi.getRecords({ service: f.service, unique_id: f.uniqueId }).then(function (r) {
-                                var rec = r && r.list && r.list[0];
-                                if (!rec || !rec.record_id) return;
-                                var union = function (a, b) {
-                                    var out = [];
-                                    (Array.isArray(a) ? a : []).concat(Array.isArray(b) ? b : []).forEach(function (x) { if (out.indexOf(x) === -1) out.push(x); });
-                                    return out.slice(0, 40);
-                                };
-                                var old = rec.data && typeof rec.data === "object" ? rec.data : {};
-                                return S.skapi.postRecord(Object.assign({}, old, {
-                                    question_words: union(old.question_words, f.data.question_words),
-                                    search_terms: union(old.search_terms, f.data.search_terms),
-                                    found_at: f.data.found_at
-                                }), { service: f.service, record_id: rec.record_id, tags: union(rec.tags, f.tags) });
-                            });
-                        });
-                    })
-                    .catch(function () { });
-            },
             // A document's page progress, the MCP's prog::<path> record (agent.vue same).
             // A file's indexing pass ids, from the "pass::<path>#<id>" records the worker
             // writes as each pass starts (agent.vue same).
@@ -6179,15 +6192,21 @@ import {
                     .then(function (found) { return (found && found.list && found.list[0] && found.list[0].data) || null; });
             },
             csrHistoryItemLookup: function (fullId, service, owner) {
-                return S.skapi.util.request('csr-poll', { id: fullId, service: service, owner: owner }, { auth: true });
+                // Signed in only when there is a session: a signed-out (anonymous) visitor's
+                // rows are read without a token, scoped by the server as their listing is
+                // (skapi-js forwardRequestRead does the same).
+                var signedIn = !!(S.skapi && S.skapi.session);
+                return S.skapi.util.request('csr-poll', { id: fullId, service: service, owner: owner }, { auth: signedIn });
             },
             // Durable index markers. Both read S lazily at call time — S.skapi /
             // S.projectId are not set yet when init() runs.
+            // Both return the write's promise: a failed write rejects, and the engine
+            // writes it again under its settle lock.
             mintIndexDoneMarker: function (info) {
-                void mintIndexDoneMarkerDb(info.service, info.storagePath);
+                return mintIndexDoneMarkerDb(info.service, info.storagePath);
             },
             upsertIndexRunRecord: function (info) {
-                void upsertIndexRunRecordDb(info.service, info.storagePath, info.patch);
+                return upsertIndexRunRecordDb(info.service, info.storagePath, info.patch);
             },
             mcpBaseUrl: mcpBaseUrl(),
             poll: 0,
@@ -6253,9 +6272,12 @@ import {
             });
         }
 
-        // Keep the MCP grant warm: returning to a backgrounded tab after the
-        // grant aged out would otherwise disconnect the next message. Silently
-        // refresh it (no redirect) when the tab becomes visible again.
+        // Tab hidden: stop background indexing polls. Tab shown: look at the server at
+        // once and resume them, exactly as agent.vue's onVisibilityChange does. Nothing
+        // here waits on the MCP grant: the looks and polls read with the skapi sign-in
+        // only, and a grant fetch that hung used to hold every look back (reconciler
+        // plan, section 4). The grant is a SEND's credential, so an aged-out one is
+        // refreshed on the side, silently (no redirect), for the next message.
         if (!S._visBound && typeof document !== "undefined" && document.addEventListener) {
             S._visBound = true;
             document.addEventListener("visibilitychange", function () {
@@ -6270,14 +6292,36 @@ import {
                     // Nothing here touches the scroll, and that is the point: the
                     // reader was never moved while they were away, because
                     // compensation runs whether or not the tab is visible.
-                    // Refresh the MCP grant BEFORE resuming, or the first poll after a long
-                    // hidden stretch 401s on an aged-out grant.
-                    var refreshed = S.user ? ensureMcpGrantFresh() : null;
-                    Promise.resolve(refreshed).catch(function () { }).then(function () {
-                        if (session && session.resumePolling) session.resumePolling("hidden");
-                    });
+                    // The engine's own listener asks for the same look; both calls are
+                    // one look (and resumePolling's catch-up rides on it).
+                    if (session && session.reconcileNow) void session.reconcileNow("visible");
+                    if (session && session.resumePolling) void session.resumePolling("hidden");
+                    // Only a grant that is missing, aged out or another user's. A fresh one
+                    // is left alone: the full session exchange it used to run on every
+                    // return is for a 401 (refreshSkapiSession still runs it then).
+                    if (S.user && mcpGrantNeedsRefresh(S.user)) {
+                        Promise.resolve().then(ensureMcpGrantFresh).catch(function () { });
+                    }
                 }
             });
+        }
+
+        // A sign-in the embedding page makes on the shared skapi instance, not through
+        // the widget's own screens (those call enterAfterLogin), also lifts
+        // state.signInNeeded: agent.vue does the same through onLoginHanger. Only on an
+        // SDK whose onLogin collects listeners (its getter hands back the list); on an
+        // older one the property may be the page's own single function, never replaced.
+        if (!S._loginBound && S.skapi) {
+            var loginListeners = null;
+            try { loginListeners = S.skapi.onLogin; } catch (e) { loginListeners = null; }
+            if (Array.isArray(loginListeners)) {
+                S._loginBound = true;
+                try {
+                    S.skapi.onLogin = function (u) {
+                        if (u && session && session.noteSignedIn) session.noteSignedIn();
+                    };
+                } catch (e) { /* the page's SDK refused it: the widget's own sign-in still resumes */ }
+            }
         }
 
         boot();

@@ -1,150 +1,4 @@
 /**
- * Retrieval memory: a compact note of what a chat turn RETRIEVED, kept with the
- * turn so a follow-up question skips discovery.
- *
- * THE PROBLEM. The provider runs the tool loop on its side and history keeps
- * only the answer text (budget.ts), so on "and what does page 3 say?" the model
- * starts from nothing: it looks the file up again, guesses a table and an access
- * group again, and routinely lands somewhere else, which is how an answer flips
- * between two turns about the same document.
- *
- * WHAT THE ENGINE CAN SEE. The provider's final body carries the tool loop:
- *   - Anthropic Messages: content[] blocks `mcp_tool_use` (name, input) and
- *     `mcp_tool_result` (content), plus `server_tool_use` / `web_*_tool_result`
- *     for the built-in web tools;
- *   - OpenAI Responses: output[] items `mcp_call` (name, arguments as a JSON
- *     string, output as a string) and `web_search_call`.
- * The polling worker stores that body on the row (spilling to S3 past 300 KB,
- * never truncating), and a streamed turn's assembled body keeps the same blocks
- * (sse.ts copies each block's skeleton and its JSON input verbatim), so the
- * same reader works live, after a stream and after a reload. When a body has no
- * tool blocks at all (a host that strips them, a provider shape this does not
- * know), the note falls back to what the ANSWER names: db: file links and src::
- * paths. Nothing is ever invented: an empty note is null, not a guess.
- *
- * WHAT IS KEPT, per turn: files (storage paths), tables, access groups,
- * searchText hits as path + page, the tool names, and whether a web tool ran.
- * Arguments are read by KEY, never by position, and only the keys the
- * BunnyQuery tools use for those four things; a query's filter values, a
- * record's data and a tool result's text are never copied, so the note cannot
- * leak a page of a document into every later turn.
- *
- * HOW IT REACHES THE MODEL. buildBoundedChatMessages appends the formatted note
- * to the LLM copy of the assistant turn it belongs to (never the displayed
- * bubble), for the newest RETRIEVAL_NOTES_MAX turns and within
- * RETRIEVAL_NOTES_TOKEN_BUDGET tokens, so the memory is bounded however long
- * the chat gets. A host that never attaches `_retrieval` sees byte-identical
- * requests to today.
- */
-type RetrievalHit = {
-    path: string;
-    page: number;
-};
-type RetrievalNote = {
-    /** Storage paths (the part after "src::") the turn read, queried or linked. */
-    files: string[];
-    /** Table names the turn queried. */
-    tables: string[];
-    /** Access groups the turn queried at, as written in the call. */
-    accessGroups: string[];
-    /** searchText hits: the page a term was found on, per file. */
-    hits: RetrievalHit[];
-    /** Tool names, in order of first use. */
-    tools: string[];
-    /** A web tool ran in this turn (web_search / web_fetch). */
-    web: boolean;
-    /** 'tools' when read off the body's tool blocks; 'answer' when only the
-     *  answer text was available to read. */
-    source: 'tools' | 'answer' | 'body';
-};
-/** How many of the newest turns carry their note into the request. */
-declare const RETRIEVAL_NOTES_MAX = 6;
-/** Ceiling on the estimated tokens all carried notes may add to one request. */
-declare const RETRIEVAL_NOTES_TOKEN_BUDGET = 1200;
-/** Per-list cap inside one note (files, tables, groups, hits, tools). */
-declare const RETRIEVAL_NOTE_MAX_ITEMS = 8;
-/** Hard cap on one formatted note. */
-declare const RETRIEVAL_NOTE_MAX_CHARS = 600;
-/** The marker a carried note opens with; also what keeps it out of the model's own voice. */
-declare const RETRIEVAL_NOTE_PREFIX = "[Retrieval note, not shown to the user";
-/**
- * What an ANSWER names: db: file links ("[name](db:path)") and src:: ids. The
- * fallback for a body with no tool blocks, and merged into a tool note too so a
- * file the model linked but never queried (it knew the path from history) is
- * still remembered.
- */
-declare function retrievalNoteFromText(text: string | null | undefined): RetrievalNote | null;
-/**
- * The note for one assistant turn: the body's tool loop when it has one, else
- * what the answer names, else null. `answerText` is the extracted answer, read
- * for file links in both cases.
- */
-declare function extractRetrievalNote(body: any, answerText?: string | null): RetrievalNote | null;
-/**
- * True when `body` is a provider response this module can read: an Anthropic
- * Messages body (`content` array) or an OpenAI Responses body (`output` array).
- */
-declare function providerBodyWasRead(body: any): boolean;
-/** True when the value is a note this module produced (or an equivalent shape). */
-declare function isRetrievalNote(value: any): value is RetrievalNote;
-/**
- * One line the model reads. Sections are omitted when empty, the whole thing is
- * capped at RETRIEVAL_NOTE_MAX_CHARS, and it opens with RETRIEVAL_NOTE_PREFIX so
- * the model can tell it from its own earlier words. Returns '' for an empty note.
- */
-declare function formatRetrievalNote(note: RetrievalNote | null | undefined): string;
-
-/**
- * Saved search findings (owner, 2026-11-20): where a hard search found its answer, kept in
- * the project's database so the same question, from anyone, later goes straight to the page.
- *
- * WHAT IS SAVED: the LOCATION, never the answer. One record per file page in table
- * "search_findings", unique_id "find::<path>#p<page>", reference "src::<path>" (so a
- * re-index or a delete of the file removes its findings through the cascade), the file's own
- * access group (a finding is never visible to someone who cannot read the file), and tags:
- * the key words of the question and the search terms that found the page, normalized the way
- * every BunnyQuery tag is (tagForms). The chat reads the page again before answering, so a
- * finding can never replay an outdated answer; it only skips the hunt.
- *
- * WHEN: after a chat turn that needed a real search (FINDING_MIN_TOOL_CALLS or more tool
- * calls) and whose answer links a file that a searchText hit found on a page, or, when the
- * turn read the file with readFileContent instead, the pages its answer cites of that file. Read from the
- * provider body the turn already has, by the engine, so it costs no model step. Nothing is
- * invented: no hit on a linked file, no finding. No page text and no result text is copied.
- *
- * The engine never writes records itself: the host's saveSearchFinding hook does (config.ts).
- */
-
-declare const FINDINGS_TABLE = "search_findings";
-declare const FINDING_ID_PREFIX = "find::";
-/** The words of a question or a search term that say WHAT is looked for. */
-declare function keyWords(text: string | null | undefined): string[];
-type SearchFinding = {
-    storagePath: string;
-    page: number;
-    uniqueId: string;
-    tags: string[];
-    data: {
-        path: string;
-        page: number;
-        question_words: string[];
-        search_terms: string[];
-        found_at: number;
-    };
-};
-/**
- * The findings one finished chat turn earns, or [] (see the file comment for the rules).
- * `note` is the turn's retrieval note (its searchText hits and the files its answer links).
- */
-declare function findingsForTurn(args: {
-    question: string | null | undefined;
-    body: any;
-    note: RetrievalNote | null | undefined;
-    answer: string | null | undefined;
-    now?: number;
-}): SearchFinding[];
-
-/**
  * Client-side attachment-parser plugins.
  *
  * Some attachment formats can't be read by the model's web_fetch (binary) and
@@ -500,6 +354,27 @@ declare function patchProjectSettings(service: string, patch: ProjectSettingsDat
 declare function clearProjectSettings(service?: string): void;
 
 /**
+ * Engine configuration / dependency injection.
+ *
+ * The engine is framework- and transport-agnostic: it never imports a skapi
+ * instance or `import.meta.env`. Each consumer calls `configureChatEngine()`
+ * once at startup to inject the skapi transport functions, the MCP base URL,
+ * and (optionally) the `poll` value to attach to every forwarded request.
+ *
+ * Why `poll` is configurable: agent.vue uses the npm-bundled skapi-js and OMITS
+ * `poll` (its request auto-resolves with the final body), whereas
+ * the BunnyQuery widget uses the deployed skapi-js@latest and must pass
+ * `poll: 0` to get the early ack + a manual `.poll()` handle (needed for queued-
+ * send cancel). So the request builders include `poll` only when it is set.
+ *
+ * THE TRANSPORT IS THE forwardRequest FAMILY ONLY (owner, 2026-11-20: clientSecretRequest
+ * is being deprecated). The old `clientSecretRequest*` keys are no longer read: a host
+ * injects `forwardRequest`, `forwardRequestHistory` and, to stream,
+ * `forwardRequestFinalize` and `forwardRequestStream`, all from skapi-js 2.1.0 or newer.
+ * Every call goes through the resolveForwardRequest* functions below.
+ */
+
+/**
  * One report about a turn that is streaming, as handed to `onLiveStreamUpdate`.
  *
  * Deliberately a flat snapshot rather than the SseParser itself: the hook is a
@@ -553,6 +428,7 @@ type ForwardRequestFinalizeFn = (requestId: string, data: any, options: {
     method: string;
     service?: string;
     owner?: string;
+    ifAbsent?: boolean;
 }) => Promise<any>;
 /** The chunk read-back call, identical under its new and its deprecated key. */
 type ForwardRequestStreamFn = (requestId: string, options: {
@@ -626,11 +502,13 @@ interface ChatEngineConfig {
      * only ever inferred here); the worker writes their marker itself.
      * Must be best-effort: tolerate the marker already existing and never
      * throw. Optional so older consumers keep the pre-marker inference.
+     * May return a promise that rejects when the write failed (not for "already
+     * there"): the engine then writes it again, a few times, with backoff.
      */
     mintIndexDoneMarker?: (info: {
         service: string;
         storagePath: string;
-    }) => void;
+    }) => void | Promise<unknown>;
     /**
      * Create-or-update the per-file indexing RUN record ("run::<path>",
      * reference "src::<path>", table __INDEXING__). The record is the durable
@@ -644,7 +522,9 @@ interface ChatEngineConfig {
      * overwrite a terminal status (done/error/cancelled) — a late create from
      * a slow enqueue must not resurrect a run another writer already closed.
      * Must be best-effort and never throw. Optional: without it the engine
-     * behaves exactly as before (legacy scan/probe path).
+     * behaves exactly as before (legacy scan/probe path). May return a promise
+     * that rejects when the write failed: the engine then writes it again, a few
+     * times, with backoff.
      */
     upsertIndexRunRecord?: (info: {
         service: string;
@@ -657,7 +537,7 @@ interface ChatEngineConfig {
             error?: string;
             queue?: string;
         };
-    }) => void;
+    }) => void | Promise<unknown>;
     /**
      * Deliver each relayed chunk over skapi's WEBSOCKET as well, so text lands as it
      * is relayed instead of on the next poll tick. Off unless a host asks.
@@ -828,18 +708,6 @@ interface ChatEngineConfig {
         pages_total?: number | null;
     } | null>;
     /**
-     * Save one search finding (findings.ts): where a hard search found its answer, as a
-     * record in table "search_findings" with the given unique_id, tags and data, reference
-     * "src::<storagePath>" and the ACCESS GROUP OF THAT FILE (read it; skip the save when
-     * the file has no record). When the unique_id is taken, add the new tags to the existing
-     * record instead. Best effort: never throw into the engine. Optional: without it nothing
-     * is saved.
-     */
-    saveSearchFinding?: (finding: SearchFinding & {
-        service: string;
-        owner?: string;
-    }) => Promise<any> | void;
-    /**
      * The request ids of one file's indexing passes: the unique ids "pass::<storagePath>#<id>"
      * the worker writes as each pass starts (getUniqueId, prefix "pass::<storagePath>#", every
      * page), answered as the ids after "#" in any order. With it (and csrHistoryItemLookup) the
@@ -847,9 +715,56 @@ interface ChatEngineConfig {
      * (ChatSession.loadRunPasses). Without it the history pages the indexing queue as before.
      */
     listIndexPasses?: (service: string, storagePath: string) => Promise<string[]>;
+    /**
+     * THE RECONCILER'S READS (reconciler plan, section 3; skapi-js 2.7.0 or newer). All
+     * three are optional, and a host hands over only what its skapi-js has: with
+     * `forwardRequestStatus` AND `forwardRequestRead` the engine follows every waiting
+     * item with one batch read per look (ChatSession's reconciler) instead of one poll
+     * per request; without them it keeps today's polls, and its looks re-attach a
+     * failed poll through the old by-id read (csrHistoryItemLookup).
+     *
+     * skapi.forwardRequestStatus(requests, { service, owner, deadline, fresh, signal }):
+     * the status of up to 100 requests per call, no bodies.
+     */
+    forwardRequestStatus?: (requests: any[], opts?: any) => Promise<{
+        list: any[];
+        [key: string]: any;
+    }>;
+    /** skapi.forwardRequestRead({ id, url, method, since, service, owner, deadline, fresh,
+     *  signal }): one request as an envelope that always carries its status, with a
+     *  streamed turn's chunks after `since`. Read once per item that just turned terminal. */
+    forwardRequestRead?: (params: any) => Promise<any>;
+    /** skapi.forwardRequestQueueCounters(queues, { service, owner, deadline, fresh,
+     *  signal }): the tiny counter rows of up to 20 queues. Read on every look; the
+     *  requests themselves are read only when a counter moved, on a trigger, or once a
+     *  minute. Optional even with the two above: without it every look reads statuses. */
+    forwardRequestQueueCounters?: (queues: string[], opts?: any) => Promise<{
+        queues: {
+            [name: string]: any;
+        };
+    }>;
+    /**
+     * Ask the host to refresh what it shows of a project's records, because indexing
+     * work of that project just settled and none is left in this page's queue. A data
+     * hook: called with no chat view mounted too (the files page, the records page), and
+     * only in the tab that holds the project's settle lock. Optional; never throws.
+     */
+    refreshRecords?: (projectId: string) => void;
 }
 declare function configureChatEngine(config: ChatEngineConfig): void;
 declare function chatEngineConfig(): ChatEngineConfig;
+/**
+ * The host handed over the reconciler's two reads (batch status and envelope read), so
+ * the engine follows waiting items with batch reads instead of one poll each. False on
+ * an older skapi-js: the engine then keeps today's polls (see forwardRequestStatus).
+ */
+declare function reconcilerReadsEnabled(): boolean;
+/**
+ * A send may carry a client reference (`cref`). Only with the reconciler's reads: the
+ * same skapi-js (2.7.0) brought both, and an older one drops the key anyway, so a send
+ * whose ack was lost could never be matched by it.
+ */
+declare function crefSupported(): boolean;
 /** True when the consumer has opted in to live streaming of chat turns. */
 /** Socket delivery of the stream: the host asked (`liveStreaming`) AND the turn streams. */
 /** Request status push is on: the host asked for it and handed over onRequestStatus. */
@@ -979,6 +894,140 @@ declare function streamRecoveryEnabled(): boolean;
  * forwardRequestHistory instead.
  */
 declare function skapiSupportsStreaming(sk: any): boolean;
+
+/**
+ * The reconciler's clock and the cross-tab settle lock (reconciler plan, sections 3 and 4b,
+ * BUNNYQUERY_CHAT_RECONCILER_PLAN.md).
+ *
+ * WHAT LIVES HERE. Only the parts that know nothing about chats: one timer chain per page
+ * (LookScheduler), the triggers that pull its next look forward, the deadline and the
+ * generation that make a hung look harmless, the backoff after a failed look, and the lock
+ * that keeps side effects (a next indexing pass, run::/done:: writes, a finalize, a records
+ * refresh) to one tab. What a look actually reads and applies is ChatSession's
+ * (_reconcileLook in session.ts), handed in as a hook, so this file is testable on its own
+ * and the session keeps its own state private.
+ *
+ * THE RULES IT ENFORCES (owner, 2026-11-24, plan 4b):
+ *   1. One loop. One setTimeout handle for the whole page, whatever the number of waiting
+ *      requests. Scheduling always clears the previous handle first.
+ *   2. Returns never add work. A trigger while a look runs sets ONE follow-up look (the
+ *      triggers are merged), never a second loop or a second timer. A trigger while no look
+ *      runs starts the look now.
+ *   3. A look that does not finish within LOOK_DEADLINE_MS is over: it counts as failed
+ *      (nothing on screen changes), its in-flight reads are aborted, and anything its
+ *      generation returns later is ignored by the session (alive() is false).
+ */
+/** How long one look may take in all. */
+declare const LOOK_DEADLINE_MS: number;
+/** The visible cadence while anything is waiting. */
+declare const LOOK_FAST_MS: number;
+/** The visible cadence while request status frames arrive (statusPush), and the hidden
+ *  cadence while a client-driven indexing chain is open. */
+declare const LOOK_SLOW_MS: number;
+/** Re-read every open item at least this often, whatever the queue counters say. */
+declare const LOOK_STALE_MS: number;
+/** Why a look runs. Several merge into one look. */
+type LookTrigger = 'tick' | 'return' | 'visible' | 'wake' | 'online' | 'pageshow' | 'reconnect' | 'view' | 'frame' | 'unknown' | 'promote' | 'send' | 'signin' | 'add';
+declare function isReturnTrigger(t: string): boolean;
+/** One look as the session sees it. */
+type LookRequest = {
+    /** Generation: grows by one per look. */
+    gen: number;
+    triggers: {
+        [k: string]: true;
+    };
+    /** Any trigger was a return (see RETURN_TRIGGERS). */
+    isReturn: boolean;
+    /** Aborts every read of this look at its deadline (undefined without AbortController). */
+    signal: any;
+    /** False once the deadline passed or a newer look started: drop every result. */
+    alive: () => boolean;
+    /** Milliseconds left before the deadline (at least 1). */
+    remaining: () => number;
+};
+/** How a look ended: 'ok' (it read what it needed), 'transient' (a read failed on the way:
+ *  backoff, nothing changed), 'auth' (the sign-in is gone), 'idle' (nothing to do). */
+type LookOutcome = 'ok' | 'transient' | 'auth' | 'idle';
+interface LookHooks {
+    /** Run one look. Never called twice at once. */
+    runLook(req: LookRequest): Promise<LookOutcome>;
+    /** Is there anything to follow: `visible` = anything at all (the 3 s cadence), `hidden`
+     *  = something worth a look once a minute while the tab is hidden. */
+    work(): {
+        visible: boolean;
+        hidden: boolean;
+    };
+    /** Status frames are arriving (statusPush): the visible cadence slows to a minute. */
+    pushLive(): boolean;
+    /** The reconnecting / sign-in flags changed (for the views). */
+    onFlags(flags: {
+        reconnecting: boolean;
+        signInNeeded: boolean;
+    }): void;
+}
+/**
+ * The one timer chain. See the file note for the rules.
+ */
+declare class LookScheduler {
+    private hooks;
+    private timer;
+    /** When the pending timer should fire, on both clocks (wake detection). */
+    private expectPerf;
+    private expectWall;
+    private running;
+    /** Triggers that arrived while a look ran: exactly one more look runs with them. */
+    private pending;
+    /** Resolvers of trigger() promises, by the look that will serve them. */
+    private waitCurrent;
+    private waitNext;
+    private backoff;
+    private listening;
+    private stopped;
+    gen: number;
+    reconnecting: boolean;
+    signInNeeded: boolean;
+    /** Diagnostics (and the throwaway checks): looks started, timers armed. */
+    looks: number;
+    timersArmed: number;
+    constructor(hooks: LookHooks);
+    /** Pull the next look forward to now. Resolves when the look that serves it ends. */
+    trigger(kind: LookTrigger): Promise<void>;
+    /** Triggers gathered for a look about to start (see trigger). */
+    private starting;
+    private waitStarting;
+    /** Make sure the chain runs at its cadence when there is work. Never adds a timer when
+     *  one is armed or a look is running, so calling it from every add is free. */
+    ensure(): void;
+    /** The sign-in came back (or the host says so): looks resume at once. */
+    signedIn(): void;
+    /** Stop the chain (tests, teardown). A later trigger or ensure starts it again. */
+    stop(): void;
+    isRunning(): boolean;
+    private _flags;
+    private _listen;
+    private _start;
+    private _finish;
+    private scheduling;
+    private _scheduleNext;
+    private _arm;
+}
+/** Has this side effect run in any tab (within a day)? */
+declare function sideEffectDone(key: string): boolean;
+/**
+ * Run `fn` once across the tabs, under the settle lock of (project, queue). `key` names
+ * the side effect (e.g. "resume:<request id>"). Never throws; `fn` may be async.
+ *
+ * Done only when it worked: the side effect is marked in flight (FX_INFLIGHT_MS, so the
+ * other tabs leave it alone) while `fn` runs, and done when `fn` returns, or when the
+ * promise it returns resolves. A throw or a rejected promise clears the mark and `fn` runs
+ * again after a backoff, up to FX_MAX_TRIES times in this tab; a later call with the same
+ * key (the next look, another tab) can still run it after that. A tab that finds it in
+ * flight elsewhere looks again once that mark would have expired, so a tab that died
+ * mid-write does not leave it undone.
+ */
+declare function runSettleSideEffect(projectId: string, queue: string, key: string, fn: () => any, attempt?: number, tries?: number): void;
+/** A client reference for one send: 1 to 64 letters, digits, "_" or "-". */
+declare function newClientRef(): string;
 
 /**
  * Duplicate-upload detection for chat attachments (reliability plan, owner's
@@ -1529,6 +1578,115 @@ declare function isAuthExpiredError(input: any): boolean;
  * reduced to by getErrorMessage, because the view usually only keeps the text.
  */
 declare function isProviderApiKeyError(input: any): boolean;
+/**
+ * The server's own "that request is gone" answer to a read of it (the row was removed:
+ * cancelled while queued, or cleaned up). A fact about the request, unlike every
+ * failure isTransportFailure covers.
+ */
+declare function isNotExistsError(err: any): boolean;
+/**
+ * True when a READ of a request failed on the way: no network, no answer in time, rate
+ * limited, a server fault (5xx), an aborted read. Such a failure says nothing about the
+ * request itself, which may be running or already answered, so a caller must never
+ * turn it into an error bubble or a failed run record (reconciler plan, section 3 item 4).
+ */
+declare function isTransportFailure(err: any): boolean;
+
+/**
+ * Retrieval memory: a compact note of what a chat turn RETRIEVED, kept with the
+ * turn so a follow-up question skips discovery.
+ *
+ * THE PROBLEM. The provider runs the tool loop on its side and history keeps
+ * only the answer text (budget.ts), so on "and what does page 3 say?" the model
+ * starts from nothing: it looks the file up again, guesses a table and an access
+ * group again, and routinely lands somewhere else, which is how an answer flips
+ * between two turns about the same document.
+ *
+ * WHAT THE ENGINE CAN SEE. The provider's final body carries the tool loop:
+ *   - Anthropic Messages: content[] blocks `mcp_tool_use` (name, input) and
+ *     `mcp_tool_result` (content), plus `server_tool_use` / `web_*_tool_result`
+ *     for the built-in web tools;
+ *   - OpenAI Responses: output[] items `mcp_call` (name, arguments as a JSON
+ *     string, output as a string) and `web_search_call`.
+ * The polling worker stores that body on the row (spilling to S3 past 300 KB,
+ * never truncating), and a streamed turn's assembled body keeps the same blocks
+ * (sse.ts copies each block's skeleton and its JSON input verbatim), so the
+ * same reader works live, after a stream and after a reload. When a body has no
+ * tool blocks at all (a host that strips them, a provider shape this does not
+ * know), the note falls back to what the ANSWER names: db: file links and src::
+ * paths. Nothing is ever invented: an empty note is null, not a guess.
+ *
+ * WHAT IS KEPT, per turn: files (storage paths), tables, access groups,
+ * searchText hits as path + page, the tool names, and whether a web tool ran.
+ * Arguments are read by KEY, never by position, and only the keys the
+ * BunnyQuery tools use for those four things; a query's filter values, a
+ * record's data and a tool result's text are never copied, so the note cannot
+ * leak a page of a document into every later turn.
+ *
+ * HOW IT REACHES THE MODEL. buildBoundedChatMessages appends the formatted note
+ * to the LLM copy of the assistant turn it belongs to (never the displayed
+ * bubble), for the newest RETRIEVAL_NOTES_MAX turns and within
+ * RETRIEVAL_NOTES_TOKEN_BUDGET tokens, so the memory is bounded however long
+ * the chat gets. A host that never attaches `_retrieval` sees byte-identical
+ * requests to today.
+ */
+type RetrievalHit = {
+    path: string;
+    page: number;
+};
+type RetrievalNote = {
+    /** Storage paths (the part after "src::") the turn read, queried or linked. */
+    files: string[];
+    /** Table names the turn queried. */
+    tables: string[];
+    /** Access groups the turn queried at, as written in the call. */
+    accessGroups: string[];
+    /** searchText hits: the page a term was found on, per file. */
+    hits: RetrievalHit[];
+    /** Tool names, in order of first use. */
+    tools: string[];
+    /** A web tool ran in this turn (web_search / web_fetch). */
+    web: boolean;
+    /** 'tools' when read off the body's tool blocks; 'answer' when only the
+     *  answer text was available to read. */
+    source: 'tools' | 'answer' | 'body';
+};
+/** How many of the newest turns carry their note into the request. */
+declare const RETRIEVAL_NOTES_MAX = 6;
+/** Ceiling on the estimated tokens all carried notes may add to one request. */
+declare const RETRIEVAL_NOTES_TOKEN_BUDGET = 1200;
+/** Per-list cap inside one note (files, tables, groups, hits, tools). */
+declare const RETRIEVAL_NOTE_MAX_ITEMS = 8;
+/** Hard cap on one formatted note. */
+declare const RETRIEVAL_NOTE_MAX_CHARS = 600;
+/** The marker a carried note opens with; also what keeps it out of the model's own voice. */
+declare const RETRIEVAL_NOTE_PREFIX = "[Retrieval note, not shown to the user";
+/**
+ * What an ANSWER names: db: file links ("[name](db:path)") and src:: ids. The
+ * fallback for a body with no tool blocks, and merged into a tool note too so a
+ * file the model linked but never queried (it knew the path from history) is
+ * still remembered.
+ */
+declare function retrievalNoteFromText(text: string | null | undefined): RetrievalNote | null;
+/**
+ * The note for one assistant turn: the body's tool loop when it has one, else
+ * what the answer names, else null. `answerText` is the extracted answer, read
+ * for file links in both cases.
+ */
+declare function extractRetrievalNote(body: any, answerText?: string | null): RetrievalNote | null;
+/**
+ * True when `body` is a provider response this module can read: an Anthropic
+ * Messages body (`content` array) or an OpenAI Responses body (`output` array).
+ */
+declare function providerBodyWasRead(body: any): boolean;
+/** True when the value is a note this module produced (or an equivalent shape). */
+declare function isRetrievalNote(value: any): value is RetrievalNote;
+/**
+ * One line the model reads. Sections are omitted when empty, the whole thing is
+ * capped at RETRIEVAL_NOTE_MAX_CHARS, and it opens with RETRIEVAL_NOTE_PREFIX so
+ * the model can tell it from its own earlier words. Returns '' for an empty note.
+ */
+declare function formatRetrievalNote(note: RetrievalNote | null | undefined): string;
 
 declare var CONTEXT_WINDOW_DEFAULT: Record<string, number>;
 declare var CONTEXT_WINDOW_BY_MODEL: Record<string, number>;
@@ -2662,400 +2820,6 @@ interface SseParser {
 }
 declare function createSseParser(): SseParser;
 
-declare const MCP_NAME = "BunnyQuery";
-declare const DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
-declare const DEFAULT_OPENAI_MODEL = "gpt-6-luna";
-/**
- * THE two `stream` flags of a streamed chat turn, produced together or not at all.
- *
- * There are two of them and they are NOT the same flag:
- *
- *   * `transport.stream` is SKAPI's. It tells the polling worker to read the
- *     destination's response incrementally and append the raw bytes to the chunk
- *     table, and it is never sent on to the destination.
- *   * `body.stream` is the DESTINATION's own field, and BunnyQuery is the party
- *     that may set it: skapi relays bytes and knows no vendor, so it cannot know
- *     that Anthropic Messages and OpenAI Responses both happen to spell it
- *     `stream` at the top level of the body.
- *
- * Setting one without the other fails QUIETLY, which is why they are produced by
- * one function from one boolean and returned as one object:
- *
- *   * body streams, skapi buffers -> the row stores an SSE TRANSCRIPT where
- *     extractClaudeText / extractOpenAIText expect a parsed document, so the turn
- *     reads back as an empty answer with nothing in the logs to say why.
- *   * skapi streams, the body never asked -> the destination sends one plain
- *     document, the relay chops it into chunks, the frame parser finds no framing
- *     at all, and the row settles with a status and no body.
- *
- * Two frozen constants rather than a fresh object per call: the pair is a
- * CONSTANT, and an object literal built at each call site is exactly the shape
- * that drifts when someone edits one arm.
- */
-type ChatStreamWiring = {
-    /** Spread into the forwardRequest OPTIONS (skapi's relay switch). `realtime`
-     *  belongs here and never in `body`: it is skapi's, not the destination's. */
-    transport: {
-        stream?: true;
-        realtime?: true;
-    };
-    /** Spread into `data` (the destination's own switch). */
-    body: {
-        stream?: true;
-    };
-};
-declare function chatStreamWiring(queue?: string): ChatStreamWiring;
-/**
- * The body fields a CHAT turn's answer mode adds, for the one provider and model the turn
- * runs on. An empty object, i.e. nothing at all, for 'standard' (the default) and for any
- * model not known to accept the field, so a project that never set a mode sends the exact
- * request it sent before the setting existed. OpenAI takes `reasoning: {effort}`, Claude
- * takes `output_config: {effort}`. Never used by an indexing pass.
- */
-declare function chatEffortFields(platform: 'claude' | 'openai', model: string | undefined, mode: AnswerMode | undefined): Record<string, any>;
-/** How a given model should be shown a rendered document. */
-type VisionProfile = {
-    /** Per-image `detail` (OpenAI only). */
-    detail: string;
-    /** Pages the worker renders into one window. */
-    pagesPerWindow: number;
-    /** Horizontal bands per page; 1 renders the whole page as one image. */
-    tile: number;
-};
-/**
- * Resolve the render profile for a model.
- *
- * Three tiers, and they fail for different reasons, which is why one set of knobs cannot
- * serve all of them:
- *   - full: everything ABOVE gpt-5.4-nano - the base models, mini, and every gpt-5.6
- *     including 5.6-nano. These already transcribe dense scans correctly, so they get
- *     'original' detail and are otherwise untouched.
- *   - gpt-5.4-nano: also gets 'original', so it sees exactly the SAME pixels as the full
- *     tier. Its gap therefore is not resolution, and tiling would do nothing for it. What
- *     it lacks is room: a smaller window leaves the same output budget divided between
- *     fewer pages.
- *   - downsampled (below the 'original' floor: gpt-5.3-nano, gpt-5-nano, gpt-4.1-nano):
- *     capped at 'high', which resamples the page onto a 512px grid no matter what DPI it
- *     was rendered at. Render resolution is wasted on these entirely; the only way to give
- *     them readable text is to make each image cover less of the page, which is `tile`.
- */
-declare function getVisionProfile(model?: string): VisionProfile;
-type ClaudeRole = 'user' | 'assistant';
-type ClaudeMessage = {
-    role: ClaudeRole;
-    content: string;
-};
-type OpenAIMessage = {
-    role: ClaudeRole;
-    content: string;
-};
-type ClaudeMcpToolConfig = {
-    enabled?: boolean;
-    defer_loading?: boolean;
-};
-type ClaudeMcpServerRequest = {
-    name: string;
-    url: string;
-    authorizationToken?: string;
-    defaultConfig?: ClaudeMcpToolConfig;
-    configs?: Record<string, ClaudeMcpToolConfig>;
-};
-declare function transformContentWithImages(content: string): string | Array<Record<string, any>>;
-declare function transformContentWithOpenAIImages(content: string, detail?: string): string | Array<Record<string, any>>;
-type CallClaudeWithMcpParams = {
-    prompt: string;
-    messages?: ClaudeMessage[];
-    service: string;
-    owner: string;
-    userId?: string;
-    model?: string;
-    maxTokens?: number;
-    system?: string;
-    mcpServer: ClaudeMcpServerRequest;
-    extractContent?: ExtractDirective[];
-    fileUrls?: FileUrlDirective[];
-    onResponse?: (res: any) => void;
-    onError?: (err: any) => void;
-    /**
-     * Attach Claude's `web_fetch` to this turn. A per-call host value under the
-     * same ceiling rule as the config option: the project's `web_access` setting
-     * is the most a turn can have, and `false` here (or in the config) takes it
-     * off. Omitted follows the config option and the project. See config.ts
-     * resolveWebAccess.
-     */
-    webAccess?: boolean;
-};
-declare const POLL_INTERVAL = 3000;
-declare const STREAM_POLL_INTERVAL = 1000;
-declare const MAX_CONCURRENT_BG_POLLS = 6;
-/**
- * What a chat turn hands the OpenAI request builder about itself, and what the builder
- * writes back. Created per turn by ChatSession; a host that calls the builder directly
- * and passes nothing gets exactly the request it always got.
- */
-type ChatTurnContext = {
-    /**
-     * Reuse the MCP tool listing OpenAI returned on an earlier chat turn (OpenAI only).
-     * Every OpenAI turn otherwise starts with OpenAI asking our MCP server for its tools,
-     * four sequential requests (server/discover, initialize, notifications/initialized,
-     * tools/list), about 0.6 s before the model starts. OpenAI's docs: "As long as the
-     * mcp_list_tools item is present in the context of an API request, the API will not
-     * fetch a list of tools from the MCP server again at each turn."
-     */
-    reuseMcpToolList?: boolean;
-    /** Who the turn runs as. Part of the listing key: a different user can see a different list. */
-    userId?: string;
-    /** Written by the builder: the key this turn's listing is stored under. */
-    mcpToolsKey?: string;
-    /** Written by the builder: true when a stored listing rode in this turn's input. */
-    mcpToolsInjected?: boolean;
-    /** Written by the builder: the project the listing belongs to (for the per-project off verdict). */
-    mcpToolsService?: string;
-    /** Written by the builder: the id of the listing that rode in this turn's input. */
-    mcpToolsItemId?: string;
-    /** Set by ChatSession once the turn's outcome was applied, so a later handler cannot apply it twice. */
-    settled?: boolean;
-};
-declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, webAccess, }: CallClaudeWithMcpParams): Promise<any>;
-declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
-    anonymous?: boolean;
-    publicProjectId?: string;
-}): Promise<any>;
-declare function callOpenAIWithPublicMcp(prompt: string, service: string, owner: string, messages?: OpenAIMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
-    anonymous?: boolean;
-    publicProjectId?: string;
-}, turn?: ChatTurnContext): Promise<any>;
-type AttachmentSaveInfo = {
-    platform: 'claude' | 'openai';
-    model?: string;
-    service: string;
-    /** The PUBLIC project ID (formatted token, skapi.project_id). Shown to the model; falls back to `service`. */
-    publicProjectId?: string;
-    owner: string;
-    /**
-     * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
-     * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
-     * `id.userId || id.projectId`) — the backend serialises requests that share a
-     * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
-     * different base does not hold the chat back at all. It was optional once,
-     * defaulting to `service`; the chatbox omitted it, and its files were indexed
-     * on "<projectId>-bg" while its question ran on "<userId>-bg" — the question
-     * was answered from a file nothing had read yet. Pass `userId || projectId`.
-     */
-    userId: string;
-    serviceName?: string;
-    serviceDescription?: string;
-    attachment: {
-        name: string;
-        storagePath: string;
-        mime?: string;
-        size?: number;
-        url: string;
-        /**
-         * Access group this file's records are written at (the uploader's choice,
-         * already applied to the "src::" record). Threaded into the indexing
-         * prompts so the agent's own records land in the same group; omitted
-         * means "authorized", the group everything used before the setting existed.
-         */
-        accessGroup?: 'public' | 'authorized' | 'private';
-    };
-    /**
-     * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
-     * parser). When set, it is inlined into the indexing message verbatim and
-     * takes precedence over server-side office extraction / web_fetch.
-     */
-    parsedContent?: string;
-    /**
-     * True for a RESUME pass: a previous indexing pass could not finish this (large)
-     * file, so continue it - always via readFileContent paging, with a "continue"
-     * message telling the agent to resume from where the saved records leave off.
-     */
-    continueIndexing?: boolean;
-    /**
-     * For an image-vision file (PDF), the 0-based PAGE the render window should start at.
-     * The worker renders [renderFrom, renderFrom+RENDER_PAGES_PER_WINDOW) and injects them
-     * as image blocks; the resume loop advances this by a window each pass.
-     */
-    renderFrom?: number;
-};
-declare function notifyAgentSaveAttachment(info: AttachmentSaveInfo): Promise<any>;
-declare function extractClaudeText(response: any): any;
-declare function extractOpenAIText(response: any): any;
-declare function listClaudeModels(service: string, owner: string): Promise<any>;
-declare function listOpenAIModels(service: string, owner: string): Promise<any>;
-declare const BG_INDEXING_QUEUE_SUFFIX = "-bg";
-/**
- * unique_id of the durable "indexing finished" marker record for a stored file.
- *
- * Written by the BACKEND (the polling worker calls the MCP server's
- * /internal/index-complete at the end of an auto_continue chain whose final
- * window reported no more content) and, for completions a client knows
- * deterministically (single-pass settle, client-chain completion token), by the
- * consumer's mintIndexDoneMarker hook — never by the model.
- * The marker record carries `reference: "src::<path>"`, so the reindex flow's
- * delete of the src:: record cascades to it and a re-run starts unmarked.
- *
- * Existence semantics: present = the whole file was read to the end. Absent =
- * unknown (still running, failed partway, indexed before this marker existed,
- * or a single-pass run minted before the client hook existed) - callers must
- * fall back to the live-queue probe (fetchLiveIndexingKeys) before reading
- * absence as anything.
- */
-/** What the MCP's /internal/index-reset answered. */
-type IndexResetResult = {
-    path: string;
-    /** The access group the old file record had, or null when there was none. */
-    access_group: string | number | null;
-    removed: number;
-    missing: number;
-    failed: number;
-    decorations: number;
-    ambiguous: number;
-    ms?: number;
-};
-/**
- * Clear a file's index on the SERVER before a Reindex or an Overwrite (owner,
- * 2026-11-20): the MCP's /internal/index-reset removes the file record (and, through its
- * cascade, everything referencing it), the agent's decorated per-window ids and the
- * done::/run:: markers, in parallel, as the signed-in user. Reached through the host's
- * forwardRequest with "$ACCESS_TOKEN", which skapi fills in with the caller's own token,
- * so no client code ever holds it.
- *
- * Resolves to the server's answer, or null when the call could not be made or answered
- * something else (an older MCP without the route, a timeout): the caller then clears
- * the index itself, as it always did. Never rejects.
- */
-declare function resetFileIndexOnServer(args: {
-    service: string;
-    owner?: string;
-    storagePath: string;
-}): Promise<IndexResetResult | null>;
-declare function indexDoneUniqueId(storagePath: string): string;
-/**
- * unique_id of the per-file indexing RUN record.
- *
- * One record per storage path, newest run wins (a reindex's delete-then-repost
- * of src:: cascade-deletes the old record first, exactly like done::). Minted
- * status='working' by the client the moment it enqueues a run's FIRST pass, and
- * closed (done/error/cancelled) by whichever side observes the ending: the
- * worker via the MCP internal routes for worker-driven chains, the client for
- * deterministic settles, cancels, and dispatch failures. It exists so chat rows
- * and files-page badges can answer "which runs exist and how did they end"
- * from ONE records query instead of scanning bg history.
- *
- * A 'working' record is a claim, not proof: a chain that dies without reaching
- * any error path leaves it dangling, so readers must treat a stale 'working'
- * (old `started`, no live-queue confirmation) as unknown, never as live.
- */
-declare function runIndexUniqueId(storagePath: string): string;
-type IndexRunStatus = 'working' | 'done' | 'error' | 'cancelled';
-type IndexRunPatch = {
-    status: IndexRunStatus;
-    filename?: string;
-    started?: number;
-    finished?: number;
-    error?: string;
-    queue?: string;
-    /** Chat that owns this run. A run:: record is keyed by storage path alone,
-     *  but a chat is per (project, platform) — without this the Claude chat's
-     *  runs surfaced as rows in the same project's ChatGPT chat, where their
-     *  passes can never load and the queue probe can never see them. */
-    platform?: 'claude' | 'openai';
-};
-/**
- * Fire-and-forget wrapper over the consumer's upsertIndexRunRecord hook.
- * Safe everywhere: missing hook, unconfigured engine, and consumer throws all
- * reduce to a no-op — a run record must never be able to break the run itself.
- */
-declare function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch): void;
-/**
- * The one place the background-indexing queue name is spelled out. The backend
- * serialises requests sharing a queue name and runs different names in PARALLEL,
- * so every indexing pass AND the chat turn that must wait behind them have to
- * resolve to the identical string — see AttachmentSaveInfo.userId for what
- * happens when they do not.
- */
-declare function bgIndexingQueueName(userId?: string, service?: string): string;
-/**
- * True when a request belongs to the background-indexing queue.
- *
- * Accepts BOTH shapes this value arrives in: the bare queue name the client sends
- * ("<userId>-bg"), and the server qid that comes back on history/poll responses
- * ("<service>:<queue>|<seq>"). Testing the tail of the raw value only works for the
- * first: a qid ends in "|<seq>", so `endsWith('-bg')` is always false for it — which
- * silently meant history items were NEVER recognised as background tasks.
- */
-declare function isBgIndexingQueue(queueName?: string): boolean;
-type BgTaskEntry = {
-    projectId: string;
-    platform: 'claude' | 'openai';
-    id: string;
-    filename: string;
-    storagePath?: string;
-    isReindex?: boolean;
-    mime?: string;
-    size?: number;
-    status: 'running' | 'pending';
-    poll: ((opts: {
-        latency: number;
-        notify?: boolean;
-        onResponse?: (res: any, meta?: {
-            executed?: number;
-        }) => void;
-    }) => Promise<any>) | undefined;
-    /** How many CONTINUE passes have already run for this file (resume-across-passes). */
-    resumePass?: number;
-    /** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
-     *  drainBgTaskQueue inserts this pass's bubble directly ABOVE that turn's bubble, so the
-     *  collapsed row sits where the reader expects it — right before the message the files
-     *  came with — from the moment it appears, instead of the turn being moved down past it
-     *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
-     *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
-    stageId?: string;
-    /** Settled from the 10-second queue check instead of its own poll (owner, 2026-11-20).
-     *  Set by drainBgTaskQueue on every pass when the host has csrHistoryItemLookup, and on
-     *  adoption for the worker's lanes. Polls on one queue run one at a time in skapi-js, so
-     *  a pass that finished waited behind every pass ahead of it; see
-     *  ChatSession._settleByListing. */
-    byListing?: boolean;
-    /** When this client first tracked the pass (ms). A pass missing from a listing taken
-     *  BEFORE that proves nothing about it. */
-    adoptedAt?: number;
-};
-declare const INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
-declare const EMPTY_INDEXING_REPLY = "Finished reading this file.";
-/**
- * `queue` narrows the fetch to one processing chain; `status` narrows it to items
- * in one state. Passing both is how the client asks "is there still unresolved
- * work on the background-indexing queue?" without pulling a page of chat history
- * (see ChatSession._adoptWorkerIndexingPasses) — the server answers that from a
- * status-keyed index, so the reply carries only the live items, not the bodies of
- * everything already finished.
- */
-declare function getChatHistory(params: {
-    service?: string;
-    owner?: string;
-    platform: 'claude' | 'openai';
-    queue?: string;
-    status?: 'pending' | 'running' | 'resolved' | 'failed';
-    /** Exact-queue listing: without it the qid range is a PREFIX match, so
-     *  queue "u1" also returns "u1-bg" rows. Requires the updated polling
-     *  lambda; older backends ignore it (harmless, wider results). */
-    queue_exact?: boolean;
-    /** Label/marker STUBS instead of full bodies (see the polling lambda).
-     *  Older backends ignore it and return full items. */
-    compact?: boolean;
-    /** Drop one queue's rows from an id-prefix listing — how the surface
-     *  chat is fetched WITHOUT the bg-indexing queue while legacy items on
-     *  odd queue names survive. Older backends ignore it. */
-    queue_exclude?: string;
-}, fetchOptions: Record<string, any>): Promise<any>;
-/** Full server-side id of one history item, for a csr-poll POINT LOOKUP (the
- *  single-item path returns the item WITH bodies — how an expanded row fetches
- *  the passes a compact listing stubbed out). Mirrors the id the SDK builds:
- *  `[METHOD]url#service:` + the item's own `stamp:entropy` id. */
-declare function buildHistoryItemFullId(platform: 'claude' | 'openai', service: string, itemId: string): string;
-
 /**
  * ChatSession host adapter + state types.
  *
@@ -3197,10 +2961,10 @@ interface ChatMessage {
     /** PROTOCOL + PRESENTATIONAL: this bubble is being painted from a LIVE stream.
      *
      *  It sits alongside `isPending`, never instead of it. The bubble is still the
-     *  turn's "Thinking..." placeholder as far as every queue mechanism is concerned
-     *  (_ownThinkingIndex, resolveQueuedUserBubble, typewriteLatestReply and the
-     *  stray-pending sweep all find their target by isPending), and clearing that flag
-     *  to mean "it has text now" would strand the turn's real answer beside an orphan.
+     *  turn's "Thinking..." placeholder as far as every settle is concerned (the apply
+     *  funnel, ChatSession.applyTerminal, finds a turn's waiting bubble by its server id
+     *  AND isPending), and clearing that flag to mean "it has text now" would make the
+     *  turn read as already answered, so its real answer would be refused.
      *  What this adds is the one thing those mechanisms do not care about and the VIEW
      *  does: `content` is already worth rendering, so draw the text instead of the
      *  spinner.
@@ -3300,6 +3064,16 @@ interface ChatMessage {
      *  never carries it, so neither view needs a second test. */
     _tsStart?: number;
     _ownerKey?: string;
+    /** The client reference the turn was sent with (reconciler plan, section 3 item 9). On
+     *  the user bubble of a send; a send whose ack was lost is matched to its row by it. */
+    _cref?: string;
+    /** A send whose POST got no answer while the reconciler looks for its row by `_cref`:
+     *  kept through history merges until its row is found or it is "Not sent". */
+    _unconfirmed?: boolean;
+    /** A send whose POST got no answer and whose row the server never showed: the reply
+     *  bubble says "Not sent. Retry?" and ChatSession.retryNotSent(msg) sends it again.
+     *  Never retried on its own. */
+    _notSent?: boolean;
 }
 interface ChatState {
     messages: ChatMessage[];
@@ -3377,6 +3151,31 @@ interface ChatState {
     stoppedIndexIds: {
         [serverItemId: string]: boolean;
     };
+    /** The reconciler's last look failed on the way (network, timeout, 429, 5xx) and it is
+     *  trying again with backoff. Nothing on screen was changed by the failure; a view may
+     *  show a small "Reconnecting..." note while this is true. */
+    reconnecting?: boolean;
+    /** The reconciler's reads are refused for want of a sign-in. Looks resume on the next
+     *  sign-in (ChatSession.noteSignedIn); a view may say "Sign in to see the latest
+     *  answers" while this is true. */
+    signInNeeded?: boolean;
+    /** The background indexing queue of a project as the reconciler last read it, for a
+     *  page that shows indexing state with or without a chat view (the dashboard's files
+     *  page), by project id. Filled while someone watches it (ChatSession.watchIndexQueue).
+     *  `keys` holds the storage paths and file names with a pass waiting or running;
+     *  `checked` is false when the read came back cut off (absence then proves nothing);
+     *  `at` is when the read ran (a re-served read keeps its time, so two different `at`
+     *  values are two independent looks). */
+    indexQueues?: {
+        [projectId: string]: IndexQueueSnapshot;
+    };
+}
+interface IndexQueueSnapshot {
+    keys: {
+        [fileKey: string]: true;
+    };
+    checked: boolean;
+    at: number;
 }
 interface ChatHost {
     /** Read live (platform/model/name can change between sends). */
@@ -3426,6 +3225,21 @@ interface ChatHost {
     formatIndexingLabel(name: string, mime?: string, size?: number | null, storagePath?: string, reindex?: boolean, continued?: boolean): string;
     /** drainBgTaskQueue is a no-op until the chat view is mounted. */
     isViewMounted(): boolean;
+    /**
+     * Optional. Read the run:: records of these files again (reconciler plan, section 3
+     * item 1). The engine follows a file whose record says 'working' (syncFileRuns) until
+     * the record says it ended or a complete look at the queue finds no pass of it, and
+     * asks for this every 30 seconds meanwhile, while the file is not seen live. The host
+     * re-reads its records and hands the 'working' paths back through syncFileRuns.
+     */
+    recheckFileRuns?(projectId: string, storagePaths: string[]): void;
+    /**
+     * Optional. A provider answer (or a provider error) just settled a request of this
+     * project, whichever path read it (a poll, a look, a stream). The host may judge the
+     * project's API key from it (web-bunnyquery's "Your API key is invalid"). Called once
+     * per request, after the bubble is written.
+     */
+    onProviderAnswer?(projectId: string, platform: 'claude' | 'openai', result: any): void;
     /** Clear-horizon timestamp (localStorage, per service#platform) — view-owned. */
     getClearedAt(): number;
     uploadFile(args: {
@@ -3514,6 +3328,434 @@ interface ChatHost {
     updateComposerControls(): void;
 }
 
+declare const MCP_NAME = "BunnyQuery";
+declare const DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5";
+declare const DEFAULT_OPENAI_MODEL = "gpt-6-luna";
+/**
+ * THE two `stream` flags of a streamed chat turn, produced together or not at all.
+ *
+ * There are two of them and they are NOT the same flag:
+ *
+ *   * `transport.stream` is SKAPI's. It tells the polling worker to read the
+ *     destination's response incrementally and append the raw bytes to the chunk
+ *     table, and it is never sent on to the destination.
+ *   * `body.stream` is the DESTINATION's own field, and BunnyQuery is the party
+ *     that may set it: skapi relays bytes and knows no vendor, so it cannot know
+ *     that Anthropic Messages and OpenAI Responses both happen to spell it
+ *     `stream` at the top level of the body.
+ *
+ * Setting one without the other fails QUIETLY, which is why they are produced by
+ * one function from one boolean and returned as one object:
+ *
+ *   * body streams, skapi buffers -> the row stores an SSE TRANSCRIPT where
+ *     extractClaudeText / extractOpenAIText expect a parsed document, so the turn
+ *     reads back as an empty answer with nothing in the logs to say why.
+ *   * skapi streams, the body never asked -> the destination sends one plain
+ *     document, the relay chops it into chunks, the frame parser finds no framing
+ *     at all, and the row settles with a status and no body.
+ *
+ * Two frozen constants rather than a fresh object per call: the pair is a
+ * CONSTANT, and an object literal built at each call site is exactly the shape
+ * that drifts when someone edits one arm.
+ */
+type ChatStreamWiring = {
+    /** Spread into the forwardRequest OPTIONS (skapi's relay switch). `realtime`
+     *  belongs here and never in `body`: it is skapi's, not the destination's. */
+    transport: {
+        stream?: true;
+        realtime?: true;
+    };
+    /** Spread into `data` (the destination's own switch). */
+    body: {
+        stream?: true;
+    };
+};
+declare function chatStreamWiring(queue?: string): ChatStreamWiring;
+/**
+ * The body fields a CHAT turn's answer mode adds, for the one provider and model the turn
+ * runs on. An empty object, i.e. nothing at all, for 'standard' (the default) and for any
+ * model not known to accept the field, so a project that never set a mode sends the exact
+ * request it sent before the setting existed. OpenAI takes `reasoning: {effort}`, Claude
+ * takes `output_config: {effort}`. Never used by an indexing pass.
+ */
+declare function chatEffortFields(platform: 'claude' | 'openai', model: string | undefined, mode: AnswerMode | undefined): Record<string, any>;
+/** How a given model should be shown a rendered document. */
+type VisionProfile = {
+    /** Per-image `detail` (OpenAI only). */
+    detail: string;
+    /** Pages the worker renders into one window. */
+    pagesPerWindow: number;
+    /** Horizontal bands per page; 1 renders the whole page as one image. */
+    tile: number;
+};
+/**
+ * Resolve the render profile for a model.
+ *
+ * Three tiers, and they fail for different reasons, which is why one set of knobs cannot
+ * serve all of them:
+ *   - full: everything ABOVE gpt-5.4-nano - the base models, mini, and every gpt-5.6
+ *     including 5.6-nano. These already transcribe dense scans correctly, so they get
+ *     'original' detail and are otherwise untouched.
+ *   - gpt-5.4-nano: also gets 'original', so it sees exactly the SAME pixels as the full
+ *     tier. Its gap therefore is not resolution, and tiling would do nothing for it. What
+ *     it lacks is room: a smaller window leaves the same output budget divided between
+ *     fewer pages.
+ *   - downsampled (below the 'original' floor: gpt-5.3-nano, gpt-5-nano, gpt-4.1-nano):
+ *     capped at 'high', which resamples the page onto a 512px grid no matter what DPI it
+ *     was rendered at. Render resolution is wasted on these entirely; the only way to give
+ *     them readable text is to make each image cover less of the page, which is `tile`.
+ */
+declare function getVisionProfile(model?: string): VisionProfile;
+type ClaudeRole = 'user' | 'assistant';
+type ClaudeMessage = {
+    role: ClaudeRole;
+    content: string;
+};
+type OpenAIMessage = {
+    role: ClaudeRole;
+    content: string;
+};
+type ClaudeMcpToolConfig = {
+    enabled?: boolean;
+    defer_loading?: boolean;
+};
+type ClaudeMcpServerRequest = {
+    name: string;
+    url: string;
+    authorizationToken?: string;
+    defaultConfig?: ClaudeMcpToolConfig;
+    configs?: Record<string, ClaudeMcpToolConfig>;
+};
+declare function transformContentWithImages(content: string): string | Array<Record<string, any>>;
+declare function transformContentWithOpenAIImages(content: string, detail?: string): string | Array<Record<string, any>>;
+type CallClaudeWithMcpParams = {
+    prompt: string;
+    messages?: ClaudeMessage[];
+    service: string;
+    owner: string;
+    userId?: string;
+    model?: string;
+    maxTokens?: number;
+    system?: string;
+    mcpServer: ClaudeMcpServerRequest;
+    extractContent?: ExtractDirective[];
+    fileUrls?: FileUrlDirective[];
+    onResponse?: (res: any) => void;
+    onError?: (err: any) => void;
+    /**
+     * Attach Claude's `web_fetch` to this turn. A per-call host value under the
+     * same ceiling rule as the config option: the project's `web_access` setting
+     * is the most a turn can have, and `false` here (or in the config) takes it
+     * off. Omitted follows the config option and the project. See config.ts
+     * resolveWebAccess.
+     */
+    webAccess?: boolean;
+    /** The send's client reference (ChatTurnContext.cref), passed to forwardRequest. */
+    cref?: string;
+};
+declare const POLL_INTERVAL = 3000;
+declare const STREAM_POLL_INTERVAL = 1000;
+declare const MAX_CONCURRENT_BG_POLLS = 6;
+/**
+ * What a chat turn hands the OpenAI request builder about itself, and what the builder
+ * writes back. Created per turn by ChatSession; a host that calls the builder directly
+ * and passes nothing gets exactly the request it always got.
+ */
+type ChatTurnContext = {
+    /**
+     * Reuse the MCP tool listing OpenAI returned on an earlier chat turn (OpenAI only).
+     * Every OpenAI turn otherwise starts with OpenAI asking our MCP server for its tools,
+     * four sequential requests (server/discover, initialize, notifications/initialized,
+     * tools/list), about 0.6 s before the model starts. OpenAI's docs: "As long as the
+     * mcp_list_tools item is present in the context of an API request, the API will not
+     * fetch a list of tools from the MCP server again at each turn."
+     */
+    reuseMcpToolList?: boolean;
+    /** Who the turn runs as. Part of the listing key: a different user can see a different list. */
+    userId?: string;
+    /** Written by the builder: the key this turn's listing is stored under. */
+    mcpToolsKey?: string;
+    /** Written by the builder: true when a stored listing rode in this turn's input. */
+    mcpToolsInjected?: boolean;
+    /** Written by the builder: the project the listing belongs to (for the per-project off verdict). */
+    mcpToolsService?: string;
+    /** Written by the builder: the id of the listing that rode in this turn's input. */
+    mcpToolsItemId?: string;
+    /** Set by ChatSession once the turn's outcome was applied, so a later handler cannot apply it twice. */
+    settled?: boolean;
+    /** The client reference of this send (reconciler plan, section 3 item 9): sent as
+     *  forwardRequest's `cref`, so a send whose ack was lost is found by it and never sent
+     *  twice. Set by ChatSession only when the host's skapi-js carries it (crefSupported). */
+    cref?: string;
+};
+declare function callClaudeWithMcp({ prompt, messages, service, owner, userId, model, maxTokens, system, mcpServer, extractContent, fileUrls, webAccess, cref, }: CallClaudeWithMcpParams): Promise<any>;
+declare function callClaudeWithPublicMcp(prompt: string, service: string, owner: string, messages?: ClaudeMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
+    anonymous?: boolean;
+    publicProjectId?: string;
+}, turn?: ChatTurnContext): Promise<any>;
+declare function callOpenAIWithPublicMcp(prompt: string, service: string, owner: string, messages?: OpenAIMessage[], system?: string, model?: string, userId?: string, extractContent?: ExtractDirective[], fileUrls?: FileUrlDirective[], onResponse?: (res: any) => void, onError?: (err: any) => void, mcpScope?: {
+    anonymous?: boolean;
+    publicProjectId?: string;
+}, turn?: ChatTurnContext): Promise<any>;
+type AttachmentSaveInfo = {
+    platform: 'claude' | 'openai';
+    model?: string;
+    service: string;
+    /** The PUBLIC project ID (formatted token, skapi.project_id). Shown to the model; falls back to `service`. */
+    publicProjectId?: string;
+    owner: string;
+    /**
+     * Queue base for this indexing pass: "<userId>-bg". REQUIRED, and it must be
+     * the SAME value the chat turn uses (ChatSession.dispatchComposedMessage's
+     * `id.userId || id.projectId`) — the backend serialises requests that share a
+     * queue name and runs different ones IN PARALLEL, so a pass enqueued under a
+     * different base does not hold the chat back at all. It was optional once,
+     * defaulting to `service`; the chatbox omitted it, and its files were indexed
+     * on "<projectId>-bg" while its question ran on "<userId>-bg" — the question
+     * was answered from a file nothing had read yet. Pass `userId || projectId`.
+     */
+    userId: string;
+    serviceName?: string;
+    serviceDescription?: string;
+    attachment: {
+        name: string;
+        storagePath: string;
+        mime?: string;
+        size?: number;
+        url: string;
+        /**
+         * Access group this file's records are written at (the uploader's choice,
+         * already applied to the "src::" record). Threaded into the indexing
+         * prompts so the agent's own records land in the same group; omitted
+         * means "authorized", the group everything used before the setting existed.
+         */
+        accessGroup?: 'public' | 'authorized' | 'private';
+    };
+    /**
+     * Content parsed CLIENT-SIDE by an attachment-parser plugin (e.g. an .hwp
+     * parser). When set, it is inlined into the indexing message verbatim and
+     * takes precedence over server-side office extraction / web_fetch.
+     */
+    parsedContent?: string;
+    /**
+     * True for a RESUME pass: a previous indexing pass could not finish this (large)
+     * file, so continue it - always via readFileContent paging, with a "continue"
+     * message telling the agent to resume from where the saved records leave off.
+     */
+    continueIndexing?: boolean;
+    /** The pass's client reference, passed to forwardRequest's `cref`: a pass whose ack was
+     *  lost on the way is found by it in the queue listing and never sent twice. */
+    cref?: string;
+    /**
+     * For an image-vision file (PDF), the 0-based PAGE the render window should start at.
+     * The worker renders [renderFrom, renderFrom+RENDER_PAGES_PER_WINDOW) and injects them
+     * as image blocks; the resume loop advances this by a window each pass.
+     */
+    renderFrom?: number;
+};
+declare function notifyAgentSaveAttachment(info: AttachmentSaveInfo): Promise<any>;
+declare function extractClaudeText(response: any): any;
+declare function extractOpenAIText(response: any): any;
+declare function listClaudeModels(service: string, owner: string): Promise<any>;
+declare function listOpenAIModels(service: string, owner: string): Promise<any>;
+declare const BG_INDEXING_QUEUE_SUFFIX = "-bg";
+/**
+ * unique_id of the durable "indexing finished" marker record for a stored file.
+ *
+ * Written by the BACKEND (the polling worker calls the MCP server's
+ * /internal/index-complete at the end of an auto_continue chain whose final
+ * window reported no more content) and, for completions a client knows
+ * deterministically (single-pass settle, client-chain completion token), by the
+ * consumer's mintIndexDoneMarker hook — never by the model.
+ * The marker record carries `reference: "src::<path>"`, so the reindex flow's
+ * delete of the src:: record cascades to it and a re-run starts unmarked.
+ *
+ * Existence semantics: present = the whole file was read to the end. Absent =
+ * unknown (still running, failed partway, indexed before this marker existed,
+ * or a single-pass run minted before the client hook existed) - callers must
+ * fall back to the live-queue probe (fetchLiveIndexingKeys) before reading
+ * absence as anything.
+ */
+/** What the MCP's /internal/index-reset answered. */
+type IndexResetResult = {
+    path: string;
+    /** The access group the old file record had, or null when there was none. */
+    access_group: string | number | null;
+    removed: number;
+    missing: number;
+    failed: number;
+    decorations: number;
+    ambiguous: number;
+    ms?: number;
+};
+/**
+ * Clear a file's index on the SERVER before a Reindex or an Overwrite (owner,
+ * 2026-11-20): the MCP's /internal/index-reset removes the file record (and, through its
+ * cascade, everything referencing it), the agent's decorated per-window ids and the
+ * done::/run:: markers, in parallel, as the signed-in user. Reached through the host's
+ * forwardRequest with "$ACCESS_TOKEN", which skapi fills in with the caller's own token,
+ * so no client code ever holds it.
+ *
+ * Resolves to the server's answer, or null when the call could not be made or answered
+ * something else (an older MCP without the route, a timeout): the caller then clears
+ * the index itself, as it always did. Never rejects.
+ */
+declare function resetFileIndexOnServer(args: {
+    service: string;
+    owner?: string;
+    storagePath: string;
+}): Promise<IndexResetResult | null>;
+declare function indexDoneUniqueId(storagePath: string): string;
+/**
+ * unique_id of the per-file indexing RUN record.
+ *
+ * One record per storage path, newest run wins (a reindex's delete-then-repost
+ * of src:: cascade-deletes the old record first, exactly like done::). Minted
+ * status='working' by the client the moment it enqueues a run's FIRST pass, and
+ * closed (done/error/cancelled) by whichever side observes the ending: the
+ * worker via the MCP internal routes for worker-driven chains, the client for
+ * deterministic settles, cancels, and dispatch failures. It exists so chat rows
+ * and files-page badges can answer "which runs exist and how did they end"
+ * from ONE records query instead of scanning bg history.
+ *
+ * A 'working' record is a claim, not proof: a chain that dies without reaching
+ * any error path leaves it dangling, so readers must treat a stale 'working'
+ * (old `started`, no live-queue confirmation) as unknown, never as live.
+ */
+declare function runIndexUniqueId(storagePath: string): string;
+type IndexRunStatus = 'working' | 'done' | 'error' | 'cancelled';
+type IndexRunPatch = {
+    status: IndexRunStatus;
+    filename?: string;
+    started?: number;
+    finished?: number;
+    error?: string;
+    queue?: string;
+    /** Chat that owns this run. A run:: record is keyed by storage path alone,
+     *  but a chat is per (project, platform) — without this the Claude chat's
+     *  runs surfaced as rows in the same project's ChatGPT chat, where their
+     *  passes can never load and the queue probe can never see them. */
+    platform?: 'claude' | 'openai';
+};
+/**
+ * Wrapper over the consumer's upsertIndexRunRecord hook. Never throws: a run record
+ * must never be able to break the run itself. A missing hook or an unconfigured engine
+ * is a no-op.
+ *
+ * The promise: with `report`, it rejects when the write failed (the hook threw or its
+ * promise rejected), so a caller that retries (the settle lock) can see it; without
+ * `report` it always resolves (fire and forget).
+ */
+declare function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch, opts?: {
+    report?: boolean;
+}): Promise<void>;
+/**
+ * The one place the background-indexing queue name is spelled out. The backend
+ * serialises requests sharing a queue name and runs different names in PARALLEL,
+ * so every indexing pass AND the chat turn that must wait behind them have to
+ * resolve to the identical string — see AttachmentSaveInfo.userId for what
+ * happens when they do not.
+ */
+declare function bgIndexingQueueName(userId?: string, service?: string): string;
+/**
+ * True when a request belongs to the background-indexing queue.
+ *
+ * Accepts BOTH shapes this value arrives in: the bare queue name the client sends
+ * ("<userId>-bg"), and the server qid that comes back on history/poll responses
+ * ("<service>:<queue>|<seq>"). Testing the tail of the raw value only works for the
+ * first: a qid ends in "|<seq>", so `endsWith('-bg')` is always false for it — which
+ * silently meant history items were NEVER recognised as background tasks.
+ */
+declare function isBgIndexingQueue(queueName?: string): boolean;
+type BgTaskEntry = {
+    projectId: string;
+    platform: 'claude' | 'openai';
+    id: string;
+    filename: string;
+    storagePath?: string;
+    isReindex?: boolean;
+    mime?: string;
+    size?: number;
+    status: 'running' | 'pending';
+    poll: ((opts: {
+        latency: number;
+        notify?: boolean;
+        onResponse?: (res: any, meta?: {
+            executed?: number;
+        }) => void;
+    }) => Promise<any>) | undefined;
+    /** How many CONTINUE passes have already run for this file (resume-across-passes). */
+    resumePass?: number;
+    /** The STAGED chat turn these files were attached to (ChatSession.stageOutgoingMessage).
+     *  drainBgTaskQueue inserts this pass's bubble directly ABOVE that turn's bubble, so the
+     *  collapsed row sits where the reader expects it — right before the message the files
+     *  came with — from the moment it appears, instead of the turn being moved down past it
+     *  once everything finishes. Absent for work with no chat turn behind it (the dbfile
+     *  page, an attachment-only send, a worker-adopted pass), which appends as before. */
+    stageId?: string;
+    /** Settled from the 10-second queue check instead of its own poll (owner, 2026-11-20).
+     *  Set by drainBgTaskQueue on every pass when the host has csrHistoryItemLookup, and on
+     *  adoption for the worker's lanes. Polls on one queue run one at a time in skapi-js, so
+     *  a pass that finished waited behind every pass ahead of it; see
+     *  ChatSession._settleByListing. */
+    byListing?: boolean;
+    /** When this client first tracked the pass (ms). A pass missing from a listing taken
+     *  BEFORE that proves nothing about it. */
+    adoptedAt?: number;
+    /** The identity this pass was dispatched or adopted under, pinned at that moment
+     *  (reconciler plan, section 3 item 1). Its settle, its by-id reads and the next
+     *  CONTINUE pass of a client-driven file use this, never the identity live at the
+     *  time, which a project or platform switch has moved on. Filled by the engine the
+     *  first time it sees the entry when a host pushed it without one. */
+    identity?: ChatIdentity;
+    /** The project owner, pinned with the identity (by-id reads are scoped by it). */
+    owner?: string;
+    /** History cache key of the chat this pass belongs to, pinned with the identity. */
+    ownerKey?: string;
+};
+declare const INDEXING_COMPLETE_MARKER = "INDEXING_COMPLETE";
+declare const EMPTY_INDEXING_REPLY = "Finished reading this file.";
+/**
+ * `queue` narrows the fetch to one processing chain; `status` narrows it to items
+ * in one state. Passing both is how the client asks "is there still unresolved
+ * work on the background-indexing queue?" without pulling a page of chat history
+ * (see ChatSession._adoptWorkerIndexingPasses) — the server answers that from a
+ * status-keyed index, so the reply carries only the live items, not the bodies of
+ * everything already finished.
+ */
+declare function getChatHistory(params: {
+    service?: string;
+    owner?: string;
+    platform: 'claude' | 'openai';
+    queue?: string;
+    status?: 'pending' | 'running' | 'resolved' | 'failed';
+    /** Exact-queue listing: without it the qid range is a PREFIX match, so
+     *  queue "u1" also returns "u1-bg" rows. Requires the updated polling
+     *  lambda; older backends ignore it (harmless, wider results). */
+    queue_exact?: boolean;
+    /** Label/marker STUBS instead of full bodies (see the polling lambda).
+     *  Older backends ignore it and return full items. */
+    compact?: boolean;
+    /** Drop one queue's rows from an id-prefix listing — how the surface
+     *  chat is fetched WITHOUT the bg-indexing queue while legacy items on
+     *  odd queue names survive. Older backends ignore it. */
+    queue_exclude?: string;
+    /** "ids": the light listing (id, status, times, queue, cref; no bodies). skapi-js 2.7.0. */
+    fields?: 'ids';
+    /** Only rows newer than this request id. skapi-js 2.7.0. */
+    after?: string;
+    /** Transport options for a reconciler read (skapi-js 2.7.0): its deadline, an
+     *  abort signal, and `fresh` (never join an identical listing in flight). */
+    deadline?: number;
+    signal?: any;
+    fresh?: boolean;
+}, fetchOptions: Record<string, any>): Promise<any>;
+/** Full server-side id of one history item, for a csr-poll POINT LOOKUP (the
+ *  single-item path returns the item WITH bodies — how an expanded row fetches
+ *  the passes a compact listing stubbed out). Mirrors the id the SDK builds:
+ *  `[METHOD]url#service:` + the item's own `stamp:entropy` id. */
+declare function buildHistoryItemFullId(platform: 'claude' | 'openai', service: string, itemId: string): string;
+
 /**
  * History mapping (pure). Moved verbatim from the chatbox. The clear-horizon
  * timestamp and the "Indexing: …" display label are INJECTED (clearedAt param,
@@ -3524,6 +3766,10 @@ interface ChatHost {
 declare function filterListByClearHorizon(list: any[], clearedAt: number): any[];
 declare function normalizeTextContent(content: any): string;
 declare function extractLastUserTextFromRequest(requestBody: any): string;
+/** The last user text of a listed row: the compact stub's `request_text` when the
+ *  listing was compact (the body never left the server), else read from the full
+ *  request echo (a backend without compact stubs). */
+declare function listedRequestText(item: any): string;
 /** The two openings an indexing prompt can have. A bg-queue item that starts with
  *  neither is an ordinary chat that happened to be routed onto that queue. */
 declare function isIndexingRequestText(userText: any): boolean;
@@ -3568,6 +3814,9 @@ declare function fetchLiveIndexingKeys(params: {
     platform: 'claude' | 'openai';
     /** Same value the dispatch used - see bgIndexingQueueName. */
     userId?: string;
+}, opts?: {
+    /** Reuse a shared answer up to this old (default BG_PROBE_TTL_MS); 0 always asks. */
+    maxAgeMs?: number;
 }): Promise<{
     keys: Set<string>;
     checked: boolean;
@@ -3691,6 +3940,20 @@ declare function mapHistoryListToMessages(list: any[], platform: 'claude' | 'ope
  * the settle would drop the real answer on the floor.
  */
 declare function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessage): boolean;
+/**
+ * Keep the LIVE TEXT of a turn the page still shows as running. Mutates `incoming`;
+ * true when it took anything.
+ *
+ * A running row maps to an empty "Thinking..." placeholder (the row has no body
+ * yet), so a first-page refetch landing while an answer streams replaced the bubble
+ * the reader was watching with an empty one. The painter only paints when the text
+ * GROWS past what it already painted, so the bubble then sat on "Thinking..." until
+ * a larger chunk arrived and jumped back, or, with every chunk already delivered,
+ * stayed blank until the settle retyped the whole answer. The local copy is the same
+ * turn (same server id), so its text and its live state come across; the settle
+ * still replaces the text with the authoritative answer.
+ */
+declare function adoptLiveTextIntoRunningRow(incoming: ChatMessage, local: ChatMessage): boolean;
 interface RescueDecisionContext {
     /** Is this `_serverItemId` in the page that was just fetched? */
     hasServerId: (id: string) => boolean;
@@ -4352,6 +4615,130 @@ type PollHandle = {
     /** Absent on an older skapi-js that cannot stop an attached poll. */
     stop?: () => void;
 };
+/** Where an item stands, by the server's account. Only ever moves forward. */
+type OpenItemState = 'queued' | 'running' | 'terminal';
+/**
+ * An item this page follows (a chat turn or an indexing pass), with the identity it
+ * belongs to PINNED at the moment it was added: the dispatch ack, a history page that
+ * showed it running or waiting, or a background entry the drain adopted. Every settle,
+ * read and follow-up of the item uses this identity, never the one live at the time,
+ * which a project, platform or account switch has moved on.
+ */
+type OpenItem = {
+    /** History cache key (chatCacheKey) of the chat the item belongs to. */
+    ownerKey: string;
+    projectId: string;
+    owner: string;
+    platform: 'claude' | 'openai';
+    /** The server queue it runs on, when known. */
+    queue?: string;
+    kind: 'chat' | 'indexing';
+    state: OpenItemState;
+    /** Wall clock when this page started following it: "did the reader watch it live". */
+    addedAt: number;
+    /** The send's client reference, when known (reconciler plan, section 3 item 9). */
+    cref?: string;
+    /** An anonymous visitor's item: its row is keyed by the network it was sent from, so
+     *  "missing" reads as "no longer reachable from this network". */
+    anonymous?: boolean;
+    /** performance.now() of the last look that read this item's status. 0 = never. */
+    lastConfirmed: number;
+    /** The status the last read gave (pending, running, resolved, ...). */
+    lastStatus?: string;
+    /** The row streams its answer (batch status `stream`). */
+    stream?: boolean;
+    /** When the worker began executing it (a running read's `executed`): the start of the
+     *  pass's duration when an older skapi-js's look, not a poll, settles it. */
+    executedAt?: number;
+    /** A look saw it terminal while a live poll or stream still held it: the next look
+     *  reads it itself if that reader has not settled it by then. */
+    terminalSeen?: boolean;
+    /** The user id of the identity it was sent under (ChatIdentity.userId), pinned when it
+     *  was added. A row is readable only by the caller who made it, so while another
+     *  identity is signed in (signed out, another account) the item is left alone: not
+     *  read, not settled, never marked "no longer available" (see _recReadable). */
+    uid?: string;
+    /** Envelope reads that answered body_unavailable (stored, not loadable now), and when
+     *  the last one was. See _recBodyUnavailable. */
+    unavail?: number;
+    unavailAt?: number;
+    /** A worker-driven indexing pass read as failed without the worker's `retried` mark:
+     *  when that was (performance.now()). Read once more before the failure is shown, as
+     *  the worker writes the mark only after it queued the window again (plan 3.8). */
+    failedPending?: number;
+    /** That second read is due (a complete queue look came, or the wait ran out). */
+    failedRecheck?: boolean;
+    /** A chat turn sent by this page (dispatchAgentRequest): sends it once more when the
+     *  answer a look reads is an expired sign-in (the dispatch poll's one resend). Used once. */
+    resend?: (body: any) => void;
+    /** The send's turn context (dispatchAgentRequest), settled when a look applies its answer. */
+    turn?: ChatTurnContext;
+};
+/** What trackOpenItem takes: the identity, plus the state the caller saw. */
+type OpenItemInit = {
+    ownerKey?: string;
+    projectId?: string;
+    owner?: string;
+    platform?: string;
+    queue?: string;
+    kind?: 'chat' | 'indexing';
+    state?: 'queued' | 'running';
+    cref?: string;
+    anonymous?: boolean;
+    /** The identity's user id it was sent under; the live identity's when left out. */
+    uid?: string;
+};
+/** What a caller of applyTerminal / onPollFailure knows about the item. Every field
+ *  is optional: the pinned identity of an open item fills the gaps, the live identity
+ *  only after that. */
+type TerminalContext = {
+    ownerKey?: string;
+    projectId?: string;
+    platform?: string;
+    owner?: string;
+    queue?: string;
+    /** Write the text at once, never typed out. */
+    instant?: boolean;
+    /** A corrected answer for a turn already settled (a stream read back in full after
+     *  an incomplete live parse): replaces the settled text instead of being refused. */
+    correction?: boolean;
+};
+/** Who a page watches the background indexing queue of (see ChatSession.watchIndexQueue). */
+type IndexQueueIdentity = {
+    projectId: string;
+    owner: string;
+    platform: 'claude' | 'openai';
+    /** The user the queue is named after (the same value the dispatch used). */
+    userId?: string;
+};
+/** A page that shows indexing state from the queue (the dashboard's files page). */
+type IndexQueueWatchOptions = {
+    /** Read live on every look: null while the page cannot ask (no platform, no key). */
+    identity: () => IndexQueueIdentity | null;
+    /** The page needs a second look soon (a green waiting for its confirmation). */
+    wantsConfirm?: () => boolean;
+    /** The page follows runs of its own that the queue cannot show (run:: 'working'
+     *  records of other users): recheckRuns is called every FILE_RUN_RECHECK_MS while
+     *  this says so and the tab is visible. */
+    runsOpen?: () => boolean;
+    recheckRuns?: () => void;
+};
+/** What watchIndexQueue hands back. */
+type IndexQueueWatchHandle = {
+    /** Stop watching (the page unmounts). */
+    stop(): void;
+    /** A fresh read unless the last one is younger than `maxAgeMs` (default 0). Resolves
+     *  once the look that reads it is over (the snapshot is then in state.indexQueues). */
+    refresh(maxAgeMs?: number): Promise<void>;
+    /** Something the page waits on changed (wantsConfirm, runsOpen): the chain runs. */
+    ensure(): void;
+};
+/** What a send whose row the server never showed says. */
+declare var NOT_SENT_TEXT: string;
+/** What a chat turn whose row is gone says ("missing" on a strongly consistent read). */
+declare var REQUEST_GONE_TEXT: string;
+/** The same for an anonymous visitor, whose rows are keyed by the network they were sent from. */
+declare var REQUEST_UNREACHABLE_TEXT: string;
 /**
  * The prefix of a still-arriving answer that is safe to render as markdown.
  *
@@ -5199,8 +5586,8 @@ declare class ChatSession {
      * history fetch issued in that window returns the turn ALREADY SETTLED, with no
      * pending assistant in it. The rescue then re-appends the local pair below the
      * server's copy (the question, twice), and when the poll finally resolves,
-     * typewriteLatestReply writes the answer into the rescued placeholder because it
-     * is the only pending assistant left (the answer, twice). updateHistoryCache
+     * the old positional settle wrote the answer into the rescued placeholder because
+     * it was the only pending assistant left (the answer, twice). updateHistoryCache
      * persists the result, so it survives every later visit.
      *
      * Navigating away while waiting and coming back is what lands a fetch in that
@@ -5215,15 +5602,101 @@ declare class ChatSession {
      * above these bubbles while the request is in flight.
      */
     private _stampTurnWithItemId;
+    /** Pinned identity of every item this page follows, by server id. Lazy, like the
+     *  stream-recovery bookkeeping, so a session built with Object.create works. */
+    private _openItems?;
+    /** Items whose result was applied (or that were cancelled), for the life of the page. */
+    private _terminalIds?;
+    /** Wall clock of the last time the tab was hidden; 0 = never in this page life. */
+    private _hiddenAt?;
+    private _visibilityWatched?;
+    /** The by-id "is the next queued turn running yet" look (see _checkQueuedRunning). */
+    private _queuedCheckTimer?;
+    private _openMap;
+    private _tomb;
+    /** Remember when the tab was last hidden, for the "watched live" test. */
+    private _watchVisibility;
     /**
-     * Land a resolved reply in the history cache of a chat that is NOT currently
-     * visible, without touching state.messages. Mirrors the cache-only path in
-     * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
-     * (append only when there is none), and settle the matching pending user
-     * bubble, so the cached copy never keeps a stuck "Thinking..." that a later
-     * cache-first load would re-render forever.
+     * Follow an item, with its identity pinned NOW (the ack, a page showing it running
+     * or waiting, a background entry being adopted). Adding an id already followed
+     * changes nothing but its state, and only forward; a terminal id is never reopened.
      */
-    private _applyReplyToCache;
+    trackOpenItem(itemId: string, init: OpenItemInit): void;
+    /** The pinned identity of an item this page follows, or null. */
+    getOpenItem(itemId: string): OpenItem | null;
+    /** True once an item's result was applied (or it was cancelled) in this page. */
+    isItemSettled(itemId: string): boolean;
+    private _closeItem;
+    /** Did the reader watch this turn arrive? Live text was painted into it, or the tab
+     *  has stayed visible (with this chat on screen) since the page started following it. */
+    private _watchedLive;
+    /** The identity a settle uses: the caller's, then the pinned one, then the live one. */
+    private _settleIdentity;
+    /**
+     * Apply how an item ended. The ONLY writer of a settled result; see the section note.
+     * `result` is what the server gave back: a provider body, an error body, a cancelled
+     * envelope, or a status envelope (which is not a result and is routed instead).
+     * True when a bubble was written.
+     */
+    applyTerminal(itemId: string, result: any, ctx?: TerminalContext): boolean;
+    /** Hand a settled provider answer to the host (ChatHost.onProviderAnswer), whichever
+     *  path read it. Optional, and never in the way of the settle. */
+    private _noteProviderAnswer;
+    /** A bubble of this item that still reads as waiting (a stale page can put one back). */
+    private _hasWaitingBubble;
+    /** The settled copy of a request bubble: its pending and sending flags come off,
+     *  everything that places it (file row, queue, chat, time, render key) stays. */
+    private _settledUserCopy;
+    /**
+     * The shared core: settle the item with id `itemId` inside `list`, by id only.
+     * Returns what happened and, for a reply to type out, where and from what.
+     */
+    private _settleInList;
+    private _applyTerminalOnScreen;
+    /** Put the whole text of a reply (found by local id) into a chat's cache copy. */
+    private _patchCachedText;
+    /** The same settle for a chat that is not on screen: made in its history cache,
+     *  which is what the next visit renders. Never typed. */
+    private _applyTerminalToCache;
+    /**
+     * A read of an item failed (its poll, or a by-id read). Only the server's own answer
+     * changes the screen: NOT_EXISTS settles the item as cancelled; a failure on the way
+     * (network, timeout, 429, 5xx) or of the sign-in leaves everything as it is, and the
+     * next look settles it; any other refusal is shown on the item, by id.
+     */
+    onPollFailure(itemId: string, err: any, ctx?: TerminalContext): 'cancelled' | 'kept' | 'failed';
+    /**
+     * A streamed turn's row settled 'resolved' with no body: its answer is in the chunk
+     * store. A live stream that is still being fed settles it itself; otherwise the
+     * chunks are read back by id, and the read's apply goes through the funnel.
+     */
+    private _readBackSettledStream;
+    /** The server says the item is running (or waiting): move it forward, never back. */
+    private _noteServerState;
+    /**
+     * Show a queued chat turn as RUNNING, found by its server id, because the server said
+     * so. This replaces the guess that "the next waiting bubble on screen" was the one
+     * the server took next. False when that turn is not waiting on screen.
+     */
+    private _promoteChatItemToRunning;
+    /**
+     * After a chat turn ends, ask the SERVER whether the next queued turn of this chat
+     * runs now, by id: the oldest waiting main-queue turn with a server id is read once
+     * (csrHistoryItemLookup) a few times over a few seconds, and promoted when the row
+     * says running. Bounded and single: a new call restarts the ladder. A host without
+     * the by-id read gets no promotion; the turn shows as answered when its poll settles.
+     */
+    /** The chat `key` is on screen and none of its main-queue turns shows as running
+     *  (no "Thinking..." of an ordinary turn): the next settle will not come to ask. */
+    private _noRunningChatTurnOnScreen;
+    private _checkQueuedRunning;
+    /**
+     * Settle a send that has NO server id: its POST failed, or the POST answered with a
+     * body directly. Found by the bubbles' own local ids, never by position.
+     */
+    private _settleLocalTurn;
+    /** A provider body (or error) read as the reply it renders as. */
+    private _replyFromBody;
     /**
      * projectId/owner are passed explicitly by every caller: a request can be
      * dispatched after the user moved to another project, and re-reading the live
@@ -5247,6 +5720,31 @@ declare class ChatSession {
      * handler on the same chain is not a provider failure.
      */
     private _settleChatTurnTools;
+    /**
+     * Send one chat turn and follow it to its end. Two phases (reconciler plan, section 3
+     * item 6):
+     *
+     * ACK. The POST that puts the turn on the server's queue. Only a 401 on THIS request
+     * may refresh the session and send again, once. When it comes back with the server
+     * id the turn is stamped (params.onItemId, matched by local id), pinned as an open
+     * item, and the sending state clears: pendingAgentRequests[key] (an immediate send's
+     * marker) is the ack and nothing longer.
+     *
+     * FOLLOW. The poll on that id. Whatever it ends with goes through applyTerminal or
+     * onPollFailure. A failed READ never sends the turn again: a 401 on a poll tick used
+     * to resend the whole prompt as a new request while the first one kept running.
+     * The one resend left is the server's own FINAL answer saying the turn's
+     * credentials expired (the MCP bearer the turn carried went stale): that turn is
+     * over and failed, so one fresh turn is sent in its place.
+     *
+     * params: key, projectId, owner, aiPlatform, aiModel, systemPrompt, text,
+     * boundedMessages, userId (the queue), extractContent, fileUrls, plus
+     *   userLid / placeholderLid  the local ids of the turn's bubbles (a send with no
+     *                             server id is settled through these);
+     *   onItemId(itemId)          the ack, every time an id is learned;
+     *   onAck(itemId?)            once, when the POST is over either way;
+     *   immediate                 an immediate send: marks pendingAgentRequests[key].
+     */
     dispatchAgentRequest(params: any): Promise<any>;
     /**
      * Put a turn on screen the INSTANT the user hits Send, before its attachments
@@ -5257,9 +5755,9 @@ declare class ChatSession {
      *
      * Staged bubbles carry _useBgQueue because that is where a turn with
      * attachments ultimately dispatches (behind its own indexing tasks). That flag
-     * is also what keeps promoteNextQueuedToRunning / resolveQueuedUserBubble off
-     * them: those advance the SERVER queue, and a staged turn has no server
-     * request behind it yet.
+     * is also what keeps the queued-turn promotion (_checkQueuedRunning) off them:
+     * it follows the SERVER queue, and a staged turn has no server request behind
+     * it yet.
      *
      * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
      */
@@ -5352,42 +5850,24 @@ declare class ChatSession {
      */
     private scrollForDispatch;
     promoteNextBgQueuedToRunning(): void;
+    /**
+     * The next queued chat turn shows "Thinking..." once the SERVER says it runs.
+     *
+     * This used to promote "the first waiting bubble on screen" the moment any turn
+     * ended, which was a guess about the server's queue, and wrong whenever the screen
+     * and the queue disagreed: a turn still running on the server after a failed read,
+     * a cancel in flight, a send whose ack had not come back. Now it asks: the oldest
+     * waiting turn is read by id and promoted when its row says running (see
+     * _checkQueuedRunning). Kept public under its old name for hosts that call it.
+     */
     promoteNextQueuedToRunning(): void;
     /**
-     * The "Thinking..." placeholder belonging to the user bubble at `userIdx`, or -1.
-     *
-     * Every path that creates one puts it IMMEDIATELY after its user bubble
-     * (promoteNextQueuedToRunning, the immediate-send pair, applyHistoryItemResolution),
-     * so ownership is adjacency — modulo background bubbles, which get spliced in
-     * around them. Taking the first pending assistant ANYWHERE below instead was a
-     * hijack: a turn sent with attachments never gets a placeholder of its own
-     * (promoteNextQueuedToRunning skips _useBgQueue turns) and now keeps the position
-     * it was sent in, so an ordinary turn sent while its files indexed sits BELOW it
-     * with a placeholder of its own — and the attachment turn's answer was rendered
-     * as the answer to that unrelated question.
+     * A queued send's answer, routed through the funnel by its server id. Kept for hosts
+     * that call it; the engine's own queued path settles through dispatchAgentRequest.
+     * Without a server id there is nothing to settle by, and nothing is written.
      */
-    private _ownThinkingIndex;
-    resolveQueuedUserBubble(serverId?: string): number | undefined;
-    insertAtTarget(msg: ChatMessage, targetIdx: number): void;
-    /**
-     * The server's OWN copy of this turn is already on screen.
-     *
-     * A first-page fetch can land between the server settling the item and this
-     * poll's tick, and now that the local bubbles carry the item id
-     * (_stampTurnWithItemId) the rescue correctly drops them and renders the
-     * server's settled pair instead. There is then nothing left to resolve: the
-     * -1 fallback would push the answer in a SECOND time at the bottom of the list,
-     * and the positional fallbacks would hijack some other turn's bubble.
-     *
-     * The USER bubble counts, not just a settled assistant: an item whose answer is
-     * empty produces no assistant bubble at all in the mapper, and that variant
-     * would otherwise still bottom-push "No text response received...". While a turn
-     * is genuinely live its user bubble is always pending (the queued branch sets
-     * isPendingQueued, promoteNextQueuedToRunning sets isPendingInProcess), so this
-     * cannot fire early.
-     */
-    private _turnAlreadyRendered;
     onQueuedSendResponse(_composed: string, response: any, platform: string, serverId?: string, ownerKey?: string): void;
+    /** A queued send's failed read, routed through onPollFailure by its server id. */
     onQueuedSendError(_composed: string, err: any, serverId?: string, ownerKey?: string): void;
     cancelQueuedMessage(msg: ChatMessage, idx: number): void;
     /** The button's label and the message it sends, read off the session so the
@@ -5432,12 +5912,12 @@ declare class ChatSession {
      *   2. the poll on it is stopped, which settles whichever chain was awaiting it
      *      with a stopped result: dispatchAgentRequest's for an immediate send, the
      *      queued chain for a promoted turn, the history poll after a reload. Each
-     *      reads a stopped or cancelled result as "no reply" and releases what it
-     *      holds (state.sending, pendingAgentRequests, historyItemPolls), which is
-     *      what lets the next send go out immediately instead of queueing;
+     *      reads a stopped result as "no reply" and releases its poll registration
+     *      (state.sending and pendingAgentRequests were already released at the ack);
      *   3. the bubbles settle at once, without waiting for that chain: the user
-     *      bubble takes its cancelled form, the placeholder goes, and the next queued
-     *      turn, if there is one, is promoted so its own "Thinking" appears.
+     *      bubble takes its cancelled form, the placeholder goes, the id is
+     *      tombstoned, and the server is asked whether the next queued turn runs now,
+     *      so its own "Thinking" appears when it does.
      *
      * What it does NOT do: the provider call already in flight on the worker runs
      * to its end (a streamed one stops within about a second). A message sent
@@ -5466,17 +5946,16 @@ declare class ChatSession {
      *
      * Idempotent on purpose: a cancel this client made settles the bubbles at once,
      * and the chain that was awaiting the poll settles again a moment later when the
-     * stop resolves it. The second pass finds nothing to do. Deliberately NOT
-     * _removeStrayPendingAssistants: by then the placeholder on screen is the freshly
-     * promoted turn's, whose user bubble is pending, and the sweep would take it.
+     * stop resolves it. The second pass finds nothing to do.
      */
     private _settleCancelledTurn;
     /**
      * _settleCancelledTurn for a chat that is not on screen: the same edit, made in
-     * its history cache. Matched by id where the cached bubbles carry one; an
-     * off-chat send caches its pair before the ack (see dispatchComposedMessage), so
-     * the fallback is positional, exactly as _applyReplyToCache's is: the trailing
-     * pending placeholder, and the last request bubble still marked in flight.
+     * its history cache, by id only. Every bubble of a turn that can be cancelled
+     * carries its id: an off-chat send's pair is stamped at the ack like any other
+     * (dispatchComposedMessage), and a cancel needs the id to be sent at all. (The
+     * positional fallback this had, "the trailing pending placeholder", could take
+     * another turn's.)
      */
     private _applyCancelToCache;
     /**
@@ -5504,23 +5983,316 @@ declare class ChatSession {
     typewriteIntoIndex(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<void>;
     private typewriterQueue;
     enqueueTypewrite(idx: number, fullText: string, localId?: string, paintedText?: string): Promise<any>;
-    typewriteLatestReply(key: string): Promise<any>;
-    _removeStrayPendingAssistants(): void;
-    /** Index of the USER bubble the message at `idx` belongs to — the nearest one
-     *  above it, stepping over background bubbles (a file's indexing rows are
-     *  inserted between turns). -1 when the nearest thing above is not a user turn,
-     *  which for a placeholder means it is an orphan. */
-    private _owningUserIndex;
-    /** The bubble at `idx` is the "Thinking…" of a DIFFERENT turn that is still
-     *  waiting for its answer, so the sweep above must leave it alone. */
-    private _isLiveImmediatePlaceholder;
-    /** A pending assistant at `idx` is the placeholder OF the turn above it, so a
-     *  reply may take its slot. Every path that makes one copies the parent's
-     *  _serverItemId (or neither has one yet), so a mismatch means the slot belongs to
-     *  some other request and the reply must be spliced in beside it, not on top. */
-    private _isOwnPlaceholderOf;
     _clearPendingUserBubble(itemId: string): void;
-    resumePendingRequest(token: number): Promise<void>;
+    resumePendingRequest(_token: number): Promise<void>;
+    private _sched?;
+    /** The last counters seen, per "<projectId>|<queue>". */
+    private _recCounters?;
+    /** performance.now() of the last look that read every open item's status. */
+    private _recFullReadAt;
+    /** performance.now() of the last return look's start (see resumePolling). */
+    private _recReturnAt;
+    /** Open items a status frame named since the last look: read by the next one. */
+    private _recFrameIds?;
+    /** Looks that still read statuses after a counter moved: a queued turn starts a moment
+     *  after the one ahead of it finishes, and starting moves no counter. */
+    private _recFollowUps;
+    /** The backend refused the counters read (too old): statuses are read every look. */
+    private _recCountersOff;
+    /** The backend refused the batch status read (too old): today's polls instead. */
+    private _recReadsOff;
+    /** Chunks of a terminal streamed turn read so far, by id (a long answer can take more
+     *  than one read, and more than one look). */
+    private _recChunks?;
+    /** Sends whose POST got no answer, by cref. */
+    private _recPending?;
+    /** "Not sent. Retry?" replies, by their local id. */
+    private _notSent?;
+    /** Chat turns shown as "could not be loaded", tried again later (_recRetryUnloadable). */
+    private _recUnloadable?;
+    /** A first-page read a look could not run yet (a load in flight, polling paused). */
+    private _recFirstPageOwed;
+    /** performance.now() of the last first-page read a look started. */
+    private _recFirstPageAt;
+    /** gateRefreshToken of the last first-page load started (see loadHistory). */
+    private _recFirstPageToken;
+    /** performance.now() when the last first-page load landed (see loadHistory). */
+    private _recFirstPageDoneAt;
+    /** performance.now() of the last indexing queue check a look ran. */
+    private _recAdoptAt;
+    /** Indexing runs whose run:: record says 'working', by "<projectId>|<path>". */
+    private _fileRuns?;
+    /** Runs a complete queue look found no pass for: not re-opened by the same records. */
+    private _fileRunsIdle?;
+    private _fileRunCheckAt;
+    private _recSyncing;
+    /** Pages watching a project's background indexing queue (watchIndexQueue). */
+    private _iqWatches;
+    private _recNewMode;
+    private _recSched;
+    /** Keep the chain running at its cadence while there is anything to follow. */
+    private _recEnsure;
+    /** A view host may be absent (the dashboard's files page): nothing here may throw then. */
+    private _viewMounted;
+    private _viewNotify;
+    /**
+     * Look at the server now. `trigger` says why (default 'return': the user is back, so
+     * readers restart and the first page is read). Resolves when that look ends. Any
+     * number of calls at once run one look, plus exactly one more for calls that arrive
+     * while it runs.
+     */
+    reconcileNow(trigger?: string): Promise<void>;
+    /** The sign-in is back: looks resume at once (state.signInNeeded clears on success). */
+    noteSignedIn(): void;
+    /** A chat view was (re)opened: a return look (readers, discovery, first page). */
+    noteViewOpened(): void;
+    /** The host changed bgTaskQueue (the files page pushes passes with no chat view):
+     *  the new entries join the open set and the chain runs. */
+    noteBgQueueChanged(): void;
+    /**
+     * True when this page's reconciler follows every bgTaskQueue entry itself, with or
+     * without a chat view (the host's skapi-js has the batch reads). A host's own poller of
+     * that queue (web-bunnyquery main.vue's fallback poller) then stands down: two
+     * followers of one pass race to settle it, and the poller's settle skips the next pass
+     * of a file this client drives and its run:: record.
+     */
+    followsBackgroundQueue(): boolean;
+    /** Stop the reconciler's timer (tests, teardown). Any trigger starts it again. */
+    stopReconciler(): void;
+    /** Diagnostics: the open set's size, looks run, timers armed, pending sends. */
+    reconcilerStats(): {
+        open: number;
+        looks: number;
+        timers: number;
+        generation: number;
+        pendingSends: number;
+        fileRuns: number;
+        reconnecting: boolean;
+        signInNeeded: boolean;
+        running: boolean;
+    };
+    /** The bg entry of a pass, by id. */
+    private _bgEntry;
+    /** The queue an indexing pass runs on. */
+    private _bgQueueOf;
+    /**
+     * Every bgTaskQueue entry is an open item, whoever pushed it (the engine, the files
+     * page with no chat view, a host's own code). Its identity is pinned here when the
+     * host pushed it without one, from the identity live now when that is the entry's
+     * project.
+     */
+    private _syncOpenFromBgQueue;
+    private _chains?;
+    /** Passes whose chain ended (see _forgetChain): never kept again. */
+    private _chainEnded?;
+    private _chainsRestored;
+    private _chainStorage;
+    private _chainKey;
+    /** Keep every client-driven pass in bgTaskQueue (the newest pass per file wins). */
+    private _persistChains;
+    /** The chain of this file ended: forget it (only when the kept pass is not newer than
+     *  `upToId`, a later run of the same file being newer; without it, whatever is kept). */
+    private _forgetChain;
+    /** Is a chain of this file kept (this page or another tab of this browser)? */
+    private _chainKept;
+    /** Once per page, at its first look: the kept chains go back into bgTaskQueue. */
+    private _restoreChains;
+    /** An open indexing pass whose file this client drives (it sends the next pass). */
+    private _isClientDrivenOpen;
+    /** What the chain has to follow: anything at all (visible cadence), and what is worth
+     *  a look once a minute while the tab is hidden (a client-driven chain: without the
+     *  browser its next pass is never sent). Never reads the network. */
+    private _recWork;
+    /** How a failed read is taken: 'auth' (the sign-in is gone), 'transient' (on the way),
+     *  'refused' (the server's own no). */
+    private _recErrKind;
+    /** The user id signed in now (ChatIdentity.userId), or null when the host cannot say. */
+    private _recLiveUid;
+    /**
+     * Can the caller signed in now read an item sent under `uid`? A row answers only the
+     * identity that made it: after a sign-out (or with another account) every read of it
+     * would come back "missing" and settle a turn that is fine as "no longer available".
+     * Such an item is left exactly as it is (not read, not counted as work) until its user
+     * is back. An item pinned before the user was known (uid = the project id, the hosts'
+     * fallback) is always read.
+     */
+    private _recReadable;
+    /** The newest server id of a chat known here (on screen, in its cache, or open). */
+    private _recNewestKnownId;
+    /** Put a send's cref on its bubbles (on screen and in the chat's cache). */
+    private _stampCref;
+    /** A send whose POST got no answer: its row is looked for by cref (see dispatchAgentRequest). */
+    private _recAddPendingSend;
+    /** Patch the bubbles of a local turn (by local id), on screen and in its chat's cache. */
+    private _markLocalTurn;
+    /**
+     * Send again a turn that said "Not sent. Retry?". Only ever on the user's click: the
+     * reply bubble goes back to waiting and the same send goes out with a new cref. False
+     * when `msg` is not such a reply (or was retried already).
+     */
+    retryNotSent(msg: ChatMessage): boolean;
+    /** Is a send of this chat in flight right now (see retryNotSent)? */
+    private _chatBusy;
+    /** True for a "Not sent. Retry?" reply that retryNotSent can still send. */
+    canRetryNotSent(msg: ChatMessage): boolean;
+    /**
+     * Follow an indexing run from its run:: 'working' record (reconciler plan, section 3
+     * item 1): the host passes the project's paths whose record says working, after every
+     * read of those records. A run stays open until its record says done/error/cancelled
+     * (it leaves the list), or a complete look at the queue finds no pass of it. While one
+     * is open and not seen live, a look asks the host to read the records again
+     * (host.recheckFileRuns) every FILE_RUN_RECHECK_MS: no fixed number of rounds.
+     */
+    syncFileRuns(projectId: string, workingPaths: string[], info?: {
+        [path: string]: {
+            owner?: string;
+            filename?: string;
+        };
+    }): void;
+    /** The runs of a project this page follows, by storage path. */
+    openFileRuns(projectId: string): string[];
+    /**
+     * Watch a project's background indexing queue, with or without a chat view (the
+     * dashboard's files page draws its "Indexing" and "Indexed" badges from it). The
+     * reconciler's one timer chain reads it (no timer or poll of the page's own):
+     *  - at once when the watch starts, on every return (tab shown, wake, online,
+     *    reconnect) and when a status frame names the indexing queue;
+     *  - every 8 s while the queue holds work or the last read came back cut off (once a
+     *    minute while status frames arrive);
+     *  - every 2.5 s while the page waits for a second, independent look (wantsConfirm);
+     *  - never while the tab is hidden (a refresh() still reads).
+     * The answer lands in state.indexQueues[projectId] (IndexQueueSnapshot). Runs the page
+     * follows itself (runsOpen) get recheckRuns every FILE_RUN_RECHECK_MS from the same
+     * chain. A failed read keeps the last snapshot.
+     */
+    watchIndexQueue(opts: IndexQueueWatchOptions): IndexQueueWatchHandle;
+    /** The last read of a project's indexing queue (see watchIndexQueue), or null. */
+    indexQueueSnapshot(projectId: string): IndexQueueSnapshot | null;
+    private _iqIdentity;
+    /** What the watches give the chain to do (see _recWork). */
+    private _iqWork;
+    /** The watched queues' part of a look: read the ones that are due (see watchIndexQueue). */
+    private _iqLook;
+    /**
+     * A run closed idle (a complete queue look found no pass of it) whose record still says
+     * 'working': when it is THIS user's run of a client-driven file and no browser tab here
+     * keeps its chain (a reload, a discarded tab, or a browser without localStorage lost
+     * it), nothing will ever send its next pass, so run:: says CHAIN_LOST_TEXT. Never for a
+     * worker-driven file (the worker writes its endings), another user's run (their chain is
+     * in their browser), or a run whose next pass is being looked for.
+     */
+    private _flipIfChainLost;
+    /** A file run the queue says is live, or that this page has a pass queued for. */
+    private _fileRunLive;
+    /** Ask the host to read the records of open runs that are not seen live. */
+    private _recCheckFileRuns;
+    /** A COMPLETE look at the queue (both listings shorter than their limit) found no pass
+     *  for these runs: they are over. The host reads their records one last time. */
+    private _closeIdleFileRuns;
+    /**
+     * Rule 3 of 4b: on every return each live stream reader is stopped (and its in-flight
+     * read aborted) before the look decides anything; a fresh one starts after the look if
+     * the turn still streams. A reader whose poll cannot be stopped (an older skapi-js) is
+     * left alone, and none is added beside it.
+     */
+    private _recStopLiveReaders;
+    /** Start the one reader of a running streamed turn on screen that has none. */
+    private _recStartReaders;
+    private _recAttachReader;
+    /** One look. See the section note. Never throws; never changes the screen on a failure. */
+    private _reconcileLook;
+    private _reconcileChatLook;
+    /**
+     * The look of a host whose skapi-js has no batch reads: today's polls stay, and the
+     * look re-attaches what a failed poll let go of (onPollFailure 'kept', a bg entry whose
+     * read failed): one by-id read each through csrHistoryItemLookup, a few per look.
+     */
+    private _reconcileLookLegacy;
+    /**
+     * The discovery listing: rows of a chat's queue newer than what the page knows, ids and
+     * status only. On a return (the chat on screen), and while a send waits for its row
+     * (its chat). A row carrying a waiting send's cref IS that send: its bubbles get the id
+     * and it is followed like any acked turn. A waiting send no complete listing has shown
+     * twice says "Not sent. Retry?". A live row nothing here knows makes the look read the
+     * first page.
+     */
+    private _recDiscover;
+    private _recApplyDiscovery;
+    /** A waiting send's row was found by its cref: the send was received after all. */
+    private _recMatchPending;
+    /** Two complete listings never showed the send: it did not reach the server. Shown as
+     *  "Not sent. Retry?" and never sent again unless the user asks (retryNotSent). */
+    private _recNotSent;
+    /** The first history page, merged (loadHistory's own merge), on a return or when a live
+     *  row nothing here knows was seen. Not awaited: the look's own reads decide its outcome,
+     *  and the merge applies itself. Owed (run by a later look) while a load is in flight or
+     *  polling is paused. */
+    private _recFirstPage;
+    /** The indexing queue check (adoption, page progress, file runs), at its own cadence
+     *  inside the one chain. Needs the chat view: what it adopts are rows of that chat. */
+    private _recIndexingCheck;
+    /**
+     * Read the queue counters and, when needed, the status of the open items.
+     *
+     * WHICH ITEMS. A row read costs as much as the conversation it carries, so a look reads
+     * every open item only on a return and at the stale watch (once a minute). Otherwise it
+     * reads only the items whose status can have changed: the ones never confirmed or seen
+     * terminal, the ones a status frame named, and, when a counter moved or something
+     * nudged the look (a settle asking for the next turn, a send), the running items plus
+     * the head of each queue's line (a queue runs its requests in order, so only the first
+     * few waiting ones can have started). A bulk upload's hundreds of waiting passes are
+     * then read once a minute, not on every finish.
+     */
+    private _recReadStatuses;
+    private _recReadGroup;
+    private _recApplyStatuses;
+    /** A pass the server says runs now: its waiting bubble becomes the running one, by id
+     *  (replaces promoteNextBgQueuedToRunning's guess). True when a bubble changed. */
+    private _recPromoteBg;
+    /** One item the batch read says is over: let a live reader settle it if it is still
+     *  being fed (one look's grace), else read it once and apply it. */
+    private _recSettleTerminal;
+    private _recChunkState;
+    /**
+     * The envelope read of one terminal item. A streamed turn with no stored answer is read
+     * from its cursor (`since`), as many reads as it takes within the look, and is final
+     * only when the cursor reaches `final_seq` (without one, when `more` is false); what is
+     * read so far is kept for the next look when the deadline comes first.
+     */
+    private _recReadEnvelope;
+    /**
+     * An envelope read answered body_unavailable: the answer is stored but could not be
+     * loaded now (an S3 read that failed on the server). Read again at every look for the
+     * first BODY_UNAVAILABLE_BACKOFF_AFTER tries, then only at the stale watch or a return
+     * (_recSettleTerminal). After BODY_UNAVAILABLE_GIVE_UP the turn stops saying
+     * "Thinking..." and shows ANSWER_UNLOADABLE_TEXT; a later read that loads the answer
+     * replaces that text (_recRetryUnloadable). An indexing pass ends with that error.
+     */
+    private _recBodyUnavailable;
+    /**
+     * Chat turns shown as ANSWER_UNLOADABLE_TEXT: one envelope read each at a return or
+     * the stale watch, at most UNLOADABLE_RETRIES times. An answer that loads replaces the
+     * text (a correction); a row that is gone or failed leaves the text as it is.
+     */
+    private _recRetryUnloadable;
+    /** A streamed turn read whole (or given up on): shown at once, finalized only when
+     *  whole and keepable, with if_absent so a complete answer another tab stored wins. */
+    private _recApplyStreamed;
+    /** Apply one terminal value (a provider body, a failed or cancelled envelope). */
+    private _recApplyValue;
+    /** An item the server no longer has ("missing" on a strongly consistent read). */
+    private _recApplyMissing;
+    /** After a terminal apply: an item whose bubble is nowhere (no chat view, no cache of
+     *  its chat) is closed all the same; the next history load shows the server's state. */
+    private _recAfterApply;
+    /**
+     * Store a streamed answer as the version history keeps (csr-finalize) with if_absent,
+     * in the tab that holds the settle lock. When another tab stored one first ("exists"),
+     * the stored one is read back and shown instead.
+     */
+    private _finalizeAnswer;
+    /** Another tab stored this turn's answer first: show the stored one. */
+    private _readStoredAnswer;
     /** Record how long a background indexing pass took, on the bubble that just
      *  settled, so the duration shows immediately instead of waiting for whatever
      *  next refetches history.
@@ -5536,18 +6308,10 @@ declare class ChatSession {
      *  Indexing passes only: an ordinary turn has no duration to show, and
      *  `_tsStart`'s presence is what both views read to decide. */
     private _stampPassDuration;
-    handleHistoryItemResolution(itemId: string, response: any, platform: string, executedAt?: number): void;
+    handleHistoryItemResolution(itemId: string, response: any, platform: string, executedAt?: number, ctx?: TerminalContext): void;
     /** The file an already-rendered background pass is about, off its request
      *  bubble. Null for an ordinary turn, which is most of them. */
     private _indexRefOfItem;
-    /**
-     * Settle a turn the server reports as cancelled: the request bubble goes to its
-     * cancelled form and the "Thinking..." placeholder goes away. The same shape
-     * cancelQueuedMessage produces locally, so a cancel this client made and one it
-     * merely found out about render identically — and an indexing pass keeps the
-     * markers that hold it in its file's collapsed row.
-     */
-    private _settleCancelledItem;
     /**
      * A poll that came back saying the request was CANCELLED, rather than with an
      * answer.
@@ -5563,7 +6327,13 @@ declare class ChatSession {
      * another device, or the row being cancelled server-side by the file's own stop.
      */
     private _isCancelledPollResult;
-    applyHistoryItemResolution(itemId: string, response: any, platform: string): void;
+    /**
+     * A history-attached poll (the engine's, agent.vue's, the files page's) settled.
+     * Routed through the one funnel, by id: see applyTerminal. `ctx` is the identity the
+     * caller pinned when it attached the poll; the open item's pinned identity fills
+     * whatever it leaves out.
+     */
+    applyHistoryItemResolution(itemId: string, response: any, platform: string, ctx?: TerminalContext): void;
     /** How a bg task maps onto a collapsed row: the row's own key (storage path
      *  when known, else the filename), scoped to the chat it belongs to. A storage
      *  path is project-relative ("report.xlsx"), and ONE ChatSession serves every
@@ -5644,35 +6414,23 @@ declare class ChatSession {
      *  work, so a tab return no longer re-asks for ten minutes after every run. Memory only:
      *  a reload starts without it and asks once, as before. */
     private _idleVerdictAt;
-    private _adoptTickTimer;
     /** Newest wall-clock `_ts` of any indexing pass on screen, or 0. */
     private _newestIndexPassTs;
     /** Live indexing work THIS page is tracking for the project: a queued or adopted pass,
      *  an attached bg poll, or a live key a look recorded. No recency guess. */
     private _hasLocalLiveIndexWork;
-    /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
-     *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
-     *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
-    private _catchUpAt;
-    private _catchUpTimer;
-    private _returnWatchTimer;
-    private _returnWatchAt;
-    private _returnListeners;
     private _statusUnsub;
-    private _statusNudgeTimer;
-    private _statusNudgeAt;
     private _statusSeenConnect;
     /**
-     * Re-read the chat from the server now (see the rule above). Safe to call from any
-     * number of triggers at once: calls within CATCH_UP_MIN_GAP_MS of the last one run
-     * once, at the end of the gap. Nothing happens while no chat view is mounted (the
-     * mount loads the chat anyway) or while background polling is paused (the tab is
-     * hidden: showing it calls this again).
+     * Re-read the chat from the server now (see the rule above). A thin wrapper over the
+     * reconciler's return look: safe to call from any number of triggers at once, runs
+     * with no chat view too (the first page is read only when one is mounted, and owed
+     * while polling is paused), and resolves when that look ends.
      */
     catchUpHistory(): Promise<void>;
     /**
      * Watch for the moments the user comes back without the tab being hidden first: the
-     * computer waking from sleep (the timer finds a gap far longer than its interval),
+     * computer waking from sleep (the reconciler's timer finds a gap far longer than asked),
      * the network coming back, a page restored from the back-forward cache. Also starts
      * the status push listener. Runs while a chat view is mounted and stops itself when
      * none is.
@@ -5689,8 +6447,8 @@ declare class ChatSession {
      * was already woken by skapi-js itself. Chat turns are left to their own polls.
      */
     private _onRequestStatus;
-    /** Run the queue check (adopt, settle by listing, page progress) now, at most once per
-     *  STATUS_NUDGE_MIN_GAP_MS, then let the heartbeat carry on. */
+    /** Run the queue check (adopt, settle by listing, page progress) now, through the
+     *  reconciler's one chain. */
     private _nudgeQueueCheck;
     private _ensureAdoptTick;
     /** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
@@ -5720,20 +6478,6 @@ declare class ChatSession {
      *  the running one, with a "Thinking..." placeholder under it. False when that pass has
      *  no waiting bubble (already running, settled, or not on screen). */
     private _promoteBgItemToRunning;
-    /** Turns whose findings were already looked at (a turn can settle by more than one path). */
-    private _findingsDone;
-    /**
-     * Save where a hard search found its answer (findings.ts), through the host's
-     * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
-     * throws, never waited on.
-     *
-     * OFF since 1.20.1 (owner, 2026-11-24): the MCP's searchText now learns which page answered
-     * a question by itself (learned links, read first by every search), so the chat no longer
-     * reads "search_findings" first (that read cost 7 to 8 s at the start of every turn in
-     * production) and nothing is saved here. SAVE_SEARCH_FINDINGS turns it back on.
-     */
-    static SAVE_SEARCH_FINDINGS: boolean;
-    private _saveFindings;
     /**
      * Chats-only history (owner, 2026-11-21): on when the host can list a file's passes
      * (listIndexPasses) and read one by id (csrHistoryItemLookup). The history fetch then
@@ -5844,6 +6588,15 @@ declare class ChatSession {
      *  repeats and races harmless. */
     _flipRunRecord(entry: BgTaskEntry, status: IndexRunStatus, error?: string): void;
     maybeResumeIndexing(entry: BgTaskEntry, response: any, platform: string): void;
+    /**
+     * Send the next pass of a client-driven file (maybeResumeIndexing) and follow it. A POST
+     * that failed on the way may still have been queued, so with a cref it becomes a pending
+     * send the discovery listing looks for on the bg queue: found, it is followed like any
+     * pass; not found by two complete listings, it is sent once more with a new cref. A
+     * refusal, a second miss, or no way to look for it (no cref, no batch reads) ends the
+     * chain: run:: says NEXT_PASS_NOT_SENT_TEXT.
+     */
+    private _sendNextIndexingPass;
     loadHistory(fetchMore?: boolean, token?: number): Promise<void>;
     uploadSingleAttachment(att: any, stageId?: string): Promise<Array<{
         name: string;
@@ -5859,4 +6612,4 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, FINDINGS_TABLE, FINDING_ID_PREFIX, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, type LiveStreamUpdate, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SearchFinding, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, keyWords as findingKeyWords, findingsForTurn, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isServerExtractable, isServiceDbAttachmentHref, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexQueueIdentity, type IndexQueueSnapshot, type IndexQueueWatchHandle, type IndexQueueWatchOptions, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, type LiveStreamUpdate, type LookOutcome, type LookRequest, LookScheduler, type LookTrigger, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, type OpenItem, type OpenItemInit, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, type TerminalContext, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, formatChatTimestamp, formatDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

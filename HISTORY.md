@@ -5,8 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.20.0**. The latest version on npm
-  when this was written is 1.19.2. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.21.0**. The latest version on npm
+  when this was written is 1.20.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -25,13 +25,125 @@ A few notes on how to read this:
 
 ---
 
-## 1.20.1 (2026-11-24, not yet published)
+## 1.21.0 (2026-11-24, not yet published)
+
+The chat follows every unfinished request from the server (the reconciler), so it is right after the user comes back from sleep, other tabs or a network loss. Needs skapi-js 2.7.0 and the backend reads in infra (older ones fall back to polls).
+
+Results are applied by request id through one engine funnel, and a failed read no longer changes the screen (step 3). Every waiting item is then followed by one reconciler per page that reads the server about all of them at once (step 4). Plan: `BUNNYQUERY_CHAT_RECONCILER_PLAN.md`, sections 3 and 4b.
+
+### Engine
+
+- **New:** `ChatSession.applyTerminal(itemId, result, ctx)`, the only writer of a settled result. It finds the turn by `_serverItemId` on screen, or in that chat's history cache when another chat is showing; a settled id is tombstoned for the life of the page (a second result is refused, and a stale history page that shows it waiting again keeps the settled copy); state only moves forward; a resolved status envelope of a streamed turn is never an answer (the chunks are read back instead). The immediate send, the queued send, every history poll (engine and agent.vue), the background drain, the queue check, the live stream settle and stream recovery all go through it.
+- **New:** `ChatSession.onPollFailure(itemId, err, ctx)`: NOT_EXISTS settles the item as cancelled; a read that failed on the way (network, timeout, 429, 5xx, sign-in) leaves the item exactly as it is, with no error bubble and no run:: flip; any other refusal is shown on the item, by id. `isTransportFailure` and `isNotExistsError` are exported.
+- **New:** `trackOpenItem`, `getOpenItem`, `isItemSettled`: every followed item carries the identity (chat key, project, owner, platform, queue) pinned at the ack, the history page or the drain's adoption, and settles, by-id reads and a client-driven file's next pass use it. `BgTaskEntry` gains `identity`, `owner`, `ownerKey`.
+- **Changed:** `state.sending` and `pendingAgentRequests` clear at the ack of the POST, not when the answer lands. Only a 401 on the POST itself refreshes and sends again; a 401 or any other error on a poll never resends the turn. `resumePendingRequest` only shows the sending state until the ack.
+- **Changed:** a queued turn is shown running when the server says so, by id (a by-id read after each settle and after a queued send's ack, a status frame, or the first streamed bytes of its answer), not by promoting the first waiting bubble. `promoteNextQueuedToRunning` keeps its name and does that.
+- **Fixed:** when the one resend after an expired-credentials answer cannot go out (the refresh or the POST fails), the turn shows its own error instead of staying on "Thinking..."; a throw while building a send still releases the sending state.
+- **Changed:** a file's indexing steps whose read failed on the way are left out and asked again by the next "Load more", instead of being drawn as failed passes.
+- **Removed:** the positional writers `typewriteLatestReply`, `resolveQueuedUserBubble`, `insertAtTarget`, `_applyReplyToCache`, `_removeStrayPendingAssistants`; the queued ack's "first sending bubble" stamp (the ack now stamps by local id, in the cache too). `onQueuedSendResponse` / `onQueuedSendError` settle by server id only.
+- **Changed:** sends made while another chat is on screen carry local ids and are stamped at the ack; every error bubble a settle writes carries the item id.
+- **Fixed:** an error bubble is never adopted as a streamed turn's answer (`adoptLocalAnswerIntoPage`), and a first-page load keeps the live text of a turn still streaming (`adoptLiveTextIntoRunningRow`).
+- **Changed:** an answer is typed out only when the reader watched the turn (live text was painted, or the tab stayed visible since it was sent or followed); an answer that landed while they were away is written at once.
+
+### Engine: the reconciler (step 4)
+
+- **New:** the open set. Every chat turn and indexing pass the page shows as unfinished is one entry by server id (`trackOpenItem`: chat key, project, owner, platform, queue, kind, cref, state, last confirmed), whoever added it: the ack, a history page, the drain, and every `bgTaskQueue` entry a host pushed (the files page, with no chat view). Adding an id that is there changes nothing.
+- **New:** one timer chain per page (`LookScheduler`, new `reconciler.ts`). Each look reads the queue counters of the queues with open items (`forwardRequestQueueCounters`), and only when a counter moved, on a trigger, once a minute, or while a queue holds only waiting turns, one batch status read per project (`forwardRequestStatus`, 100 ids a call). Items that turned terminal are read once (`forwardRequestRead`) and applied through the funnel; a streamed turn is read from its cursor (`since`) until it reaches `final_seq` (or `more` is false), then finalized with `ifAbsent`, and when another tab stored first (`reason: "exists"`) the stored answer is shown. `missing` reads "This request is no longer available." ("no longer reachable from this network" for an anonymous visitor). Each look has a 15 s deadline and a generation; a trigger during a look runs exactly one more look; triggers fired by one event are one look.
+- **New:** cadence: every 3 s while the tab is visible and anything is open (a minute while status frames arrive), once a minute while hidden only for a client-driven indexing chain, at once on tab shown, wake (a timer that fires far too late), online, socket reconnect, bfcache restore, a chat view opened, and a frame naming an open id. Nothing open: no timer at all.
+- **New:** a return (any of those) stops each live stream reader first (and aborts its read), then runs the discovery listing (`fields: "ids"`, `after` a watermark, exact queue) and the first-page merge, and starts one fresh reader for a turn still streaming on screen: at most one reader per request.
+- **New:** errors never change the screen. A read that failed on the way sets `state.reconnecting` and the next look comes after 1, 2, 4 ... 30 s; a lost sign-in sets `state.signInNeeded` and stops the 3 s looks until `noteSignedIn()` (both clients call it on sign-in).
+- **New:** `cref` on every send (`newClientRef`, stored on the send's bubble as `_cref`). A send whose POST got no answer stays waiting while the discovery listing looks for its row by cref; found, it is followed as if acked and never resent; not found by two complete listings, the reply reads "Not sent. Retry?" (`_notSent`) and `retryNotSent(msg)` sends it again on the user's click only.
+- **New:** queued chat turns and waiting indexing passes are shown running from the batch statuses, by id. `promoteNextQueuedToRunning` asks for a look; `promoteNextBgQueuedToRunning`'s positional guess and the 0.6/2.5/6 s lookups run only on an skapi-js without the batch reads.
+- **New:** side effects that send or write (the next pass of a client-driven file, run:: and done:: records, finalize, the records refresh) run in one tab: the one holding `navigator.locks` `bq-settle:<project>:<queue>`, once per pass across the tabs (a registry in localStorage). The next pass of a file is sent once per settled pass.
+- **New:** file runs. `syncFileRuns(projectId, workingPaths)` follows each file whose run:: record says working until the record says it ended or a complete queue look finds no pass of it; meanwhile `host.recheckFileRuns(projectId, paths)` is asked every 30 s while the file is not seen live (replaces both clients' 5-round stub recheck).
+- **New:** `ChatEngineConfig.forwardRequestStatus`, `forwardRequestRead`, `forwardRequestQueueCounters` (skapi-js 2.7.0) and `refreshRecords(projectId)` (a data hook, called with no view too). Without the two reads the engine keeps today's polls, and its looks re-attach a poll that failed on the way through `csrHistoryItemLookup`.
+- **Changed:** with the batch reads, a history page and the drain attach no poll per request: the reconciler follows them. `catchUpHistory`, the return watch, the adoption tick and the frame nudge are thin wrappers over the reconciler's chain (same names). `resumePolling` runs the return look with no chat view too. `needsHistoryRefetch` is false for an id the reconciler follows.
+- **New:** `reconcileNow(trigger)`, `noteViewOpened()`, `noteBgQueueChanged()`, `noteSignedIn()`, `reconcilerStats()`, `stopReconciler()`, `canRetryNotSent(msg)`; `NOT_SENT_TEXT`, `REQUEST_GONE_TEXT`, `REQUEST_UNREACHABLE_TEXT`, `reconcilerReadsEnabled`, `crefSupported` exported.
+
+- **Fixed (step 4 review):** a send with attachments whose POST got no answer is looked for on its own queue (the chat's background queue), so a return no longer lists only the main queue for it and calls it "Not sent" while it was queued (a Retry would have sent it twice).
+- **Fixed (step 4 review):** after a sign-out (or with another account) the items of the user who sent them are not read, not settled and never marked "no longer available"; they wait, with no looks, until that user signs in again. Each open item and waiting send pins the user id it was sent under.
+- **Changed (step 4 review):** between full reads (a return, the once-a-minute stale watch) a look reads only what can have changed: items never confirmed or seen terminal, items a status frame named, and on a counter move or a nudge the running items plus the first 5 waiting ones of each queue. A bulk upload's waiting passes are no longer read on every finish or frame.
+- **Fixed (step 4 review):** a first page that failed on the way is owed and read again by the next look; a finished row newer than anything the chat shows (answered from another tab or device) makes the next look read the first page; `resumePolling` right after a return look rides on that look instead of running a second one.
+- **Fixed (step 4 review):** the settle lock is held for at most 20 s per side effect, and a side effect whose lock stays busy for good runs anyway (the registry still runs it once) instead of being dropped.
+- **Fixed (step 4 review):** with an older skapi-js the look no longer reads waiting background passes by id on every look; a pass without a poll is re-attached by the drain when a poll slot is free.
+- **Fixed (step 4 review):** passes the drain adds join the open set with their queue (so their queue counters are read); a matched lost-ack send drops its `_unconfirmed` mark; a throwing `work()` or `pushLive()` hook no longer ends the timer chain.
+- **New:** `ChatSession.followsBackgroundQueue()`: true when the reconciler follows `bgTaskQueue` itself (web-bunnyquery's fallback poller in main.vue stands down then).
+
+### Widget (step 4)
+
+- Hands the engine `forwardRequestStatus`, `forwardRequestRead` and `forwardRequestQueueCounters` when the embedder's skapi-js has them.
+- Coming back to the tab looks at once; the MCP grant refresh no longer holds the look back. `isViewMounted` is false once the message list left the page.
+- A "Retry" button under "Not sent. Retry?". The run:: stub recheck is the engine's (no 5-round limit). The chat view opening and signing in tell the engine (`noteViewOpened`, `noteSignedIn`).
+
+### Engine (step 5)
+
+- **New:** `ChatSession.watchIndexQueue({ identity, wantsConfirm?, runsOpen?, recheckRuns? })` (returns `{ stop, refresh(maxAgeMs), ensure }`) and `indexQueueSnapshot(projectId)`: a page that draws indexing state from the background queue, with or without a chat view (the dashboard's files page), has the queue read on the reconciler's one timer chain. At once on start, on every return and on a status frame about the indexing queue; every 8 s while it holds work or the read came back cut off (a minute while status frames arrive); every 2.5 s while the page waits for a second, independent look; never while the tab is hidden. The answer is `state.indexQueues[projectId]` (`{ keys, checked, at }`, type `IndexQueueSnapshot`); a failed read keeps the last one. `recheckRuns` is called every 30 s while `runsOpen()` says so. Status frames are held only while a watched queue has work. Types `IndexQueueIdentity`, `IndexQueueWatchOptions`, `IndexQueueWatchHandle` exported.
+- **Changed:** `awaitIndexingDrained` reads the queue through such a watch on the same chain instead of a timer of its own. Same rules: fresh reads, two idle reads with distinct times and the confirm gap between them, at least 8 s in all, a read that fails or never answers (45 s) counts as busy, a nudge pulls the next read forward, 15 minutes at most. While the tab is hidden it is read once a minute.
+- **New:** `ChatHost.onProviderAnswer(projectId, platform, result)` (optional): called once per request after its answer or provider error is written, whichever path read it (a poll, a look, a stream). The dashboard judges the project's API key from it.
+- **Changed:** with an skapi-js without the batch reads and no chat view (nothing drains), a look reads by id the oldest waiting background passes too, as many as the drain would poll at once (6), so passes the files page queued are still followed and settled with the chat closed. The `executed` time a running read gives is kept on the item and handed to the settle, so such a pass keeps its duration (main.vue's poller carried it from the poll's running ticks).
+- **New:** `fetchLiveIndexingKeys(params, { maxAgeMs })`: how old a shared answer may be (default 4 s; 0 always asks).
+- **New:** `styles/chat.css` `.bq-chat-status`: the look of the "Reconnecting..." / "Sign in to see the latest answers." line both clients show.
+
+### web-bunnyquery dashboard (step 5, not part of this package)
+
+- agent.vue loads history only through the engine's `loadHistory` (its own mapper, merge, poll attach with a background poll budget, onError writer and the queue-detect polling loop are gone); main.vue's fallback poller is gone; the files page reads `watchIndexQueue` instead of its own probe timer, confirmation timer and status frame listener. The chat view shows the two connection notes.
+
+### Widget (step 5)
+
+- **New:** the chat shows "Reconnecting..." while the engine's looks fail on the way (`state.reconnecting`) and "Sign in to see the latest answers." while they are refused for want of a sign-in (`state.signInNeeded`), the same words as the dashboard. Class `bq-chat-status` (shared look in `styles/chat.css`); in the widget it sits between the list and the composer with no height of its own, so it never moves the list. Hidden while the settings panel is open.
+- **Changed:** coming back to the tab resumes background polling at once, as agent.vue does, instead of after the MCP grant refresh (the step 4 version waited for it, up to 10 s, and re-checked visibility after). The grant is refreshed on return only when it is missing, aged out or another user's; a fresh grant no longer runs the full MCP session exchange on every return (that stays the answer to a 401, through `refreshSession`).
+- **New:** a sign-in the embedding page makes on its shared skapi instance also resumes the looks (`noteSignedIn`), through skapi-js's `onLogin` listener list (agent.vue: `onLoginHanger`). Only on an SDK whose `onLogin` is a list; an older one's single function is never replaced.
+- **Changed:** the chat view tells the engine it opened (`noteViewOpened`) after the cached conversation is put back, so the look works against the restored list.
+
+### Engine (bug sweep, step 6)
+
+- **Changed:** opening the chat view is a return (owner, 2026-11-24, replaces the 2026-11-20 "history loaded once" rule): the first page is read and merged by id every time the view opens, in both clients and in the engine's 'view' look (which reads it only when the host did not start one a moment before). A first page dropped because the view was redrawn while it was on the way is owed to the next look.
+- **Fixed:** history attaches the waiting rows of a page oldest first, so an older skapi-js (before 2.7.0) puts the one row that can settle next at the head of its poll line.
+- **Changed:** the background queue look (`probeBgQueue`, `fetchLiveIndexingKeys`, worker-pass adoption) asks for compact stubs of the exact queue (`compact`, `queue_exact`) and reads the label from `request_text`, so it no longer carries each pass's request echo. New export `listedRequestText(item)`.
+- **Fixed:** `fetchLiveIndexingKeys` reports `checked: false` when the server says more rows exist (`endOfList: false`), not only when the page is full.
+- **Fixed:** a failed pass of a file the worker drives is read once more (after the next complete queue look, or 30 s) before it is shown as failed, and a live settle marks a failure the worker already sent again (`isRetried`), so the file's row does not go red over it (plan 3.8).
+- **Fixed:** a "running" read no longer promotes a turn or a pass whose cancel is still on the way, or one this page cancelled.
+- **Fixed:** a client-driven indexing chain survives a reload or a discarded tab: each chain is kept in localStorage (`bq-chain:<project>|<path>`) until it ends, and a new page follows its current pass and sends the next one (once across tabs). A run of this user's own whose chain is lost and whose queue went idle says "Indexing stopped before the file finished (the page was closed). Index it again." `syncFileRuns(projectId, paths, info?)` takes each record's `owner` and `filename` for this.
+- **Fixed:** a next indexing pass whose POST failed on the way carries a cref and is looked for on the queue: found, it is followed; not found by two complete looks, it is sent once more; if that fails too (or the server refused it) run:: says "Could not send the next indexing pass."
+- **Fixed:** the settle lock marks a side effect done only when it worked: it is marked in flight (60 s) while it runs, and a throw or a rejected promise is tried again with backoff, up to 5 times. `mintIndexDoneMarker` and `upsertIndexRunRecord` may return a promise that rejects on a failed write; `upsertIndexRunRecordSafe(..., { report: true })` passes it on. A finalize that failed on the way is tried again too. The in-memory registry is pruned with the stored one.
+- **Fixed:** when a look (not the dispatch's poll) reads a turn's answer, an expired sign-in sends the turn once more instead of showing the error (once in all, when the dispatch's poll and a look both read that answer), and the turn's tool listing is settled.
+- **Fixed:** an answer that is stored but cannot be loaded (`body_unavailable`) is read at every look 3 times, then once a minute; after 5 reads the turn says "The answer is stored but could not be loaded right now. Reload to try again.", and a later read that loads it replaces that.
+- **Fixed:** "Retry" on a "Not sent" turn while another send of that chat is in flight sends it as a queued turn, so it no longer takes over the running send's state.
+- **Fixed:** an item sent by a user is never read after a full sign-out leaves no identity at all.
+- **Fixed:** the files page's green confirmation reads the queue fresh (about 3 s, was about 6 s).
+- **Fixed:** `awaitIndexingDrained`'s 15 minute cap has its own timer, so it holds while the tab is hidden or a sign-in is needed.
+- **Fixed:** a pass settled by an older skapi-js's look takes its start time from the terminal read when no running read saw it.
+- **Fixed:** a pass the engine sends itself (an attached file, a reindex of a stored file) joins the followed items the moment its POST is answered, with or without a chat view, like the passes a host pushes (`noteBgQueueChanged`). Before, it waited for the next look, and with nothing else open no look came.
+
+### Widget (bug sweep, step 6)
+
+- **Changed:** drawing the chat view always reads the first page after the cached conversation is put back (was: only when a waiting bubble had nothing to settle it).
+- **Fixed:** a by-id read for a signed-out visitor goes without a token (`csrHistoryItemLookup` sent `auth: true` and failed with no session).
+- **Changed:** the run:: and done:: writers return a promise that rejects when the write failed, so the engine writes it again; the run records sweep passes each record's owner and file name to `syncFileRuns`.
+
+### web-bunnyquery dashboard (bug sweep, not part of this package)
+
+- agent.vue reads the first page every time the chat view opens; the files page and agent.vue tell the engine at once when they push a pass (`noteBgQueueChanged`); `agentViewMounted` is gone (nothing read it); the run:: and done:: hooks hand back the write's promise (`throwOnFailure`).
+
+## 1.20.2 (2026-11-24, not yet published)
+
+The saved-findings code that 1.20.1 switched off is removed.
+
+### Engine
+
+- **Removed:** `findings.ts` and its exports (`FINDINGS_TABLE`, `FINDING_ID_PREFIX`, `findingsForTurn`, `findingKeyWords`, `SearchFinding`), the `saveSearchFinding` hook in `configureChatEngine`, and `ChatSession.SAVE_SEARCH_FINDINGS`. A host that still passes `saveSearchFinding` is ignored. Records already in table "search_findings" stay where they are and are no longer read or written.
+
+### Widget
+
+- The `saveSearchFinding` hook is removed (agent.vue's too).
+
+## 1.20.1 (2026-11-24)
 
 The chat no longer starts every turn by reading saved search findings.
 
 ### Engine
 
-- **SAVED FINDINGS FIRST removed from the chat prompt, and findings are no longer saved.** The MCP's searchText now learns which page answered a question by itself (learned links, which every search reads first), so the agent's own getRecords on table "search_findings" was a second copy of the same thing. In production it was the slowest call of every turn (7 to 8 s for a 3.6 KB answer). `ChatSession.SAVE_SEARCH_FINDINGS` (false) turns the saving back on; the `saveSearchFinding` hook and `findings.ts` exports are unchanged. Records already in "search_findings" stay where they are and are no longer read.
+- **SAVED FINDINGS FIRST removed from the chat prompt, and findings are no longer saved.** The MCP's searchText now learns which page answered a question by itself (learned links, which every search reads first), so the agent's own getRecords on table "search_findings" was a second copy of the same thing. In production it was the slowest call of every turn (7 to 8 s for a 3.6 KB answer). `ChatSession.SAVE_SEARCH_FINDINGS` (false) switched the saving off; the code itself was removed in 1.20.2.
 
 ## Unreleased (book search, 2026-11-23)
 

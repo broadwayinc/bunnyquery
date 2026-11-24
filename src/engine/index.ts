@@ -47,19 +47,33 @@ export {
 	// and whether status messages are arriving right now.
 	statusPushEnabled,
 	statusPushLive,
+	// The reconciler's reads (skapi-js 2.7.0): whether the host handed over the batch
+	// status and envelope reads (then items are followed by looks, not one poll each),
+	// and whether a send may carry a client reference.
+	reconcilerReadsEnabled,
+	crefSupported,
 } from './config';
+
+// The reconciler's clock (one timer chain per page) and the cross-tab settle lock. The
+// session drives them; exported for diagnostics and for a host's own side effects.
+export {
+	LookScheduler,
+	LOOK_DEADLINE_MS,
+	LOOK_FAST_MS,
+	LOOK_SLOW_MS,
+	LOOK_STALE_MS,
+	isReturnTrigger,
+	runSettleSideEffect,
+	sideEffectDone,
+	newClientRef,
+	type LookTrigger,
+	type LookRequest,
+	type LookOutcome,
+} from './reconciler';
 
 // "Has this user already uploaded this file here?", answered from the `src::` file
 // records and the stored copy's indexing state. The widget wires it as the host's
 // findDuplicateUpload hook, and www's duplicates.ts wraps it; it never throws.
-// Saved search findings: where a hard search found its answer (findings.ts).
-export {
-	FINDINGS_TABLE,
-	FINDING_ID_PREFIX,
-	findingsForTurn,
-	keyWords as findingKeyWords,
-	type SearchFinding,
-} from './findings';
 export {
 	findDuplicateUpload,
 	isDuplicateCandidateId,
@@ -117,6 +131,8 @@ export {
 	// was answered twice before, one of the two one level too shallow, which is how
 	// a wrong API key on a streamed turn reported "No text response received".
 	isCsrStatusEnvelope, csrEnvelopeError,
+	// A read that failed on the way vs the server's own "that request is gone".
+	isTransportFailure, isNotExistsError,
 } from './errors';
 export * from './budget';
 // Retrieval memory: the per-turn note of what a chat turn read, queried or
@@ -142,6 +158,7 @@ export {
 	filterListByClearHorizon,
 	normalizeTextContent,
 	extractLastUserTextFromRequest,
+	listedRequestText,
 	mapHistoryListToMessages,
 	// The indexing-prompt reader. Exported because the prompt is the only record
 	// of what a pass is about, so anything that meets a pass without a bubble
@@ -159,6 +176,9 @@ export {
 	// unknown answer is not an empty one. Shared for the same reason the rescue
 	// rule is: a client mapper that forks it erases answers off the screen.
 	adoptLocalAnswerIntoPage,
+	// The same rule for a turn the page still shows as RUNNING: the live text the
+	// reader is watching is kept instead of being blanked until the next chunk.
+	adoptLiveTextIntoRunningRow,
 	// One bounded look at the bg-indexing queue: which files still have a live
 	// pass. The dbfile browser's "indexed" badge uses this so a file only goes
 	// green once the run is confirmed over, not when its src:: record appears.
@@ -224,8 +244,17 @@ export {
 	ChatSession, liveSafePrefix, typewriterResumeIndex, mayKeepStreamedAnswer,
 	streamRecoveryPhase, streamRecoveryLabels,
 	type StreamDispatchContext,
+	// The one apply funnel's types: the identity an open item is pinned to, and what
+	// a caller hands applyTerminal / onPollFailure.
+	type OpenItem, type OpenItemInit, type TerminalContext,
+	// What the reconciler writes: a send whose row never appeared ("Not sent. Retry?",
+	// ChatSession.retryNotSent) and a turn whose row is gone.
+	NOT_SENT_TEXT, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT,
+	// A page that draws indexing state from the queue, with or without a chat view
+	// (ChatSession.watchIndexQueue; the answer is in state.indexQueues).
+	type IndexQueueIdentity, type IndexQueueWatchOptions, type IndexQueueWatchHandle,
 } from './session';
-export type { ChatHost, ChatIdentity, ChatState, ChatMessage, IndexingFileRef, PinnedDispatchContext } from './host';
+export type { ChatHost, ChatIdentity, ChatState, ChatMessage, IndexingFileRef, PinnedDispatchContext, IndexQueueSnapshot } from './host';
 
 // Display transform: collapse a file's many background-indexing turns into one
 // row, wherever they sit in the conversation. Shared so both chatboxes match.

@@ -545,11 +545,15 @@ helpers. See the `.d.ts` shipped with `bunnyquery/engine`.
 | `onRequestStatus`             | `function?` | `skapi.onRequestStatus`, bound to the host's skapi instance (skapi-js 2.5.0+). Required for `statusPush`. |
 | `isRequestStatusLive`         | `function?` | `skapi.isRequestStatusLive`, bound to the host's skapi instance (skapi-js 2.5.0+). |
 | `streamRecovery`              | `boolean?`  | Set `false` to force the read-back of already-streamed turns **off**, even though the chunk reader is injected. There is no need to set it to turn recovery on: injecting `forwardRequestStream` is what arms it. |
-| `mintIndexDoneMarker`         | `function?` | Write the durable "indexing finished" marker (`done::<path>`, reference `src::<path>`, table `__INDEXING__`) for the runs this client knows are complete. Best-effort, must never throw. Without it the engine falls back to inference. |
-| `upsertIndexRunRecord`        | `function?` | Create-or-update the per-file run record (`run::<path>`, reference `src::<path>`, table `__INDEXING__`), which is what lets chat rows and files-page badges paint without scanning background history. You implement the upsert (the records API has none) and the status precedence: `'working'` must never overwrite a terminal status. Without it the engine uses the legacy scan/probe path. |
+| `mintIndexDoneMarker`         | `function?` | Write the durable "indexing finished" marker (`done::<path>`, reference `src::<path>`, table `__INDEXING__`) for the runs this client knows are complete. Best-effort, must never throw. May return a promise that rejects when the write failed (not when the marker is already there): the engine then writes it again, up to 5 times. Without it the engine falls back to inference. |
+| `upsertIndexRunRecord`        | `function?` | Create-or-update the per-file run record (`run::<path>`, reference `src::<path>`, table `__INDEXING__`), which is what lets chat rows and files-page badges paint without scanning background history. You implement the upsert (the records API has none) and the status precedence: `'working'` must never overwrite a terminal status. May return a promise that rejects when the write failed: the engine then writes it again, up to 5 times. Without it the engine uses the legacy scan/probe path. |
 | `csrHistoryItemLookup`        | `function?` | Single-item `csr-poll` point lookup. Used by `ChatSession.hydrateCompactItems` to fetch a compact history stub's real body when an indexing row is expanded, and to settle every indexing pass (each file's first pass and the passes the worker runs in parallel): with it, each 10-second check of the indexing queue lists the finished passes and reads each one once by id, so a pass shows within about 10 seconds of finishing instead of waiting for the passes ahead of it to be polled one at a time. Without it stubs keep their server-extracted heads and indexing passes are polled as before. |
 | `listIndexPasses`             | `function?` | `(service, storagePath) => Promise<string[]>`: the request ids of one file's indexing passes, read from the `pass::<storagePath>#<request id>` records the indexing worker writes as each pass starts (`getUniqueId` with the prefix `pass::<storagePath>#`, every page). With it and `csrHistoryItemLookup`, the chat history fetches the conversation only: a file's row comes from its `run::` record, says "Fetching status" until the indexing queue has answered and then Indexing, Queued, Indexed, Indexing failed or Indexing cancelled, and opening the row loads its steps ten at a time with a Load more button. Without it the history pages the indexing queue as before. |
 | `readIndexProgress`           | `function?` | `(service, storagePath) => Promise<{ pages_saved, pages_total } \| null>`: reads a document's `prog::<storagePath>` record, which the MCP keeps up to date while the document's pages are saved. Asked by the 10-second check of the indexing queue for files still being indexed; a row then shows "175 of 530 pages" beside its passes. Without it a row shows passes only. |
+| `forwardRequestStatus`        | `function?` | `skapi.forwardRequestStatus`, bound to the host's skapi instance (skapi-js 2.7.0+). With it and `forwardRequestRead`, the engine's reconciler follows every waiting chat turn and indexing pass with one batch status read per look (100 ids a call) instead of one poll each, and shows a queued turn running when the server says so. Without them the engine keeps its polls. |
+| `forwardRequestRead`          | `function?` | `skapi.forwardRequestRead` (skapi-js 2.7.0+): one request as an envelope that always carries its status. Read once per item that turned terminal; a streamed turn is read from its chunk cursor until `final_seq`, then finalized with `ifAbsent`. |
+| `forwardRequestQueueCounters` | `function?` | `skapi.forwardRequestQueueCounters` (skapi-js 2.7.0+): the tiny counter rows of the queues with waiting items, read on every look; the batch status read runs only when a counter moved, on a trigger (tab shown, wake, online, socket back), or once a minute. Without it every look reads the statuses. |
+| `refreshRecords`              | `function?` | `(projectId) => void`: indexing of that project settled and none is left in the page's queue, so a records view should refresh. Called with no chat view too, in one tab only. |
 | `saveSearchFinding`           | `function?` | `(finding) => Promise`: saves where a hard chat search found its answer (3+ tool calls, a cited file page) as a record in table `search_findings`: `unique_id` `find::<path>#p<page>`, `reference` `src::<path>` (a re-index removes it), the source file's own access group, and normalized tags from the question's key words and the search terms; when the page already has one, merge the new tags into it. The chat prompt checks these first and then reads the page itself, so a finding is a pointer, never a cached answer. Without it nothing is saved. |
 
 **Removed config keys.** `clientSecretRequest`, `clientSecretRequestHistory`,
@@ -635,6 +639,41 @@ the user is waiting on keep polling deliberately, so their results still land in
 the cache. Server-side work is untouched either way, so pausing drops traffic,
 never progress.
 
+**The reconciler.** Everything the chat shows as unfinished (chat turns, indexing
+passes, by request id) is followed by one timer chain per page: every 3 seconds while
+the tab is visible and anything is waiting (once a minute while status messages
+arrive), once a minute while hidden only for an indexing chain the browser drives, and
+at once when the user comes back (tab shown, the computer awake, the network or the
+socket back, the chat reopened). A look that fails on the way changes nothing on screen
+and sets `state.reconnecting` (retried after 1, 2, 4 ... 30 seconds); a lost sign-in sets
+`state.signInNeeded` until `ChatSession.noteSignedIn()`. A send whose answer was lost is
+found by its client reference and never sent twice; one the server never received reads
+"Not sent. Retry?" and `ChatSession.retryNotSent(msg)` sends it again on the user's
+click. Side effects (the next pass of a file, run:: and done:: records, finalize) run in
+one tab (`navigator.locks`), and count as done only when they worked: a failed write is
+tried again (up to 5 times), so `mintIndexDoneMarker` and `upsertIndexRunRecord` should
+return a promise that rejects when the write failed. Opening the chat view is a return:
+the host reads the first page every time the view opens (`loadHistory`), merged by id.
+An indexing chain the browser drives is kept in localStorage until it ends, so a reload
+carries on with its next pass. Hosts tell the engine about a view opening
+(`noteViewOpened()`), passes they push to `bgTaskQueue` (`noteBgQueueChanged()`, right
+after the push) and the files whose run:: record says working
+(`syncFileRuns(projectId, paths, info)`, `info[path] = { owner, filename }` from the
+record, with the optional `ChatHost.recheckFileRuns(projectId, paths)` to re-read those
+records). A run of the signed-in user's own whose browser chain was lost is closed as an
+error once its queue is idle. With
+the batch reads the engine follows `bgTaskQueue` with or without a chat view, so a host's
+own poller of that queue stands down while `ChatSession.followsBackgroundQueue()` is true.
+Items sent under another identity (signed out, another account) are left as they are
+until that user signs in again. Both chat views show those two states in the same words,
+"Reconnecting..." and "Sign in to see the latest answers." (class `bq-chat-status`).
+A page that draws indexing state from the background queue without a chat view (a
+files page) watches it on the same chain: `ChatSession.watchIndexQueue({ identity,
+wantsConfirm, runsOpen, recheckRuns })` reads it at once, on every return, on a status
+message about it, every 8 seconds while it holds work and every 2.5 seconds while the
+page waits for a second look, and puts the answer in `state.indexQueues[projectId]`
+(`stop()` when the page goes). `awaitIndexingDrained` reads the queue the same way.
+
 ## OAuth & redirects
 
 BunnyQuery connects to your AI agent through an MCP OAuth server
@@ -647,8 +686,10 @@ needed; just make sure the page that hosts the widget is a stable, reachable URL
 Once granted, the connection is kept alive **silently**. When the stored grant
 ages out, BunnyQuery refreshes it through the OAuth `refresh_token` flow with no
 redirect, so an embedded widget never yanks the host page away mid-chat. It also
-refreshes on tab focus, because returning to a backgrounded tab after the grant
-expired would otherwise disconnect the next message. The full redirect is only a
+refreshes on tab focus when the grant has aged out, because returning to a
+backgrounded tab after the grant expired would otherwise disconnect the next
+message. Nothing on return waits for that refresh: the chat reads its answers with
+the skapi sign-in alone. The full redirect is only a
 boot-time fallback for when the silent path cannot refresh.
 
 ## Notes

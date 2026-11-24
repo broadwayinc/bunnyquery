@@ -72,7 +72,7 @@ export interface LiveStreamUpdate {
 type ForwardRequestFinalizeFn = (
     requestId: string,
     data: any,
-    options: { url: string; method: string; service?: string; owner?: string },
+    options: { url: string; method: string; service?: string; owner?: string; ifAbsent?: boolean },
 ) => Promise<any>;
 
 /** The chunk read-back call, identical under its new and its deprecated key. */
@@ -151,8 +151,10 @@ export interface ChatEngineConfig {
      * only ever inferred here); the worker writes their marker itself.
      * Must be best-effort: tolerate the marker already existing and never
      * throw. Optional so older consumers keep the pre-marker inference.
+     * May return a promise that rejects when the write failed (not for "already
+     * there"): the engine then writes it again, a few times, with backoff.
      */
-    mintIndexDoneMarker?: (info: { service: string; storagePath: string }) => void;
+    mintIndexDoneMarker?: (info: { service: string; storagePath: string }) => void | Promise<unknown>;
     /**
      * Create-or-update the per-file indexing RUN record ("run::<path>",
      * reference "src::<path>", table __INDEXING__). The record is the durable
@@ -166,7 +168,9 @@ export interface ChatEngineConfig {
      * overwrite a terminal status (done/error/cancelled) — a late create from
      * a slow enqueue must not resurrect a run another writer already closed.
      * Must be best-effort and never throw. Optional: without it the engine
-     * behaves exactly as before (legacy scan/probe path).
+     * behaves exactly as before (legacy scan/probe path). May return a promise
+     * that rejects when the write failed: the engine then writes it again, a few
+     * times, with backoff.
      */
     upsertIndexRunRecord?: (info: {
         service: string;
@@ -179,7 +183,7 @@ export interface ChatEngineConfig {
             error?: string;
             queue?: string;
         };
-    }) => void;
+    }) => void | Promise<unknown>;
     /**
      * Deliver each relayed chunk over skapi's WEBSOCKET as well, so text lands as it
      * is relayed instead of on the next poll tick. Off unless a host asks.
@@ -347,15 +351,6 @@ export interface ChatEngineConfig {
      */
     readIndexProgress?: (service: string, storagePath: string) => Promise<{ pages_saved?: number; pages_total?: number | null } | null>;
     /**
-     * Save one search finding (findings.ts): where a hard search found its answer, as a
-     * record in table "search_findings" with the given unique_id, tags and data, reference
-     * "src::<storagePath>" and the ACCESS GROUP OF THAT FILE (read it; skip the save when
-     * the file has no record). When the unique_id is taken, add the new tags to the existing
-     * record instead. Best effort: never throw into the engine. Optional: without it nothing
-     * is saved.
-     */
-    saveSearchFinding?: (finding: import('./findings').SearchFinding & { service: string; owner?: string }) => Promise<any> | void;
-    /**
      * The request ids of one file's indexing passes: the unique ids "pass::<storagePath>#<id>"
      * the worker writes as each pass starts (getUniqueId, prefix "pass::<storagePath>#", every
      * page), answered as the ids after "#" in any order. With it (and csrHistoryItemLookup) the
@@ -363,6 +358,34 @@ export interface ChatEngineConfig {
      * (ChatSession.loadRunPasses). Without it the history pages the indexing queue as before.
      */
     listIndexPasses?: (service: string, storagePath: string) => Promise<string[]>;
+    /**
+     * THE RECONCILER'S READS (reconciler plan, section 3; skapi-js 2.7.0 or newer). All
+     * three are optional, and a host hands over only what its skapi-js has: with
+     * `forwardRequestStatus` AND `forwardRequestRead` the engine follows every waiting
+     * item with one batch read per look (ChatSession's reconciler) instead of one poll
+     * per request; without them it keeps today's polls, and its looks re-attach a
+     * failed poll through the old by-id read (csrHistoryItemLookup).
+     *
+     * skapi.forwardRequestStatus(requests, { service, owner, deadline, fresh, signal }):
+     * the status of up to 100 requests per call, no bodies.
+     */
+    forwardRequestStatus?: (requests: any[], opts?: any) => Promise<{ list: any[]; [key: string]: any }>;
+    /** skapi.forwardRequestRead({ id, url, method, since, service, owner, deadline, fresh,
+     *  signal }): one request as an envelope that always carries its status, with a
+     *  streamed turn's chunks after `since`. Read once per item that just turned terminal. */
+    forwardRequestRead?: (params: any) => Promise<any>;
+    /** skapi.forwardRequestQueueCounters(queues, { service, owner, deadline, fresh,
+     *  signal }): the tiny counter rows of up to 20 queues. Read on every look; the
+     *  requests themselves are read only when a counter moved, on a trigger, or once a
+     *  minute. Optional even with the two above: without it every look reads statuses. */
+    forwardRequestQueueCounters?: (queues: string[], opts?: any) => Promise<{ queues: { [name: string]: any } }>;
+    /**
+     * Ask the host to refresh what it shows of a project's records, because indexing
+     * work of that project just settled and none is left in this page's queue. A data
+     * hook: called with no chat view mounted too (the files page, the records page), and
+     * only in the tab that holds the project's settle lock. Optional; never throws.
+     */
+    refreshRecords?: (projectId: string) => void;
 }
 
 let _config: ChatEngineConfig | null = null;
@@ -451,6 +474,45 @@ export function resolveForwardRequestFinalize(): ForwardRequestFinalizeFn | unde
 export function resolveForwardRequestStream(): ForwardRequestStreamFn | undefined {
     const cfg = chatEngineConfig();
     return typeof cfg.forwardRequestStream === 'function' ? cfg.forwardRequestStream : undefined;
+}
+
+/** skapi.forwardRequestStatus, or undefined (an skapi-js older than 2.7.0). Never throws. */
+export function resolveForwardRequestStatus(): ((requests: any[], opts?: any) => Promise<any>) | undefined {
+    if (!_config || typeof _config.forwardRequestStatus !== 'function') return undefined;
+    const cfg = _config;
+    return (requests: any[], opts?: any) => cfg.forwardRequestStatus!.call(cfg, requests, opts);
+}
+
+/** skapi.forwardRequestRead, or undefined. Never throws. */
+export function resolveForwardRequestRead(): ((params: any) => Promise<any>) | undefined {
+    if (!_config || typeof _config.forwardRequestRead !== 'function') return undefined;
+    const cfg = _config;
+    return (params: any) => cfg.forwardRequestRead!.call(cfg, params);
+}
+
+/** skapi.forwardRequestQueueCounters, or undefined. Never throws. */
+export function resolveForwardRequestQueueCounters(): ((queues: string[], opts?: any) => Promise<any>) | undefined {
+    if (!_config || typeof _config.forwardRequestQueueCounters !== 'function') return undefined;
+    const cfg = _config;
+    return (queues: string[], opts?: any) => cfg.forwardRequestQueueCounters!.call(cfg, queues, opts);
+}
+
+/**
+ * The host handed over the reconciler's two reads (batch status and envelope read), so
+ * the engine follows waiting items with batch reads instead of one poll each. False on
+ * an older skapi-js: the engine then keeps today's polls (see forwardRequestStatus).
+ */
+export function reconcilerReadsEnabled(): boolean {
+    return !!resolveForwardRequestStatus() && !!resolveForwardRequestRead();
+}
+
+/**
+ * A send may carry a client reference (`cref`). Only with the reconciler's reads: the
+ * same skapi-js (2.7.0) brought both, and an older one drops the key anyway, so a send
+ * whose ack was lost could never be matched by it.
+ */
+export function crefSupported(): boolean {
+    return reconcilerReadsEnabled();
 }
 
 /** True when the consumer has opted in to server-driven windowed indexing. */

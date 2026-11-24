@@ -8,7 +8,7 @@
  *                                    `forwardRequest*` keys (the only ones read)
  *   - MCP endpoint URL              -> chatEngineConfig().mcpBaseUrl
  *   - `poll` on each request        -> pollOpt() (set per consumer; see config.ts)
- *   - Vue `reactive`/`ref` removed  (bgTaskQueue/agentViewMounted are app-level
+ *   - Vue `reactive`/`ref` removed  (bgTaskQueue is app-level
  *                                    state that stays in the consumer, not here;
  *                                    only the BgTaskEntry TYPE lives here)
  */
@@ -17,6 +17,7 @@ import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedRead
 import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess, resolveAnswerMode, statusPushEnabled } from './config';
 import { type AnswerMode } from './project_settings';
 import { csrEnvelopeError } from './errors';
+import type { ChatIdentity } from './host';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
 // budget subtracts cannot drift; getMaxOutputTokens also clamps per model.
 import { getMaxOutputTokens, getModelContextWindow } from './budget';
@@ -702,6 +703,8 @@ export type CallClaudeWithMcpParams = {
 	 * resolveWebAccess.
 	 */
 	webAccess?: boolean;
+	/** The send's client reference (ChatTurnContext.cref), passed to forwardRequest. */
+	cref?: string;
 };
 // Poll cadence for every client-secret request the chat waits on. Shared by the
 // engine's own poll sites and imported by agent.vue; the widget carries its own
@@ -768,6 +771,10 @@ export type ChatTurnContext = {
 	mcpToolsItemId?: string;
 	/** Set by ChatSession once the turn's outcome was applied, so a later handler cannot apply it twice. */
 	settled?: boolean;
+	/** The client reference of this send (reconciler plan, section 3 item 9): sent as
+	 *  forwardRequest's `cref`, so a send whose ack was lost is found by it and never sent
+	 *  twice. Set by ChatSession only when the host's skapi-js carries it (crefSupported). */
+	cref?: string;
 };
 
 type McpListToolsItem = { type: 'mcp_list_tools'; id: string; server_label: string; tools: any[] };
@@ -906,6 +913,7 @@ export async function callClaudeWithMcp({
 	extractContent,
 	fileUrls,
 	webAccess,
+	cref,
 }: CallClaudeWithMcpParams) {
 	// Resolved HERE and not only in callClaudeWithPublicMcp, so a host calling this
 	// builder directly gets the same switch: the project's setting is the ceiling,
@@ -939,6 +947,7 @@ export async function callClaudeWithMcp({
 		owner,
 		...pollOpt(),
 		...stream.transport,
+		...(cref ? { cref } : {}),
 		url: ANTHROPIC_MESSAGES_API_URL,
 		method: 'POST',
 		headers: {
@@ -1016,9 +1025,11 @@ export async function callClaudeWithPublicMcp(
 	onResponse?: (res: any) => void,
 	onError?: (err: any) => void,
 	mcpScope?: { anonymous?: boolean; publicProjectId?: string },
+	turn?: ChatTurnContext,
 ) {
 	const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
 	return callClaudeWithMcp({
+		cref: turn?.cref,
 		prompt,
 		messages,
 		service,
@@ -1125,6 +1136,7 @@ export async function callOpenAIWithPublicMcp(
 		owner,
 		...pollOpt(),
 		...stream.transport,
+		...(turn && turn.cref ? { cref: turn.cref } : {}),
 		url: OPENAI_RESPONSES_API_URL,
 		method: 'POST',
 		headers: {
@@ -1212,6 +1224,9 @@ export type AttachmentSaveInfo = {
 	 * message telling the agent to resume from where the saved records leave off.
 	 */
 	continueIndexing?: boolean;
+	/** The pass's client reference, passed to forwardRequest's `cref`: a pass whose ack was
+	 *  lost on the way is found by it in the queue listing and never sent twice. */
+	cref?: string;
 	/**
 	 * For an image-vision file (PDF), the 0-based PAGE the render window should start at.
 	 * The worker renders [renderFrom, renderFrom+RENDER_PAGES_PER_WINDOW) and injects them
@@ -1440,6 +1455,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			service,
 			owner,
 			...pollOpt(),
+			...(info.cref ? { cref: info.cref } : {}),
 			// Status push for this pass and the continuations the worker queues from it
 			// (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
 			...(statusPushEnabled() ? { notify: true } : {}),
@@ -1488,6 +1504,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 		service,
 		owner,
 		...pollOpt(),
+		...(info.cref ? { cref: info.cref } : {}),
 		// Status push for this pass and the continuations the worker queues from it
 		// (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
 		...(statusPushEnabled() ? { notify: true } : {}),
@@ -1736,19 +1753,27 @@ export type IndexRunPatch = {
 };
 
 /**
- * Fire-and-forget wrapper over the consumer's upsertIndexRunRecord hook.
- * Safe everywhere: missing hook, unconfigured engine, and consumer throws all
- * reduce to a no-op — a run record must never be able to break the run itself.
+ * Wrapper over the consumer's upsertIndexRunRecord hook. Never throws: a run record
+ * must never be able to break the run itself. A missing hook or an unconfigured engine
+ * is a no-op.
+ *
+ * The promise: with `report`, it rejects when the write failed (the hook threw or its
+ * promise rejected), so a caller that retries (the settle lock) can see it; without
+ * `report` it always resolves (fire and forget).
  */
-export function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch): void {
-	if (!service || !storagePath) return;
+export function upsertIndexRunRecordSafe(service: string, storagePath: string, patch: IndexRunPatch, opts?: { report?: boolean }): Promise<void> {
+	const report = !!(opts && opts.report);
+	if (!service || !storagePath) return Promise.resolve();
+	let out: any;
 	try {
 		const hook = chatEngineConfig().upsertIndexRunRecord;
-		if (typeof hook !== 'function') return;
-		hook({ service, storagePath, patch });
+		if (typeof hook !== 'function') return Promise.resolve();
+		out = hook({ service, storagePath, patch });
 	} catch (e) {
-		// best-effort by contract
+		return report ? Promise.reject(e) : Promise.resolve();
 	}
+	const p = Promise.resolve(out).then(function () { return undefined; });
+	return report ? p : p.catch(function () { return undefined; });
 }
 
 /**
@@ -1815,6 +1840,16 @@ export type BgTaskEntry = {
 	/** When this client first tracked the pass (ms). A pass missing from a listing taken
 	 *  BEFORE that proves nothing about it. */
 	adoptedAt?: number;
+	/** The identity this pass was dispatched or adopted under, pinned at that moment
+	 *  (reconciler plan, section 3 item 1). Its settle, its by-id reads and the next
+	 *  CONTINUE pass of a client-driven file use this, never the identity live at the
+	 *  time, which a project or platform switch has moved on. Filled by the engine the
+	 *  first time it sees the entry when a host pushed it without one. */
+	identity?: ChatIdentity;
+	/** The project owner, pinned with the identity (by-id reads are scoped by it). */
+	owner?: string;
+	/** History cache key of the chat this pass belongs to, pinned with the identity. */
+	ownerKey?: string;
 };
 
 // Token the indexing agent appends to its final message ONLY when it has fully read and
@@ -1873,6 +1908,15 @@ export async function getChatHistory(
 		 *  chat is fetched WITHOUT the bg-indexing queue while legacy items on
 		 *  odd queue names survive. Older backends ignore it. */
 		queue_exclude?: string;
+		/** "ids": the light listing (id, status, times, queue, cref; no bodies). skapi-js 2.7.0. */
+		fields?: 'ids';
+		/** Only rows newer than this request id. skapi-js 2.7.0. */
+		after?: string;
+		/** Transport options for a reconciler read (skapi-js 2.7.0): its deadline, an
+		 *  abort signal, and `fresh` (never join an identical listing in flight). */
+		deadline?: number;
+		signal?: any;
+		fresh?: boolean;
 	},
 	fetchOptions: Record<string, any>,
 ) {
@@ -1891,6 +1935,11 @@ export async function getChatHistory(
 		params.queue_exact ? { queue_exact: true } : {},
 		params.compact ? { compact: true } : {},
 		params.queue_exclude ? { queue_exclude: params.queue_exclude } : {},
+		params.fields ? { fields: params.fields } : {},
+		params.after ? { after: params.after } : {},
+		params.deadline ? { deadline: params.deadline } : {},
+		params.signal ? { signal: params.signal } : {},
+		params.fresh ? { fresh: true } : {},
 	);
 
 	return resolveForwardRequestHistory()(

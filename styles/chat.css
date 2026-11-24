@@ -149,6 +149,21 @@
     font-style: italic;
     clear: both;
 }
+/* ---- connection note ----------------------------------------------------*/
+/* The reconciler's two flags (engine state.reconnecting, state.signInNeeded) as one
+   short line by the composer: "Reconnecting..." or "Sign in to see the latest
+   answers.". The LOOK only, shared by both chat clients; where it sits is each
+   client's own layout (agent.vue: a line of the composer row; the widget: a
+   zero-height strip over the bottom of the list, widget.css). Never a colour that
+   reads as an error: nothing on screen is wrong, it is only not being refreshed
+   right now. */
+.bq-chat-status {
+    font-size: 0.7rem;
+    font-style: italic;
+    line-height: 1.3;
+    text-align: center;
+    color: var(--bq-muted);
+}
 /* ---- citations + the no-source mark -------------------------------------*/
 /* Under an answer that read something: one chip per cited file (and page, in
    the label only). The chips are the ordinary stored-file link chips

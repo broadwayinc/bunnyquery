@@ -196,6 +196,27 @@
     const cfg = chatEngineConfig();
     return typeof cfg.forwardRequestStream === "function" ? cfg.forwardRequestStream : void 0;
   }
+  function resolveForwardRequestStatus() {
+    if (!_config || typeof _config.forwardRequestStatus !== "function") return void 0;
+    const cfg = _config;
+    return (requests, opts) => cfg.forwardRequestStatus.call(cfg, requests, opts);
+  }
+  function resolveForwardRequestRead() {
+    if (!_config || typeof _config.forwardRequestRead !== "function") return void 0;
+    const cfg = _config;
+    return (params) => cfg.forwardRequestRead.call(cfg, params);
+  }
+  function resolveForwardRequestQueueCounters() {
+    if (!_config || typeof _config.forwardRequestQueueCounters !== "function") return void 0;
+    const cfg = _config;
+    return (queues, opts) => cfg.forwardRequestQueueCounters.call(cfg, queues, opts);
+  }
+  function reconcilerReadsEnabled() {
+    return !!resolveForwardRequestStatus() && !!resolveForwardRequestRead();
+  }
+  function crefSupported() {
+    return reconcilerReadsEnabled();
+  }
   function windowedIndexingEnabled() {
     return _config?.windowedIndexing === true;
   }
@@ -254,321 +275,510 @@
     return p === void 0 ? {} : { poll: p };
   }
 
-  // src/engine/findings.ts
-  var FINDINGS_TABLE = "search_findings";
-  var FINDING_ID_PREFIX = "find::";
-  var FINDING_MIN_TOOL_CALLS = 3;
-  var FINDING_MAX_PER_TURN = 3;
-  var FINDING_MAX_WORDS = 8;
-  var FINDING_MAX_TAGS = 40;
-  var STOP_WORDS = /* @__PURE__ */ new Set([
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "what",
-    "whats",
-    "which",
-    "who",
-    "where",
-    "when",
-    "how",
-    "why",
-    "please",
-    "tell",
-    "me",
-    "show",
-    "give",
-    "find",
-    "can",
-    "you",
-    "could",
-    "would",
-    "of",
-    "for",
-    "to",
-    "in",
-    "on",
-    "at",
-    "and",
-    "or",
-    "about",
-    "i",
-    "my",
-    "our",
-    "do",
-    "does",
-    "did",
-    "\uC880",
-    "\uC54C\uB824\uC918",
-    "\uC54C\uB824\uC8FC\uC138\uC694",
-    "\uC54C\uB824",
-    "\uC918",
-    "\uC8FC\uC138\uC694",
-    "\uBB50\uC57C",
-    "\uBB50\uC608\uC694",
-    "\uBB54\uAC00\uC694",
-    "\uBB34\uC5C7",
-    "\uBB34\uC5C7\uC778\uAC00\uC694",
-    "\uC5B4\uB5BB\uAC8C",
-    "\uD574\uC918",
-    "\uD574\uC8FC\uC138\uC694",
-    "\uC788\uC5B4",
-    "\uC788\uB098\uC694",
-    "\uC788\uC5B4\uC694",
-    "\uC5B4\uB514",
-    "\uC5B4\uB514\uC57C",
-    "\uB9D0\uD574\uC918",
-    "\uCC3E\uC544\uC918",
-    "\uBCF4\uC5EC\uC918"
-  ]);
-  var WORD_SPLIT = /[\s\-_/,;|+&]+/u;
-  var NOT_KEPT = /[\s\p{P}\p{S}]+/gu;
-  function nfkcLower(text) {
-    var s = String(text == null ? "" : text);
-    try {
-      s = s.normalize("NFKC");
-    } catch (e) {
+  // src/engine/reconciler.ts
+  var LOOK_DEADLINE_MS = 15 * 1e3;
+  var LOOK_FAST_MS = 3 * 1e3;
+  var LOOK_SLOW_MS = 60 * 1e3;
+  var LOOK_STALE_MS = 60 * 1e3;
+  var WAKE_GAP_MS = 30 * 1e3;
+  var BACKOFF_MAX_MS = 30 * 1e3;
+  var RETURN_TRIGGERS = {
+    return: true,
+    visible: true,
+    wake: true,
+    online: true,
+    pageshow: true,
+    reconnect: true,
+    view: true,
+    unknown: true,
+    signin: true
+  };
+  var _g = typeof globalThis !== "undefined" ? globalThis : {};
+  function perfNow() {
+    return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
+  }
+  function tabHidden() {
+    var doc = _g.document;
+    return !!doc && doc.visibilityState === "hidden";
+  }
+  var LookScheduler = class {
+    constructor(hooks) {
+      this.timer = null;
+      /** When the pending timer should fire, on both clocks (wake detection). */
+      this.expectPerf = 0;
+      this.expectWall = 0;
+      this.running = false;
+      /** Triggers that arrived while a look ran: exactly one more look runs with them. */
+      this.pending = null;
+      /** Resolvers of trigger() promises, by the look that will serve them. */
+      this.waitCurrent = [];
+      this.waitNext = [];
+      this.backoff = 0;
+      this.listening = false;
+      this.stopped = false;
+      this.gen = 0;
+      this.reconnecting = false;
+      this.signInNeeded = false;
+      /** Diagnostics (and the throwaway checks): looks started, timers armed. */
+      this.looks = 0;
+      this.timersArmed = 0;
+      /** Triggers gathered for a look about to start (see trigger). */
+      this.starting = null;
+      this.waitStarting = [];
+      this.scheduling = false;
+      this.hooks = hooks;
     }
-    return s.toLowerCase();
-  }
-  function normalizeTagText(text) {
-    return nfkcLower(text).replace(NOT_KEPT, "");
-  }
-  function tagForms(text) {
-    if (typeof text !== "string") return [];
-    if (text.indexOf("::") !== -1) return [text];
-    var joined = normalizeTagText(text);
-    if (!joined) return [];
-    var words = nfkcLower(text).split(WORD_SPLIT).map(function(w) {
-      return w.replace(NOT_KEPT, "");
-    }).filter(function(w) {
-      return Array.from(w).length >= 2;
-    });
-    var out = [joined];
-    if (words.length > 1) {
-      for (var i = 0; i < words.length; i++) if (words[i] !== joined) out.push(words[i]);
+    /** Pull the next look forward to now. Resolves when the look that serves it ends. */
+    trigger(kind) {
+      var self = this;
+      this.stopped = false;
+      this._listen();
+      return new Promise(function(resolve) {
+        if (self.running) {
+          if (!self.pending) self.pending = {};
+          self.pending[kind] = true;
+          self.waitNext.push(resolve);
+          return;
+        }
+        if (!self.starting) {
+          self.starting = {};
+          setTimeout(function() {
+            var t = self.starting || {};
+            self.starting = null;
+            if (self.running) {
+              if (!self.pending) self.pending = {};
+              for (var k in t) self.pending[k] = true;
+              self.waitNext = self.waitNext.concat(self.waitStarting);
+              self.waitStarting = [];
+              return;
+            }
+            self.waitCurrent = self.waitCurrent.concat(self.waitStarting);
+            self.waitStarting = [];
+            self._start(t);
+          }, 0);
+        }
+        self.starting[kind] = true;
+        self.waitStarting.push(resolve);
+      });
     }
-    return out;
-  }
-  var KO_ENDINGS = [
-    "\uC5D0\uC11C\uB294",
-    "\uC73C\uB85C\uB294",
-    "\uC5D0\uC11C",
-    "\uC73C\uB85C",
-    "\uC5D0\uAC8C",
-    "\uAE4C\uC9C0",
-    "\uBD80\uD130",
-    "\uC774\uB098",
-    "\uC774\uB791",
-    "\uD558\uACE0",
-    "\uCC98\uB7FC",
-    "\uC2DC",
-    "\uC880",
-    "\uC740",
-    "\uB294",
-    "\uC774",
-    "\uAC00",
-    "\uC744",
-    "\uB97C",
-    "\uC758",
-    "\uC5D0",
-    "\uB85C",
-    "\uC640",
-    "\uACFC",
-    "\uB3C4",
-    "\uB9CC",
-    "\uB791",
-    "\uB098",
-    "\uC694"
-  ];
-  function koreanStem(word) {
-    if (!/[\uac00-\ud7a3]$/.test(word)) return "";
-    for (var i = 0; i < KO_ENDINGS.length; i++) {
-      var e = KO_ENDINGS[i];
-      if (word.length > e.length && word.slice(-e.length) === e) {
-        var stem = word.slice(0, -e.length);
-        return Array.from(stem).length >= 2 ? stem : "";
+    /** Make sure the chain runs at its cadence when there is work. Never adds a timer when
+     *  one is armed or a look is running, so calling it from every add is free. */
+    ensure() {
+      this.stopped = false;
+      this._listen();
+      if (this.running || this.timer || this.starting) return;
+      this._scheduleNext("ok");
+    }
+    /** The sign-in came back (or the host says so): looks resume at once. */
+    signedIn() {
+      if (!this.signInNeeded) {
+        this.ensure();
+        return;
+      }
+      this.signInNeeded = false;
+      this.backoff = 0;
+      this._flags();
+      void this.trigger("signin");
+    }
+    /** Stop the chain (tests, teardown). A later trigger or ensure starts it again. */
+    stop() {
+      this.stopped = true;
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
       }
     }
-    return "";
-  }
-  function keyWords(text) {
-    if (typeof text !== "string" || !text.trim()) return [];
-    var out = [];
-    var parts = nfkcLower(text).split(WORD_SPLIT);
-    for (var i = 0; i < parts.length && out.length < FINDING_MAX_WORDS; i++) {
-      var w = parts[i].replace(NOT_KEPT, "");
-      if (Array.from(w).length < 2 || STOP_WORDS.has(w)) continue;
-      var stem = koreanStem(w);
-      if (stem && STOP_WORDS.has(w.slice(stem.length))) w = stem, stem = "";
-      if (out.indexOf(w) === -1) out.push(w);
-      if (stem && out.indexOf(stem) === -1 && out.length < FINDING_MAX_WORDS) out.push(stem);
+    isRunning() {
+      return this.running;
     }
-    return out;
-  }
-  function citedPages(answer) {
-    var out = [];
-    if (typeof answer !== "string" || !answer) return out;
-    var add = function(n) {
-      var v = Number(n);
-      if (Number.isInteger(v) && v > 0 && v < 1e5 && out.indexOf(v) === -1) out.push(v);
-    };
-    var m;
-    var after = /((?:\d{1,5}\s*(?:[·,/~\-–]|및|와|과)\s*)*\d{1,5})\s*(?:쪽|페이지|면)/g;
-    while (m = after.exec(answer)) {
-      var nums = m[1].match(/\d{1,5}/g) || [];
-      for (var a = 0; a < nums.length; a++) add(nums[a]);
+    _flags() {
+      try {
+        this.hooks.onFlags({ reconnecting: this.reconnecting, signInNeeded: this.signInNeeded });
+      } catch (e) {
+      }
     }
-    var before = /\b(?:pages?|pp?\.?)\s*(\d{1,5}(?:\s*(?:,|and|&|-|–)\s*\d{1,5})*)/gi;
-    while (m = before.exec(answer)) {
-      var list = m[1].match(/\d{1,5}/g) || [];
-      for (var b = 0; b < list.length; b++) add(list[b]);
+    _listen() {
+      if (this.listening) return;
+      this.listening = true;
+      var self = this;
+      var doc = _g.document;
+      if (doc && typeof doc.addEventListener === "function") {
+        doc.addEventListener("visibilitychange", function() {
+          if (doc.visibilityState === "hidden") {
+            if (!self.running && self.timer) {
+              clearTimeout(self.timer);
+              self.timer = null;
+              self._scheduleNext("ok");
+            }
+            return;
+          }
+          void self.trigger("visible");
+        });
+      }
+      var win = _g.window;
+      if (win && typeof win.addEventListener === "function") {
+        win.addEventListener("online", function() {
+          if (!tabHidden()) void self.trigger("online");
+        });
+        win.addEventListener("pageshow", function(ev) {
+          if (ev && ev.persisted) void self.trigger("pageshow");
+        });
+      }
     }
-    return out;
-  }
-  function parseJsonLoose(value) {
-    if (typeof value !== "string") return value;
+    _start(triggers) {
+      var self = this;
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      this.running = true;
+      var gen = ++this.gen;
+      this.looks++;
+      var isReturn = false;
+      for (var k in triggers) if (RETURN_TRIGGERS[k]) isReturn = true;
+      var ac = typeof _g.AbortController === "function" ? new _g.AbortController() : null;
+      var startedAt = perfNow();
+      var done = false;
+      var deadline = setTimeout(function() {
+        if (done) return;
+        done = true;
+        try {
+          if (ac) ac.abort();
+        } catch (e) {
+        }
+        console.warn("[chat-engine] a reconciler look ran past its deadline; nothing it read is applied");
+        self._finish("transient");
+      }, LOOK_DEADLINE_MS);
+      var req = {
+        gen,
+        triggers,
+        isReturn,
+        signal: ac ? ac.signal : void 0,
+        alive: function() {
+          return !done && self.gen === gen;
+        },
+        remaining: function() {
+          return Math.max(1, Math.round(LOOK_DEADLINE_MS - (perfNow() - startedAt)));
+        }
+      };
+      var run;
+      try {
+        run = Promise.resolve(this.hooks.runLook(req));
+      } catch (e) {
+        run = Promise.reject(e);
+      }
+      run.then(function(outcome) {
+        if (done) return;
+        done = true;
+        clearTimeout(deadline);
+        self._finish(outcome || "ok");
+      }, function(err) {
+        if (done) return;
+        done = true;
+        clearTimeout(deadline);
+        console.warn("[chat-engine] a reconciler look threw", err);
+        self._finish("transient");
+      });
+    }
+    _finish(outcome) {
+      this.running = false;
+      var served = this.waitCurrent;
+      this.waitCurrent = [];
+      if (outcome === "transient") {
+        this.backoff = this.backoff ? Math.min(BACKOFF_MAX_MS, this.backoff * 2) : 1e3;
+        if (!this.reconnecting) {
+          this.reconnecting = true;
+          this._flags();
+        }
+      } else if (outcome === "auth") {
+        this.backoff = 0;
+        var changed = !this.signInNeeded || this.reconnecting;
+        this.signInNeeded = true;
+        this.reconnecting = false;
+        if (changed) this._flags();
+      } else {
+        this.backoff = 0;
+        if (this.reconnecting || this.signInNeeded) {
+          this.reconnecting = false;
+          this.signInNeeded = false;
+          this._flags();
+        }
+      }
+      for (var i = 0; i < served.length; i++) {
+        try {
+          served[i]();
+        } catch (e) {
+        }
+      }
+      if (this.pending) {
+        var next = this.pending;
+        this.pending = null;
+        this.waitCurrent = this.waitNext;
+        this.waitNext = [];
+        this._start(next);
+        return;
+      }
+      this._scheduleNext(outcome);
+    }
+    _scheduleNext(outcome) {
+      if (this.stopped || this.scheduling) return;
+      this.scheduling = true;
+      try {
+        this._arm(outcome);
+      } finally {
+        this.scheduling = false;
+      }
+    }
+    _arm(outcome) {
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      var hidden = tabHidden();
+      var work;
+      try {
+        work = this.hooks.work();
+      } catch (e) {
+        work = { visible: true, hidden: false };
+      }
+      var delay = -1;
+      if (this.signInNeeded) {
+        if (!hidden && work.visible) delay = LOOK_SLOW_MS;
+      } else if (outcome === "transient" && this.backoff) {
+        if (!hidden && work.visible || work.hidden) delay = hidden ? Math.max(this.backoff, LOOK_SLOW_MS) : this.backoff;
+      } else if (!hidden && work.visible) {
+        var live = false;
+        try {
+          live = this.hooks.pushLive();
+        } catch (e) {
+          live = false;
+        }
+        delay = live ? LOOK_SLOW_MS : LOOK_FAST_MS;
+      } else if (hidden && work.hidden) {
+        delay = LOOK_SLOW_MS;
+      }
+      if (delay < 0) return;
+      var self = this;
+      this.expectPerf = perfNow() + delay;
+      this.expectWall = Date.now() + delay;
+      this.timersArmed++;
+      this.timer = setTimeout(function() {
+        self.timer = null;
+        var t = { tick: true };
+        var lateWall = Date.now() - self.expectWall;
+        var latePerf = perfNow() - self.expectPerf;
+        if (!tabHidden() && (lateWall > WAKE_GAP_MS || latePerf > WAKE_GAP_MS || Date.now() < self.expectWall - delay)) t.wake = true;
+        self._start(t);
+      }, delay);
+    }
+  };
+  var FX_PREFIX = "bq-fx:";
+  var FXI_PREFIX = "bq-fxi:";
+  var LOCK_HOLD_MAX_MS = 20 * 1e3;
+  var FX_TTL_MS = 24 * 60 * 60 * 1e3;
+  var FX_INFLIGHT_MS = 60 * 1e3;
+  var FX_MAX_TRIES = 5;
+  var FX_RETRY_BASE_MS = 2e3;
+  var _fxDone = {};
+  var _fxBusy = {};
+  var _fxPrunedAt = 0;
+  function storage() {
     try {
-      return JSON.parse(value);
+      var ls = _g.localStorage;
+      return ls && typeof ls.getItem === "function" ? ls : null;
     } catch (e) {
       return null;
     }
   }
-  function toolCallsOf(body) {
-    var calls = 0;
-    var queries = [];
-    var readPaths = [];
-    var add = function(name, args) {
-      calls += 1;
-      if (name === "searchText" && args && typeof args.query === "string" && args.query.trim()) queries.push(args.query.trim());
-      if (name === "readFileContent" && args && typeof args.path === "string" && args.path.trim() && readPaths.indexOf(args.path.trim()) === -1) readPaths.push(args.path.trim());
-    };
-    if (body && Array.isArray(body.content)) {
-      for (var i = 0; i < body.content.length; i++) {
-        var b = body.content[i];
-        if (b && (b.type === "mcp_tool_use" || b.type === "tool_use")) add(b.name, b.input);
-      }
+  function fxIsDone(key) {
+    if (_fxDone[key]) return true;
+    var ls = storage();
+    if (!ls) return false;
+    try {
+      var v = Number(ls.getItem(FX_PREFIX + key));
+      return isFinite(v) && v > 0 && Date.now() - v < FX_TTL_MS;
+    } catch (e) {
+      return false;
     }
-    if (body && Array.isArray(body.output)) {
-      for (var j = 0; j < body.output.length; j++) {
-        var o = body.output[j];
-        if (o && (o.type === "mcp_call" || o.type === "function_call")) add(o.name, parseJsonLoose(o.arguments) || o.arguments);
-      }
-    }
-    return { calls, queries, readPaths };
   }
-  function usedAFinding(body) {
-    var returned = function(out) {
-      var text = typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
-      return text.indexOf("record_id") !== -1;
-    };
-    var isFindingsQuery = function(name, a) {
-      return name === "getRecords" && !!a && (a.table_name === FINDINGS_TABLE || a.table === FINDINGS_TABLE);
-    };
-    if (body && Array.isArray(body.output)) {
-      for (var i = 0; i < body.output.length; i++) {
-        var o = body.output[i];
-        if (o && (o.type === "mcp_call" || o.type === "function_call") && isFindingsQuery(o.name, parseJsonLoose(o.arguments) || o.arguments) && returned(o.output)) return true;
-      }
+  function fxBusyAt(key) {
+    var now = Date.now();
+    var t = _fxBusy[key] || 0;
+    if (t && now - t < FX_INFLIGHT_MS) return t;
+    var ls = storage();
+    if (!ls) return 0;
+    try {
+      var v = Number(ls.getItem(FXI_PREFIX + key));
+      return isFinite(v) && v > 0 && now - v < FX_INFLIGHT_MS ? v : 0;
+    } catch (e) {
+      return 0;
     }
-    if (body && Array.isArray(body.content)) {
-      var ids = {};
-      for (var j = 0; j < body.content.length; j++) {
-        var b = body.content[j];
-        if (b && (b.type === "mcp_tool_use" || b.type === "tool_use") && isFindingsQuery(b.name, b.input) && typeof b.id === "string") ids[b.id] = true;
-        else if (b && (b.type === "mcp_tool_result" || b.type === "tool_result") && ids[b.tool_use_id] && !b.is_error && returned(b.content)) return true;
-      }
-    }
-    return false;
   }
-  function findingsForTurn(args) {
-    var note = args.note;
-    if (!note) return [];
-    var tc = toolCallsOf(args.body);
-    if (tc.calls < FINDING_MIN_TOOL_CALLS) return [];
-    if (usedAFinding(args.body)) return [];
-    var answer = typeof args.answer === "string" ? args.answer : "";
-    var linked = function(path) {
-      if (!answer) return false;
-      if (answer.indexOf("db:" + path) !== -1) return true;
-      var name = path.split("/").pop() || path;
-      return answer.indexOf(name) !== -1;
-    };
-    var questionWords = keyWords(args.question);
-    var searchWords = [];
-    for (var q = 0; q < tc.queries.length; q++) {
-      var ws = keyWords(tc.queries[q]);
-      for (var k = 0; k < ws.length && searchWords.length < FINDING_MAX_WORDS; k++) {
-        if (searchWords.indexOf(ws[k]) === -1) searchWords.push(ws[k]);
+  function fxMarkBusy(key) {
+    var now = Date.now();
+    _fxBusy[key] = now;
+    var ls = storage();
+    if (!ls) return;
+    try {
+      ls.setItem(FXI_PREFIX + key, String(now));
+    } catch (e) {
+    }
+  }
+  function fxClearBusy(key) {
+    delete _fxBusy[key];
+    var ls = storage();
+    if (!ls) return;
+    try {
+      ls.removeItem(FXI_PREFIX + key);
+    } catch (e) {
+    }
+  }
+  function fxPrune(now) {
+    if (now - _fxPrunedAt <= 60 * 60 * 1e3) return;
+    _fxPrunedAt = now;
+    var k;
+    for (k in _fxDone) if (now - _fxDone[k] > FX_TTL_MS) delete _fxDone[k];
+    for (k in _fxBusy) if (now - _fxBusy[k] > FX_INFLIGHT_MS) delete _fxBusy[k];
+    var ls = storage();
+    if (!ls) return;
+    try {
+      var drop = [];
+      for (var i = 0; i < ls.length; i++) {
+        var lk = ls.key(i);
+        if (!lk) continue;
+        var life = lk.indexOf(FX_PREFIX) === 0 ? FX_TTL_MS : lk.indexOf(FXI_PREFIX) === 0 ? FX_INFLIGHT_MS : 0;
+        if (!life) continue;
+        var t = Number(ls.getItem(lk));
+        if (!isFinite(t) || now - t > life) drop.push(lk);
+      }
+      for (var d = 0; d < drop.length; d++) ls.removeItem(drop[d]);
+    } catch (e) {
+    }
+  }
+  function fxMarkDone(key) {
+    var now = Date.now();
+    _fxDone[key] = now;
+    delete _fxBusy[key];
+    var ls = storage();
+    if (ls) {
+      try {
+        ls.setItem(FX_PREFIX + key, String(now));
+        ls.removeItem(FXI_PREFIX + key);
+      } catch (e) {
       }
     }
-    if (!questionWords.length && !searchWords.length) return [];
-    var tags = [];
-    var addTags = function(list) {
-      for (var i = 0; i < list.length; i++) {
-        var forms = tagForms(list[i]);
-        for (var f = 0; f < forms.length; f++) if (tags.indexOf(forms[f]) === -1 && tags.length < FINDING_MAX_TAGS) tags.push(forms[f]);
-      }
+    fxPrune(now);
+  }
+  function sideEffectDone(key) {
+    return fxIsDone(key);
+  }
+  function claimSideEffect(key) {
+    if (!key || fxIsDone(key) || fxBusyAt(key)) return false;
+    fxMarkDone(key);
+    return true;
+  }
+  var _fxDepth = 0;
+  function runSettleSideEffect(projectId, queue, key, fn, attempt, tries) {
+    if (!key || fxIsDone(key)) return;
+    var tryNo = tries || 0;
+    var again = function(delay, nextTry) {
+      setTimeout(function() {
+        runSettleSideEffect(projectId, queue, key, fn, 0, nextTry);
+      }, delay);
     };
-    addTags(questionWords);
-    addTags(searchWords);
-    var cited = citedPages(answer);
-    var out = [];
-    var seen = {};
-    var make = function(path, page) {
-      return {
-        storagePath: path,
-        page,
-        uniqueId: FINDING_ID_PREFIX + path + "#p" + page,
-        tags: tags.slice(),
-        data: {
-          path,
-          page,
-          question_words: questionWords,
-          search_terms: searchWords,
-          found_at: typeof args.now === "number" ? args.now : Date.now()
+    var run = function() {
+      if (fxIsDone(key)) return;
+      var busy = fxBusyAt(key);
+      if (busy) {
+        if (!_fxBusy[key] && tryNo < FX_MAX_TRIES) again(Math.max(1e3, FX_INFLIGHT_MS - (Date.now() - busy) + 1e3), tryNo + 1);
+        return;
+      }
+      fxMarkBusy(key);
+      var failed = function(e) {
+        fxClearBusy(key);
+        if (tryNo + 1 < FX_MAX_TRIES) {
+          console.warn("[chat-engine] a settle side effect failed; trying again", key, e);
+          again(FX_RETRY_BASE_MS * Math.pow(2, tryNo), tryNo + 1);
+        } else {
+          console.warn("[chat-engine] a settle side effect failed " + FX_MAX_TRIES + " times; left for a later settle", key, e);
         }
       };
-    };
-    var hitsList = Array.isArray(note.hits) ? note.hits : [];
-    for (var h = 0; h < hitsList.length && out.length < FINDING_MAX_PER_TURN; h++) {
-      var hit = hitsList[h];
-      if (!hit || typeof hit.path !== "string" || !hit.path || typeof hit.page !== "number") continue;
-      if (!linked(hit.path)) continue;
-      if (cited.length ? cited.indexOf(hit.page) === -1 : out.length > 0) continue;
-      var id = FINDING_ID_PREFIX + hit.path + "#p" + hit.page;
-      if (seen[id]) continue;
-      seen[id] = true;
-      out.push({
-        storagePath: hit.path,
-        page: hit.page,
-        uniqueId: id,
-        tags: tags.slice(),
-        data: {
-          path: hit.path,
-          page: hit.page,
-          question_words: questionWords,
-          search_terms: searchWords,
-          found_at: typeof args.now === "number" ? args.now : Date.now()
-        }
-      });
-    }
-    if (!out.length && cited.length) {
-      for (var r = 0; r < tc.readPaths.length && out.length < FINDING_MAX_PER_TURN; r++) {
-        var rp = tc.readPaths[r];
-        if (!linked(rp)) continue;
-        for (var c = 0; c < cited.length && out.length < FINDING_MAX_PER_TURN; c++) {
-          var rid = FINDING_ID_PREFIX + rp + "#p" + cited[c];
-          if (seen[rid]) continue;
-          seen[rid] = true;
-          out.push(make(rp, cited[c]));
-        }
+      var out;
+      _fxDepth++;
+      try {
+        out = fn();
+      } catch (e) {
+        _fxDepth--;
+        failed(e);
+        return;
       }
+      _fxDepth--;
+      return Promise.resolve(out).then(function() {
+        fxMarkDone(key);
+      }, failed);
+    };
+    if (_fxDepth > 0 || !locks()) {
+      run();
+      return;
     }
-    return out;
+    var lk = locks();
+    var name = "bq-settle:" + (projectId || "") + ":" + (queue || "");
+    var n = attempt || 0;
+    var p;
+    try {
+      p = lk.request(name, { ifAvailable: true }, function(lock) {
+        if (!lock) return false;
+        return new Promise(function(resolve) {
+          var t = setTimeout(function() {
+            resolve(true);
+          }, LOCK_HOLD_MAX_MS);
+          Promise.resolve(run()).then(function() {
+            clearTimeout(t);
+            resolve(true);
+          }, function() {
+            clearTimeout(t);
+            resolve(true);
+          });
+        });
+      });
+    } catch (e) {
+      run();
+      return;
+    }
+    Promise.resolve(p).then(function(got) {
+      if (got !== false) return;
+      if (n >= 30) {
+        run();
+        return;
+      }
+      setTimeout(function() {
+        runSettleSideEffect(projectId, queue, key, fn, n + 1, tryNo);
+      }, Math.min(5e3, 250 * Math.pow(2, n)));
+    }, function() {
+      run();
+    });
+  }
+  function locks() {
+    var l = _g.navigator && _g.navigator.locks;
+    return l && typeof l.request === "function" ? l : null;
+  }
+  function newClientRef() {
+    var rnd = "";
+    var c = _g.crypto;
+    if (c && typeof c.getRandomValues === "function") {
+      var a = new Uint32Array(2);
+      c.getRandomValues(a);
+      rnd = a[0].toString(36) + a[1].toString(36);
+    } else {
+      rnd = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    }
+    return ("c" + Date.now().toString(36) + "_" + rnd).slice(0, 64);
+  }
+  function queueNameOf(q) {
+    if (typeof q !== "string" || !q) return "";
+    var head = q.split("|")[0];
+    var i = head.lastIndexOf(":");
+    return i === -1 ? head : head.slice(i + 1);
   }
 
   // src/engine/office.ts
@@ -1139,6 +1349,26 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (!hay) return false;
     return hay.indexOf("token has expired") !== -1 || hay.indexOf("token is expired") !== -1 || hay.indexOf("expired_token") !== -1 || hay.indexOf("invalid_token") !== -1 || hay.indexOf("unauthorized") !== -1 || hay.indexOf("not authorized") !== -1 || hay.indexOf("invalid_request") !== -1 && hay.indexOf("token") !== -1;
   }
+  function isNotExistsError(err) {
+    return !!err && typeof err === "object" && (err.code === "NOT_EXISTS" || !!err.body && err.body.code === "NOT_EXISTS");
+  }
+  var TRANSPORT_FAILURE_CODES = ["NETWORK_ERROR", "TIMEOUT", "RATE_LIMITED", "TOO_MANY_REQUESTS", "SERVER_ERROR", "ABORTED", "TOKEN_REFRESH_FAILED"];
+  function isTransportFailure(err) {
+    if (err === void 0 || err === null) return true;
+    if (typeof err === "string") {
+      var s = err.toLowerCase();
+      return s.indexOf("network") !== -1 || s.indexOf("abort") !== -1 || s.indexOf("too many") !== -1 || s.indexOf("timeout") !== -1 || s.indexOf("timed out") !== -1 || s.indexOf("no response for") !== -1;
+    }
+    if (typeof err !== "object") return false;
+    if (typeof TypeError !== "undefined" && err instanceof TypeError) return true;
+    var code = err.code !== void 0 && err.code !== null ? String(err.code) : "";
+    if (TRANSPORT_FAILURE_CODES.indexOf(code) !== -1) return true;
+    if (code === "429" || /^5\d\d$/.test(code)) return true;
+    var status = typeof err.status === "number" ? err.status : typeof err.statusCode === "number" ? err.statusCode : 0;
+    if (status === 429 || status >= 500) return true;
+    var msg = typeof err.message === "string" ? err.message.toLowerCase() : "";
+    return msg.indexOf("network error") !== -1 || msg.indexOf("failed to fetch") !== -1 || msg.indexOf("no response for") !== -1 || msg.indexOf("timed out") !== -1 || msg === "aborted";
+  }
 
   // src/engine/links.ts
   var EXPIRED_ATTACHMENT_URL_HOST = "_expired_.url";
@@ -1504,7 +1734,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var rest = value.slice(SRC_PREFIX.length).trim();
     return rest ? rest : null;
   }
-  function parseJsonLoose2(value) {
+  function parseJsonLoose(value) {
     if (typeof value !== "string") return value;
     var t = value.trim();
     if (!t || t[0] !== "{" && t[0] !== "[") return null;
@@ -1532,7 +1762,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var RESULT_STRING_MAX_CHARS = 2 * 1024 * 1024;
   function readHits(note, result) {
-    var parsed = parseJsonLoose2(result);
+    var parsed = parseJsonLoose(result);
     if (!parsed || typeof parsed !== "object") return;
     var visited = 0;
     var walk = function(node, depth) {
@@ -1550,7 +1780,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var v = node[k];
         if (v && typeof v === "object") walk(v, depth + 1);
         else if (typeof v === "string" && v.length > 1 && v.length <= RESULT_STRING_MAX_CHARS && (v.charAt(0) === "{" || v.charAt(0) === "[")) {
-          var inner = parseJsonLoose2(v);
+          var inner = parseJsonLoose(v);
           if (inner && typeof inner === "object") walk(inner, depth + 1);
         }
       }
@@ -1613,7 +1843,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (kind === "mcp_call" || kind === "function_call") {
           sawTool = true;
           pushUnique(note.tools, item.name);
-          readArguments(note, parseJsonLoose2(item.arguments) || item.arguments);
+          readArguments(note, parseJsonLoose(item.arguments) || item.arguments);
           if (!item.error && item.name === "searchText") readHits(note, item.output);
         } else if (kind.indexOf("web_search") === 0 || kind.indexOf("web_fetch") === 0) {
           sawTool = true;
@@ -2234,7 +2464,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     mcpServer,
     extractContent,
     fileUrls,
-    webAccess
+    webAccess,
+    cref
   }) {
     const web = await resolveWebAccess(service, typeof webAccess === "boolean" ? webAccess : void 0);
     const effortFields = chatEffortFields("claude", model, await resolveAnswerMode(service));
@@ -2254,6 +2485,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       owner,
       ...pollOpt(),
       ...stream.transport,
+      ...cref ? { cref } : {},
       url: ANTHROPIC_MESSAGES_API_URL,
       method: "POST",
       headers: {
@@ -2306,9 +2538,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
     });
   }
-  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope) {
+  async function callClaudeWithPublicMcp(prompt, service, owner, messages, system, model, userId, extractContent, fileUrls, onResponse, onError, mcpScope, turn) {
     const endpoint = mcpEndpointFor(mcpScope?.anonymous, mcpScope?.publicProjectId, service);
     return callClaudeWithMcp({
+      cref: turn?.cref,
       prompt,
       messages,
       service,
@@ -2380,6 +2613,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       owner,
       ...pollOpt(),
       ...stream.transport,
+      ...turn && turn.cref ? { cref: turn.cref } : {},
       url: OPENAI_RESPONSES_API_URL,
       method: "POST",
       headers: {
@@ -2527,6 +2761,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         service,
         owner,
         ...pollOpt(),
+        ...info.cref ? { cref: info.cref } : {},
         // Status push for this pass and the continuations the worker queues from it
         // (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
         ...statusPushEnabled() ? { notify: true } : {},
@@ -2574,6 +2809,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       service,
       owner,
       ...pollOpt(),
+      ...info.cref ? { cref: info.cref } : {},
       // Status push for this pass and the continuations the worker queues from it
       // (see ChatEngineConfig.statusPush). Absent unless the host turned it on.
       ...statusPushEnabled() ? { notify: true } : {},
@@ -2686,14 +2922,23 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function runIndexUniqueId(storagePath) {
     return "run::" + storagePath;
   }
-  function upsertIndexRunRecordSafe(service, storagePath, patch) {
-    if (!service || !storagePath) return;
+  function upsertIndexRunRecordSafe(service, storagePath, patch, opts) {
+    const report = !!(opts && opts.report);
+    if (!service || !storagePath) return Promise.resolve();
+    let out;
     try {
       const hook = chatEngineConfig().upsertIndexRunRecord;
-      if (typeof hook !== "function") return;
-      hook({ service, storagePath, patch });
+      if (typeof hook !== "function") return Promise.resolve();
+      out = hook({ service, storagePath, patch });
     } catch (e) {
+      return report ? Promise.reject(e) : Promise.resolve();
     }
+    const p = Promise.resolve(out).then(function() {
+      return void 0;
+    });
+    return report ? p : p.catch(function() {
+      return void 0;
+    });
   }
   function bgIndexingQueueName(userId, service) {
     return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
@@ -2721,7 +2966,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       params.status ? { status: params.status } : {},
       params.queue_exact ? { queue_exact: true } : {},
       params.compact ? { compact: true } : {},
-      params.queue_exclude ? { queue_exclude: params.queue_exclude } : {}
+      params.queue_exclude ? { queue_exclude: params.queue_exclude } : {},
+      params.fields ? { fields: params.fields } : {},
+      params.after ? { after: params.after } : {},
+      params.deadline ? { deadline: params.deadline } : {},
+      params.signal ? { signal: params.signal } : {},
+      params.fresh ? { fresh: true } : {}
     );
     return resolveForwardRequestHistory()(
       p,
@@ -4372,6 +4622,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     return "";
   }
+  function listedRequestText(item) {
+    if (item && typeof item.request_text === "string") return item.request_text;
+    return extractLastUserTextFromRequest(item && item.request_body);
+  }
   function isIndexingRequestText(userText) {
     if (typeof userText !== "string") return false;
     return userText.indexOf("A new file has just been uploaded") === 0 || userText.indexOf("CONTINUE indexing") === 0;
@@ -4391,6 +4645,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       continued: userText.indexOf("CONTINUE indexing") === 0
     };
   }
+  var LIVE_INDEX_PROBE_LIMIT = 20;
   var BG_PROBE_TTL_MS = 4e3;
   var bgProbeCache = {};
   var bgProbeInflight = {};
@@ -4404,7 +4659,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const inflight = bgProbeInflight[key];
     if (inflight) return inflight;
     const p = Promise.resolve(getChatHistory(
-      { service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
+      { service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status, compact: true, queue_exact: true },
       { limit: params.limit, fetchMore: false }
     )).then(function(result) {
       const entry2 = { result, at: Date.now() };
@@ -4418,6 +4673,31 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       delete bgProbeInflight[key];
     });
     return p;
+  }
+  async function fetchLiveIndexingKeys(params, opts) {
+    const queue = bgIndexingQueueName(params.userId, params.service);
+    const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
+    const maxAgeMs = opts && typeof opts.maxAgeMs === "number" ? opts.maxAgeMs : BG_PROBE_TTL_MS;
+    const [pending, running] = await Promise.all([
+      probeBgQueue({ ...base, status: "pending", limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs }),
+      probeBgQueue({ ...base, status: "running", limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs })
+    ]);
+    const keys = /* @__PURE__ */ new Set();
+    let truncated = false;
+    for (const entry2 of [pending, running]) {
+      const res = entry2.result;
+      const list = res && Array.isArray(res.list) ? res.list : [];
+      if (list.length >= LIVE_INDEX_PROBE_LIMIT || res && res.endOfList === false) truncated = true;
+      for (const item of list) {
+        const text = listedRequestText(item);
+        if (!text || !isIndexingRequestText(text)) continue;
+        const ref = parseIndexingRequestText(text);
+        if (!ref) continue;
+        if (ref.path) keys.add(ref.path);
+        if (ref.name) keys.add(ref.name);
+      }
+    }
+    return { keys, checked: !truncated, at: Math.min(pending.at, running.at) };
   }
   var BG_COVERAGE_MAX_PAGES = 2;
   var splitHistoryStates = {};
@@ -4756,6 +5036,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function adoptLocalAnswerIntoPage(incoming, local) {
     if (!incoming || !local || !incoming._streamPending) return false;
     if (incoming.role !== "assistant" || local.role !== "assistant") return false;
+    if (local.isError) return false;
     var hasText = typeof local.content === "string" && local.content.length > 0;
     var isLive = !!(local.isPending || local._streaming);
     if (!hasText && !isLive) return false;
@@ -4769,6 +5050,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (local._streaming) incoming._streaming = true;
     return true;
   }
+  function adoptLiveTextIntoRunningRow(incoming, local) {
+    if (!incoming || !local) return false;
+    if (incoming.role !== "assistant" || local.role !== "assistant") return false;
+    if (!incoming.isPending || incoming.isBackgroundTask || incoming._streamPending) return false;
+    if (local.isError || !(local.isPending || local._streaming)) return false;
+    if (typeof local.content !== "string" || !local.content) return false;
+    if (typeof incoming.content === "string" && incoming.content.length >= local.content.length) return false;
+    incoming.content = local.content;
+    if (local._localId !== void 0) incoming._localId = local._localId;
+    if (local._streaming) incoming._streaming = true;
+    return true;
+  }
   function shouldRescueInFlightMessage(m, ctx) {
     if (!m) return false;
     if (m.isBackgroundTask) return false;
@@ -4776,12 +5069,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     if (m._serverItemId && ctx.hasServerId(m._serverItemId)) return false;
     if (m._stageId) return true;
     if (m._streaming && !m._serverItemId) return true;
+    if (!m._serverItemId && (m._unconfirmed || m._notSent)) return true;
     if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
     if (m.isSendingToServer || m.isPendingQueued || m.isPendingInProcess || m.isPending) return true;
-    if (ctx.sending && m.role === "user") {
+    if (m.role === "user") {
       var next = ctx.next;
-      if (!next || next.isBackgroundTask || !next.isPending) return false;
-      return next._serverItemId === void 0 || next._serverItemId === m._serverItemId;
+      if (!next || next.isBackgroundTask || !next.isPending || next.role !== "assistant") return false;
+      if (ctx.sending && (next._serverItemId === void 0 || next._serverItemId === m._serverItemId)) return true;
+      return !!m._serverItemId && next._serverItemId === m._serverItemId;
     }
     return false;
   }
@@ -5141,9 +5436,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var ADOPT_TICK_MS = 10 * 1e3;
   var STATUS_PUSH_ADOPT_TICK_MS = 60 * 1e3;
   var CATCH_UP_MIN_GAP_MS = 2e3;
-  var RETURN_WATCH_MS = 15 * 1e3;
-  var RETURN_WATCH_SLEEP_GAP_MS = 45 * 1e3;
-  var STATUS_NUDGE_MIN_GAP_MS = 2e3;
   var EARLY_PROBE_SCHEDULE_MS = [400, 900, 1700];
   var INDEXING_DRAIN_BUSY_POLL_MS = 8e3;
   var INDEXING_DRAIN_CONFIRM_POLL_MS = 3e3;
@@ -5153,13 +5445,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   var INDEXING_DRAIN_TIMEOUT_MS = 15 * 60 * 1e3;
   var INDEXING_DRAIN_LOOK_TIMEOUT_MS = 45e3;
   var INDEXING_DRAIN_NUDGE_MIN_GAP_MS = 1500;
-  var _g = typeof globalThis !== "undefined" ? globalThis : {};
+  var _g2 = typeof globalThis !== "undefined" ? globalThis : {};
   function nowMs() {
-    return _g.performance && typeof _g.performance.now === "function" ? _g.performance.now() : Date.now();
+    return _g2.performance && typeof _g2.performance.now === "function" ? _g2.performance.now() : Date.now();
   }
   function nextFrame(cb) {
-    if (typeof _g.requestAnimationFrame === "function") {
-      _g.requestAnimationFrame(cb);
+    if (typeof _g2.requestAnimationFrame === "function") {
+      _g2.requestAnimationFrame(cb);
       return;
     }
     setTimeout(function() {
@@ -5169,6 +5461,38 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function isPollStopped(res) {
     return !!res && typeof res === "object" && res.status === "stopped";
   }
+  var OPEN_STATE_RANK = { queued: 0, running: 1, terminal: 2 };
+  var IQ_LIVE_MS = 8 * 1e3;
+  var IQ_PUSH_LIVE_MS = 60 * 1e3;
+  var IQ_CONFIRM_MS = 2500;
+  var IQ_FRAME_GAP_MS = 2e3;
+  var NOT_SENT_TEXT = "Not sent. Retry?";
+  var REQUEST_GONE_TEXT = "This request is no longer available.";
+  var REQUEST_UNREACHABLE_TEXT = "This answer is no longer reachable from this network.";
+  var ANSWER_UNLOADABLE_TEXT = "The answer is stored but could not be loaded right now. Reload to try again.";
+  var BODY_UNAVAILABLE_BACKOFF_AFTER = 3;
+  var BODY_UNAVAILABLE_GIVE_UP = 5;
+  var UNLOADABLE_RETRIES = 10;
+  var FAILED_PASS_RECHECK_MIN_MS = 3 * 1e3;
+  var FAILED_PASS_RECHECK_MAX_MS = 30 * 1e3;
+  var CHAIN_STORE_PREFIX = "bq-chain:";
+  var CHAIN_STORE_TTL_MS = 24 * 60 * 60 * 1e3;
+  var CHAIN_LOST_TEXT = "Indexing stopped before the file finished (the page was closed). Index it again.";
+  var NEXT_PASS_NOT_SENT_TEXT = "Could not send the next indexing pass.";
+  var NOT_SENT_MIN_AGE_MS = 15 * 1e3;
+  var LOOK_READ_CAP = 300;
+  var RETURN_COVER_MS = 15 * 1e3;
+  var LOOK_HEAD_OF_LINE = 5;
+  var LOOK_READ_CONCURRENCY = 4;
+  var FILE_RUN_RECHECK_MS = 30 * 1e3;
+  function cancelledEnvelope(id) {
+    return { id, status: "cancelled", in_queue: false };
+  }
+  function pollErrorBody(err) {
+    return { type: "error", error: { type: "request_error", message: getErrorMessage(err) } };
+  }
+  var NO_TEXT_RESPONSE = "No text response received from AI provider.";
+  var EMPTY_PROVIDER_BODY = { content: [], output: [] };
   var LIVE_PENDING_LINK_WINDOW = 512;
   var STREAM_RECOVERY_PER_LOAD = 2;
   function liveSafePrefix(text) {
@@ -5345,6 +5669,32 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.wrongAnswerLabel = WRONG_ANSWER_LABEL;
       this.wrongAnswerMessage = WRONG_ANSWER_MESSAGE;
       this.typewriterQueue = Promise.resolve();
+      /** performance.now() of the last look that read every open item's status. */
+      this._recFullReadAt = 0;
+      /** performance.now() of the last return look's start (see resumePolling). */
+      this._recReturnAt = 0;
+      /** Looks that still read statuses after a counter moved: a queued turn starts a moment
+       *  after the one ahead of it finishes, and starting moves no counter. */
+      this._recFollowUps = 0;
+      /** The backend refused the counters read (too old): statuses are read every look. */
+      this._recCountersOff = false;
+      /** The backend refused the batch status read (too old): today's polls instead. */
+      this._recReadsOff = false;
+      /** A first-page read a look could not run yet (a load in flight, polling paused). */
+      this._recFirstPageOwed = false;
+      /** performance.now() of the last first-page read a look started. */
+      this._recFirstPageAt = 0;
+      /** gateRefreshToken of the last first-page load started (see loadHistory). */
+      this._recFirstPageToken = void 0;
+      /** performance.now() when the last first-page load landed (see loadHistory). */
+      this._recFirstPageDoneAt = 0;
+      /** performance.now() of the last indexing queue check a look ran. */
+      this._recAdoptAt = 0;
+      this._fileRunCheckAt = 0;
+      this._recSyncing = false;
+      /** Pages watching a project's background indexing queue (watchIndexQueue). */
+      this._iqWatches = [];
+      this._chainsRestored = false;
       /**
        * Pick up indexing passes the WORKER minted, which no client ever dispatched.
        *
@@ -5379,27 +5729,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
        *  work, so a tab return no longer re-asks for ten minutes after every run. Memory only:
        *  a reload starts without it and asks once, as before. */
       this._idleVerdictAt = {};
-      this._adoptTickTimer = null;
-      /** Start the ADOPT_TICK_MS follow-up if this page is tracking live indexing work and
-       *  is visible. Idempotent; each tick re-checks and stops when the work is gone, the tab
-       *  is hidden (resume restarts it through refreshLiveIndexState) or the view closed. */
       // ── RETURN CATCH-UP + REQUEST STATUS PUSH (owner, 2026-11-23) ──────────────
       // The rule: when the user comes back to the chat (the tab shown again, the computer
       // awake again, the network or the websocket back), the chat is re-read from the
-      // server, so nothing that happened while they were away is missing. The re-read is
-      // loadHistory's own first-page refresh, the one every mount runs: it keeps older pages
-      // the user loaded, keeps a send still in flight, never lets an empty answer replace a
-      // known one, re-attaches polls to whatever is still waiting, and reads back a streamed
-      // answer nobody finalized. Status frames (statusPush) only make things faster; they
-      // never decide anything on screen.
-      this._catchUpAt = 0;
-      this._catchUpTimer = null;
-      this._returnWatchTimer = null;
-      this._returnWatchAt = 0;
-      this._returnListeners = false;
+      // server, so nothing that happened while they were away is missing. Since the
+      // reconciler (2026-11-24) that is its return look: the live readers restart, the
+      // discovery listing finds sends whose ack was lost, the first page is merged (keeps
+      // older pages, a send in flight, never lets an empty answer replace a known one), and
+      // every open item is read. Status frames (statusPush) only make looks sooner; they
+      // never decide anything on screen. The methods below keep their names as wrappers.
       this._statusUnsub = null;
-      this._statusNudgeTimer = null;
-      this._statusNudgeAt = 0;
       this._statusSeenConnect = false;
       /** The last COMPLETE running+pending look at this user's bg queue: which pass ids were
        *  live. Complete means both lists came back shorter than their limit, so a tracked pass
@@ -5408,8 +5747,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       /** By-listing passes whose by-id lookup is in flight, so one tick never reads a pass twice. */
       this._listingSettling = {};
       this._listingLookInflight = false;
-      /** Turns whose findings were already looked at (a turn can settle by more than one path). */
-      this._findingsDone = {};
       this._progressInflight = false;
       this.host = host;
       this.state = {
@@ -5435,7 +5772,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         liveIndexRunning: {},
         liveIndexRunningChecked: false,
         liveIndexSettled: {},
-        stoppedIndexIds: {}
+        stoppedIndexIds: {},
+        reconnecting: false,
+        signInNeeded: false,
+        indexQueues: {}
       };
       this.bgTaskQueue = [];
       this.cancelledServerIds = /* @__PURE__ */ new Set();
@@ -5458,6 +5798,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this._bgQueueByFile = null;
       this._bgQueueStamp = { arr: null, length: 0, first: void 0, last: void 0 };
       this._bgQueueIndexRebuilds = 0;
+      this._watchVisibility();
     }
     /** What the display layer needs to decide whether a run is finished. `keys` holds
      *  every file the server still has indexing work for; `checked` is false until the
@@ -5655,6 +5996,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                     projectId: id.projectId,
                     platform: id.platform,
                     id: ack.id,
+                    identity: Object.assign({}, id),
+                    owner: id.owner,
                     filename: name,
                     storagePath,
                     isReindex: true,
@@ -5663,6 +6006,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                     status: ack.status === "running" ? "running" : "pending",
                     poll: ack.poll
                   });
+                  self.noteBgQueueChanged();
                   self.drainBgTaskQueue();
                 } else {
                   self.releaseIndexRun(storagePath);
@@ -5769,7 +6113,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var item = list[i];
           if (!item || item.status !== "pending" && item.status !== "running") continue;
           if (item.id && settledIds[item.id]) continue;
-          var text = extractLastUserTextFromRequest(item.request_body);
+          var text = listedRequestText(item);
           if (!isIndexingRequestText(text)) continue;
           var ref = parseIndexingRequestText(text);
           if (!ref) continue;
@@ -6007,9 +6351,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       var base = source.poll(Object.assign({ latency: POLL_INTERVAL }, opts || {}));
       var lookup = chatEngineConfig().csrHistoryItemLookup;
-      var ident = this.host.getIdentity();
-      var platform = ident && ident.platform;
-      if (!lookup || !itemId || !ident || !ident.projectId || platform !== "claude" && platform !== "openai") {
+      var liveIdent = this.host.getIdentity();
+      var ident = {
+        projectId: ctx && ctx.projectId !== void 0 ? ctx.projectId : liveIdent && liveIdent.projectId,
+        owner: ctx && ctx.owner !== void 0 ? ctx.owner : liveIdent && liveIdent.owner
+      };
+      var platform = ctx && (ctx.platform === "claude" || ctx.platform === "openai") ? ctx.platform : liveIdent && liveIdent.platform;
+      if (!lookup || !itemId || !ident.projectId || platform !== "claude" && platform !== "openai") {
         return base;
       }
       var settled = false;
@@ -6199,6 +6547,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       st.lastPaintAt = nowMs();
       if (this.getHistoryCacheKey() !== st.ownerKey) return;
       var idx = this._liveTargetIndex(st.id);
+      if (idx === -1) {
+        this._noteServerState(st.id, "running", st.ownerKey);
+        idx = this._liveTargetIndex(st.id);
+      }
       if (idx === -1) return;
       var msg = this.state.messages[idx];
       if (!msg) return;
@@ -6383,19 +6735,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var fin = resolveForwardRequestFinalize();
       if (!fin || st.finalBody == null) return;
       st.finalized = true;
-      var url = st.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
-      try {
-        Promise.resolve(fin(st.id, st.finalBody, {
-          url,
-          method: "POST",
-          service: st.projectId,
-          owner: st.owner
-        })).catch(function(err) {
-          console.warn("[chat-engine] forwardRequestFinalize failed", err);
-        });
-      } catch (e) {
-        console.warn("[chat-engine] forwardRequestFinalize threw", e);
-      }
+      var item = this._openMap()[st.id];
+      this._finalizeAnswer(st.id, st.finalBody, {
+        ownerKey: st.ownerKey,
+        platform: st.platform,
+        projectId: st.projectId,
+        owner: st.owner,
+        queue: item ? item.queue : void 0
+      });
     }
     /** Painted-but-unsettled live text on a bubble, for the typewriter to resume from.
      *  A pending assistant placeholder is created with content '' by every path that
@@ -6457,26 +6804,69 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      */
     _adoptLocalAnswers(mapped, loadKey) {
       if (!mapped || !mapped.length) return;
-      var pendingIncoming = [];
+      var tomb = this._tomb();
+      var needsLocals = false;
       for (var i = 0; i < mapped.length; i++) {
-        if (mapped[i] && mapped[i]._streamPending) pendingIncoming.push(mapped[i]);
+        var mi = mapped[i];
+        if (!mi) continue;
+        if (mi._streamPending || mi.isPending && mi.role === "assistant" && !mi.isBackgroundTask || mi._serverItemId && tomb[mi._serverItemId] && (mi.isPending || mi.isPendingQueued || mi.isPendingInProcess)) {
+          needsLocals = true;
+          break;
+        }
       }
-      if (!pendingIncoming.length) return;
+      if (!needsLocals) return;
       var locals = {};
+      var localUsers = {};
       for (var j = 0; j < this.state.messages.length; j++) {
         var lm = this.state.messages[j];
-        if (!lm || lm.role !== "assistant" || !lm._serverItemId) continue;
+        if (!lm || !lm._serverItemId) continue;
         if (lm._ownerKey !== void 0 && loadKey !== void 0 && lm._ownerKey !== loadKey) continue;
-        if (locals[lm._serverItemId] === void 0) locals[lm._serverItemId] = lm;
+        if (lm.role === "assistant") {
+          if (locals[lm._serverItemId] === void 0) locals[lm._serverItemId] = lm;
+        } else if (lm.role === "user") {
+          if (localUsers[lm._serverItemId] === void 0) localUsers[lm._serverItemId] = lm;
+        }
       }
-      for (var k = 0; k < pendingIncoming.length; k++) {
-        var inc = pendingIncoming[k];
+      var pendingIncoming = [];
+      for (var k = 0; k < mapped.length; k++) {
+        var inc = mapped[k];
+        if (!inc) continue;
         var id = inc._serverItemId;
+        if (inc._streamPending) pendingIncoming.push(inc);
         if (!id) continue;
         var local = locals[id];
-        if (!local) continue;
-        if (!adoptLocalAnswerIntoPage(inc, local)) continue;
-        if (this._rec().incomplete[id]) inc._streamPending = true;
+        if (inc._streamPending) {
+          if (!local) continue;
+          if (!adoptLocalAnswerIntoPage(inc, local)) continue;
+          if (this._rec().incomplete[id]) inc._streamPending = true;
+          continue;
+        }
+        if (local && inc.role === "assistant" && inc.isPending && !tomb[id]) adoptLiveTextIntoRunningRow(inc, local);
+      }
+      for (var t = mapped.length - 1; t >= 0; t--) {
+        var tm = mapped[t];
+        var tid = tm ? tm._serverItemId : void 0;
+        if (!tid || !tomb[tid]) continue;
+        if (tm.role === "assistant" && tm.isPending) {
+          var la = locals[tid];
+          if (la && !la.isPending && !la._streamPending) mapped[t] = Object.assign({}, la);
+          continue;
+        }
+        if (tm.role === "user" && (tm.isPendingQueued || tm.isPendingInProcess)) {
+          var lu = localUsers[tid];
+          if (!lu || lu.isPendingQueued || lu.isPendingInProcess || lu.isSendingToServer) continue;
+          mapped[t] = lu.isCancelled ? Object.assign({}, lu) : this._settledUserCopy(tm, tid);
+          var hasAnswer = false;
+          for (var q = 0; q < mapped.length; q++) {
+            var qm = mapped[q];
+            if (qm && qm.role === "assistant" && qm._serverItemId === tid) {
+              hasAnswer = true;
+              break;
+            }
+          }
+          var lans = locals[tid];
+          if (!hasAnswer && !lu.isCancelled && lans && !lans.isPending && !lans._streamPending) mapped.splice(t + 1, 0, Object.assign({}, lans));
+        }
       }
       for (var p = 0; p < pendingIncoming.length; p++) {
         var pi = pendingIncoming[p];
@@ -6695,48 +7085,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           return;
         }
         this._clearStreamPendingMark(itemId, ownerKey, true);
+        if (this._hasWaitingBubble(itemId, ownerKey)) {
+          this.applyTerminal(itemId, EMPTY_PROVIDER_BODY, { ownerKey, platform, projectId, owner, instant: true });
+        }
         return;
       }
-      var reply = isErr ? { role: "assistant", content: getErrorMessage(body), isError: true, _serverItemId: itemId } : { role: "assistant", content: text, _serverItemId: itemId };
-      if (!isErr) {
-        var rNote = extractRetrievalNote(body, text);
-        if (rNote) reply._retrieval = rNote;
-        this._saveFindings(itemId, body, text, rNote);
-      }
-      if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
-        this._applyReplyToCache(ownerKey, reply, itemId);
-      } else {
-        var idx = -1;
-        for (var i = 0; i < this.state.messages.length; i++) {
-          var m = this.state.messages[i];
-          if (m && m.role === "assistant" && m._serverItemId === itemId) {
-            idx = i;
-            break;
-          }
-        }
-        if (idx === -1) {
-          this._applyReplyToCache(ownerKey, reply, itemId);
-        } else {
-          var prev = this.state.messages[idx];
-          if (prev._ts !== void 0) reply._ts = prev._ts;
-          if (prev._ownerKey !== void 0) reply._ownerKey = prev._ownerKey;
-          this.state.messages[idx] = reply;
-          this.updateHistoryCache();
-          this.host.notify();
-        }
-      }
+      this.applyTerminal(itemId, body, { ownerKey, platform, projectId, owner, instant: true, correction: true });
       if (!degraded) delete this._rec().incomplete[itemId];
       if (!store || body == null || isErr) return;
-      var fin = resolveForwardRequestFinalize();
-      if (!fin) return;
-      var url = platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
-      try {
-        Promise.resolve(fin(itemId, body, { url, method: "POST", service: projectId, owner })).catch(function(err) {
-          console.warn("[chat-engine] finalize of a recovered turn failed", err);
-        });
-      } catch (e) {
-        console.warn("[chat-engine] finalize of a recovered turn threw", e);
-      }
+      this._finalizeAnswer(itemId, body, { ownerKey, platform, projectId, owner });
     }
     /**
      * Take the "answer is elsewhere" marker off a turn once it is settled one way or
@@ -6835,11 +7192,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     resumePolling(reason) {
       this._pauseReasons.delete(reason || "paused");
       if (this._pauseReasons.size > 0 || this._resuming) return Promise.resolve();
-      if (!this.host.isViewMounted || !this.host.isViewMounted()) return Promise.resolve();
       var self = this;
       this._resuming = true;
       return Promise.resolve().then(function() {
-        self.drainBgTaskQueue();
+        if (self._viewMounted()) self.drainBgTaskQueue();
+        if (self._recReturnAt && nowMs() - self._recReturnAt < RETURN_COVER_MS) {
+          self._recEnsure();
+          return;
+        }
         return self.catchUpHistory();
       }).catch(function(e) {
         console.error("[chat-engine] resume polling failed", e);
@@ -6866,6 +7226,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var sid = m._serverItemId;
         if (!sid) continue;
         if (this.historyItemPolls.has(sid) || tracked[sid]) continue;
+        if (this._recNewMode() && this._openMap()[sid]) continue;
         return true;
       }
       return false;
@@ -6980,8 +7341,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * history fetch issued in that window returns the turn ALREADY SETTLED, with no
      * pending assistant in it. The rescue then re-appends the local pair below the
      * server's copy (the question, twice), and when the poll finally resolves,
-     * typewriteLatestReply writes the answer into the rescued placeholder because it
-     * is the only pending assistant left (the answer, twice). updateHistoryCache
+     * the old positional settle wrote the answer into the rescued placeholder because
+     * it was the only pending assistant left (the answer, twice). updateHistoryCache
      * persists the result, so it survives every later visit.
      *
      * Navigating away while waiting and coming back is what lands a fetch in that
@@ -7004,8 +7365,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var m = list[i];
           if (!m || !m._localId) continue;
           if (m._localId !== userLid && m._localId !== placeholderLid) continue;
-          if (m._serverItemId === itemId) continue;
-          list[i] = Object.assign({}, m, { _serverItemId: itemId });
+          var ackFlags = m._localId === userLid && m.role === "user" && (!!m.isSendingToServer || !!m._dimSending) && !m._stageId;
+          if (m._serverItemId === itemId && !ackFlags) continue;
+          var patch = { _serverItemId: itemId };
+          if (ackFlags) {
+            patch.isSendingToServer = false;
+            patch._dimSending = false;
+          }
+          list[i] = Object.assign({}, m, patch);
           hit = true;
         }
         return hit;
@@ -7024,60 +7391,509 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }
       if (changed) this.host.notify();
     }
+    _openMap() {
+      if (!this._openItems) this._openItems = {};
+      return this._openItems;
+    }
+    _tomb() {
+      if (!this._terminalIds) this._terminalIds = {};
+      return this._terminalIds;
+    }
+    /** Remember when the tab was last hidden, for the "watched live" test. */
+    _watchVisibility() {
+      if (this._visibilityWatched) return;
+      this._visibilityWatched = true;
+      var doc = _g2.document;
+      if (!doc || typeof doc.addEventListener !== "function") return;
+      var self = this;
+      if (doc.visibilityState === "hidden") this._hiddenAt = Date.now();
+      doc.addEventListener("visibilitychange", function() {
+        if (doc.visibilityState === "hidden") self._hiddenAt = Date.now();
+      });
+    }
     /**
-     * Land a resolved reply in the history cache of a chat that is NOT currently
-     * visible, without touching state.messages. Mirrors the cache-only path in
-     * dispatchAgentRequest: REPLACE the trailing pending "Thinking..." bubble
-     * (append only when there is none), and settle the matching pending user
-     * bubble, so the cached copy never keeps a stuck "Thinking..." that a later
-     * cache-first load would re-render forever.
+     * Follow an item, with its identity pinned NOW (the ack, a page showing it running
+     * or waiting, a background entry being adopted). Adding an id already followed
+     * changes nothing but its state, and only forward; a terminal id is never reopened.
      */
-    _applyReplyToCache(key, reply, serverId) {
-      if (!key) return;
-      var existing = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
-      var msgs = existing.messages.slice();
-      var thIdx = -1;
-      for (var i = msgs.length - 1; i >= 0; i--) {
-        var m = msgs[i];
-        if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
-        if (serverId && m._serverItemId && m._serverItemId !== serverId) continue;
-        thIdx = i;
-        break;
-      }
-      if (thIdx !== -1) {
-        if (reply._serverItemId === void 0 && msgs[thIdx]._serverItemId !== void 0) reply._serverItemId = msgs[thIdx]._serverItemId;
-        msgs[thIdx] = reply;
-      } else {
-        var dupIdx = -1;
-        if (serverId) {
-          for (var d = msgs.length - 1; d >= 0; d--) {
-            var dm = msgs[d];
-            if (dm && dm.role === "assistant" && dm._serverItemId === serverId) {
-              dupIdx = d;
-              break;
-            }
+    trackOpenItem(itemId, init) {
+      if (!itemId || !init) return;
+      this._watchVisibility();
+      if (this._tomb()[itemId]) return;
+      var map = this._openMap();
+      var state = init.state === "running" ? "running" : "queued";
+      var cur = map[itemId];
+      if (!cur) {
+        var plat = init.platform === "openai" ? "openai" : "claude";
+        if (init.platform !== "claude" && init.platform !== "openai") {
+          var live = this.host.getIdentity();
+          plat = live && live.platform === "openai" ? "openai" : "claude";
+        }
+        map[itemId] = {
+          ownerKey: init.ownerKey || "",
+          projectId: init.projectId || "",
+          owner: init.owner || "",
+          platform: plat,
+          queue: init.queue,
+          kind: init.kind === "indexing" ? "indexing" : "chat",
+          state,
+          addedAt: Date.now(),
+          lastConfirmed: 0
+        };
+        if (init.cref) map[itemId].cref = init.cref;
+        var who = null;
+        if (init.anonymous === void 0 || init.uid === void 0) {
+          try {
+            who = this.host.getIdentity();
+          } catch (e) {
+            who = null;
           }
         }
-        if (dupIdx !== -1) msgs[dupIdx] = reply;
-        else msgs.push(reply);
+        if (init.anonymous) map[itemId].anonymous = true;
+        else if (init.anonymous === void 0 && who && who.anonymous) map[itemId].anonymous = true;
+        var uid = init.uid !== void 0 ? init.uid : who ? who.userId : "";
+        if (uid) map[itemId].uid = uid;
+        this._recEnsure();
+        return;
       }
-      for (var j = 0; j < msgs.length; j++) {
-        var u = msgs[j];
-        if (!u || u.role !== "user" || u.isBackgroundTask) continue;
-        if (u._stageId) continue;
-        if (!(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer)) continue;
-        if (serverId && u._serverItemId && u._serverItemId !== serverId) continue;
-        var settled = { role: "user", content: u.content };
-        if (u._serverItemId !== void 0) settled._serverItemId = u._serverItemId;
-        if (u._ownerKey !== void 0) settled._ownerKey = u._ownerKey;
-        msgs[j] = settled;
-        break;
-      }
-      this.aiChatHistoryCache[key] = {
-        messages: msgs,
-        endOfList: existing.endOfList,
-        startKeyHistory: existing.startKeyHistory
+      if (OPEN_STATE_RANK[state] > OPEN_STATE_RANK[cur.state]) cur.state = state;
+      if (!cur.queue && init.queue) cur.queue = init.queue;
+      if (!cur.cref && init.cref) cur.cref = init.cref;
+    }
+    /** The pinned identity of an item this page follows, or null. */
+    getOpenItem(itemId) {
+      return itemId && this._openMap()[itemId] || null;
+    }
+    /** True once an item's result was applied (or it was cancelled) in this page. */
+    isItemSettled(itemId) {
+      return !!itemId && !!this._tomb()[itemId];
+    }
+    _closeItem(itemId) {
+      this._tomb()[itemId] = true;
+      delete this._openMap()[itemId];
+      if (this._recChunks) delete this._recChunks[itemId];
+    }
+    /** Did the reader watch this turn arrive? Live text was painted into it, or the tab
+     *  has stayed visible (with this chat on screen) since the page started following it. */
+    _watchedLive(itemId, painted, ownerKey) {
+      if (painted) return true;
+      var doc = _g2.document;
+      if (doc && doc.visibilityState === "hidden") return false;
+      if (!this.host.isViewMounted || !this.host.isViewMounted()) return false;
+      if (ownerKey && ownerKey !== this.getHistoryCacheKey()) return false;
+      var item = this._openMap()[itemId];
+      if (!item) return false;
+      return !(this._hiddenAt && this._hiddenAt >= item.addedAt);
+    }
+    /** The identity a settle uses: the caller's, then the pinned one, then the live one. */
+    _settleIdentity(itemId, ctx) {
+      var c = ctx || {};
+      var pin = this._openMap()[itemId];
+      var live = null;
+      var liveId = function() {
+        if (!live) live = this.host.getIdentity() || {};
+        return live;
       };
+      var ownerKey = c.ownerKey !== void 0 && c.ownerKey !== "" ? c.ownerKey : pin && pin.ownerKey ? pin.ownerKey : this.getHistoryCacheKey();
+      var platform = c.platform === "claude" || c.platform === "openai" ? c.platform : pin ? pin.platform : liveId.call(this).platform;
+      var projectId = c.projectId !== void 0 ? c.projectId : pin && pin.projectId ? pin.projectId : liveId.call(this).projectId;
+      var owner = c.owner !== void 0 ? c.owner : pin && pin.owner ? pin.owner : liveId.call(this).owner;
+      return { ownerKey: ownerKey || "", platform: platform === "openai" ? "openai" : "claude", projectId: projectId || "", owner: owner || "" };
+    }
+    /**
+     * Apply how an item ended. The ONLY writer of a settled result; see the section note.
+     * `result` is what the server gave back: a provider body, an error body, a cancelled
+     * envelope, or a status envelope (which is not a result and is routed instead).
+     * True when a bubble was written.
+     */
+    applyTerminal(itemId, result, ctx) {
+      if (!itemId || isPollStopped(result)) return false;
+      var c = ctx || {};
+      var who = this._settleIdentity(itemId, c);
+      if (this._isCancelledPollResult(result)) {
+        if (this._tomb()[itemId] && !this._hasWaitingBubble(itemId, who.ownerKey)) return false;
+        this._closeItem(itemId);
+        this._settleCancelledTurn(itemId, who.ownerKey);
+        return true;
+      }
+      if (isCsrStatusEnvelope(result) && !isErrorResponseBody(result)) {
+        if (result.status === "running" || result.status === "pending") {
+          this._noteServerState(itemId, result.status, who.ownerKey);
+        } else if (result.status === "resolved") {
+          this._readBackSettledStream(itemId, who);
+        }
+        return false;
+      }
+      if (this._tomb()[itemId] && !c.correction && !this._hasWaitingBubble(itemId, who.ownerKey)) return false;
+      var onScreen = !who.ownerKey || who.ownerKey === this.getHistoryCacheKey();
+      var outcome = onScreen ? this._applyTerminalOnScreen(itemId, result, who, c) : "missing";
+      if (outcome === "missing") outcome = this._applyTerminalToCache(itemId, result, who, c);
+      if (outcome === "missing") return false;
+      this._closeItem(itemId);
+      if (!c.correction) this._noteProviderAnswer(who, result);
+      return outcome === "applied";
+    }
+    /** Hand a settled provider answer to the host (ChatHost.onProviderAnswer), whichever
+     *  path read it. Optional, and never in the way of the settle. */
+    _noteProviderAnswer(who, result) {
+      if (!who || !who.projectId || who.platform !== "claude" && who.platform !== "openai") return;
+      var hook;
+      try {
+        hook = this.host && this.host.onProviderAnswer;
+      } catch (e) {
+        hook = void 0;
+      }
+      if (typeof hook !== "function") return;
+      try {
+        hook(who.projectId, who.platform, result);
+      } catch (e) {
+      }
+    }
+    /** A bubble of this item that still reads as waiting (a stale page can put one back). */
+    _hasWaitingBubble(itemId, ownerKey) {
+      var test = function(m) {
+        return !!m && m._serverItemId === itemId && (!!m.isPending || !!m.isPendingQueued || !!m.isPendingInProcess || !!m._streamPending);
+      };
+      if (!ownerKey || ownerKey === this.getHistoryCacheKey()) {
+        if (this.state.messages.some(test)) return true;
+      }
+      var cached = ownerKey ? this.aiChatHistoryCache[ownerKey] : void 0;
+      return !!cached && cached.messages.some(test);
+    }
+    /** The settled copy of a request bubble: its pending and sending flags come off,
+     *  everything that places it (file row, queue, chat, time, render key) stays. */
+    _settledUserCopy(u, itemId) {
+      var out = { role: "user", content: u.content };
+      var sid = itemId || u._serverItemId;
+      if (sid) out._serverItemId = sid;
+      if (u.isBackgroundTask) out.isBackgroundTask = true;
+      if (u._indexFile) out._indexFile = u._indexFile;
+      if (u._useBgQueue) out._useBgQueue = true;
+      if (u._ownerKey !== void 0) out._ownerKey = u._ownerKey;
+      if (u._ts !== void 0) out._ts = u._ts;
+      if (u._localId !== void 0) out._localId = u._localId;
+      if (u._fromBgChain) out._fromBgChain = true;
+      return out;
+    }
+    /**
+     * The shared core: settle the item with id `itemId` inside `list`, by id only.
+     * Returns what happened and, for a reply to type out, where and from what.
+     */
+    _settleInList(list, itemId, result, who, c, mayType) {
+      var none = { outcome: "missing", idx: -1, isBg: false, typed: false, text: "", painted: "" };
+      var aIdx = -1, settledIdx = -1, uIdx = -1;
+      for (var i = 0; i < list.length; i++) {
+        var m = list[i];
+        if (!m || m._serverItemId !== itemId) continue;
+        if (who.ownerKey && m._ownerKey !== void 0 && m._ownerKey !== who.ownerKey) continue;
+        if (m.role === "assistant") {
+          if (m.isPending || m._streamPending) {
+            if (aIdx === -1) aIdx = i;
+          } else if (settledIdx === -1) settledIdx = i;
+        } else if (m.role === "user" && uIdx === -1) uIdx = i;
+      }
+      if (aIdx === -1 && c.correction && settledIdx !== -1) aIdx = settledIdx;
+      if (aIdx === -1 && uIdx === -1 && settledIdx === -1) return none;
+      var u = uIdx !== -1 ? list[uIdx] : null;
+      if (aIdx === -1 && settledIdx !== -1) {
+        none.outcome = "settled";
+        return none;
+      }
+      if (aIdx === -1 && u && u.isCancelled) {
+        none.outcome = "settled";
+        return none;
+      }
+      if (aIdx === -1 && u && !(u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer || u.isPendingOlder)) {
+        none.outcome = "settled";
+        return none;
+      }
+      var a = aIdx !== -1 ? list[aIdx] : null;
+      var isBg = !!(a && a.isBackgroundTask || u && u.isBackgroundTask);
+      var isErr = isErrorResponseBody(result);
+      var platform = who.platform;
+      var answer = isErr ? getErrorMessage(result) : ((platform === "openai" ? extractOpenAIText(result) : extractClaudeText(result)) || "").trim();
+      var reportedComplete = isBg && !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
+      var keyOf = a && a._ownerKey !== void 0 ? a._ownerKey : u && u._ownerKey !== void 0 ? u._ownerKey : void 0;
+      var reply;
+      var typed = false, text = "", painted = "", lid;
+      if (isErr) {
+        reply = { role: "assistant", content: answer, isError: true, _serverItemId: itemId };
+        if (isBg && isRetriedFailure(result)) reply.isRetried = true;
+        if (isBg) reply.isBackgroundTask = true;
+        else reply._ts = this._replyStampFor(reply);
+      } else if (isBg) {
+        var bgText = answer || NO_TEXT_RESPONSE;
+        if (reportedComplete) bgText = bgText.split(INDEXING_COMPLETE_MARKER).join("").trim();
+        reply = { role: "assistant", content: bgText || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId };
+        if (reportedComplete) reply._indexComplete = true;
+      } else {
+        text = answer || NO_TEXT_RESPONSE;
+        painted = a && (a.isPending || a._streaming) && typeof a.content === "string" ? a.content : "";
+        typed = mayType && !c.instant && this._watchedLive(itemId, painted, who.ownerKey);
+        lid = this._newLocalId();
+        reply = { role: "assistant", content: typed ? painted : text, _serverItemId: itemId, _localId: lid };
+        var note = extractRetrievalNote(result, answer);
+        if (note) reply._retrieval = note;
+        if (!typed) reply._ts = this._replyStampFor(reply);
+      }
+      if (keyOf !== void 0) reply._ownerKey = keyOf;
+      if (u && (u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer || u.isPendingOlder)) list[uIdx] = this._settledUserCopy(u, itemId);
+      var idx;
+      if (aIdx !== -1) {
+        list[aIdx] = reply;
+        idx = aIdx;
+      } else {
+        idx = uIdx + 1;
+        list.splice(idx, 0, reply);
+      }
+      for (var k = list.length - 1; k >= 0; k--) {
+        if (k === idx) continue;
+        var d = list[k];
+        if (!d || d.role !== "assistant" || d._serverItemId !== itemId || !(d.isPending || d._streamPending)) continue;
+        list.splice(k, 1);
+        if (k < idx) idx--;
+      }
+      return { outcome: "applied", idx, isBg, typed, text, lid, painted };
+    }
+    _applyTerminalOnScreen(itemId, result, who, c) {
+      var self = this;
+      var r = this._settleInList(this.state.messages, itemId, result, who, c, true);
+      if (r.outcome !== "applied") return r.outcome;
+      this.host.notify();
+      var cacheKey2 = this.getHistoryCacheKey();
+      if (r.typed) {
+        var lid = r.lid, full = r.text;
+        Promise.resolve(this.enqueueTypewrite(r.idx, full, lid, r.painted)).then(function() {
+          self._patchCachedText(cacheKey2, lid, full);
+        });
+      }
+      this.updateHistoryCache();
+      if (r.typed) this._patchCachedText(cacheKey2, r.lid, r.text);
+      if (!r.isBg) {
+        this.host.scrollToBottomIfSticky(true);
+        this._checkQueuedRunning(who.ownerKey);
+      }
+      return "applied";
+    }
+    /** Put the whole text of a reply (found by local id) into a chat's cache copy. */
+    _patchCachedText(key, lid, text) {
+      var entry2 = key ? this.aiChatHistoryCache[key] : void 0;
+      if (!entry2 || !lid) return;
+      var msgs = entry2.messages;
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (!m || m._localId !== lid || m.role !== "assistant") continue;
+        if (m.content === text) return;
+        var next = msgs.slice();
+        next[i] = Object.assign({}, m, { content: text });
+        this.aiChatHistoryCache[key] = { messages: next, endOfList: entry2.endOfList, startKeyHistory: entry2.startKeyHistory };
+        return;
+      }
+    }
+    /** The same settle for a chat that is not on screen: made in its history cache,
+     *  which is what the next visit renders. Never typed. */
+    _applyTerminalToCache(itemId, result, who, c) {
+      var key = who.ownerKey;
+      var existing = key ? this.aiChatHistoryCache[key] : void 0;
+      if (!existing) return "missing";
+      var msgs = existing.messages.slice();
+      var r = this._settleInList(msgs, itemId, result, who, c, false);
+      if (r.outcome !== "applied") return r.outcome;
+      this.aiChatHistoryCache[key] = { messages: msgs, endOfList: existing.endOfList, startKeyHistory: existing.startKeyHistory };
+      return "applied";
+    }
+    /**
+     * A read of an item failed (its poll, or a by-id read). Only the server's own answer
+     * changes the screen: NOT_EXISTS settles the item as cancelled; a failure on the way
+     * (network, timeout, 429, 5xx) or of the sign-in leaves everything as it is, and the
+     * next look settles it; any other refusal is shown on the item, by id.
+     */
+    onPollFailure(itemId, err, ctx) {
+      if (!itemId) return "kept";
+      this.historyItemPolls.delete(itemId);
+      if (isNotExistsError(err)) {
+        this.applyTerminal(itemId, cancelledEnvelope(itemId), ctx);
+        return "cancelled";
+      }
+      if (isTransportFailure(err) || isAuthExpiredError(err)) {
+        console.warn("[chat-engine] a read of " + itemId + " failed on the way; the item is left as it is", err);
+        return "kept";
+      }
+      this.applyTerminal(itemId, pollErrorBody(err), ctx);
+      return "failed";
+    }
+    /**
+     * A streamed turn's row settled 'resolved' with no body: its answer is in the chunk
+     * store. A live stream that is still being fed settles it itself; otherwise the
+     * chunks are read back by id, and the read's apply goes through the funnel.
+     */
+    _readBackSettledStream(itemId, who) {
+      var st = this.liveStreams[itemId];
+      if (st && st.fed && !st.ended) return;
+      if (st) this._closeLiveStream(st, false);
+      if (!streamRecoveryEnabled() || !resolveForwardRequestStream()) {
+        this.applyTerminal(itemId, EMPTY_PROVIDER_BODY, { ownerKey: who.ownerKey, platform: who.platform, projectId: who.projectId, owner: who.owner, instant: true });
+        return;
+      }
+      void this._readBackStreamedTurn(itemId, who.ownerKey, who.platform, who.projectId, who.owner, true);
+    }
+    /** The server says the item is running (or waiting): move it forward, never back. */
+    _noteServerState(itemId, status, ownerKey) {
+      if (!itemId || this._tomb()[itemId]) return;
+      if (this.cancelledServerIds.has(itemId)) return;
+      var item = this._openMap()[itemId];
+      if (status === "running") {
+        if (item && OPEN_STATE_RANK[item.state] < OPEN_STATE_RANK.running) item.state = "running";
+        this._promoteChatItemToRunning(itemId, ownerKey !== void 0 ? ownerKey : item ? item.ownerKey : void 0);
+      }
+    }
+    /**
+     * Show a queued chat turn as RUNNING, found by its server id, because the server said
+     * so. This replaces the guess that "the next waiting bubble on screen" was the one
+     * the server took next. False when that turn is not waiting on screen.
+     */
+    _promoteChatItemToRunning(itemId, ownerKey) {
+      if (ownerKey && ownerKey !== this.getHistoryCacheKey()) return false;
+      var msgs = this.state.messages;
+      var idx = -1;
+      for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (m && m.role === "user" && m._serverItemId === itemId && m.isPendingQueued && !m.isBackgroundTask && !m._stageId && !m.isCancelled && !m._cancelling) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx === -1) return false;
+      var ex = msgs[idx];
+      var promoted = Object.assign({}, ex, { isPendingInProcess: true });
+      delete promoted.isPendingQueued;
+      msgs[idx] = promoted;
+      var hasPlaceholder = msgs.some(function(m2) {
+        return !!m2 && m2.role === "assistant" && m2._serverItemId === itemId && !!m2.isPending;
+      });
+      if (!hasPlaceholder) {
+        var placeholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _serverItemId: itemId };
+        if (ex._ownerKey !== void 0) placeholder._ownerKey = ex._ownerKey;
+        if (ex._useBgQueue) placeholder._useBgQueue = true;
+        msgs.splice(idx + 1, 0, placeholder);
+      }
+      this.host.notify();
+      this.updateHistoryCache();
+      return true;
+    }
+    /**
+     * After a chat turn ends, ask the SERVER whether the next queued turn of this chat
+     * runs now, by id: the oldest waiting main-queue turn with a server id is read once
+     * (csrHistoryItemLookup) a few times over a few seconds, and promoted when the row
+     * says running. Bounded and single: a new call restarts the ladder. A host without
+     * the by-id read gets no promotion; the turn shows as answered when its poll settles.
+     */
+    /** The chat `key` is on screen and none of its main-queue turns shows as running
+     *  (no "Thinking..." of an ordinary turn): the next settle will not come to ask. */
+    _noRunningChatTurnOnScreen(key) {
+      if (!key || key !== this.getHistoryCacheKey()) return false;
+      return !this.state.messages.some(function(m) {
+        return !!m && !m.isBackgroundTask && !m._useBgQueue && (m.role === "assistant" && !!m.isPending || m.role === "user" && !!m.isPendingInProcess);
+      });
+    }
+    _checkQueuedRunning(ownerKey) {
+      var self = this;
+      if (this._recNewMode()) {
+        void this._recSched().trigger("promote");
+        return;
+      }
+      var lookup = chatEngineConfig().csrHistoryItemLookup;
+      if (typeof lookup !== "function") return;
+      if (this._queuedCheckTimer) {
+        clearTimeout(this._queuedCheckTimer);
+        this._queuedCheckTimer = null;
+      }
+      var delays = [600, 2500, 6e3];
+      var step = 0;
+      var look = function() {
+        self._queuedCheckTimer = null;
+        if (ownerKey && ownerKey !== self.getHistoryCacheKey()) return;
+        var target;
+        var msgs = self.state.messages;
+        for (var i = 0; i < msgs.length; i++) {
+          var m = msgs[i];
+          if (!m || m.role !== "user" || !m.isPendingQueued || m.isBackgroundTask || m._useBgQueue || m._stageId || m._cancelling) continue;
+          var sid = m._serverItemId;
+          if (!sid || self._tomb()[sid]) continue;
+          if (target === void 0 || sid < target) target = sid;
+        }
+        if (!target) return;
+        var who = self._settleIdentity(target, ownerKey ? { ownerKey } : void 0);
+        if (!who.projectId) return;
+        var id = target;
+        Promise.resolve(lookup(buildHistoryItemFullId(who.platform, who.projectId, id), who.projectId, who.owner)).then(function(body) {
+          if (!body || typeof body !== "object" || !isCsrStatusEnvelope(body)) return;
+          if (body.status === "running") {
+            self._noteServerState(id, "running", ownerKey);
+            return;
+          }
+          if (body.status === "pending") next();
+        }, function() {
+          next();
+        });
+      };
+      var next = function() {
+        step++;
+        if (step >= delays.length || self._queuedCheckTimer) return;
+        self._queuedCheckTimer = setTimeout(look, delays[step]);
+      };
+      this._queuedCheckTimer = setTimeout(look, delays[0]);
+    }
+    /**
+     * Settle a send that has NO server id: its POST failed, or the POST answered with a
+     * body directly. Found by the bubbles' own local ids, never by position.
+     */
+    _settleLocalTurn(key, userLid, placeholderLid, reply) {
+      if (!userLid && !placeholderLid) return;
+      var self = this;
+      var apply = function(list) {
+        var uIdx = -1, pIdx = -1;
+        for (var i = 0; i < list.length; i++) {
+          var m = list[i];
+          if (!m || !m._localId) continue;
+          if (userLid && m._localId === userLid && m.role === "user") uIdx = i;
+          else if (placeholderLid && m._localId === placeholderLid && m.role === "assistant") pIdx = i;
+        }
+        if (uIdx === -1 && pIdx === -1) return false;
+        if (pIdx !== -1 && !list[pIdx].isPending) return false;
+        if (uIdx !== -1) {
+          var u = list[uIdx];
+          if (u.isPendingQueued || u.isPendingInProcess || u.isSendingToServer || u._dimSending) list[uIdx] = self._settledUserCopy(u);
+        }
+        var out = Object.assign({}, reply);
+        var host = pIdx !== -1 ? list[pIdx] : uIdx !== -1 ? list[uIdx] : null;
+        if (host && host._ownerKey !== void 0) out._ownerKey = host._ownerKey;
+        if (out._ts === void 0) out._ts = self._replyStampFor(out);
+        if (pIdx !== -1) list[pIdx] = out;
+        else list.splice(uIdx + 1, 0, out);
+        return true;
+      };
+      if (!key || key === this.getHistoryCacheKey()) {
+        if (apply(this.state.messages)) {
+          this.host.notify();
+          this.updateHistoryCache();
+          this.host.scrollToBottomIfSticky(true);
+          return;
+        }
+      }
+      var existing = key ? this.aiChatHistoryCache[key] : void 0;
+      if (!existing) return;
+      var msgs = existing.messages.slice();
+      if (apply(msgs)) this.aiChatHistoryCache[key] = { messages: msgs, endOfList: existing.endOfList, startKeyHistory: existing.startKeyHistory };
+    }
+    /** A provider body (or error) read as the reply it renders as. */
+    _replyFromBody(body, platform) {
+      if (isErrorResponseBody(body)) return { role: "assistant", content: getErrorMessage(body), isError: true };
+      var text = ((platform === "openai" ? extractOpenAIText(body) : extractClaudeText(body)) || "").trim();
+      var reply = { role: "assistant", content: text || NO_TEXT_RESPONSE };
+      var note = extractRetrievalNote(body, text);
+      if (note) reply._retrieval = note;
+      return reply;
     }
     /**
      * projectId/owner are passed explicitly by every caller: a request can be
@@ -7095,7 +7911,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var liveId = this.host.getIdentity();
       var mcpScope = { anonymous: liveId.anonymous, publicProjectId: liveId.publicProjectId };
       if (turn) turn.userId = liveId.anonymous ? "" : liveId.userId || "";
-      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope, turn) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope);
+      return platform === "openai" ? callOpenAIWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope, turn) : callClaudeWithPublicMcp(prompt, projectId, owner, messages, system, model, userId, extractContent, fileUrls, void 0, void 0, mcpScope, turn);
     }
     /**
      * A fresh per-send record for the request builder (see requests.ts ChatTurnContext).
@@ -7129,66 +7945,199 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (isPollStopped(response) || this._isCancelledPollResult(response)) return;
       rememberMcpListTools(turn, response);
     }
+    /**
+     * Send one chat turn and follow it to its end. Two phases (reconciler plan, section 3
+     * item 6):
+     *
+     * ACK. The POST that puts the turn on the server's queue. Only a 401 on THIS request
+     * may refresh the session and send again, once. When it comes back with the server
+     * id the turn is stamped (params.onItemId, matched by local id), pinned as an open
+     * item, and the sending state clears: pendingAgentRequests[key] (an immediate send's
+     * marker) is the ack and nothing longer.
+     *
+     * FOLLOW. The poll on that id. Whatever it ends with goes through applyTerminal or
+     * onPollFailure. A failed READ never sends the turn again: a 401 on a poll tick used
+     * to resend the whole prompt as a new request while the first one kept running.
+     * The one resend left is the server's own FINAL answer saying the turn's
+     * credentials expired (the MCP bearer the turn carried went stale): that turn is
+     * over and failed, so one fresh turn is sent in its place.
+     *
+     * params: key, projectId, owner, aiPlatform, aiModel, systemPrompt, text,
+     * boundedMessages, userId (the queue), extractContent, fileUrls, plus
+     *   userLid / placeholderLid  the local ids of the turn's bubbles (a send with no
+     *                             server id is settled through these);
+     *   onItemId(itemId)          the ack, every time an id is learned;
+     *   onAck(itemId?)            once, when the POST is over either way;
+     *   immediate                 an immediate send: marks pendingAgentRequests[key].
+     */
     dispatchAgentRequest(params) {
       var self = this;
-      var dispatchItemId;
       var turn;
-      var sendAndPoll = function() {
+      var ident = {
+        ownerKey: params.key,
+        projectId: params.projectId,
+        owner: params.owner,
+        platform: params.aiPlatform,
+        queue: params.userId
+      };
+      var streamCtx = {
+        platform: params.aiPlatform,
+        projectId: params.projectId,
+        owner: params.owner,
+        ownerKey: params.key
+      };
+      var watermark = self._recNewestKnownId(params.key);
+      var post = function() {
         turn = self._newChatTurn(params.aiPlatform);
+        if (crefSupported()) {
+          turn.cref = newClientRef();
+          self._stampCref(params.key, params.userLid, params.placeholderLid, turn.cref);
+        }
         return Promise.resolve(
           self._callProviderFor(params.aiPlatform, params.text, params.boundedMessages, params.systemPrompt, params.aiModel, params.userId, params.extractContent, params.fileUrls, params.projectId, params.owner, turn)
-        ).then(function(initial) {
-          if (initial && initial.poll && (initial.status === "pending" || initial.status === "running")) {
-            if (initial.id) {
-              if (dispatchItemId && dispatchItemId !== initial.id) self.historyItemPolls.delete(dispatchItemId);
-              dispatchItemId = initial.id;
-              if (typeof params.onItemId === "function") params.onItemId(initial.id);
-            }
-            var dp = self._fgPollWithEarlyProbe(initial, initial.id, void 0, {
-              platform: params.aiPlatform,
-              projectId: params.projectId,
-              owner: params.owner,
-              ownerKey: params.key
-            });
-            if (initial.id) self._trackPoll(initial.id, "fg", dp);
-            return dp;
-          }
-          return initial;
+        );
+      };
+      var postOnce = function() {
+        return post().catch(function(err) {
+          if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(post);
+          throw err;
         });
       };
-      var run = sendAndPoll().catch(function(err) {
-        if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(sendAndPoll);
-        throw err;
-      }).then(function(response) {
-        if (isErrorResponseBody(response) && isAuthExpiredError(response) && !isNonRetryableRequestError(response)) {
-          return self.host.refreshSession().then(sendAndPoll);
-        }
-        return response;
-      }).then(function(response) {
-        self._settleChatTurnTools(turn, response);
-        if (isPollStopped(response) || self._isCancelledPollResult(response)) return { content: "", isError: false, cancelled: true };
-        if (isErrorResponseBody(response)) return { content: getErrorMessage(response), isError: true };
-        var answer = params.aiPlatform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
-        answer = (answer || "").trim();
-        return { content: answer || "No text response received from AI provider.", isError: false, retrieval: extractRetrievalNote(response, answer), body: response };
-      }).catch(function(err) {
-        self._settleChatTurnTools(turn, err, true);
-        return { content: getErrorMessage(err), isError: true };
-      }).then(function(result) {
-        delete self.pendingAgentRequests[params.key];
-        if (dispatchItemId) self.historyItemPolls.delete(dispatchItemId);
-        if (result.cancelled) {
-          if (dispatchItemId) self._settleCancelledTurn(dispatchItemId, params.key);
-          return result;
-        }
-        var reply = { role: "assistant", content: result.content, isError: result.isError };
-        if (dispatchItemId) reply._serverItemId = dispatchItemId;
-        if (result.retrieval) reply._retrieval = result.retrieval;
-        if (!result.isError && result.body) self._saveFindings(dispatchItemId, result.body, result.content, result.retrieval);
-        self._applyReplyToCache(params.key, reply, dispatchItemId);
-        return result;
+      var acked = false;
+      var ackResolve = null;
+      var ackPromise = new Promise(function(r) {
+        ackResolve = r;
       });
-      this.pendingAgentRequests[params.key] = run;
+      var markAck = function(itemId) {
+        if (acked) return;
+        acked = true;
+        if (self.pendingAgentRequests[params.key] === ackPromise) delete self.pendingAgentRequests[params.key];
+        if (ackResolve) ackResolve();
+        if (typeof params.onAck === "function") {
+          try {
+            params.onAck(itemId);
+          } catch (e) {
+            console.warn("[chat-engine] onAck threw", e);
+          }
+        }
+      };
+      var mayResendFor = function(body) {
+        return isErrorResponseBody(body) && isAuthExpiredError(body) && !isNonRetryableRequestError(body);
+      };
+      var resend = function(failed, oldItemId) {
+        return self.host.refreshSession().then(postOnce).then(function(next) {
+          return follow(next, false);
+        }, function(err) {
+          self._settleChatTurnTools(turn, err, true);
+          if (oldItemId) self.applyTerminal(oldItemId, failed, ident);
+          else self._settleLocalTurn(params.key, params.userLid, params.placeholderLid, self._replyFromBody(failed, params.aiPlatform));
+          return { itemId: oldItemId, error: err };
+        });
+      };
+      var follow = function(initial, mayResend) {
+        var queued = !!initial && !!initial.poll && (initial.status === "pending" || initial.status === "running");
+        if (queued && typeof initial.id === "string" && initial.id) {
+          var itemId = initial.id;
+          self.trackOpenItem(itemId, {
+            ownerKey: params.key,
+            projectId: params.projectId,
+            owner: params.owner,
+            platform: params.aiPlatform,
+            queue: params.userId,
+            kind: "chat",
+            state: initial.status === "running" ? "running" : "queued",
+            cref: turn && turn.cref || (typeof initial.cref === "string" ? initial.cref : void 0)
+          });
+          if (typeof params.onItemId === "function") params.onItemId(itemId);
+          markAck(itemId);
+          var resent = false;
+          var resendOnce = function(body) {
+            if (resent) return null;
+            resent = true;
+            return resend(body, itemId);
+          };
+          var oi = self._openMap()[itemId];
+          if (oi) {
+            oi.turn = turn;
+            if (mayResend) oi.resend = function(body) {
+              void resendOnce(body);
+            };
+          }
+          if (initial.status === "running") self._noteServerState(itemId, "running", params.key);
+          else if (!params.immediate && self._noRunningChatTurnOnScreen(params.key)) {
+            self._checkQueuedRunning(params.key);
+          }
+          var dp = self._fgPollWithEarlyProbe(initial, itemId, void 0, streamCtx);
+          self._trackPoll(itemId, "fg", dp);
+          var myHandle = self.historyItemPolls.get(itemId);
+          return Promise.resolve(dp).then(function(res) {
+            if (self.historyItemPolls.get(itemId) === myHandle) self.historyItemPolls.delete(itemId);
+            if (isPollStopped(res)) return { itemId, stopped: true };
+            if (mayResend && mayResendFor(res)) {
+              self._closeItem(itemId);
+              var again = resendOnce(res);
+              return again || { itemId, stopped: true };
+            }
+            self._settleChatTurnTools(turn, res);
+            self.applyTerminal(itemId, res, ident);
+            return { itemId, response: res };
+          }, function(err) {
+            self._settleChatTurnTools(turn, err, true);
+            if (self.historyItemPolls.get(itemId) !== myHandle) return { itemId, error: err };
+            self.onPollFailure(itemId, err, ident);
+            return { itemId, error: err };
+          });
+        }
+        markAck(void 0);
+        if (queued) {
+          return Promise.resolve(initial.poll({ latency: POLL_INTERVAL })).then(function(res) {
+            if (isPollStopped(res)) return { stopped: true };
+            self._settleChatTurnTools(turn, res);
+            self._settleLocalTurn(params.key, params.userLid, params.placeholderLid, self._replyFromBody(res, params.aiPlatform));
+            return { response: res };
+          }, function(err) {
+            self._settleChatTurnTools(turn, err, true);
+            self._settleLocalTurn(params.key, params.userLid, params.placeholderLid, { role: "assistant", content: getErrorMessage(err), isError: true });
+            return { error: err };
+          });
+        }
+        if (mayResend && mayResendFor(initial)) {
+          return resend(initial);
+        }
+        self._settleChatTurnTools(turn, initial);
+        self._settleLocalTurn(params.key, params.userLid, params.placeholderLid, self._replyFromBody(initial, params.aiPlatform));
+        return Promise.resolve({ response: initial });
+      };
+      if (params.immediate) this.pendingAgentRequests[params.key] = ackPromise;
+      var posted;
+      try {
+        posted = postOnce();
+      } catch (syncErr) {
+        posted = Promise.reject(syncErr);
+      }
+      var run = posted.then(function(initial) {
+        return follow(initial, true);
+      }, function(err) {
+        markAck(void 0);
+        if (turn && turn.cref && isTransportFailure(err) && !isNotExistsError(err) && reconcilerReadsEnabled()) {
+          self._recAddPendingSend({
+            cref: turn.cref,
+            key: params.key,
+            userLid: params.userLid,
+            placeholderLid: params.placeholderLid,
+            projectId: params.projectId,
+            owner: params.owner,
+            platform: params.aiPlatform === "openai" ? "openai" : "claude",
+            queue: params.userId || params.projectId,
+            watermark,
+            params
+          });
+          return { error: err, cref: turn.cref, pending: true };
+        }
+        self._settleChatTurnTools(turn, err, true);
+        self._settleLocalTurn(params.key, params.userLid, params.placeholderLid, { role: "assistant", content: getErrorMessage(err), isError: true });
+        return { error: err };
+      });
       return run;
     }
     /**
@@ -7200,9 +8149,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *
      * Staged bubbles carry _useBgQueue because that is where a turn with
      * attachments ultimately dispatches (behind its own indexing tasks). That flag
-     * is also what keeps promoteNextQueuedToRunning / resolveQueuedUserBubble off
-     * them: those advance the SERVER queue, and a staged turn has no server
-     * request behind it yet.
+     * is also what keeps the queued-turn promotion (_checkQueuedRunning) off them:
+     * it follows the SERVER queue, and a staged turn has no server request behind
+     * it yet.
      *
      * Returns the id to hand back as PinnedDispatchContext.stageId at dispatch.
      */
@@ -7347,109 +8296,101 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var svcId = identity && identity.projectId;
       var platform = identity && identity.platform;
       if (!svcId || platform !== "claude" && platform !== "openai") return Promise.resolve("skipped");
-      var owner = identity.owner;
-      var queue = bgIndexingQueueName(identity.userId, svcId);
+      var ident = { projectId: svcId, owner: identity.owner, platform, userId: identity.userId };
       var startedAt = nowMs();
       var deadline = startedAt + INDEXING_DRAIN_TIMEOUT_MS;
       var idleLooks = 0;
-      var ask = function(status) {
-        var answered = false;
-        return new Promise(function(res) {
-          var bail = null;
-          var settle = function(v) {
-            if (answered) return;
-            answered = true;
-            if (bail) {
-              clearTimeout(bail);
-              bail = null;
-            }
-            res(v);
-          };
-          bail = setTimeout(function() {
-            settle(null);
-          }, INDEXING_DRAIN_LOOK_TIMEOUT_MS);
-          Promise.resolve(probeBgQueue(
-            { service: svcId, owner, platform, queue, status, limit: WORKER_PASS_ADOPT_LIMIT },
-            { maxAgeMs: 0 }
-          )).then(function(entry2) {
-            settle(entry2.result);
-          }, function() {
-            settle(null);
-          });
-        });
-      };
-      var hasLiveIndexing = function(res) {
-        var list = res && Array.isArray(res.list) ? res.list : [];
-        for (var i = 0; i < list.length; i++) {
-          var item = list[i];
-          if (!item || item.status !== "pending" && item.status !== "running") continue;
-          if (isIndexingRequestText(extractLastUserTextFromRequest(item.request_body))) return true;
-        }
-        return false;
-      };
+      var lastIdleAt = 0;
+      var lastLookAt = -Infinity;
+      var askToken = 0, asked = 0, askedAt = 0;
+      var nudged = false;
       return new Promise(function(resolve) {
-        var timer = null;
-        var lastLookAt = -Infinity;
-        var nudgedThisInterval = false;
-        var inFlight = false;
+        var done = false;
+        var w;
+        var capTimer = null;
         var finish = function(v) {
-          if (timer) {
-            clearTimeout(timer);
-            timer = null;
+          if (done) return;
+          done = true;
+          if (capTimer !== null) {
+            clearTimeout(capTimer);
+            capTimer = null;
           }
+          var i = self._iqWatches.indexOf(w);
+          if (i !== -1) self._iqWatches.splice(i, 1);
           var ni = self._drainNudges.indexOf(nudge);
           if (ni !== -1) self._drainNudges.splice(ni, 1);
           resolve(v);
         };
-        var again = function(ms) {
-          if (timer) {
-            clearTimeout(timer);
-            timer = null;
-          }
-          var wait = ms == null ? idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS : ms;
-          timer = setTimeout(look, wait);
-        };
         var nudge = function() {
-          if (idleLooks > 0) return;
-          if (inFlight) return;
-          if (nudgedThisInterval) return;
+          if (done || idleLooks > 0 || asked) return;
           if (self._indexDispatchesInFlight > 0) return;
-          nudgedThisInterval = true;
-          again(Math.max(0, INDEXING_DRAIN_NUDGE_MIN_GAP_MS - (nowMs() - lastLookAt)));
+          nudged = true;
+          var doc = _g2.document;
+          if (doc && doc.visibilityState === "hidden") {
+            self._recEnsure();
+            return;
+          }
+          void self._recSched().trigger("frame");
         };
-        var look = function() {
-          timer = null;
-          if (inFlight) return;
-          lastLookAt = nowMs();
-          nudgedThisInterval = false;
-          if (nowMs() >= deadline) {
-            finish("timedout");
-            return;
-          }
-          if (self._indexDispatchesInFlight > 0) {
-            idleLooks = 0;
-            again();
-            return;
-          }
-          inFlight = true;
-          Promise.all([ask("running"), ask("pending")]).then(function(res) {
-            inFlight = false;
-            var unknown = res[0] === null || res[1] === null;
-            if (unknown || hasLiveIndexing(res[0]) || hasLiveIndexing(res[1])) idleLooks = 0;
-            else idleLooks += 1;
-            if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) {
-              finish("drained");
-              return;
+        w = {
+          opts: { identity: function() {
+            return ident;
+          } },
+          force: false,
+          frame: false,
+          runsCheckAt: 0,
+          lastTryAt: 0,
+          drain: {
+            due: function() {
+              if (done) return false;
+              if (nowMs() >= deadline) {
+                finish("timedout");
+                return false;
+              }
+              if (asked) {
+                if (nowMs() - askedAt < INDEXING_DRAIN_LOOK_TIMEOUT_MS) return false;
+                asked = 0;
+                idleLooks = 0;
+              }
+              var since = nowMs() - lastLookAt;
+              if (self._indexDispatchesInFlight > 0) {
+                if (since >= INDEXING_DRAIN_BUSY_POLL_MS) {
+                  idleLooks = 0;
+                  lastLookAt = nowMs();
+                }
+                return false;
+              }
+              if (nudged && since >= INDEXING_DRAIN_NUDGE_MIN_GAP_MS) return true;
+              return since >= (idleLooks > 0 ? INDEXING_DRAIN_CONFIRM_POLL_MS : INDEXING_DRAIN_BUSY_POLL_MS);
+            },
+            onAsk: function() {
+              askToken += 1;
+              asked = askToken;
+              askedAt = nowMs();
+              lastLookAt = askedAt;
+              nudged = false;
+              return askToken;
+            },
+            onSnapshot: function(snap, failed, token) {
+              if (done || token !== asked) return;
+              asked = 0;
+              if (failed || !snap || !snap.checked || Object.keys(snap.keys).length > 0) idleLooks = 0;
+              else if (snap.at !== lastIdleAt) {
+                idleLooks += 1;
+                lastIdleAt = snap.at;
+              }
+              if (idleLooks >= INDEXING_DRAIN_IDLE_LOOKS && nowMs() - startedAt >= INDEXING_DRAIN_MIN_MS) finish("drained");
             }
-            again();
-          }, function() {
-            inFlight = false;
-            idleLooks = 0;
-            again();
-          });
+          }
         };
+        self._iqWatches.push(w);
         self._drainNudges.push(nudge);
-        look();
+        capTimer = setTimeout(function() {
+          capTimer = null;
+          finish("timedout");
+        }, INDEXING_DRAIN_TIMEOUT_MS);
+        if (capTimer && typeof capTimer.unref === "function") capTimer.unref();
+        void self._recSched().trigger("add");
       });
     }
     /**
@@ -7510,7 +8451,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           history: offHistory.concat([{ role: "user", content: llmComposed }])
         });
         var offExisting = this.aiChatHistoryCache[key] || { messages: [], endOfList: false, startKeyHistory: [] };
-        var offUser = { role: "user", content: composed, _ownerKey: key, _ts: wallClockNow() };
+        var offUser = { role: "user", content: composed, _ownerKey: key, _ts: wallClockNow(), _localId: this._newLocalId() };
+        var offPlaceholder = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key, _localId: this._newLocalId() };
         var offStage = this._stageIndex(this.state.messages, stageId);
         if (offStage !== -1) {
           if (this.state.messages[offStage]._ts !== void 0) offUser._ts = this.state.messages[offStage]._ts;
@@ -7526,13 +8468,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
         }
         this.aiChatHistoryCache[key] = {
-          messages: offCached.concat([
-            offUser,
-            { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _ownerKey: key }
-          ]),
+          messages: offCached.concat([offUser, offPlaceholder]),
           endOfList: offExisting.endOfList,
           startKeyHistory: offExisting.startKeyHistory
         };
+        var offUserLid = offUser._localId, offPlaceholderLid = offPlaceholder._localId;
         this.dispatchAgentRequest({
           key,
           projectId: id.projectId,
@@ -7544,7 +8484,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           boundedMessages: offBounded.messages,
           userId: chatQueue,
           extractContent,
-          fileUrls
+          fileUrls,
+          userLid: offUserLid,
+          placeholderLid: offPlaceholderLid,
+          onItemId: function(itemId) {
+            self._stampTurnWithItemId(key, offUserLid, offPlaceholderLid, itemId);
+          }
         });
         return;
       }
@@ -7575,43 +8520,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         this.host.notify();
         this.updateHistoryCache();
         this.scrollForDispatch(stageId);
-        var capturedComposed = composed, capturedPlatform = aiPlatform, capturedKey = key;
+        var capturedKey = key;
         var capturedQueuedLid = queuedBubble._localId;
-        var queuedTurn = this._newChatTurn(aiPlatform);
-        Promise.resolve(this._callProviderFor(aiPlatform, composed, boundedQ.messages, systemPrompt, aiModel, chatQueue, extractContent, fileUrls, id.projectId, id.owner, queuedTurn)).then(function(result) {
-          var sendingIdx = self.getHistoryCacheKey() !== capturedKey ? -1 : self.state.messages.findIndex(function(m) {
-            return m.isSendingToServer && (m.isPendingQueued || m.isPendingInProcess) && m.role === "user" && !m._stageId && (m._ownerKey === void 0 || m._ownerKey === capturedKey);
-          });
-          var serverId = result && typeof result.id === "string" ? result.id : void 0;
-          if (sendingIdx >= 0) {
-            var upd = Object.assign({}, self.state.messages[sendingIdx], { isSendingToServer: false, _dimSending: false });
-            if (serverId) upd._serverItemId = serverId;
-            self.state.messages[sendingIdx] = upd;
-            self.host.notify();
+        this.dispatchAgentRequest({
+          key,
+          projectId: id.projectId,
+          owner: id.owner,
+          aiPlatform,
+          aiModel,
+          systemPrompt,
+          text: composed,
+          boundedMessages: boundedQ.messages,
+          userId: chatQueue,
+          extractContent,
+          fileUrls,
+          userLid: capturedQueuedLid,
+          onItemId: function(itemId) {
+            self._stampTurnWithItemId(capturedKey, capturedQueuedLid, void 0, itemId);
           }
-          if (serverId) self._stampTurnWithItemId(capturedKey, capturedQueuedLid, void 0, serverId);
-          if (result && result.poll && (result.status === "pending" || result.status === "running")) {
-            var qp = self._fgPollWithEarlyProbe(result, serverId, void 0, {
-              platform: capturedPlatform,
-              projectId: id.projectId,
-              owner: id.owner,
-              ownerKey: capturedKey
-            });
-            if (serverId) self._trackPoll(serverId, "fg", qp);
-            return qp.then(function(res) {
-              self._settleChatTurnTools(queuedTurn, res);
-              if (isPollStopped(res)) return;
-              return self.onQueuedSendResponse(capturedComposed, res, capturedPlatform, serverId, capturedKey);
-            }).catch(function(err) {
-              self._settleChatTurnTools(queuedTurn, err, true);
-              return self.onQueuedSendError(capturedComposed, err, serverId, capturedKey);
-            });
-          }
-          self._settleChatTurnTools(queuedTurn, result);
-          return self.onQueuedSendResponse(capturedComposed, result, capturedPlatform, serverId, capturedKey);
-        }).catch(function(err) {
-          self._settleChatTurnTools(queuedTurn, err, true);
-          return self.onQueuedSendError(capturedComposed, err, void 0, capturedKey);
         });
         return;
       }
@@ -7645,7 +8571,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         history: historyForLlm
       });
       var immediatePlaceholderLid = immediatePlaceholder._localId;
-      var run = this.dispatchAgentRequest({
+      this.dispatchAgentRequest({
         key,
         projectId: id.projectId,
         owner: id.owner,
@@ -7657,6 +8583,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         userId: chatQueue,
         extractContent,
         fileUrls,
+        immediate: true,
+        userLid: immediateUserLid,
+        placeholderLid: immediatePlaceholderLid,
         // THE fix for a turn rendering twice after navigate-away-and-back. Until
         // this existed the immediate-send pair carried no server id for its whole
         // life (only the QUEUED path stamped one, off its ack), so nothing could
@@ -7664,16 +8593,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         // _stampTurnWithItemId.
         onItemId: function(itemId) {
           self._stampTurnWithItemId(key, immediateUserLid, immediatePlaceholderLid, itemId);
+        },
+        // `sending` clears at the ACK, not when the answer lands (reconciler plan,
+        // section 3 item 6). It is session-global (it routes the next send onto the
+        // queued path and locks the pickers), and holding it for the whole turn meant
+        // a poll that hung wedged every later send in every project. Once acked, the
+        // turn's own "Thinking..." bubble is what routes the next send to the queue.
+        onAck: function() {
+          self.state.sending = false;
+          self.host.notify();
         }
-      });
-      Promise.resolve(run).catch(function() {
-      }).then(function(result) {
-        self.state.sending = false;
-        if (result && result.cancelled) return;
-        if (!(self.host.isViewMounted() && self.getHistoryCacheKey() === key)) return;
-        return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
-          self.host.scrollToBottomIfSticky(true);
-        });
       });
     }
     /**
@@ -7699,6 +8628,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       else this.host.scrollToBottom(true);
     }
     promoteNextBgQueuedToRunning() {
+      if (this._recNewMode()) return;
       var listed = {};
       for (var q = 0; q < this.bgTaskQueue.length; q++) {
         var qe = this.bgTaskQueue[q];
@@ -7727,270 +8657,33 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.state.messages.splice(nextIdx + 1, 0, placeholder);
       this.host.notify();
     }
+    /**
+     * The next queued chat turn shows "Thinking..." once the SERVER says it runs.
+     *
+     * This used to promote "the first waiting bubble on screen" the moment any turn
+     * ended, which was a guess about the server's queue, and wrong whenever the screen
+     * and the queue disagreed: a turn still running on the server after a failed read,
+     * a cancel in flight, a send whose ack had not come back. Now it asks: the oldest
+     * waiting turn is read by id and promoted when its row says running (see
+     * _checkQueuedRunning). Kept public under its old name for hosts that call it.
+     */
     promoteNextQueuedToRunning() {
-      if (this.state.messages.some(function(m) {
-        return m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-      })) return;
-      var nextIdx = this.state.messages.findIndex(function(m) {
-        return m.isPendingQueued && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue;
-      });
-      if (nextIdx === -1) return;
-      var existing = this.state.messages[nextIdx];
-      var promoted = { role: "user", content: existing.content, isPendingInProcess: true };
-      if (existing.isBackgroundTask) promoted.isBackgroundTask = true;
-      if (existing._indexFile) promoted._indexFile = existing._indexFile;
-      if (existing._ts !== void 0) promoted._ts = existing._ts;
-      if (existing._serverItemId !== void 0) promoted._serverItemId = existing._serverItemId;
-      if (existing._ownerKey !== void 0) promoted._ownerKey = existing._ownerKey;
-      if (existing.isSendingToServer) promoted.isSendingToServer = true;
-      if (existing._dimSending) promoted._dimSending = true;
-      if (existing._localId !== void 0) promoted._localId = existing._localId;
-      this.state.messages[nextIdx] = promoted;
-      var placeholder = { role: "assistant", content: "", isPending: true };
-      if (existing._serverItemId !== void 0) placeholder._serverItemId = existing._serverItemId;
-      if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
-      this.state.messages.splice(nextIdx + 1, 0, placeholder);
-      this.host.notify();
+      this._checkQueuedRunning(this.getHistoryCacheKey());
     }
     /**
-     * The "Thinking..." placeholder belonging to the user bubble at `userIdx`, or -1.
-     *
-     * Every path that creates one puts it IMMEDIATELY after its user bubble
-     * (promoteNextQueuedToRunning, the immediate-send pair, applyHistoryItemResolution),
-     * so ownership is adjacency — modulo background bubbles, which get spliced in
-     * around them. Taking the first pending assistant ANYWHERE below instead was a
-     * hijack: a turn sent with attachments never gets a placeholder of its own
-     * (promoteNextQueuedToRunning skips _useBgQueue turns) and now keeps the position
-     * it was sent in, so an ordinary turn sent while its files indexed sits BELOW it
-     * with a placeholder of its own — and the attachment turn's answer was rendered
-     * as the answer to that unrelated question.
+     * A queued send's answer, routed through the funnel by its server id. Kept for hosts
+     * that call it; the engine's own queued path settles through dispatchAgentRequest.
+     * Without a server id there is nothing to settle by, and nothing is written.
      */
-    _ownThinkingIndex(userIdx, serverId) {
-      if (userIdx < 0) return -1;
-      for (var i = userIdx + 1; i < this.state.messages.length; i++) {
-        var m = this.state.messages[i];
-        if (!m) return -1;
-        if (m.isBackgroundTask) continue;
-        if (m.isPending && m.role === "assistant") {
-          if (serverId && m._serverItemId && m._serverItemId !== serverId) return -1;
-          return i;
-        }
-        return -1;
-      }
-      return -1;
-    }
-    resolveQueuedUserBubble(serverId) {
-      var liveKey = this.getHistoryCacheKey();
-      var isLocal = function(m) {
-        return m._ownerKey === void 0 || m._ownerKey === liveKey;
-      };
-      var userIdx = -1;
-      if (serverId) {
-        userIdx = this.state.messages.findIndex(function(m) {
-          return m._serverItemId === serverId && (m.isPendingInProcess || m.isPendingQueued) && m.role === "user" && !m.isBackgroundTask;
-        });
-      }
-      if (userIdx === -1) {
-        userIdx = this.state.messages.findIndex(function(m) {
-          return m.isPendingInProcess && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
-        });
-      }
-      if (userIdx === -1) {
-        userIdx = this.state.messages.findIndex(function(m) {
-          return m.isPendingQueued && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue && isLocal(m);
-        });
-      }
-      if (serverId && this.cancelledServerIds.has(serverId)) {
-        this.cancelledServerIds.delete(serverId);
-        if (userIdx >= 0) {
-          var ex = this.state.messages[userIdx];
-          this.state.messages[userIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId, ...ex._ownerKey !== void 0 ? { _ownerKey: ex._ownerKey } : {} };
-          var thIdx = this._ownThinkingIndex(userIdx, serverId);
-          if (thIdx !== -1) this.state.messages.splice(thIdx, 1);
-        }
-        this.promoteNextQueuedToRunning();
-        return void 0;
-      }
-      if (userIdx >= 0) {
-        var exist = this.state.messages[userIdx];
-        var repl = { role: "user", content: exist.content };
-        if (exist._serverItemId !== void 0) repl._serverItemId = exist._serverItemId;
-        if (exist._ownerKey !== void 0) repl._ownerKey = exist._ownerKey;
-        if (exist._ts !== void 0) repl._ts = exist._ts;
-        if (exist._localId !== void 0) repl._localId = exist._localId;
-        this.state.messages[userIdx] = repl;
-      }
-      var thinkingIdx = this._ownThinkingIndex(userIdx, serverId);
-      return thinkingIdx !== -1 ? thinkingIdx : userIdx >= 0 ? userIdx + 1 : -1;
-    }
-    insertAtTarget(msg, targetIdx) {
-      if (msg && msg.role === "assistant" && msg._ts === void 0) msg._ts = this._replyStampFor(msg);
-      var tgt = targetIdx >= 0 ? this.state.messages[targetIdx] : void 0;
-      var replaceable = !!tgt && !!tgt.isPending && !tgt.isBackgroundTask && this._isOwnPlaceholderOf(targetIdx, this._owningUserIndex(targetIdx));
-      if (replaceable) this.state.messages[targetIdx] = msg;
-      else if (targetIdx >= 0) this.state.messages.splice(targetIdx, 0, msg);
-      else this.state.messages.push(msg);
-    }
-    /**
-     * The server's OWN copy of this turn is already on screen.
-     *
-     * A first-page fetch can land between the server settling the item and this
-     * poll's tick, and now that the local bubbles carry the item id
-     * (_stampTurnWithItemId) the rescue correctly drops them and renders the
-     * server's settled pair instead. There is then nothing left to resolve: the
-     * -1 fallback would push the answer in a SECOND time at the bottom of the list,
-     * and the positional fallbacks would hijack some other turn's bubble.
-     *
-     * The USER bubble counts, not just a settled assistant: an item whose answer is
-     * empty produces no assistant bubble at all in the mapper, and that variant
-     * would otherwise still bottom-push "No text response received...". While a turn
-     * is genuinely live its user bubble is always pending (the queued branch sets
-     * isPendingQueued, promoteNextQueuedToRunning sets isPendingInProcess), so this
-     * cannot fire early.
-     */
-    _turnAlreadyRendered(serverId) {
-      if (!serverId) return false;
-      return this.state.messages.some(function(m) {
-        return m._serverItemId === serverId && !m.isPending && !m.isPendingQueued && !m.isPendingInProcess;
-      });
-    }
     onQueuedSendResponse(_composed, response, platform, serverId, ownerKey) {
-      if (serverId) this.historyItemPolls.delete(serverId);
-      if (this._isCancelledPollResult(response)) {
-        if (serverId) this._settleCancelledTurn(serverId, ownerKey);
-        return;
-      }
-      if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
-        var offReply = isErrorResponseBody(response) ? { role: "assistant", content: getErrorMessage(response), isError: true } : { role: "assistant", content: ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim() || "No text response received from AI provider." };
-        if (!offReply.isError) {
-          var offNote = extractRetrievalNote(response, offReply.content);
-          if (offNote) offReply._retrieval = offNote;
-          this._saveFindings(serverId, response, offReply.content, offNote);
-        }
-        this._applyReplyToCache(ownerKey, offReply, serverId);
-        if (serverId) this.cancelledServerIds.delete(serverId);
-        return;
-      }
-      if (this._turnAlreadyRendered(serverId)) {
-        if (serverId) this.cancelledServerIds.delete(serverId);
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      var targetIdx = this.resolveQueuedUserBubble(serverId);
-      if (targetIdx === void 0) {
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      if (isErrorResponseBody(response)) {
-        this.insertAtTarget({ role: "assistant", content: getErrorMessage(response), isError: true }, targetIdx);
-      } else {
-        var answer = platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response);
-        answer = (answer || "").trim() || "No text response received from AI provider.";
-        var qNote = extractRetrievalNote(response, answer);
-        this._saveFindings(serverId, response, answer, qNote);
-        var lid = this._newLocalId();
-        if (targetIdx >= 0 && this.state.messages[targetIdx] && this.state.messages[targetIdx].isPending) {
-          var qPainted = this._paintedTextAt(targetIdx);
-          var prevQ = this.state.messages[targetIdx] || {};
-          var qSettled = { role: "assistant", content: qPainted, _localId: lid };
-          if (prevQ._serverItemId) qSettled._serverItemId = prevQ._serverItemId;
-          if (prevQ._ownerKey) qSettled._ownerKey = prevQ._ownerKey;
-          if (qNote) qSettled._retrieval = qNote;
-          this.state.messages[targetIdx] = qSettled;
-          this.host.notify();
-          this.enqueueTypewrite(targetIdx, answer, lid, qPainted);
-        } else if (targetIdx >= 0) {
-          var qInsert = { role: "assistant", content: "", _localId: lid };
-          if (qNote) qInsert._retrieval = qNote;
-          this.state.messages.splice(targetIdx, 0, qInsert);
-          this.host.notify();
-          this.enqueueTypewrite(targetIdx, answer, lid);
-        } else {
-          var aiIdx = this.state.messages.length;
-          var qAppend = { role: "assistant", content: "", _localId: lid };
-          if (qNote) qAppend._retrieval = qNote;
-          this.state.messages.push(qAppend);
-          this.host.notify();
-          this.enqueueTypewrite(aiIdx, answer, lid);
-        }
-      }
-      this._removeStrayPendingAssistants();
-      this.promoteNextQueuedToRunning();
-      this.updateHistoryCache();
-      this.host.notify();
-      this.host.scrollToBottomIfSticky(true);
+      if (!serverId) return;
+      this.historyItemPolls.delete(serverId);
+      this.applyTerminal(serverId, response, { platform, ownerKey });
     }
+    /** A queued send's failed read, routed through onPollFailure by its server id. */
     onQueuedSendError(_composed, err, serverId, ownerKey) {
-      if (serverId) this.historyItemPolls.delete(serverId);
-      if (ownerKey && this.getHistoryCacheKey() !== ownerKey) {
-        var isGone = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
-        this._applyReplyToCache(ownerKey, isGone ? { role: "assistant", content: "Request was cancelled.", isError: true } : { role: "assistant", content: getErrorMessage(err), isError: true }, serverId);
-        if (serverId) this.cancelledServerIds.delete(serverId);
-        return;
-      }
-      if (this._turnAlreadyRendered(serverId)) {
-        if (serverId) this.cancelledServerIds.delete(serverId);
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
-      if (isNotExists) {
-        var userIdx = serverId ? this.state.messages.findIndex(function(m) {
-          return m._serverItemId === serverId && (m.isPendingInProcess || m.isPendingQueued) && m.role === "user" && !m.isBackgroundTask;
-        }) : this.state.messages.findIndex(function(m) {
-          return m.isPendingInProcess && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue;
-        });
-        if (!serverId && userIdx === -1) {
-          userIdx = this.state.messages.findIndex(function(m) {
-            return m.isPendingQueued && m.role === "user" && !m.isBackgroundTask && !m._useBgQueue;
-          });
-        }
-        if (userIdx >= 0) {
-          var ex = this.state.messages[userIdx];
-          var repl = { role: "user", content: ex.content, isCancelled: true };
-          if (ex._serverItemId !== void 0) repl._serverItemId = ex._serverItemId;
-          this.state.messages[userIdx] = repl;
-        }
-        if (serverId) {
-          var thById = this.state.messages.findIndex(function(m) {
-            return m._serverItemId === serverId && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-          });
-          if (thById !== -1) this.state.messages.splice(thById, 1);
-          else if (userIdx >= 0) {
-            var thPos = this.state.messages.findIndex(function(m, i) {
-              return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-            });
-            if (thPos !== -1) this.state.messages.splice(thPos, 1);
-          }
-        } else if (userIdx >= 0) {
-          var thPos2 = this.state.messages.findIndex(function(m, i) {
-            return i > userIdx && m.isPending && m.role === "assistant" && !m.isBackgroundTask;
-          });
-          if (thPos2 !== -1) this.state.messages.splice(thPos2, 1);
-        }
-        if (serverId) this.cancelledServerIds.delete(serverId);
-        this._removeStrayPendingAssistants();
-        this.promoteNextQueuedToRunning();
-        this.updateHistoryCache();
-        this.host.notify();
-        this.host.scrollToBottomIfSticky(true);
-        return;
-      }
-      var targetIdx = this.resolveQueuedUserBubble(serverId);
-      if (targetIdx === void 0) {
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      this.insertAtTarget({ role: "assistant", content: getErrorMessage(err), isError: true }, targetIdx);
-      this._removeStrayPendingAssistants();
-      this.promoteNextQueuedToRunning();
-      this.updateHistoryCache();
-      this.host.notify();
-      this.host.scrollToBottomIfSticky(true);
+      if (!serverId) return;
+      this.onPollFailure(serverId, err, { ownerKey });
     }
     cancelQueuedMessage(msg, idx) {
       var self = this;
@@ -8020,6 +8713,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (result && result.removed) {
           self.cancelledServerIds.add(serverId);
           self._stopPoll(serverId);
+          self._closeItem(serverId);
           var qi = self.bgTaskQueue.findIndex(function(e) {
             return e.id === serverId;
           });
@@ -8039,12 +8733,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               return m._serverItemId === serverId && m.isPending && m.role === "assistant";
             });
             if (thById !== -1) self.state.messages.splice(thById, 1);
-            else {
-              var thPos = self.state.messages.findIndex(function(m, i) {
-                return i > removeIdx && m.isPending && m.role === "assistant" && (msg.isBackgroundTask ? !!m.isBackgroundTask : !m.isBackgroundTask);
-              });
-              if (thPos !== -1) self.state.messages.splice(thPos, 1);
-            }
             if (msg.isBackgroundTask) self.promoteNextBgQueuedToRunning();
             else self.promoteNextQueuedToRunning();
             self.updateHistoryCache();
@@ -8136,12 +8824,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *   2. the poll on it is stopped, which settles whichever chain was awaiting it
      *      with a stopped result: dispatchAgentRequest's for an immediate send, the
      *      queued chain for a promoted turn, the history poll after a reload. Each
-     *      reads a stopped or cancelled result as "no reply" and releases what it
-     *      holds (state.sending, pendingAgentRequests, historyItemPolls), which is
-     *      what lets the next send go out immediately instead of queueing;
+     *      reads a stopped result as "no reply" and releases its poll registration
+     *      (state.sending and pendingAgentRequests were already released at the ack);
      *   3. the bubbles settle at once, without waiting for that chain: the user
-     *      bubble takes its cancelled form, the placeholder goes, and the next queued
-     *      turn, if there is one, is promoted so its own "Thinking" appears.
+     *      bubble takes its cancelled form, the placeholder goes, the id is
+     *      tombstoned, and the server is asked whether the next queued turn runs now,
+     *      so its own "Thinking" appears when it does.
      *
      * What it does NOT do: the provider call already in flight on the worker runs
      * to its end (a streamed one stops within about a second). A message sent
@@ -8189,6 +8877,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       })).then(function(result) {
         if (result && result.removed) {
           self._stopPoll(serverId);
+          self._closeItem(serverId);
           self._settleCancelledTurn(serverId);
           return;
         }
@@ -8225,9 +8914,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      *
      * Idempotent on purpose: a cancel this client made settles the bubbles at once,
      * and the chain that was awaiting the poll settles again a moment later when the
-     * stop resolves it. The second pass finds nothing to do. Deliberately NOT
-     * _removeStrayPendingAssistants: by then the placeholder on screen is the freshly
-     * promoted turn's, whose user bubble is pending, and the sweep would take it.
+     * stop resolves it. The second pass finds nothing to do.
      */
     _settleCancelledTurn(itemId, ownerKey) {
       if (!itemId) return;
@@ -8259,43 +8946,25 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     /**
      * _settleCancelledTurn for a chat that is not on screen: the same edit, made in
-     * its history cache. Matched by id where the cached bubbles carry one; an
-     * off-chat send caches its pair before the ack (see dispatchComposedMessage), so
-     * the fallback is positional, exactly as _applyReplyToCache's is: the trailing
-     * pending placeholder, and the last request bubble still marked in flight.
+     * its history cache, by id only. Every bubble of a turn that can be cancelled
+     * carries its id: an off-chat send's pair is stamped at the ack like any other
+     * (dispatchComposedMessage), and a cancel needs the id to be sent at all. (The
+     * positional fallback this had, "the trailing pending placeholder", could take
+     * another turn's.)
      */
     _applyCancelToCache(key, itemId) {
       var existing = key ? this.aiChatHistoryCache[key] : void 0;
       if (!existing) return;
       var msgs = existing.messages.slice();
       var changed = false;
-      var pIdx = -1, uIdx = -1;
+      var uIdx = -1;
       for (var i = msgs.length - 1; i >= 0; i--) {
         var m = msgs[i];
         if (!m || m._serverItemId !== itemId) continue;
         if (m.role === "assistant" && m.isPending) {
           msgs.splice(i, 1);
           changed = true;
-          pIdx = i;
         } else if (m.role === "user" && !m.isCancelled && uIdx === -1) uIdx = i;
-      }
-      if (pIdx === -1) {
-        for (var p = msgs.length - 1; p >= 0; p--) {
-          var pm = msgs[p];
-          if (!pm || !pm.isPending || pm.role !== "assistant" || pm.isBackgroundTask || pm._serverItemId !== void 0) continue;
-          msgs.splice(p, 1);
-          changed = true;
-          break;
-        }
-      }
-      if (uIdx === -1) {
-        for (var u = msgs.length - 1; u >= 0; u--) {
-          var um = msgs[u];
-          if (!um || um.role !== "user" || um.isBackgroundTask || um._serverItemId !== void 0 || um._stageId) continue;
-          if (!(um.isPendingQueued || um.isPendingInProcess || um.isSendingToServer)) continue;
-          uIdx = u;
-          break;
-        }
       }
       if (uIdx !== -1) {
         msgs[uIdx] = this._cancelledCopyOf(msgs[uIdx], itemId);
@@ -8366,6 +9035,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var ident = this.host.getIdentity();
           if (ident && ident.projectId) {
             upsertIndexRunRecordSafe(ident.projectId, runPath, { status: "cancelled", finished: Date.now() });
+            this._forgetChain(ident.projectId, runPath);
           }
         }
       }
@@ -8427,7 +9097,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var last = nowMs();
       return new Promise(function(resolve) {
         var done = false;
-        var doc = _g.document;
+        var doc = _g2.document;
         function isHidden() {
           return !!(doc && doc.hidden);
         }
@@ -8514,113 +9184,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       return this.typewriterQueue;
     }
-    // --- cache+resume immediate-send rendering -----------------------------
-    // Render the just-resolved reply (read from aiChatHistoryCache) into the
-    // pending assistant bubble, character-by-character. Runs AFTER the reply is
-    // already in the cache (dispatchAgentRequest appended it); errors are shown
-    // instantly (no typing). Promotes the next queued message immediately so its
-    // "Thinking…" bubble appears without waiting for this typewriter to finish.
-    typewriteLatestReply(key) {
-      var cached = this.aiChatHistoryCache[key];
-      if (!cached || !cached.messages.length) return Promise.resolve();
-      var latest;
-      for (var i = cached.messages.length - 1; i >= 0; i--) {
-        var m = cached.messages[i];
-        if (m.role === "assistant" && !m.isPending) {
-          latest = m;
-          break;
-        }
-      }
-      if (!latest) return Promise.resolve();
-      var pendingIdx = this.state.messages.findIndex(function(mm) {
-        return mm.isPending && mm.role === "assistant" && !mm.isBackgroundTask;
-      });
-      if (pendingIdx === -1) return Promise.resolve();
-      if (latest.isError || !latest.content) {
-        this.state.messages[pendingIdx] = { role: "assistant", content: latest.content || "", isError: !!latest.isError };
-        this._removeStrayPendingAssistants();
-        this.host.notify();
-        this.promoteNextQueuedToRunning();
-        return Promise.resolve();
-      }
-      var painted = this._paintedTextAt(pendingIdx);
-      var lid = this._newLocalId();
-      var prevSettled = this.state.messages[pendingIdx] || {};
-      var settled = { role: "assistant", content: painted, isPending: false, _localId: lid };
-      if (prevSettled._serverItemId) settled._serverItemId = prevSettled._serverItemId;
-      if (prevSettled._ownerKey) settled._ownerKey = prevSettled._ownerKey;
-      if (latest._retrieval) settled._retrieval = latest._retrieval;
-      this.state.messages[pendingIdx] = settled;
-      this._removeStrayPendingAssistants();
-      this.host.notify();
-      this.promoteNextQueuedToRunning();
-      return this.enqueueTypewrite(pendingIdx, latest.content, lid, painted);
-    }
-    // Remove leftover non-background pending ("Thinking…") assistant bubbles: the
-    // duplicate that appears when a concurrent history refetch re-maps the still-
-    // "running" turn into a pending placeholder (with a real _serverItemId) while the
-    // local pending bubble (no _serverItemId) is rescued and re-appended (see the
-    // loadHistory rescue below), and the orphan a resolve leaves when it splices its
-    // reply beside a placeholder instead of into it. Each resolve path only replaces
-    // ONE pending bubble, so without this a stray "Thinking…" survives forever next to
-    // the reply. MUST run AFTER the resolved bubble has been made non-pending and
-    // BEFORE promoteNext*() (which only adds a Thinking once none remains).
-    //
-    // It used to take EVERY one, on the premise that there is at most one at a time
-    // because promoteNext* refuses to add a second. That premise never covered the
-    // immediate-send path, which creates its pair directly — and a turn sent with
-    // attachments does not block the composer and resolves on its own queue, so an
-    // ordinary question asked while files index is in flight, with a placeholder of
-    // its own, exactly when the attachment turn resolves. Sweeping it left that
-    // question with no spinner and, worse, nowhere for its answer to land:
-    // typewriteLatestReply bails when there is no pending assistant, so the reply
-    // reached the cache and never the screen.
-    //
-    // The discriminator is the owning USER bubble. A live immediate send's user bubble
-    // carries NO pending flags (its in-flight-ness lives in state.sending), while every
-    // duplicate this sweep is for belongs to a user bubble that is still pending — and
-    // an orphan has no user bubble above it at all.
-    _removeStrayPendingAssistants() {
-      for (var k = this.state.messages.length - 1; k >= 0; k--) {
-        var m = this.state.messages[k];
-        if (!m || !m.isPending || m.role !== "assistant" || m.isBackgroundTask) continue;
-        if (m._streaming) continue;
-        if (this._isLiveImmediatePlaceholder(k)) continue;
-        this.state.messages.splice(k, 1);
-      }
-    }
-    /** Index of the USER bubble the message at `idx` belongs to — the nearest one
-     *  above it, stepping over background bubbles (a file's indexing rows are
-     *  inserted between turns). -1 when the nearest thing above is not a user turn,
-     *  which for a placeholder means it is an orphan. */
-    _owningUserIndex(idx) {
-      for (var j = idx - 1; j >= 0; j--) {
-        var p = this.state.messages[j];
-        if (!p) return -1;
-        if (p.isBackgroundTask) continue;
-        return p.role === "user" ? j : -1;
-      }
-      return -1;
-    }
-    /** The bubble at `idx` is the "Thinking…" of a DIFFERENT turn that is still
-     *  waiting for its answer, so the sweep above must leave it alone. */
-    _isLiveImmediatePlaceholder(idx) {
-      var ui = this._owningUserIndex(idx);
-      if (ui === -1) return false;
-      var p = this.state.messages[ui];
-      return !p.isPending && !p.isPendingQueued && !p.isPendingInProcess && !p.isPendingOlder && !p.isSendingToServer && !p.isCancelled;
-    }
-    /** A pending assistant at `idx` is the placeholder OF the turn above it, so a
-     *  reply may take its slot. Every path that makes one copies the parent's
-     *  _serverItemId (or neither has one yet), so a mismatch means the slot belongs to
-     *  some other request and the reply must be spliced in beside it, not on top. */
-    _isOwnPlaceholderOf(idx, userIdx) {
-      if (userIdx === -1) return false;
-      var ph = this.state.messages[idx], u = this.state.messages[userIdx];
-      if (!ph || !u) return false;
-      if (ph._serverItemId === void 0 || u._serverItemId === void 0) return true;
-      return ph._serverItemId === u._serverItemId;
-    }
+    // (_removeStrayPendingAssistants, the "Thinking..." sweep that guessed which
+    // pending bubble was a stray from the user bubble above it, is gone with the
+    // positional writers it cleaned up after. A settle now removes every other waiting
+    // copy of ITS OWN request, by id: see _settleInList.)
     // Drop the pending flags on the resolved turn's USER bubble (preserving its
     // content + background-task marker). Needed because a bg "Indexing:" turn's user
     // bubble carries isPendingInProcess; leaving it set keeps the bubble visually
@@ -8637,30 +9204,1770 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (u._indexFile) cleaned._indexFile = u._indexFile;
       this.state.messages[uIdx] = cleaned;
     }
-    // If an immediate-send request for the current cache key is still in flight
-    // (e.g. the view unmounted then remounted mid-request), show the sending
-    // state, await it, then render the reply from the cache. Skipped when the
-    // list already has its own pending/queued bubbles (those resolve via their
-    // own polls). The displayed reply also lands via dispatchComposedMessage's
-    // own finally if the view never unmounted — this is the remount recovery.
-    resumePendingRequest(token) {
+    // An immediate send for the chat on screen whose POST has not been acked yet (the
+    // view unmounted and remounted mid-request): show the sending state until the ack.
+    // Nothing is rendered from here any more. Once acked, the turn is an ordinary open
+    // item, and applyTerminal settles it by its id wherever its bubble lives (on screen
+    // or in its chat's cache), so a remount needs no replay of the reply.
+    resumePendingRequest(_token) {
       var self = this;
       var key = this.getHistoryCacheKey();
       var pending = key ? this.pendingAgentRequests[key] : void 0;
       if (!pending) return Promise.resolve();
-      if (this.state.messages.some(function(m) {
-        return (m.isPending || m.isPendingQueued) && !m.isBackgroundTask && !m._useBgQueue;
-      })) return Promise.resolve();
       this.state.sending = true;
-      this.host.scrollToBottomIfSticky(true);
+      this.host.notify();
       return Promise.resolve(pending).catch(function() {
-      }).then(function(result) {
-        if (token !== self.state.gateRefreshToken) return;
+      }).then(function() {
+        if (key && self.pendingAgentRequests[key]) return;
         self.state.sending = false;
-        if (result && result.cancelled) return;
-        return Promise.resolve(self.typewriteLatestReply(key)).then(function() {
-          self.host.scrollToBottomIfSticky(true);
+        self.host.notify();
+      });
+    }
+    _recNewMode() {
+      return !this._recReadsOff && reconcilerReadsEnabled();
+    }
+    _recSched() {
+      if (!this._sched) {
+        var self = this;
+        this._sched = new LookScheduler({
+          runLook: function(req) {
+            return self._reconcileLook(req);
+          },
+          work: function() {
+            return self._recWork();
+          },
+          pushLive: function() {
+            return statusPushLive();
+          },
+          onFlags: function(f) {
+            if (!!self.state.reconnecting === f.reconnecting && !!self.state.signInNeeded === f.signInNeeded) return;
+            self.state.reconnecting = f.reconnecting;
+            self.state.signInNeeded = f.signInNeeded;
+            self._viewNotify();
+          }
         });
+      }
+      return this._sched;
+    }
+    /** Keep the chain running at its cadence while there is anything to follow. */
+    _recEnsure() {
+      if (this._recSyncing) return;
+      try {
+        this._recSched().ensure();
+      } catch (e) {
+      }
+    }
+    /** A view host may be absent (the dashboard's files page): nothing here may throw then. */
+    _viewMounted() {
+      try {
+        return !!(this.host && this.host.isViewMounted && this.host.isViewMounted());
+      } catch (e) {
+        return false;
+      }
+    }
+    _viewNotify() {
+      if (!this._viewMounted()) return;
+      try {
+        this.host.notify();
+      } catch (e) {
+      }
+    }
+    /**
+     * Look at the server now. `trigger` says why (default 'return': the user is back, so
+     * readers restart and the first page is read). Resolves when that look ends. Any
+     * number of calls at once run one look, plus exactly one more for calls that arrive
+     * while it runs.
+     */
+    reconcileNow(trigger) {
+      return this._recSched().trigger(trigger || "return");
+    }
+    /** The sign-in is back: looks resume at once (state.signInNeeded clears on success). */
+    noteSignedIn() {
+      this._recSched().signedIn();
+    }
+    /** A chat view was (re)opened: a return look (readers, discovery, first page). */
+    noteViewOpened() {
+      void this._recSched().trigger("view");
+    }
+    /** The host changed bgTaskQueue (the files page pushes passes with no chat view):
+     *  the new entries join the open set and the chain runs. */
+    noteBgQueueChanged() {
+      this._syncOpenFromBgQueue();
+      this._recEnsure();
+    }
+    /**
+     * True when this page's reconciler follows every bgTaskQueue entry itself, with or
+     * without a chat view (the host's skapi-js has the batch reads). A host's own poller of
+     * that queue (web-bunnyquery main.vue's fallback poller) then stands down: two
+     * followers of one pass race to settle it, and the poller's settle skips the next pass
+     * of a file this client drives and its run:: record.
+     */
+    followsBackgroundQueue() {
+      return this._recNewMode();
+    }
+    /** Stop the reconciler's timer (tests, teardown). Any trigger starts it again. */
+    stopReconciler() {
+      if (this._sched) this._sched.stop();
+    }
+    /** Diagnostics: the open set's size, looks run, timers armed, pending sends. */
+    reconcilerStats() {
+      var sc = this._sched;
+      return {
+        open: Object.keys(this._openMap()).length,
+        looks: sc ? sc.looks : 0,
+        timers: sc ? sc.timersArmed : 0,
+        generation: sc ? sc.gen : 0,
+        pendingSends: Object.keys(this._recPending || {}).length,
+        fileRuns: Object.keys(this._fileRuns || {}).length,
+        reconnecting: !!this.state.reconnecting,
+        signInNeeded: !!this.state.signInNeeded,
+        running: !!sc && sc.isRunning()
+      };
+    }
+    /** The bg entry of a pass, by id. */
+    _bgEntry(itemId) {
+      var q = this.bgTaskQueue || [];
+      for (var i = 0; i < q.length; i++) if (q[i] && q[i].id === itemId) return q[i];
+      return null;
+    }
+    /** The queue an indexing pass runs on. */
+    _bgQueueOf(entry2) {
+      var uid = entry2.identity ? entry2.identity.userId : "";
+      return bgIndexingQueueName(uid, entry2.projectId);
+    }
+    /**
+     * Every bgTaskQueue entry is an open item, whoever pushed it (the engine, the files
+     * page with no chat view, a host's own code). Its identity is pinned here when the
+     * host pushed it without one, from the identity live now when that is the entry's
+     * project.
+     */
+    _syncOpenFromBgQueue() {
+      var q = this.bgTaskQueue;
+      if (!q || !q.length) return;
+      var map = this._openMap(), tomb = this._tomb();
+      var live = null;
+      this._recSyncing = true;
+      try {
+        for (var i = 0; i < q.length; i++) {
+          var e = q[i];
+          if (!e || !e.id || !e.projectId || map[e.id] || tomb[e.id]) continue;
+          if (!e.identity) {
+            if (!live) {
+              try {
+                live = this.host.getIdentity();
+              } catch (err) {
+                live = null;
+              }
+            }
+            if (live && live.projectId === e.projectId) e.identity = Object.assign({}, live, { platform: e.platform });
+          }
+          if (e.owner === void 0 && e.identity) e.owner = e.identity.owner;
+          var uid = e.identity ? e.identity.userId : "";
+          if (e.ownerKey === void 0 && e.identity) e.ownerKey = chatCacheKey(e.projectId, e.platform, uid);
+          this.trackOpenItem(e.id, {
+            ownerKey: e.ownerKey || chatCacheKey(e.projectId, e.platform, uid),
+            projectId: e.projectId,
+            owner: e.owner || "",
+            platform: e.platform,
+            queue: bgIndexingQueueName(uid, e.projectId),
+            kind: "indexing",
+            state: e.status === "running" ? "running" : "queued",
+            anonymous: !!(e.identity && e.identity.anonymous),
+            uid: e.identity ? e.identity.userId : void 0
+          });
+        }
+      } finally {
+        this._recSyncing = false;
+      }
+      this._persistChains();
+    }
+    _chainStorage() {
+      try {
+        var ls = _g2.localStorage;
+        return ls && typeof ls.getItem === "function" ? ls : null;
+      } catch (e) {
+        return null;
+      }
+    }
+    _chainKey(projectId, storagePath) {
+      return projectId + "|" + storagePath;
+    }
+    /** Keep every client-driven pass in bgTaskQueue (the newest pass per file wins). */
+    _persistChains() {
+      var q = this.bgTaskQueue;
+      if (!q || !q.length) return;
+      if (!this._chains) this._chains = {};
+      var ls = this._chainStorage();
+      for (var i = 0; i < q.length; i++) {
+        var e = q[i];
+        if (!e || !e.id || !e.storagePath || !e.projectId || !e.identity) continue;
+        if (e.platform !== "claude" && e.platform !== "openai") continue;
+        if (this._chainEnded && this._chainEnded[e.id]) continue;
+        if (this._isWorkerDrivenIndexing(e.filename, e.mime)) continue;
+        var k = this._chainKey(e.projectId, e.storagePath);
+        var cur = this._chains[k];
+        if (cur && cur.id >= e.id) continue;
+        var rec = {
+          projectId: e.projectId,
+          platform: e.platform,
+          owner: e.owner !== void 0 ? e.owner : e.identity.owner,
+          ownerKey: e.ownerKey,
+          identity: Object.assign({}, e.identity),
+          storagePath: e.storagePath,
+          filename: e.filename,
+          mime: e.mime,
+          size: e.size,
+          isReindex: e.isReindex,
+          resumePass: e.resumePass || 0,
+          id: e.id,
+          at: Date.now()
+        };
+        this._chains[k] = rec;
+        if (!ls) continue;
+        try {
+          var had = ls.getItem(CHAIN_STORE_PREFIX + k);
+          var prev = had ? JSON.parse(had) : null;
+          if (prev && typeof prev.id === "string" && prev.id > e.id) continue;
+          ls.setItem(CHAIN_STORE_PREFIX + k, JSON.stringify(rec));
+        } catch (err) {
+        }
+      }
+    }
+    /** The chain of this file ended: forget it (only when the kept pass is not newer than
+     *  `upToId`, a later run of the same file being newer; without it, whatever is kept). */
+    _forgetChain(projectId, storagePath, upToId) {
+      if (!projectId || !storagePath) return;
+      if (upToId) {
+        if (!this._chainEnded) this._chainEnded = {};
+        this._chainEnded[upToId] = true;
+      }
+      var k = this._chainKey(projectId, storagePath);
+      if (this._chains && this._chains[k] && (!upToId || this._chains[k].id <= upToId)) delete this._chains[k];
+      var ls = this._chainStorage();
+      if (!ls) return;
+      try {
+        var had = ls.getItem(CHAIN_STORE_PREFIX + k);
+        if (!had) return;
+        var prev = JSON.parse(had);
+        if (upToId && prev && typeof prev.id === "string" && prev.id > upToId) return;
+        ls.removeItem(CHAIN_STORE_PREFIX + k);
+      } catch (err) {
+      }
+    }
+    /** Is a chain of this file kept (this page or another tab of this browser)? */
+    _chainKept(projectId, storagePath) {
+      var k = this._chainKey(projectId, storagePath);
+      if (this._chains && this._chains[k]) return true;
+      var ls = this._chainStorage();
+      if (!ls) return false;
+      try {
+        return !!ls.getItem(CHAIN_STORE_PREFIX + k);
+      } catch (e) {
+        return false;
+      }
+    }
+    /** Once per page, at its first look: the kept chains go back into bgTaskQueue. */
+    _restoreChains() {
+      if (this._chainsRestored) return;
+      this._chainsRestored = true;
+      var ls = this._chainStorage();
+      if (!ls) return;
+      if (!this._recNewMode() && typeof chatEngineConfig().csrHistoryItemLookup !== "function") return;
+      var keys = [];
+      try {
+        for (var i = 0; i < ls.length; i++) {
+          var lk = ls.key(i);
+          if (lk && lk.indexOf(CHAIN_STORE_PREFIX) === 0) keys.push(lk);
+        }
+      } catch (e) {
+        return;
+      }
+      if (!this._chains) this._chains = {};
+      var tomb = this._tomb();
+      var added = false;
+      for (var j = 0; j < keys.length; j++) {
+        var rec = null;
+        try {
+          rec = JSON.parse(ls.getItem(keys[j]) || "null");
+        } catch (e) {
+          rec = null;
+        }
+        var ok = !!rec && typeof rec.id === "string" && !!rec.projectId && !!rec.storagePath && !!rec.identity && (rec.platform === "claude" || rec.platform === "openai") && typeof rec.at === "number";
+        if (!ok || Date.now() - rec.at > CHAIN_STORE_TTL_MS) {
+          try {
+            ls.removeItem(keys[j]);
+          } catch (e) {
+          }
+          continue;
+        }
+        var r = rec;
+        this._chains[this._chainKey(r.projectId, r.storagePath)] = r;
+        if (tomb[r.id] || this.bgTaskQueue.some(function(e) {
+          return !!e && e.id === r.id;
+        })) continue;
+        this.bgTaskQueue.push({
+          projectId: r.projectId,
+          platform: r.platform,
+          id: r.id,
+          identity: Object.assign({}, r.identity),
+          owner: r.owner,
+          ownerKey: r.ownerKey,
+          filename: r.filename,
+          storagePath: r.storagePath,
+          isReindex: r.isReindex,
+          mime: r.mime,
+          size: r.size,
+          status: "pending",
+          poll: void 0,
+          resumePass: r.resumePass
+        });
+        added = true;
+      }
+      if (added && this._viewMounted()) {
+        try {
+          this.drainBgTaskQueue();
+        } catch (e) {
+        }
+      }
+    }
+    /** An open indexing pass whose file this client drives (it sends the next pass). */
+    _isClientDrivenOpen(itemId) {
+      var e = this._bgEntry(itemId);
+      return !!e && !!e.storagePath && !this._isWorkerDrivenIndexing(e.filename, e.mime);
+    }
+    /** What the chain has to follow: anything at all (visible cadence), and what is worth
+     *  a look once a minute while the tab is hidden (a client-driven chain: without the
+     *  browser its next pass is never sent). Never reads the network. */
+    _recWork() {
+      var open = this._openMap();
+      var any = false, hidden = false;
+      var live = this._recLiveUid();
+      for (var id in open) {
+        if (!this._recReadable(open[id].uid, open[id].projectId, live)) continue;
+        any = true;
+        if (open[id].kind === "indexing" && this._isClientDrivenOpen(id)) {
+          hidden = true;
+          break;
+        }
+      }
+      if (this._recPending) {
+        for (var c in this._recPending) {
+          if (!this._recReadable(this._recPending[c].uid, this._recPending[c].projectId, live)) continue;
+          any = true;
+          if (this._recPending[c].kind === "indexing") hidden = true;
+        }
+      }
+      if (!any && this._recFirstPageOwed && this._viewMounted()) any = true;
+      if (!any && this._fileRuns && Object.keys(this._fileRuns).length && this._viewMounted()) any = true;
+      if (!any && this._viewMounted()) {
+        try {
+          var ident = this.host.getIdentity();
+          if (ident && ident.projectId && this._hasLocalLiveIndexWork(ident.projectId)) any = true;
+        } catch (e) {
+        }
+      }
+      var iq = this._iqWork();
+      return { visible: any || iq.visible, hidden: hidden || iq.hidden };
+    }
+    /** How a failed read is taken: 'auth' (the sign-in is gone), 'transient' (on the way),
+     *  'refused' (the server's own no). */
+    _recErrKind(err) {
+      var msg = err && typeof err === "object" && typeof err.message === "string" ? err.message.toLowerCase() : typeof err === "string" ? err.toLowerCase() : "";
+      if (isAuthExpiredError(err) || msg.indexOf("login is required") !== -1 || msg.indexOf("user login") !== -1) return "auth";
+      if (isTransportFailure(err)) return "transient";
+      return "refused";
+    }
+    /** The user id signed in now (ChatIdentity.userId), or null when the host cannot say. */
+    _recLiveUid() {
+      try {
+        var id = this.host.getIdentity();
+        return id ? { uid: id.userId || "", projectId: id.projectId || "" } : null;
+      } catch (e) {
+        return null;
+      }
+    }
+    /**
+     * Can the caller signed in now read an item sent under `uid`? A row answers only the
+     * identity that made it: after a sign-out (or with another account) every read of it
+     * would come back "missing" and settle a turn that is fine as "no longer available".
+     * Such an item is left exactly as it is (not read, not counted as work) until its user
+     * is back. An item pinned before the user was known (uid = the project id, the hosts'
+     * fallback) is always read.
+     */
+    _recReadable(uid, projectId, live) {
+      if (!uid || uid === projectId) return true;
+      if (!live) return false;
+      var now = live.uid || live.projectId;
+      return !!now && uid === now;
+    }
+    /** The newest server id of a chat known here (on screen, in its cache, or open). */
+    _recNewestKnownId(key) {
+      var best = "";
+      var scan = function(list) {
+        if (!list) return;
+        for (var i = 0; i < list.length; i++) {
+          var sid = list[i] && list[i]._serverItemId;
+          if (typeof sid === "string" && sid > best && !list[i].isBackgroundTask) best = sid;
+        }
+      };
+      if (!key || key === this.getHistoryCacheKey()) scan(this.state.messages);
+      var cached = key ? this.aiChatHistoryCache[key] : void 0;
+      if (cached) scan(cached.messages);
+      var open = this._openMap();
+      for (var id in open) if (open[id].ownerKey === key && open[id].kind === "chat" && id > best) best = id;
+      return best;
+    }
+    /** Put a send's cref on its bubbles (on screen and in the chat's cache). */
+    _stampCref(key, userLid, placeholderLid, cref) {
+      if (!userLid && !placeholderLid || !cref) return;
+      var stamp = function(list) {
+        if (!list) return;
+        for (var i = 0; i < list.length; i++) {
+          var m = list[i];
+          if (!m || !m._localId) continue;
+          if (m.role === "user" && m._localId === userLid || m.role === "assistant" && m._localId === placeholderLid) m._cref = cref;
+        }
+      };
+      stamp(this.state.messages);
+      var cached = key ? this.aiChatHistoryCache[key] : void 0;
+      if (cached) stamp(cached.messages);
+    }
+    /** A send whose POST got no answer: its row is looked for by cref (see dispatchAgentRequest). */
+    _recAddPendingSend(p) {
+      if (!this._recPending) this._recPending = {};
+      p.sentAt = Date.now();
+      p.looks = 0;
+      if (p.uid === void 0) {
+        var live = this._recLiveUid();
+        p.uid = live ? live.uid : "";
+      }
+      this._recPending[p.cref] = p;
+      if (p.kind !== "indexing") this._markLocalTurn(p.key, p.userLid, p.placeholderLid, { _unconfirmed: true });
+      void this._recSched().trigger("send");
+    }
+    /** Patch the bubbles of a local turn (by local id), on screen and in its chat's cache. */
+    _markLocalTurn(key, userLid, placeholderLid, patch) {
+      var hit = function(m) {
+        return !!m && !!m._localId && (m.role === "user" && m._localId === userLid || m.role === "assistant" && m._localId === placeholderLid);
+      };
+      var apply = function(list) {
+        var any = false;
+        for (var i = 0; i < list.length; i++) {
+          if (!hit(list[i])) continue;
+          var next = Object.assign({}, list[i], patch);
+          for (var k in patch) if (patch[k] === void 0) delete next[k];
+          list[i] = next;
+          any = true;
+        }
+        return any;
+      };
+      if (!key || key === this.getHistoryCacheKey()) {
+        if (apply(this.state.messages)) this._viewNotify();
+      }
+      var cached = key ? this.aiChatHistoryCache[key] : void 0;
+      if (cached) {
+        var msgs = cached.messages.slice();
+        if (apply(msgs)) this.aiChatHistoryCache[key] = { messages: msgs, endOfList: cached.endOfList, startKeyHistory: cached.startKeyHistory };
+      }
+    }
+    /**
+     * Send again a turn that said "Not sent. Retry?". Only ever on the user's click: the
+     * reply bubble goes back to waiting and the same send goes out with a new cref. False
+     * when `msg` is not such a reply (or was retried already).
+     */
+    retryNotSent(msg) {
+      if (!msg || !msg._notSent || !msg._localId) return false;
+      var map = this._notSent || {};
+      var rec = map[msg._localId];
+      if (!rec) return false;
+      delete map[msg._localId];
+      var lid = msg._localId;
+      var onScreen = !rec.key || rec.key === this.getHistoryCacheKey();
+      var params = rec.params;
+      if (params.immediate && this._chatBusy(rec.key, onScreen)) {
+        params = Object.assign({}, params, { immediate: false, placeholderLid: void 0 });
+        rec.params = params;
+      }
+      var asQueued = !params.immediate;
+      var restore = function(list) {
+        var hit = false;
+        for (var i = list.length - 1; i >= 0; i--) {
+          var m = list[i];
+          if (!m) continue;
+          if (m.role === "assistant" && m._localId === lid && m._notSent) {
+            if (rec.placeholderLid && !asQueued) {
+              var ph = { role: "assistant", content: "", isPending: true, isPendingInProcess: true, _localId: rec.placeholderLid };
+              if (m._ownerKey !== void 0) ph._ownerKey = m._ownerKey;
+              list[i] = ph;
+            } else {
+              list.splice(i, 1);
+            }
+            hit = true;
+          } else if (m.role === "user" && rec.userLid && m._localId === rec.userLid) {
+            var back = Object.assign({}, m, asQueued ? { isPendingQueued: true, isSendingToServer: true, _dimSending: true } : {});
+            delete back._notSent;
+            list[i] = back;
+            hit = true;
+          }
+        }
+        return hit;
+      };
+      if (onScreen && restore(this.state.messages)) {
+        this._viewNotify();
+        this.updateHistoryCache();
+      } else {
+        var cached = rec.key ? this.aiChatHistoryCache[rec.key] : void 0;
+        if (cached) {
+          var msgs = cached.messages.slice();
+          if (restore(msgs)) this.aiChatHistoryCache[rec.key] = { messages: msgs, endOfList: cached.endOfList, startKeyHistory: cached.startKeyHistory };
+        }
+      }
+      if (params.immediate && onScreen) {
+        this.state.sending = true;
+        this._viewNotify();
+      }
+      this.dispatchAgentRequest(params);
+      return true;
+    }
+    /** Is a send of this chat in flight right now (see retryNotSent)? */
+    _chatBusy(key, onScreen) {
+      if (key && this.pendingAgentRequests[key]) return true;
+      if (!onScreen) return false;
+      return !!this.state.sending || !this._noRunningChatTurnOnScreen(this.getHistoryCacheKey());
+    }
+    /** True for a "Not sent. Retry?" reply that retryNotSent can still send. */
+    canRetryNotSent(msg) {
+      return !!msg && !!msg._notSent && !!msg._localId && !!(this._notSent && this._notSent[msg._localId]);
+    }
+    /**
+     * Follow an indexing run from its run:: 'working' record (reconciler plan, section 3
+     * item 1): the host passes the project's paths whose record says working, after every
+     * read of those records. A run stays open until its record says done/error/cancelled
+     * (it leaves the list), or a complete look at the queue finds no pass of it. While one
+     * is open and not seen live, a look asks the host to read the records again
+     * (host.recheckFileRuns) every FILE_RUN_RECHECK_MS: no fixed number of rounds.
+     */
+    syncFileRuns(projectId, workingPaths, info) {
+      if (!projectId) return;
+      if (!this._fileRuns) this._fileRuns = {};
+      if (!this._fileRunsIdle) this._fileRunsIdle = {};
+      var want = {};
+      for (var i = 0; i < (workingPaths || []).length; i++) {
+        var p = workingPaths[i];
+        if (typeof p === "string" && p) want[projectId + "|" + p] = true;
+      }
+      for (var k in this._fileRuns) {
+        if (this._fileRuns[k].projectId === projectId && !want[k]) delete this._fileRuns[k];
+      }
+      for (var k2 in this._fileRunsIdle) {
+        if (k2.indexOf(projectId + "|") === 0 && !want[k2]) delete this._fileRunsIdle[k2];
+      }
+      var added = false;
+      for (var w in want) {
+        var path = w.slice(projectId.length + 1);
+        var hint = info && info[path];
+        if (this._fileRuns[w]) {
+          if (hint) {
+            this._fileRuns[w].owner = hint.owner;
+            this._fileRuns[w].filename = hint.filename;
+          }
+          continue;
+        }
+        if (this._fileRunsIdle[w]) continue;
+        this._fileRuns[w] = { projectId, storagePath: path, since: Date.now() };
+        if (hint) {
+          this._fileRuns[w].owner = hint.owner;
+          this._fileRuns[w].filename = hint.filename;
+        }
+        added = true;
+      }
+      if (added) this._recEnsure();
+    }
+    /** The runs of a project this page follows, by storage path. */
+    openFileRuns(projectId) {
+      var out = [];
+      var runs = this._fileRuns || {};
+      for (var k in runs) if (runs[k].projectId === projectId) out.push(runs[k].storagePath);
+      return out;
+    }
+    /**
+     * Watch a project's background indexing queue, with or without a chat view (the
+     * dashboard's files page draws its "Indexing" and "Indexed" badges from it). The
+     * reconciler's one timer chain reads it (no timer or poll of the page's own):
+     *  - at once when the watch starts, on every return (tab shown, wake, online,
+     *    reconnect) and when a status frame names the indexing queue;
+     *  - every 8 s while the queue holds work or the last read came back cut off (once a
+     *    minute while status frames arrive);
+     *  - every 2.5 s while the page waits for a second, independent look (wantsConfirm);
+     *  - never while the tab is hidden (a refresh() still reads).
+     * The answer lands in state.indexQueues[projectId] (IndexQueueSnapshot). Runs the page
+     * follows itself (runsOpen) get recheckRuns every FILE_RUN_RECHECK_MS from the same
+     * chain. A failed read keeps the last snapshot.
+     */
+    watchIndexQueue(opts) {
+      var self = this;
+      var w = { opts, force: true, frame: false, runsCheckAt: 0, lastTryAt: 0 };
+      this._iqWatches.push(w);
+      this._startStatusPush();
+      void this._recSched().trigger("add");
+      return {
+        stop: function() {
+          var i = self._iqWatches.indexOf(w);
+          if (i !== -1) self._iqWatches.splice(i, 1);
+          if (!self._iqWatches.length && !Object.keys(self._openMap()).length && !self._viewMounted()) self._stopStatusPush();
+        },
+        refresh: function(maxAgeMs) {
+          if (self._iqWatches.indexOf(w) === -1) return Promise.resolve();
+          var ident = self._iqIdentity(w);
+          if (!ident) return Promise.resolve();
+          var snap = self.indexQueueSnapshot(ident.projectId);
+          if (snap && maxAgeMs && Date.now() - snap.at < maxAgeMs) return Promise.resolve();
+          w.force = true;
+          return self._recSched().trigger("add");
+        },
+        ensure: function() {
+          self._recEnsure();
+        }
+      };
+    }
+    /** The last read of a project's indexing queue (see watchIndexQueue), or null. */
+    indexQueueSnapshot(projectId) {
+      var all = this.state.indexQueues;
+      return projectId && all && all[projectId] || null;
+    }
+    _iqIdentity(w) {
+      var ident = null;
+      try {
+        ident = w.opts.identity();
+      } catch (e) {
+        ident = null;
+      }
+      if (!ident || !ident.projectId || ident.platform !== "claude" && ident.platform !== "openai") return null;
+      return ident;
+    }
+    /** What the watches give the chain to do (see _recWork). */
+    _iqWork() {
+      var visible = false, hidden = false;
+      for (var i = 0; i < this._iqWatches.length; i++) {
+        var w = this._iqWatches[i];
+        if (w.drain) {
+          visible = true;
+          hidden = true;
+          continue;
+        }
+        var ident = this._iqIdentity(w);
+        if (!ident) continue;
+        var snap = this.indexQueueSnapshot(ident.projectId);
+        if (w.force || w.frame || !snap || !snap.checked || Object.keys(snap.keys).length) {
+          visible = true;
+          continue;
+        }
+        try {
+          if (w.opts.wantsConfirm && w.opts.wantsConfirm()) {
+            visible = true;
+            continue;
+          }
+          if (w.opts.runsOpen && w.opts.runsOpen()) visible = true;
+        } catch (e) {
+        }
+      }
+      return { visible, hidden };
+    }
+    /** The watched queues' part of a look: read the ones that are due (see watchIndexQueue). */
+    _iqLook(req) {
+      var self = this;
+      if (!this._iqWatches.length) return Promise.resolve();
+      var doc = _g2.document;
+      var hidden = !!doc && doc.visibilityState === "hidden";
+      var push = statusPushLive();
+      var groups = {};
+      var list = this._iqWatches.slice();
+      for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        var ident = this._iqIdentity(w);
+        if (!ident) continue;
+        var now = Date.now();
+        if (!w.drain) {
+          var runs = false;
+          try {
+            runs = !!(w.opts.runsOpen && w.opts.recheckRuns && w.opts.runsOpen());
+          } catch (e) {
+            runs = false;
+          }
+          if (!runs) w.runsCheckAt = 0;
+          else if (!w.runsCheckAt) w.runsCheckAt = now;
+          else if (!hidden && now - w.runsCheckAt >= FILE_RUN_RECHECK_MS) {
+            w.runsCheckAt = now;
+            try {
+              w.opts.recheckRuns();
+            } catch (e) {
+            }
+          }
+        }
+        var due = false;
+        var token = 0;
+        var confirm = false;
+        if (w.drain) {
+          due = w.drain.due();
+          if (due) token = w.drain.onAsk();
+        } else if (w.force) {
+          due = true;
+        } else if (!hidden) {
+          var snap = this.indexQueueSnapshot(ident.projectId);
+          var age = now - Math.max(snap ? snap.at : 0, w.lastTryAt);
+          var busy = !snap || !snap.checked || Object.keys(snap.keys).length > 0;
+          try {
+            confirm = !!(w.opts.wantsConfirm && w.opts.wantsConfirm());
+          } catch (e) {
+            confirm = false;
+          }
+          due = req.isReturn || !snap && age >= IQ_LIVE_MS || w.frame && age >= IQ_FRAME_GAP_MS || busy && age >= (push ? IQ_PUSH_LIVE_MS : IQ_LIVE_MS) || confirm && age >= IQ_CONFIRM_MS;
+        }
+        if (!due) continue;
+        w.force = false;
+        w.frame = false;
+        w.lastTryAt = now;
+        var fresh = !!w.drain || confirm;
+        var key = [ident.projectId, ident.owner, ident.platform, ident.userId || "", fresh ? "f" : ""].join("|");
+        if (!groups[key]) groups[key] = { ident, fresh, watches: [], tokens: [] };
+        groups[key].watches.push(w);
+        groups[key].tokens.push(token);
+      }
+      return Promise.all(Object.keys(groups).map(function(k) {
+        var g = groups[k];
+        var tell = function(snap2, failed) {
+          for (var j = 0; j < g.watches.length; j++) {
+            var d = g.watches[j].drain;
+            if (d) {
+              try {
+                d.onSnapshot(snap2, failed, g.tokens[j]);
+              } catch (e) {
+              }
+            }
+          }
+        };
+        return fetchLiveIndexingKeys({
+          service: g.ident.projectId,
+          owner: g.ident.owner,
+          platform: g.ident.platform,
+          userId: g.ident.userId
+        }, g.fresh ? { maxAgeMs: 0 } : void 0).then(function(res) {
+          if (!req.alive()) {
+            tell(null, true);
+            return;
+          }
+          var snap2 = { keys: {}, checked: !!res.checked, at: res.at };
+          res.keys.forEach(function(fk) {
+            snap2.keys[fk] = true;
+          });
+          var cur = self.indexQueueSnapshot(g.ident.projectId);
+          if (!cur || cur.at <= snap2.at) {
+            var next = Object.assign({}, self.state.indexQueues || {});
+            next[g.ident.projectId] = snap2;
+            self.state.indexQueues = next;
+          }
+          tell(snap2, false);
+        }, function() {
+          tell(null, true);
+        });
+      })).then(function() {
+        if (self._iqWork().visible) self._startStatusPush();
+        else if (!Object.keys(self._openMap()).length && !self._viewMounted()) self._stopStatusPush();
+      });
+    }
+    /**
+     * A run closed idle (a complete queue look found no pass of it) whose record still says
+     * 'working': when it is THIS user's run of a client-driven file and no browser tab here
+     * keeps its chain (a reload, a discarded tab, or a browser without localStorage lost
+     * it), nothing will ever send its next pass, so run:: says CHAIN_LOST_TEXT. Never for a
+     * worker-driven file (the worker writes its endings), another user's run (their chain is
+     * in their browser), or a run whose next pass is being looked for.
+     */
+    _flipIfChainLost(run) {
+      var self = this;
+      if (!run.owner) return;
+      var live = null;
+      try {
+        live = this.host.getIdentity();
+      } catch (e2) {
+        live = null;
+      }
+      if (!live || !live.userId || live.userId !== run.owner || live.projectId !== run.projectId) return;
+      var name = run.filename || run.storagePath.split("/").pop() || run.storagePath;
+      if (this._isWorkerDrivenIndexing(name, void 0)) return;
+      if (this._chainKept(run.projectId, run.storagePath)) return;
+      for (var q = 0; q < this.bgTaskQueue.length; q++) {
+        var e = this.bgTaskQueue[q];
+        if (e && e.projectId === run.projectId && e.storagePath === run.storagePath) return;
+      }
+      if (this._recPending) for (var c in this._recPending) {
+        if (this._recPending[c].kind === "indexing" && this._recPending[c].projectId === run.projectId) return;
+      }
+      var projectId = run.projectId, path = run.storagePath;
+      runSettleSideEffect(projectId, bgIndexingQueueName(live.userId, projectId), "lost:" + projectId + ":" + path + ":" + run.since, function() {
+        return upsertIndexRunRecordSafe(projectId, path, { status: "error", finished: Date.now(), error: CHAIN_LOST_TEXT }, { report: true }).then(function() {
+          if (typeof self.host.recheckFileRuns === "function") {
+            try {
+              self.host.recheckFileRuns(projectId, [path]);
+            } catch (e2) {
+            }
+          }
+        });
+      });
+    }
+    /** A file run the queue says is live, or that this page has a pass queued for. */
+    _fileRunLive(run) {
+      var keys = this.state.liveIndexKeys || {};
+      if (keys[run.storagePath]) return true;
+      var q = this.bgTaskQueue || [];
+      for (var i = 0; i < q.length; i++) {
+        if (q[i] && q[i].projectId === run.projectId && q[i].storagePath === run.storagePath) return true;
+      }
+      return false;
+    }
+    /** Ask the host to read the records of open runs that are not seen live. */
+    _recCheckFileRuns(projectId) {
+      var runs = this._fileRuns || {};
+      var paths = [];
+      for (var k in runs) if (runs[k].projectId === projectId && !this._fileRunLive(runs[k])) paths.push(runs[k].storagePath);
+      if (!paths.length || typeof this.host.recheckFileRuns !== "function") return;
+      if (nowMs() - this._fileRunCheckAt < FILE_RUN_RECHECK_MS) return;
+      this._fileRunCheckAt = nowMs();
+      try {
+        this.host.recheckFileRuns(projectId, paths);
+      } catch (e) {
+      }
+    }
+    /** A COMPLETE look at the queue (both listings shorter than their limit) found no pass
+     *  for these runs: they are over. The host reads their records one last time. */
+    _closeIdleFileRuns(projectId) {
+      var runs = this._fileRuns || {};
+      var closed = [];
+      for (var k in runs) {
+        if (runs[k].projectId !== projectId || this._fileRunLive(runs[k])) continue;
+        closed.push(runs[k].storagePath);
+        this._flipIfChainLost(runs[k]);
+        delete runs[k];
+        if (!this._fileRunsIdle) this._fileRunsIdle = {};
+        this._fileRunsIdle[k] = true;
+      }
+      if (closed.length && typeof this.host.recheckFileRuns === "function") {
+        try {
+          this.host.recheckFileRuns(projectId, closed);
+        } catch (e) {
+        }
+      }
+    }
+    /**
+     * Rule 3 of 4b: on every return each live stream reader is stopped (and its in-flight
+     * read aborted) before the look decides anything; a fresh one starts after the look if
+     * the turn still streams. A reader whose poll cannot be stopped (an older skapi-js) is
+     * left alone, and none is added beside it.
+     */
+    _recStopLiveReaders() {
+      var ids = Object.keys(this.liveStreams || {});
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var h = this.historyItemPolls.get(id);
+        if (!h || typeof h.stop !== "function") continue;
+        this._stopPoll(id);
+        var st = this.liveStreams[id];
+        if (st) this._closeLiveStream(st, false);
+      }
+    }
+    /** Start the one reader of a running streamed turn on screen that has none. */
+    _recStartReaders() {
+      if (!liveStreamingEnabled() || !this._viewMounted()) return;
+      var doc = _g2.document;
+      if (doc && doc.visibilityState === "hidden") return;
+      var key = this.getHistoryCacheKey();
+      var open = this._openMap();
+      for (var id in open) {
+        var it = open[id];
+        if (it.kind !== "chat" || it.lastStatus !== "running" || !it.stream || it.ownerKey !== key) continue;
+        if (this.historyItemPolls.has(id) || this.liveStreams[id]) continue;
+        this._recAttachReader(id, it);
+      }
+    }
+    _recAttachReader(itemId, item) {
+      var read = resolveForwardRequestStream();
+      if (!read) return;
+      var self = this;
+      var url = item.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+      var source = {
+        poll: function(o) {
+          return read(itemId, {
+            url,
+            method: "POST",
+            service: item.projectId,
+            owner: item.owner,
+            since: 0,
+            poll: Math.max(1e3, o && o.latency || 1e3),
+            onStream: o && o.onStream,
+            onResponse: o && o.onResponse,
+            onError: o && o.onError
+          });
+        }
+      };
+      var ctx = { ownerKey: item.ownerKey, projectId: item.projectId, owner: item.owner, platform: item.platform };
+      var dp;
+      try {
+        dp = this._fgPollWithEarlyProbe(source, itemId, void 0, { platform: item.platform, projectId: item.projectId, owner: item.owner, ownerKey: item.ownerKey });
+      } catch (e) {
+        return;
+      }
+      if (!dp) return;
+      this._trackPoll(itemId, "fg", dp);
+      var handle = this.historyItemPolls.get(itemId);
+      Promise.resolve(dp).then(function(res) {
+        if (self.historyItemPolls.get(itemId) === handle) self.historyItemPolls.delete(itemId);
+        if (isPollStopped(res)) return;
+        self.applyTerminal(itemId, res, ctx);
+      }, function(err) {
+        if (self.historyItemPolls.get(itemId) === handle) self.historyItemPolls.delete(itemId);
+        self.onPollFailure(itemId, err, ctx);
+      });
+    }
+    /** One look. See the section note. Never throws; never changes the screen on a failure. */
+    _reconcileLook(req) {
+      var iq = this._iqLook(req).catch(function(e) {
+        console.warn("[chat-engine] index queue read failed", e);
+      });
+      return Promise.all([this._reconcileChatLook(req), iq]).then(function(r) {
+        return r[0];
+      });
+    }
+    _reconcileChatLook(req) {
+      var self = this;
+      this._restoreChains();
+      this._syncOpenFromBgQueue();
+      if (req.isReturn) this._recReturnAt = nowMs();
+      if (!this._recNewMode()) return this._reconcileLookLegacy(req);
+      var outcome = "ok";
+      var fail = function(err) {
+        var k = self._recErrKind(err);
+        if (k === "auth") outcome = "auth";
+        else if (k === "transient" && outcome !== "auth") outcome = "transient";
+        return k;
+      };
+      if (req.isReturn) this._recStopLiveReaders();
+      return Promise.resolve().then(function() {
+        return self._recDiscover(req, fail);
+      }).then(function() {
+        if (req.alive()) self._recFirstPage(req);
+      }).then(function() {
+        return req.alive() ? self._recReadStatuses(req, fail) : void 0;
+      }).then(function() {
+        return req.alive() ? self._recRetryUnloadable(req) : void 0;
+      }).then(function() {
+        if (!req.alive()) return outcome;
+        if (self._recFollowUps > 0) self._recFollowUps--;
+        self._recStartReaders();
+        self._recIndexingCheck(req);
+        if (!Object.keys(self._openMap()).length && !self._viewMounted() && !self._iqWatches.length) self._stopStatusPush();
+        return outcome;
+      });
+    }
+    /**
+     * The look of a host whose skapi-js has no batch reads: today's polls stay, and the
+     * look re-attaches what a failed poll let go of (onPollFailure 'kept', a bg entry whose
+     * read failed): one by-id read each through csrHistoryItemLookup, a few per look.
+     */
+    _reconcileLookLegacy(req) {
+      var self = this;
+      var outcome = "ok";
+      var open = this._openMap();
+      var live = this._recLiveUid();
+      var unpolledBg = false;
+      if (this._countBgPolls() < MAX_CONCURRENT_BG_POLLS) for (var oid in open) {
+        if (open[oid].kind !== "indexing" || this.historyItemPolls.has(oid)) continue;
+        var oe = this._bgEntry(oid);
+        if (oe && !oe.byListing) {
+          unpolledBg = true;
+          break;
+        }
+      }
+      if ((req.isReturn || unpolledBg) && this._viewMounted() && !this.isPollingPaused()) this.drainBgTaskQueue();
+      this._recFirstPage(req);
+      this._recIndexingCheck(req);
+      var lookup = chatEngineConfig().csrHistoryItemLookup;
+      if (typeof lookup !== "function") return Promise.resolve(outcome);
+      var headless = !this._viewMounted();
+      var rank = function(id) {
+        var e = self._bgEntry(id);
+        return e && e.status !== "running" ? 1 : 0;
+      };
+      var ids = Object.keys(open).filter(function(id) {
+        if (self.historyItemPolls.has(id) || self.liveStreams[id]) return false;
+        if (!self._recReadable(open[id].uid, open[id].projectId, live)) return false;
+        var e = self._bgEntry(id);
+        if (e && e.byListing && !headless) return false;
+        if (e && e.status !== "running" && !headless) return false;
+        return true;
+      }).sort(function(a, b) {
+        return rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0);
+      }).slice(0, MAX_CONCURRENT_BG_POLLS);
+      return Promise.all(ids.map(function(id) {
+        var item = open[id];
+        if (!item || !item.projectId) return Promise.resolve();
+        var who = { ownerKey: item.ownerKey, projectId: item.projectId, owner: item.owner, platform: item.platform };
+        return Promise.resolve(lookup(buildHistoryItemFullId(item.platform, item.projectId, id), item.projectId, item.owner)).then(function(body) {
+          if (!req.alive() || !self._openMap()[id]) return;
+          item.lastConfirmed = nowMs();
+          if (isCsrStatusEnvelope(body) && (body.status === "running" || body.status === "pending")) {
+            item.lastStatus = body.status;
+            if (typeof body.executed === "number" && body.executed > 0) item.executedAt = body.executed;
+            if (body.status === "running") {
+              if (item.kind === "chat") self._noteServerState(id, "running", item.ownerKey);
+              else self._recPromoteBg(id);
+            }
+            return;
+          }
+          var entry2 = item.kind === "indexing" ? self._bgEntry(id) : null;
+          var started = item.executedAt;
+          if (started === void 0 && isCsrStatusEnvelope(body) && typeof body.executed === "number" && body.executed > 0) started = body.executed;
+          if (entry2) return self._settleBgOutcome(entry2, entry2.platform, Promise.resolve(body), function() {
+            return started;
+          }).then(function() {
+            self._recAfterApply(id, item);
+          });
+          if (item.kind === "indexing") self.handleHistoryItemResolution(id, body, item.platform, started, who);
+          else self.applyTerminal(id, body, who);
+          self._recAfterApply(id, item);
+        }, function(err) {
+          if (!req.alive()) return;
+          if (isNotExistsError(err)) {
+            var entry2 = item.kind === "indexing" ? self._bgEntry(id) : null;
+            if (entry2) return self._settleBgOutcome(entry2, entry2.platform, Promise.reject(err), function() {
+              return void 0;
+            });
+            self.onPollFailure(id, err, who);
+            return;
+          }
+          var k = self._recErrKind(err);
+          if (k === "auth") outcome = "auth";
+          else if (k === "transient" && outcome !== "auth") outcome = "transient";
+        });
+      })).then(function() {
+        return outcome;
+      });
+    }
+    /**
+     * The discovery listing: rows of a chat's queue newer than what the page knows, ids and
+     * status only. On a return (the chat on screen), and while a send waits for its row
+     * (its chat). A row carrying a waiting send's cref IS that send: its bubbles get the id
+     * and it is followed like any acked turn. A waiting send no complete listing has shown
+     * twice says "Not sent. Retry?". A live row nothing here knows makes the look read the
+     * first page.
+     */
+    _recDiscover(req, fail) {
+      var self = this;
+      var pend = this._recPending || {};
+      var live = this._recLiveUid();
+      var pendList = Object.keys(pend).map(function(k) {
+        return pend[k];
+      }).filter(function(p) {
+        return self._recReadable(p.uid, p.projectId, live);
+      });
+      if (!req.isReturn && !pendList.length) return Promise.resolve();
+      var chats = {};
+      var chatId = function(key2, queue) {
+        return key2 + "\0" + queue;
+      };
+      if (req.isReturn && this._viewMounted()) {
+        var id = null;
+        try {
+          id = this.host.getIdentity();
+        } catch (e) {
+          id = null;
+        }
+        if (id && id.projectId && (id.platform === "claude" || id.platform === "openai")) {
+          var key = this.getHistoryCacheKey();
+          var q0 = id.userId || id.projectId;
+          chats[chatId(key, q0)] = { key, projectId: id.projectId, owner: id.owner, platform: id.platform, queue: q0 };
+        }
+      }
+      pendList.forEach(function(p) {
+        var ck = chatId(p.key, p.queue);
+        if (!chats[ck]) chats[ck] = { key: p.key, projectId: p.projectId, owner: p.owner, platform: p.platform, queue: p.queue };
+      });
+      return Promise.all(Object.keys(chats).map(function(k) {
+        var c = chats[k];
+        var known = self._recNewestKnownId(c.key);
+        var after = known;
+        var mine = pendList.filter(function(p) {
+          return p.key === c.key && p.queue === c.queue;
+        });
+        for (var i = 0; i < mine.length; i++) {
+          if (!mine[i].watermark) after = "";
+          else if (after && mine[i].watermark < after) after = mine[i].watermark;
+        }
+        return Promise.resolve(getChatHistory({
+          service: c.projectId,
+          owner: c.owner,
+          platform: c.platform,
+          queue: c.queue,
+          queue_exact: true,
+          fields: "ids",
+          after: after || void 0,
+          deadline: req.remaining(),
+          signal: req.signal,
+          fresh: true
+        }, { limit: 100, fetchMore: false })).then(function(res) {
+          if (!req.alive()) return;
+          self._recApplyDiscovery(c, res, mine, known);
+        }, function(err) {
+          if (fail(err) === "refused" && req.alive()) self._recApplyDiscovery(c, { list: [], endOfList: true }, mine, known);
+        });
+      })).then(function() {
+      });
+    }
+    _recApplyDiscovery(c, res, mine, known) {
+      var list = res && Array.isArray(res.list) ? res.list : [];
+      var complete = !res || res.endOfList !== false;
+      var pend = this._recPending || {};
+      var open = this._openMap(), tomb = this._tomb();
+      var unknown = false;
+      var oldest = "";
+      var onScreen = c.key === this.getHistoryCacheKey();
+      var msgs = this.state.messages;
+      var shown = function(rid) {
+        return msgs.some(function(m) {
+          return !!m && m._serverItemId === rid;
+        });
+      };
+      for (var i = 0; i < list.length; i++) {
+        var row = list[i];
+        if (!row || typeof row.id !== "string") continue;
+        if (!oldest || row.id < oldest) oldest = row.id;
+        var p = typeof row.cref === "string" ? pend[row.cref] : void 0;
+        if (p && p.key === c.key && p.queue === c.queue) {
+          if (p.kind === "indexing") {
+            delete pend[p.cref];
+            if (p.onFound) {
+              try {
+                p.onFound(row);
+              } catch (e) {
+                console.warn("[chat-engine] a found pass threw", e);
+              }
+            }
+          } else {
+            this._recMatchPending(p, row);
+          }
+          continue;
+        }
+        if (open[row.id] || tomb[row.id] || !onScreen) continue;
+        if (row.status === "pending" || row.status === "running" || !!known && row.id > known && !isBgIndexingQueue(c.queue)) {
+          if (!shown(row.id)) unknown = true;
+        }
+      }
+      for (var j = 0; j < mine.length; j++) {
+        var ps = mine[j];
+        if (!pend[ps.cref]) continue;
+        var covers = complete || !!oldest && requestIdTimeMs(oldest) > 0 && requestIdTimeMs(oldest) < (ps.sentAt || 0) - 2 * 60 * 1e3;
+        if (!covers) continue;
+        ps.looks = (ps.looks || 0) + 1;
+        if (ps.looks >= 2 && Date.now() - (ps.sentAt || 0) >= NOT_SENT_MIN_AGE_MS) {
+          if (ps.kind === "indexing") {
+            delete pend[ps.cref];
+            if (ps.onMissing) {
+              try {
+                ps.onMissing();
+              } catch (e) {
+                console.warn("[chat-engine] a missing pass threw", e);
+              }
+            }
+          } else {
+            this._recNotSent(ps);
+          }
+        }
+      }
+      if (unknown) this._recFirstPageOwed = true;
+    }
+    /** A waiting send's row was found by its cref: the send was received after all. */
+    _recMatchPending(p, row) {
+      if (this._recPending) delete this._recPending[p.cref];
+      var id = row.id;
+      this._markLocalTurn(p.key, p.userLid, p.placeholderLid, { _unconfirmed: void 0 });
+      if (p.params && typeof p.params.onItemId === "function") {
+        try {
+          p.params.onItemId(id);
+        } catch (e) {
+          console.warn("[chat-engine] onItemId threw", e);
+        }
+      } else {
+        this._stampTurnWithItemId(p.key, p.userLid, p.placeholderLid, id);
+      }
+      this.trackOpenItem(id, {
+        ownerKey: p.key,
+        projectId: p.projectId,
+        owner: p.owner,
+        platform: p.platform,
+        queue: p.queue,
+        kind: "chat",
+        state: row.status === "running" ? "running" : "queued",
+        cref: p.cref,
+        uid: p.uid
+      });
+      if (row.status === "running") this._noteServerState(id, "running", p.key);
+    }
+    /** Two complete listings never showed the send: it did not reach the server. Shown as
+     *  "Not sent. Retry?" and never sent again unless the user asks (retryNotSent). */
+    _recNotSent(p) {
+      if (this._recPending) delete this._recPending[p.cref];
+      var lid = p.placeholderLid || this._newLocalId();
+      if (!this._notSent) this._notSent = {};
+      this._notSent[lid] = p;
+      this._settleLocalTurn(p.key, p.userLid, p.placeholderLid, { role: "assistant", content: NOT_SENT_TEXT, isError: true, _notSent: true, _localId: lid });
+      this._markLocalTurn(p.key, p.userLid, void 0, { _notSent: true, _unconfirmed: void 0 });
+    }
+    /** The first history page, merged (loadHistory's own merge), on a return or when a live
+     *  row nothing here knows was seen. Not awaited: the look's own reads decide its outcome,
+     *  and the merge applies itself. Owed (run by a later look) while a load is in flight or
+     *  polling is paused. */
+    _recFirstPage(req) {
+      var wants = false;
+      for (var t in req.triggers) if (t !== "tick" && t !== "add" && t !== "promote" && t !== "send" && t !== "frame") wants = true;
+      if (!wants && !this._recFirstPageOwed) return;
+      if (!this._viewMounted()) {
+        this._recFirstPageOwed = false;
+        return;
+      }
+      var id = null;
+      try {
+        id = this.host.getIdentity();
+      } catch (e) {
+        id = null;
+      }
+      if (!id || !id.projectId || id.platform === "none") {
+        this._recFirstPageOwed = false;
+        return;
+      }
+      if (nowMs() - this._recFirstPageAt < CATCH_UP_MIN_GAP_MS) return;
+      if (this.isPollingPaused() || this.state.loadingHistory) {
+        this._recFirstPageOwed = true;
+        return;
+      }
+      this._recFirstPageOwed = false;
+      this._recFirstPageAt = nowMs();
+      void this.loadHistory(false, this.state.gateRefreshToken).catch(function(e) {
+        console.warn("[chat-engine] first-page read failed", e);
+      });
+    }
+    /** The indexing queue check (adoption, page progress, file runs), at its own cadence
+     *  inside the one chain. Needs the chat view: what it adopts are rows of that chat. */
+    _recIndexingCheck(req) {
+      if (!this._viewMounted() || this.isPollingPaused()) return;
+      var id = null;
+      try {
+        id = this.host.getIdentity();
+      } catch (e) {
+        id = null;
+      }
+      if (!id || !id.projectId || id.platform !== "claude" && id.platform !== "openai") return;
+      var gap = statusPushLive() ? STATUS_PUSH_ADOPT_TICK_MS : ADOPT_TICK_MS;
+      var due = req.isReturn || !!req.triggers.frame || nowMs() - this._recAdoptAt >= gap;
+      var runs = this.openFileRuns(id.projectId).length > 0;
+      if (due && (this._hasLocalLiveIndexWork(id.projectId) || runs)) {
+        this._recAdoptAt = nowMs();
+        this._adoptWorkerIndexingPasses(0, false, true);
+        if (!this._recNewMode()) this._settleByListing();
+        this._refreshPageProgress();
+      }
+      if (runs) this._recCheckFileRuns(id.projectId);
+    }
+    /**
+     * Read the queue counters and, when needed, the status of the open items.
+     *
+     * WHICH ITEMS. A row read costs as much as the conversation it carries, so a look reads
+     * every open item only on a return and at the stale watch (once a minute). Otherwise it
+     * reads only the items whose status can have changed: the ones never confirmed or seen
+     * terminal, the ones a status frame named, and, when a counter moved or something
+     * nudged the look (a settle asking for the next turn, a send), the running items plus
+     * the head of each queue's line (a queue runs its requests in order, so only the first
+     * few waiting ones can have started). A bulk upload's hundreds of waiting passes are
+     * then read once a minute, not on every finish.
+     */
+    _recReadStatuses(req, fail) {
+      var self = this;
+      var open = this._openMap();
+      var live = this._recLiveUid();
+      var groups = {};
+      for (var id in open) {
+        var it = open[id];
+        if (!it.projectId) continue;
+        if (!this._recReadable(it.uid, it.projectId, live)) continue;
+        var g = it.projectId + "\0" + (it.owner || "");
+        if (!groups[g]) groups[g] = { projectId: it.projectId, owner: it.owner || "", ids: [], queues: {} };
+        groups[g].ids.push(id);
+        var qn = queueNameOf(it.queue);
+        if (qn) groups[g].queues[qn] = true;
+      }
+      var frames = this._recFrameIds || {};
+      this._recFrameIds = {};
+      var keys = Object.keys(groups);
+      if (!keys.length) return Promise.resolve();
+      var full = req.isReturn || nowMs() - this._recFullReadAt >= LOOK_STALE_MS;
+      var nudged = this._recFollowUps > 0;
+      for (var t in req.triggers) if (t !== "tick" && t !== "add" && t !== "frame") nudged = true;
+      if (full) this._recFullReadAt = nowMs();
+      return Promise.all(keys.map(function(k) {
+        return self._recReadGroup(req, groups[k], full, nudged, frames, fail);
+      })).then(function() {
+      });
+    }
+    _recReadGroup(req, g, full, nudged, frames, fail) {
+      var self = this;
+      var open = this._openMap();
+      var must = {}, moving = {};
+      var mustRead = full;
+      var waitingQ = {}, runningQ = {};
+      for (var i = 0; i < g.ids.length; i++) {
+        var iid = g.ids[i];
+        var it = open[iid];
+        if (!it) continue;
+        if (it.failedPending && !it.failedRecheck && nowMs() - it.failedPending >= FAILED_PASS_RECHECK_MAX_MS) {
+          it.failedRecheck = true;
+          it.terminalSeen = true;
+        }
+        if (it.lastConfirmed === 0 || it.terminalSeen || frames[iid]) {
+          must[iid] = true;
+          mustRead = true;
+        }
+        var iq = queueNameOf(it.queue);
+        if (it.state === "running" || it.lastStatus === "running") {
+          runningQ[iq] = true;
+          moving[iid] = true;
+        } else (waitingQ[iq] = waitingQ[iq] || []).push(iid);
+      }
+      for (var wq in waitingQ) {
+        var line = waitingQ[wq].sort().slice(0, LOOK_HEAD_OF_LINE);
+        for (var h = 0; h < line.length; h++) moving[line[h]] = true;
+        if (!runningQ[wq]) {
+          for (var h2 = 0; h2 < line.length; h2++) must[line[h2]] = true;
+          mustRead = true;
+        }
+      }
+      var counters = resolveForwardRequestQueueCounters();
+      var queues = Object.keys(g.queues).slice(0, 20);
+      var step;
+      if (counters && !this._recCountersOff && queues.length) {
+        step = Promise.resolve(counters(queues, { service: g.projectId, owner: g.owner, deadline: req.remaining(), signal: req.signal, fresh: true })).then(function(res) {
+          var moved = false;
+          var got = res && res.queues && typeof res.queues === "object" ? res.queues : {};
+          if (!self._recCounters) self._recCounters = {};
+          for (var q = 0; q < queues.length; q++) {
+            var c = got[queues[q]];
+            if (!c) continue;
+            var key = g.projectId + "|" + queues[q];
+            var prev = self._recCounters[key];
+            var rct = Number(c.rct) || 0, seq = Number(c.seq) || 0;
+            if (prev && (prev.rct !== rct || prev.seq !== seq)) moved = true;
+            self._recCounters[key] = { rct, seq };
+          }
+          if (moved) self._recFollowUps = 2;
+          return mustRead || moved || nudged;
+        }, function(err) {
+          var k = fail(err);
+          if (k === "refused") {
+            self._recCountersOff = true;
+            return true;
+          }
+          return false;
+        });
+      } else {
+        step = Promise.resolve(true);
+        nudged = true;
+      }
+      return step.then(function(read) {
+        if (!read || !req.alive()) {
+          if (full) self._recFullReadAt = 0;
+          return;
+        }
+        var status = resolveForwardRequestStatus();
+        if (!status) return;
+        var wide = full || nudged || self._recFollowUps > 0;
+        var rank = function(id) {
+          var it2 = self._openMap()[id];
+          if (!it2) return 9;
+          if (it2.state === "running" || it2.terminalSeen) return 0;
+          return it2.kind === "chat" ? 1 : 2;
+        };
+        var ids = g.ids.filter(function(id) {
+          if (!self._openMap()[id]) return false;
+          return full || must[id] || wide && moving[id];
+        }).sort(function(a, b) {
+          return rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0);
+        }).slice(0, LOOK_READ_CAP);
+        if (!ids.length) return;
+        var reqs = ids.map(function(id) {
+          var it2 = open[id];
+          return buildHistoryItemFullId(it2.platform, it2.projectId, id);
+        });
+        return Promise.resolve(status(reqs, { service: g.projectId, owner: g.owner, deadline: req.remaining(), signal: req.signal, fresh: true })).then(function(res) {
+          if (!req.alive()) return;
+          var rows = res && Array.isArray(res.list) ? res.list : [];
+          return self._recApplyStatuses(req, rows, fail);
+        }, function(err) {
+          var k = fail(err);
+          if (k === "refused") {
+            self._recReadsOff = true;
+            console.warn("[chat-engine] the batch status read is not available; following requests with polls", err);
+          }
+          if (full) self._recFullReadAt = 0;
+        });
+      });
+    }
+    _recApplyStatuses(req, rows, fail) {
+      var self = this;
+      var open = this._openMap();
+      var terminal = [];
+      var changedBg = false;
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (!row || typeof row.id !== "string") continue;
+        var item = open[row.id];
+        if (!item) continue;
+        item.lastConfirmed = nowMs();
+        item.lastStatus = row.status;
+        if (row.stream !== void 0) item.stream = !!row.stream;
+        if (!item.cref && typeof row.cref === "string") item.cref = row.cref;
+        if (row.status === "pending" || row.status === "running") {
+          item.terminalSeen = false;
+          if (row.status === "running") {
+            if (OPEN_STATE_RANK[item.state] < OPEN_STATE_RANK.running) item.state = "running";
+            if (item.kind === "chat") self._noteServerState(row.id, "running", item.ownerKey);
+            else if (self._recPromoteBg(row.id, true)) changedBg = true;
+          }
+          continue;
+        }
+        if (row.status === "missing") {
+          self._recApplyMissing(row.id, item);
+          continue;
+        }
+        terminal.push({ id: row.id, item, row });
+      }
+      if (changedBg) {
+        this._viewNotify();
+        this.updateHistoryCache();
+      }
+      terminal.sort(function(a, b) {
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+      var next = 0;
+      var worker = function() {
+        if (next >= terminal.length || !req.alive()) return Promise.resolve();
+        var t = terminal[next++];
+        return Promise.resolve(self._recSettleTerminal(req, t.id, t.item, t.row, fail)).catch(function(e) {
+          console.warn("[chat-engine] settling " + t.id + " threw", e);
+        }).then(worker);
+      };
+      var lanes = [];
+      for (var l = 0; l < LOOK_READ_CONCURRENCY && l < terminal.length; l++) lanes.push(worker());
+      return Promise.all(lanes).then(function() {
+      });
+    }
+    /** A pass the server says runs now: its waiting bubble becomes the running one, by id
+     *  (replaces promoteNextBgQueuedToRunning's guess). True when a bubble changed. */
+    _recPromoteBg(itemId, quiet) {
+      var e = this._bgEntry(itemId);
+      if (e && e.status === "pending") e.status = "running";
+      var changed = this._promoteBgItemToRunning(itemId);
+      if (changed && !quiet) {
+        this._viewNotify();
+        this.updateHistoryCache();
+      }
+      return changed;
+    }
+    /** One item the batch read says is over: let a live reader settle it if it is still
+     *  being fed (one look's grace), else read it once and apply it. */
+    _recSettleTerminal(req, id, item, row, fail) {
+      var hasPoll = this.historyItemPolls.has(id);
+      var st = this.liveStreams[id];
+      var fed = !!st && st.fed && !st.ended;
+      if ((hasPoll || fed) && !req.isReturn && !item.terminalSeen) {
+        item.terminalSeen = true;
+        return;
+      }
+      if ((item.unavail || 0) >= BODY_UNAVAILABLE_BACKOFF_AFTER && !req.isReturn && nowMs() - (item.unavailAt || 0) < LOOK_STALE_MS) return;
+      if (item.failedPending && !item.failedRecheck) {
+        if (nowMs() - item.failedPending < FAILED_PASS_RECHECK_MAX_MS) return;
+        item.failedRecheck = true;
+      }
+      if (hasPoll) this._stopPoll(id);
+      st = this.liveStreams[id];
+      if (st) this._closeLiveStream(st, false);
+      if (row.status === "cancelled") {
+        this._recApplyValue(id, item, cancelledEnvelope(id), row);
+        return;
+      }
+      var needChunks = row.status === "resolved" && !!row.stream && !row.has_body;
+      return this._recReadEnvelope(req, id, item, needChunks, row, fail);
+    }
+    _recChunkState(id) {
+      if (!this._recChunks) this._recChunks = {};
+      if (!this._recChunks[id]) this._recChunks[id] = { parser: createSseParser(), cursor: 0, stalls: 0 };
+      return this._recChunks[id];
+    }
+    /**
+     * The envelope read of one terminal item. A streamed turn with no stored answer is read
+     * from its cursor (`since`), as many reads as it takes within the look, and is final
+     * only when the cursor reaches `final_seq` (without one, when `more` is false); what is
+     * read so far is kept for the next look when the deadline comes first.
+     */
+    _recReadEnvelope(req, id, item, needChunks, row, fail) {
+      var self = this;
+      var read = resolveForwardRequestRead();
+      if (!read) return Promise.resolve();
+      var fullId = buildHistoryItemFullId(item.platform, item.projectId, id);
+      var ch = needChunks ? this._recChunkState(id) : null;
+      var finalSeq = typeof row.final_seq === "number" ? row.final_seq : void 0;
+      var loop = function() {
+        var params = { id: fullId, service: item.projectId, owner: item.owner, deadline: req.remaining(), signal: req.signal, fresh: true };
+        if (ch) params.since = ch.cursor;
+        return Promise.resolve(read(params)).then(function(env) {
+          if (!req.alive() || !self._openMap()[id]) return;
+          if (!env || typeof env !== "object") {
+            item.terminalSeen = true;
+            return;
+          }
+          if (env.status === "missing") {
+            self._recApplyMissing(id, item);
+            return;
+          }
+          if (env.status === "pending" || env.status === "running") {
+            item.terminalSeen = false;
+            return;
+          }
+          if (env.body_unavailable) {
+            self._recBodyUnavailable(id, item);
+            return;
+          }
+          if (env.status === "cancelled") {
+            self._recApplyValue(id, item, cancelledEnvelope(id), env);
+            return;
+          }
+          if (env.body !== void 0 && env.body !== null) {
+            self._recApplyValue(id, item, env.body, env);
+            return;
+          }
+          if (env.status === "failed") {
+            self._recApplyValue(id, item, { id, status: "failed", in_queue: false, error: env.error != null ? env.error : { message: "The request failed." } }, env);
+            return;
+          }
+          if (!ch) {
+            if (env.stream) {
+              ch = self._recChunkState(id);
+              return loop();
+            }
+            self._recApplyValue(id, item, EMPTY_PROVIDER_BODY, env);
+            return;
+          }
+          if (typeof env.final_seq === "number") finalSeq = env.final_seq;
+          var before = ch.cursor;
+          var chunks = Array.isArray(env.chunks) ? env.chunks.slice() : [];
+          chunks.sort(function(a, b) {
+            return a && b ? a.seq - b.seq : 0;
+          });
+          for (var i = 0; i < chunks.length; i++) {
+            var c = chunks[i];
+            if (!c || typeof c.seq !== "number" || c.seq <= ch.cursor) continue;
+            if (typeof c.txt === "string" && c.txt) ch.parser.feed(c.txt);
+            ch.cursor = c.seq;
+          }
+          if (typeof env.last_seq === "number" && env.last_seq > ch.cursor) ch.cursor = env.last_seq;
+          var complete = finalSeq !== void 0 ? ch.cursor >= finalSeq : env.more === false;
+          if (!complete) {
+            if (ch.cursor === before) {
+              ch.stalls++;
+              if (env.more === false && ch.stalls >= 3) {
+                self._recApplyStreamed(id, item, ch, env, false);
+                return;
+              }
+              item.terminalSeen = true;
+              return;
+            }
+            if (req.remaining() < 1500) {
+              item.terminalSeen = true;
+              return;
+            }
+            return loop();
+          }
+          self._recApplyStreamed(id, item, ch, env, true);
+        }, function(err) {
+          fail(err);
+          item.terminalSeen = true;
+        });
+      };
+      return loop();
+    }
+    /**
+     * An envelope read answered body_unavailable: the answer is stored but could not be
+     * loaded now (an S3 read that failed on the server). Read again at every look for the
+     * first BODY_UNAVAILABLE_BACKOFF_AFTER tries, then only at the stale watch or a return
+     * (_recSettleTerminal). After BODY_UNAVAILABLE_GIVE_UP the turn stops saying
+     * "Thinking..." and shows ANSWER_UNLOADABLE_TEXT; a later read that loads the answer
+     * replaces that text (_recRetryUnloadable). An indexing pass ends with that error.
+     */
+    _recBodyUnavailable(id, item) {
+      item.unavail = (item.unavail || 0) + 1;
+      item.unavailAt = nowMs();
+      if (item.unavail < BODY_UNAVAILABLE_BACKOFF_AFTER) {
+        item.terminalSeen = true;
+        return;
+      }
+      item.terminalSeen = false;
+      if (item.unavail < BODY_UNAVAILABLE_GIVE_UP) return;
+      var err = { type: "error", error: { type: "request_error", message: ANSWER_UNLOADABLE_TEXT } };
+      if (item.kind === "chat") {
+        if (!this._recUnloadable) this._recUnloadable = {};
+        this._recUnloadable[id] = { item, tries: 0, at: nowMs() };
+      }
+      this._recApplyValue(id, item, err, null);
+    }
+    /**
+     * Chat turns shown as ANSWER_UNLOADABLE_TEXT: one envelope read each at a return or
+     * the stale watch, at most UNLOADABLE_RETRIES times. An answer that loads replaces the
+     * text (a correction); a row that is gone or failed leaves the text as it is.
+     */
+    _recRetryUnloadable(req) {
+      var self = this;
+      var list = this._recUnloadable;
+      var read = resolveForwardRequestRead();
+      if (!list || !read) return Promise.resolve();
+      var live = this._recLiveUid();
+      var due = Object.keys(list).filter(function(id) {
+        var u = list[id];
+        if (!self._recReadable(u.item.uid, u.item.projectId, live)) return false;
+        return req.isReturn || nowMs() - u.at >= LOOK_STALE_MS;
+      }).slice(0, LOOK_READ_CONCURRENCY);
+      return Promise.all(due.map(function(id) {
+        var u = list[id];
+        u.at = nowMs();
+        u.tries++;
+        var it = u.item;
+        return Promise.resolve(read({ id: buildHistoryItemFullId(it.platform, it.projectId, id), service: it.projectId, owner: it.owner, deadline: req.remaining(), signal: req.signal, fresh: true })).then(function(env) {
+          if (!env || typeof env !== "object" || env.body_unavailable) {
+            if (u.tries >= UNLOADABLE_RETRIES) delete list[id];
+            return;
+          }
+          delete list[id];
+          if (env.body === void 0 || env.body === null || env.status !== "resolved") return;
+          self.applyTerminal(id, env.body, { ownerKey: it.ownerKey, platform: it.platform, projectId: it.projectId, owner: it.owner, instant: true, correction: true });
+        }, function() {
+          if (u.tries >= UNLOADABLE_RETRIES) delete list[id];
+        });
+      })).then(function() {
+      });
+    }
+    /** A streamed turn read whole (or given up on): shown at once, finalized only when
+     *  whole and keepable, with if_absent so a complete answer another tab stored wins. */
+    _recApplyStreamed(id, item, ch, env, whole) {
+      ch.parser.end();
+      var body = ch.parser.finalBody();
+      var snap = ch.parser.snapshot();
+      if (this._recChunks) delete this._recChunks[id];
+      this._noteRespondedAt(id, { id, status: "resolved", in_queue: false, responded: env && env.responded });
+      var keep = whole && body != null && mayKeepStreamedAnswer(snap, "resolved");
+      this._applyRecoveredAnswer(id, item.ownerKey, item.platform, item.projectId, item.owner, body, false, false);
+      if (keep) this._finalizeAnswer(id, body, { ownerKey: item.ownerKey, platform: item.platform, projectId: item.projectId, owner: item.owner, queue: item.queue });
+      this._recAfterApply(id, item);
+    }
+    /** Apply one terminal value (a provider body, a failed or cancelled envelope). */
+    _recApplyValue(id, item, value, env) {
+      var self = this;
+      if (env && typeof env.responded === "number") this._noteRespondedAt(id, { id, status: env.status, in_queue: false, responded: env.responded });
+      var who = { ownerKey: item.ownerKey, projectId: item.projectId, owner: item.owner, platform: item.platform, queue: item.queue };
+      var executed = env && typeof env.executed === "number" ? env.executed : void 0;
+      if (item.kind === "indexing") {
+        var entry2 = this._bgEntry(id);
+        if (entry2 && !item.failedRecheck && isErrorResponseBody(value) && !isRetriedFailure(value) && this._isWorkerDrivenIndexing(entry2.filename, entry2.mime)) {
+          if (!item.failedPending) item.failedPending = nowMs();
+          item.terminalSeen = false;
+          return;
+        }
+        if (entry2) {
+          void this._settleBgOutcome(entry2, entry2.platform, Promise.resolve(value), function() {
+            return executed;
+          }).then(function() {
+            self._recAfterApply(id, item);
+          });
+          return;
+        }
+        this.handleHistoryItemResolution(id, value, item.platform, executed, who);
+      } else {
+        var failed = isErrorResponseBody(value);
+        if (item.resend && failed && isAuthExpiredError(value) && !isNonRetryableRequestError(value)) {
+          var again = item.resend;
+          delete item.resend;
+          this._stopPoll(id);
+          this._closeItem(id);
+          again(value);
+          return;
+        }
+        delete item.resend;
+        if (item.turn) this._settleChatTurnTools(item.turn, value, failed);
+        this.applyTerminal(id, value, who);
+      }
+      this._recAfterApply(id, item);
+    }
+    /** An item the server no longer has ("missing" on a strongly consistent read). */
+    _recApplyMissing(id, item) {
+      var self = this;
+      var who = { ownerKey: item.ownerKey, projectId: item.projectId, owner: item.owner, platform: item.platform, queue: item.queue };
+      if (item.kind === "indexing") {
+        var entry2 = this._bgEntry(id);
+        var gone = { code: "NOT_EXISTS", message: "Request not found." };
+        if (entry2) {
+          void this._settleBgOutcome(entry2, entry2.platform, Promise.reject(gone), function() {
+            return void 0;
+          }).then(function() {
+            self._recAfterApply(id, item);
+          });
+          return;
+        }
+        this.applyTerminal(id, cancelledEnvelope(id), who);
+      } else {
+        var text = item.anonymous ? REQUEST_UNREACHABLE_TEXT : REQUEST_GONE_TEXT;
+        this.applyTerminal(id, { type: "error", error: { type: "request_error", message: text } }, who);
+      }
+      this._recAfterApply(id, item);
+    }
+    /** After a terminal apply: an item whose bubble is nowhere (no chat view, no cache of
+     *  its chat) is closed all the same; the next history load shows the server's state. */
+    _recAfterApply(id, item) {
+      if (!this._openMap()[id]) return;
+      if (this._hasWaitingBubble(id, item.ownerKey)) return;
+      this._closeItem(id);
+    }
+    /**
+     * Store a streamed answer as the version history keeps (csr-finalize) with if_absent,
+     * in the tab that holds the settle lock. When another tab stored one first ("exists"),
+     * the stored one is read back and shown instead.
+     */
+    _finalizeAnswer(itemId, body, who) {
+      var fin = resolveForwardRequestFinalize();
+      if (!fin || body == null) return;
+      var self = this;
+      var url = who.platform === "openai" ? OPENAI_RESPONSES_API_URL : ANTHROPIC_MESSAGES_API_URL;
+      runSettleSideEffect(who.projectId, queueNameOf(who.queue), "fin:" + who.projectId + ":" + itemId, function() {
+        return Promise.resolve(fin(itemId, body, { url, method: "POST", service: who.projectId, owner: who.owner, ifAbsent: true })).then(function(res) {
+          if (res && res.finalized === false && res.reason === "exists") self._readStoredAnswer(itemId, who);
+        }, function(err) {
+          console.warn("[chat-engine] forwardRequestFinalize failed", err);
+          if (isTransportFailure(err)) throw err;
+        });
+      });
+    }
+    /** Another tab stored this turn's answer first: show the stored one. */
+    _readStoredAnswer(itemId, who) {
+      var read = resolveForwardRequestRead();
+      if (!read) return;
+      var self = this;
+      Promise.resolve(read({ id: buildHistoryItemFullId(who.platform, who.projectId, itemId), service: who.projectId, owner: who.owner, fresh: true })).then(function(env) {
+        if (!env || env.body === void 0 || env.body === null) return;
+        self.applyTerminal(itemId, env.body, { ownerKey: who.ownerKey, platform: who.platform, projectId: who.projectId, owner: who.owner, instant: true, correction: true });
+      }, function() {
       });
     }
     // --- background-task resolution + drain -------------------------------
@@ -8693,9 +11000,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         break;
       }
     }
-    handleHistoryItemResolution(itemId, response, platform, executedAt) {
+    handleHistoryItemResolution(itemId, response, platform, executedAt, ctx) {
       var indexRef = this._indexRefOfItem(itemId);
-      this.applyHistoryItemResolution(itemId, response, platform);
+      this.applyHistoryItemResolution(itemId, response, platform, ctx);
       this._stampPassDuration(itemId, executedAt);
       this.promoteNextBgQueuedToRunning();
       this.drainBgTaskQueue();
@@ -8711,36 +11018,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return m._indexFile || null;
       }
       return null;
-    }
-    /**
-     * Settle a turn the server reports as cancelled: the request bubble goes to its
-     * cancelled form and the "Thinking..." placeholder goes away. The same shape
-     * cancelQueuedMessage produces locally, so a cancel this client made and one it
-     * merely found out about render identically — and an indexing pass keeps the
-     * markers that hold it in its file's collapsed row.
-     */
-    _settleCancelledItem(itemId) {
-      var uIdx = this.state.messages.findIndex(function(m) {
-        return m.role === "user" && m._serverItemId === itemId && !m.isCancelled;
-      });
-      if (uIdx !== -1) {
-        var u = this.state.messages[uIdx];
-        var cancelled = { role: "user", content: u.content, isCancelled: true, _serverItemId: itemId };
-        if (u.isBackgroundTask) cancelled.isBackgroundTask = true;
-        if (u._indexFile) cancelled._indexFile = u._indexFile;
-        if (u._useBgQueue) cancelled._useBgQueue = true;
-        if (u._ownerKey !== void 0) cancelled._ownerKey = u._ownerKey;
-        if (u._ts !== void 0) cancelled._ts = u._ts;
-        this.state.messages[uIdx] = cancelled;
-      }
-      var pIdx = this.state.messages.findIndex(function(m) {
-        return m.isPending && m.role === "assistant" && m._serverItemId === itemId;
-      });
-      if (pIdx !== -1) this.state.messages.splice(pIdx, 1);
-      this.cancelledServerIds.delete(itemId);
-      this._removeStrayPendingAssistants();
-      this.host.notify();
-      this.updateHistoryCache();
     }
     /**
      * A poll that came back saying the request was CANCELLED, rather than with an
@@ -8761,83 +11038,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (response.content !== void 0 || response.output !== void 0) return false;
       return response.queue_name !== void 0 || response.in_queue !== void 0;
     }
-    applyHistoryItemResolution(itemId, response, platform) {
+    /**
+     * A history-attached poll (the engine's, agent.vue's, the files page's) settled.
+     * Routed through the one funnel, by id: see applyTerminal. `ctx` is the identity the
+     * caller pinned when it attached the poll; the open item's pinned identity fills
+     * whatever it leaves out.
+     */
+    applyHistoryItemResolution(itemId, response, platform, ctx) {
       this.historyItemPolls.delete(itemId);
-      if (this._isCancelledPollResult(response)) {
-        this._settleCancelledItem(itemId);
-        return;
-      }
-      var isErr = isErrorResponseBody(response);
-      var answer = isErr ? getErrorMessage(response) : ((platform === "openai" ? extractOpenAIText(response) : extractClaudeText(response)) || "").trim();
-      var reportedComplete = !isErr && !!answer && answer.indexOf(INDEXING_COMPLETE_MARKER) !== -1;
-      var hNote = isErr ? null : extractRetrievalNote(response, answer);
-      if (hNote) this._saveFindings(itemId, response, answer, hNote);
-      var stripMarker = function(t) {
-        return reportedComplete ? t.split(INDEXING_COMPLETE_MARKER).join("").trim() : t;
-      };
-      var idx = this.state.messages.findIndex(function(m) {
-        return m.isPending && m._serverItemId === itemId;
-      });
-      if (idx !== -1) {
-        this._clearPendingUserBubble(itemId);
-        var wasBgTask = !!this.state.messages[idx].isBackgroundTask;
-        if (isErr) {
-          this.state.messages[idx] = { role: "assistant", content: answer, isError: true, _serverItemId: itemId };
-          if (wasBgTask) this.state.messages[idx].isBackgroundTask = true;
-          this.host.notify();
-          this.updateHistoryCache();
-          return;
-        }
-        var text = answer || "No text response received from AI provider.";
-        if (wasBgTask) {
-          this.state.messages[idx] = { role: "assistant", content: stripMarker(text) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} };
-          this.host.notify();
-          this.updateHistoryCache();
-          return;
-        }
-        var hPainted = this._paintedTextAt(idx);
-        var lid = this._newLocalId();
-        var hReply = { role: "assistant", content: hPainted, _localId: lid, _serverItemId: itemId };
-        if (hNote) hReply._retrieval = hNote;
-        this.state.messages[idx] = hReply;
-        this.host.notify();
-        this.enqueueTypewrite(idx, text, lid, hPainted);
-        this.updateHistoryCache();
-        return;
-      }
-      var userIdx = this.state.messages.findIndex(function(m) {
-        return m.role === "user" && m._serverItemId === itemId && (m.isPendingQueued || m.isPendingInProcess);
-      });
-      if (userIdx === -1) return;
-      var ex = this.state.messages[userIdx];
-      var settledUser = { role: "user", content: ex.content, _serverItemId: itemId };
-      if (ex.isBackgroundTask) settledUser.isBackgroundTask = true;
-      if (ex._ts !== void 0) settledUser._ts = ex._ts;
-      if (ex._indexFile) settledUser._indexFile = ex._indexFile;
-      if (ex._useBgQueue) settledUser._useBgQueue = true;
-      this.state.messages[userIdx] = settledUser;
-      if (isErr) {
-        var errReply = { role: "assistant", content: answer, isError: true, _serverItemId: itemId };
-        if (ex.isBackgroundTask) errReply.isBackgroundTask = true;
-        this.state.messages.splice(userIdx + 1, 0, errReply);
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      var text2 = answer || "No text response received from AI provider.";
-      if (ex.isBackgroundTask) {
-        this.state.messages.splice(userIdx + 1, 0, { role: "assistant", content: stripMarker(text2) || EMPTY_INDEXING_REPLY, isBackgroundTask: true, _serverItemId: itemId, ...reportedComplete ? { _indexComplete: true } : {} });
-        this.host.notify();
-        this.updateHistoryCache();
-        return;
-      }
-      var lid2 = this._newLocalId();
-      var reply = { role: "assistant", content: "", _localId: lid2, _serverItemId: itemId };
-      if (hNote) reply._retrieval = hNote;
-      this.state.messages.splice(userIdx + 1, 0, reply);
-      this.host.notify();
-      this.enqueueTypewrite(userIdx + 1, text2, lid2);
-      this.updateHistoryCache();
+      var c = Object.assign({}, ctx || {});
+      if (c.platform !== "claude" && c.platform !== "openai") c.platform = platform;
+      this.applyTerminal(itemId, response, c);
     }
     /** How a bg task maps onto a collapsed row: the row's own key (storage path
      *  when known, else the filename), scoped to the chat it belongs to. A storage
@@ -8960,72 +11171,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return found;
     }
     /**
-     * Re-read the chat from the server now (see the rule above). Safe to call from any
-     * number of triggers at once: calls within CATCH_UP_MIN_GAP_MS of the last one run
-     * once, at the end of the gap. Nothing happens while no chat view is mounted (the
-     * mount loads the chat anyway) or while background polling is paused (the tab is
-     * hidden: showing it calls this again).
+     * Re-read the chat from the server now (see the rule above). A thin wrapper over the
+     * reconciler's return look: safe to call from any number of triggers at once, runs
+     * with no chat view too (the first page is read only when one is mounted, and owed
+     * while polling is paused), and resolves when that look ends.
      */
     catchUpHistory() {
-      var self = this;
-      var id = this.host.getIdentity();
-      if (!id.projectId || id.platform === "none") return Promise.resolve();
-      if (!this.host.isViewMounted || !this.host.isViewMounted() || this.isPollingPaused()) return Promise.resolve();
-      this._ensureReturnWatch();
-      var wait = this._catchUpAt + CATCH_UP_MIN_GAP_MS - Date.now();
-      if (wait > 0) {
-        if (!this._catchUpTimer) {
-          this._catchUpTimer = setTimeout(function() {
-            self._catchUpTimer = null;
-            self.catchUpHistory();
-          }, wait);
-        }
-        return Promise.resolve();
-      }
-      this._catchUpAt = Date.now();
-      return this.loadHistory(false, this.state.gateRefreshToken).catch(function(e) {
-        console.error("[chat-engine] catch-up failed", e);
-      });
+      return this._recSched().trigger("return");
     }
     /**
      * Watch for the moments the user comes back without the tab being hidden first: the
-     * computer waking from sleep (the timer finds a gap far longer than its interval),
+     * computer waking from sleep (the reconciler's timer finds a gap far longer than asked),
      * the network coming back, a page restored from the back-forward cache. Also starts
      * the status push listener. Runs while a chat view is mounted and stops itself when
      * none is.
      */
     _ensureReturnWatch() {
-      var self = this;
-      if (typeof window === "undefined") return;
-      if (!this._returnListeners) {
-        this._returnListeners = true;
-        var onBack = function() {
-          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-          self.catchUpHistory();
-        };
-        window.addEventListener("online", onBack);
-        window.addEventListener("pageshow", function(ev) {
-          if (ev && ev.persisted) onBack();
-        });
-      }
+      this._recEnsure();
       this._startStatusPush();
-      if (this._returnWatchTimer) return;
-      this._returnWatchAt = Date.now();
-      var look = function() {
-        self._returnWatchTimer = null;
-        if (!self.host.isViewMounted || !self.host.isViewMounted()) {
-          self._stopStatusPush();
-          return;
-        }
-        var now = Date.now();
-        var gap = now - self._returnWatchAt;
-        self._returnWatchAt = now;
-        if (gap > RETURN_WATCH_SLEEP_GAP_MS && (typeof document === "undefined" || document.visibilityState !== "hidden")) {
-          self.catchUpHistory();
-        }
-        self._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
-      };
-      this._returnWatchTimer = setTimeout(look, RETURN_WATCH_MS);
     }
     /** Listen to request status frames while a chat view is mounted (statusPush on). */
     _startStatusPush() {
@@ -9045,10 +11208,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     _stopStatusPush() {
       var unsub = this._statusUnsub;
       this._statusUnsub = null;
-      if (this._statusNudgeTimer) {
-        clearTimeout(this._statusNudgeTimer);
-        this._statusNudgeTimer = null;
-      }
       if (unsub) {
         try {
           unsub();
@@ -9064,17 +11223,46 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * was already woken by skapi-js itself. Chat turns are left to their own polls.
      */
     _onRequestStatus(ev) {
-      if (!ev || !this.host.isViewMounted()) return;
+      if (!ev) return;
+      var hiddenTab = typeof document !== "undefined" && document.visibilityState === "hidden";
       if (ev.type === "connected") {
         if (!this._statusSeenConnect) {
           this._statusSeenConnect = true;
           return;
         }
-        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-        this.catchUpHistory();
+        if (hiddenTab) {
+          this._recEnsure();
+          return;
+        }
+        void this._recSched().trigger("reconnect");
         return;
       }
       if (ev.type !== "status" || typeof ev.id !== "string") return;
+      var bgFrame = !!ev.queue && isBgIndexingQueue(ev.queue);
+      if (bgFrame) for (var wi = 0; wi < this._iqWatches.length; wi++) this._iqWatches[wi].frame = true;
+      if (ev.status === "running" && (!ev.queue || !isBgIndexingQueue(ev.queue))) this._noteServerState(ev.id, "running");
+      if (this._recNewMode()) {
+        if (this._tomb()[ev.id]) return;
+        if (hiddenTab) {
+          this._recEnsure();
+          return;
+        }
+        var known = !!this._openMap()[ev.id];
+        if (known) {
+          if (!this._recFrameIds) this._recFrameIds = {};
+          this._recFrameIds[ev.id] = true;
+        }
+        var bg = !!ev.queue && isBgIndexingQueue(ev.queue);
+        void this._recSched().trigger(known || bg ? "frame" : "unknown");
+        return;
+      }
+      if (!this._viewMounted()) {
+        if (bgFrame && this._iqWatches.length) {
+          if (hiddenTab) this._recEnsure();
+          else void this._recSched().trigger("frame");
+        }
+        return;
+      }
       if (!ev.queue || !isBgIndexingQueue(ev.queue)) return;
       if (this.historyItemPolls.has(ev.id)) return;
       var tracked = false;
@@ -9088,45 +11276,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (tracked) return;
       this._nudgeQueueCheck();
     }
-    /** Run the queue check (adopt, settle by listing, page progress) now, at most once per
-     *  STATUS_NUDGE_MIN_GAP_MS, then let the heartbeat carry on. */
+    /** Run the queue check (adopt, settle by listing, page progress) now, through the
+     *  reconciler's one chain. */
     _nudgeQueueCheck() {
-      var self = this;
-      if (this._statusNudgeTimer) return;
-      var wait = Math.max(0, this._statusNudgeAt + STATUS_NUDGE_MIN_GAP_MS - Date.now());
-      this._statusNudgeTimer = setTimeout(function() {
-        self._statusNudgeTimer = null;
-        self._statusNudgeAt = Date.now();
-        var id = self.host.getIdentity();
-        if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return;
-        if (self.isPollingPaused() || !self.host.isViewMounted()) return;
-        self._adoptWorkerIndexingPasses(0, false, true);
-        self._settleByListing();
-        self._refreshPageProgress();
-        self._ensureAdoptTick();
-      }, wait);
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        this._recEnsure();
+        return;
+      }
+      void this._recSched().trigger("frame");
     }
     _ensureAdoptTick() {
-      if (this._adoptTickTimer) return;
-      var self = this;
-      var id = this.host.getIdentity();
-      if (!id.projectId || id.platform !== "claude" && id.platform !== "openai") return;
-      if (this.isPollingPaused() || !this.host.isViewMounted()) return;
-      if (!this._hasLocalLiveIndexWork(id.projectId)) return;
-      this._adoptTickTimer = setTimeout(function() {
-        self._adoptTickTimer = null;
-        var now = self.host.getIdentity();
-        if (self.isPollingPaused() || !self.host.isViewMounted()) return;
-        if (now.projectId !== id.projectId) {
-          self._ensureAdoptTick();
-          return;
-        }
-        if (!self._hasLocalLiveIndexWork(now.projectId)) return;
-        self._adoptWorkerIndexingPasses(0, false, true);
-        self._settleByListing();
-        self._refreshPageProgress();
-        self._ensureAdoptTick();
-      }, statusPushLive() ? STATUS_PUSH_ADOPT_TICK_MS : ADOPT_TICK_MS);
+      this._recEnsure();
     }
     /**
      * Follow an indexing pass found in a loaded history page through the queue check
@@ -9154,6 +11314,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         projectId: id.projectId,
         platform,
         id: item.id,
+        identity: Object.assign({}, id),
+        owner: id.owner,
         filename: ref.name,
         storagePath: ref.path,
         mime: ref.mime,
@@ -9198,6 +11360,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
       if (idx === -1) return false;
       var existing = this.state.messages[idx];
+      if (existing._cancelling) return false;
       var promoted = { role: "user", content: existing.content, isPendingInProcess: true, isBackgroundTask: true, _serverItemId: itemId };
       if (existing._indexFile) promoted._indexFile = existing._indexFile;
       if (existing._ts !== void 0) promoted._ts = existing._ts;
@@ -9207,38 +11370,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (existing._ownerKey !== void 0) placeholder._ownerKey = existing._ownerKey;
       this.state.messages.splice(idx + 1, 0, placeholder);
       return true;
-    }
-    _saveFindings(itemId, body, answer, note) {
-      if (!_ChatSession.SAVE_SEARCH_FINDINGS) return;
-      try {
-        var save = chatEngineConfig().saveSearchFinding;
-        if (typeof save !== "function" || !note || !body) return;
-        if (itemId) {
-          if (this._findingsDone[itemId]) return;
-          this._findingsDone[itemId] = true;
-        }
-        var question = null;
-        if (itemId) {
-          for (var i = 0; i < this.state.messages.length; i++) {
-            var m = this.state.messages[i];
-            if (m && m.role === "user" && m._serverItemId === itemId) {
-              if (m.isBackgroundTask) return;
-              question = typeof m.content === "string" ? m.content : null;
-              break;
-            }
-          }
-        }
-        var found = findingsForTurn({ question, body, note, answer });
-        if (!found.length) return;
-        var id = this.host.getIdentity();
-        if (!id.projectId) return;
-        for (var f = 0; f < found.length; f++) {
-          var payload = Object.assign({ service: id.projectId, owner: id.owner }, found[f]);
-          Promise.resolve(save(payload)).catch(function() {
-          });
-        }
-      } catch (e) {
-      }
     }
     /**
      * Chats-only history (owner, 2026-11-21): on when the host can list a file's passes
@@ -9301,9 +11432,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           if (m && m._serverItemId) present[m._serverItemId] = true;
         }
         var page = [];
+        var pagePos = [];
         var next = p.loaded;
         while (next < ids.length && page.length < _ChatSession.RUN_PASS_PAGE) {
-          if (!present[ids[next]]) page.push(ids[next]);
+          if (!present[ids[next]]) {
+            page.push(ids[next]);
+            pagePos.push(next);
+          }
           next++;
         }
         return Promise.all(page.map(function(rid) {
@@ -9318,13 +11453,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         })).then(function(got) {
           if (self.host.getIdentity().projectId !== svcId) return;
           var add = [];
+          var retryFrom = -1;
           for (var g = 0; g < got.length; g++) {
             var r = got[g];
             if (!r) continue;
             var body = r.body;
             if (isCsrStatusEnvelope(body) && (body.status === "running" || body.status === "pending")) continue;
-            var notExists = r.err && (r.err.code === "NOT_EXISTS" || r.err.body && r.err.body.code === "NOT_EXISTS");
+            var notExists = isNotExistsError(r.err);
             if (notExists) continue;
+            if (r.err && (isTransportFailure(r.err) || isAuthExpiredError(r.err))) {
+              if (retryFrom === -1 || pagePos[g] < retryFrom) retryFrom = pagePos[g];
+              continue;
+            }
             var continued = r.rid !== oldest;
             var when = requestIdTimeMs(r.rid);
             var user = {
@@ -9358,7 +11498,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             return (a[0]._ts || 0) - (b[0]._ts || 0);
           });
           for (var k = 0; k < add.length; k++) self._insertByTime(add[k]);
-          p.loaded = next;
+          p.loaded = retryFrom !== -1 ? retryFrom : next;
           p.done = p.loaded >= ids.length;
         });
       }).catch(function(err) {
@@ -9460,6 +11600,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         for (var i = 0; i < list.length; i++) if (list[i] && typeof list[i].id === "string") ids[list[i].id] = true;
       }
       this._lastLiveLook = complete ? { svcId, platform, at: Date.now(), ids } : null;
+      if (complete) {
+        var open = this._openMap();
+        for (var oid in open) {
+          var oi = open[oid];
+          if (oi.failedPending && !oi.failedRecheck && oi.projectId === svcId && nowMs() - oi.failedPending >= FAILED_PASS_RECHECK_MIN_MS) {
+            oi.failedRecheck = true;
+            oi.terminalSeen = true;
+          }
+        }
+      }
+      if (complete) this._closeIdleFileRuns(svcId);
     }
     /**
      * Settle indexing passes from the queue instead of from their own polls (owner,
@@ -9539,9 +11690,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     /** One by-id read of a by-listing pass, then the shared settle. */
     _settleListedEntry(entry2, platform, lookup, executedAt) {
       var self = this;
-      var id = this.host.getIdentity();
+      var owner = entry2.owner !== void 0 ? entry2.owner : entry2.identity ? entry2.identity.owner : this.host.getIdentity().owner;
       this._listingSettling[entry2.id] = true;
-      Promise.resolve(lookup(buildHistoryItemFullId(platform, entry2.projectId, entry2.id), entry2.projectId, id.owner)).then(function(body) {
+      Promise.resolve(lookup(buildHistoryItemFullId(platform, entry2.projectId, entry2.id), entry2.projectId, owner)).then(function(body) {
         delete self._listingSettling[entry2.id];
         if (self.bgTaskQueue.indexOf(entry2) === -1) return;
         if (isCsrStatusEnvelope(body) && (body.status === "running" || body.status === "pending")) return;
@@ -9551,6 +11702,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       }, function(err) {
         delete self._listingSettling[entry2.id];
         if (self.bgTaskQueue.indexOf(entry2) === -1) return;
+        if (!isNotExistsError(err) && (isTransportFailure(err) || isAuthExpiredError(err))) return;
         self._settleBgOutcome(entry2, platform, Promise.reject(err), function() {
           return executedAt;
         });
@@ -9682,10 +11834,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (msg._serverItemId !== item.id) continue;
         if (!(msg.isPending || msg.isPendingInProcess || msg.isPendingQueued)) return false;
       }
-      var body = item.request_body;
-      if (!body || typeof body !== "object") return false;
-      if (platform === "claude" ? !Array.isArray(body.messages) : !Array.isArray(body.input)) return false;
-      var userText = extractLastUserTextFromRequest(body);
+      var userText;
+      if (item.compact && typeof item.request_text === "string") {
+        userText = item.request_text;
+      } else {
+        var body = item.request_body;
+        if (!body || typeof body !== "object") return false;
+        if (platform === "claude" ? !Array.isArray(body.messages) : !Array.isArray(body.input)) return false;
+        userText = extractLastUserTextFromRequest(body);
+      }
       if (!isIndexingRequestText(userText)) return false;
       var ref = parseIndexingRequestText(userText);
       if (!ref || !ref.name) return false;
@@ -9759,10 +11916,25 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         }
       }
       var bgPollBudget = MAX_CONCURRENT_BG_POLLS - this._countBgPolls();
-      var listingSettles = typeof chatEngineConfig().csrHistoryItemLookup === "function";
+      var listingSettles = typeof chatEngineConfig().csrHistoryItemLookup === "function" || this._recNewMode();
       var injectedAny = false;
+      var drainKey = this.getHistoryCacheKey();
       this.bgTaskQueue.forEach(function(entry2) {
         if (entry2.projectId !== svcId || entry2.platform !== plat) return;
+        if (!entry2.identity) entry2.identity = Object.assign({}, id);
+        if (entry2.owner === void 0) entry2.owner = entry2.identity.owner;
+        if (entry2.ownerKey === void 0) entry2.ownerKey = drainKey;
+        self.trackOpenItem(entry2.id, {
+          ownerKey: entry2.ownerKey,
+          projectId: entry2.projectId,
+          owner: entry2.owner,
+          platform: entry2.platform,
+          // Its queue too: the look reads that queue's counters to know when to read it.
+          queue: self._bgQueueOf(entry2),
+          uid: entry2.identity.userId,
+          kind: "indexing",
+          state: entry2.status === "running" ? "running" : "queued"
+        });
         if (!presentIds[entry2.id]) {
           var isRunning = entry2.status === "running";
           var userBubble = {
@@ -9840,45 +12012,66 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var self = this;
       var capturedId = entry2.id, capturedPlat = plat;
       var capturedEntry = entry2;
+      var ctx = {
+        projectId: entry2.projectId,
+        platform: entry2.platform,
+        owner: entry2.owner !== void 0 ? entry2.owner : entry2.identity ? entry2.identity.owner : void 0,
+        ownerKey: entry2.ownerKey
+      };
       var wasStopped = false;
-      outcome.then(function(response) {
+      var kept = false;
+      var bgQueue = this._bgQueueOf(entry2);
+      return outcome.then(function(response) {
         if (isPollStopped(response)) {
           wasStopped = true;
           return;
         }
-        self.handleHistoryItemResolution(capturedId, response, capturedPlat, getExecutedAt());
-        self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
-      }).catch(function(err) {
-        self.historyItemPolls.delete(capturedId);
-        var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
-        self._clearPendingUserBubble(capturedId);
-        var bi = self.state.messages.findIndex(function(m) {
-          return m.isPending && m._serverItemId === capturedId;
+        self.handleHistoryItemResolution(capturedId, response, capturedPlat, getExecutedAt(), ctx);
+        var resumeKey = "resume:" + capturedEntry.projectId + ":" + capturedId;
+        if (sideEffectDone(resumeKey) && capturedEntry.storagePath) self._forgetChain(capturedEntry.projectId, capturedEntry.storagePath, capturedId);
+        runSettleSideEffect(capturedEntry.projectId, bgQueue, resumeKey, function() {
+          self.maybeResumeIndexing(capturedEntry, response, capturedPlat);
         });
-        if (bi !== -1) {
-          if (isNotExists) self.state.messages.splice(bi, 1);
-          else self.state.messages[bi] = { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId };
-        } else if (!isNotExists) {
-          var ui = self.state.messages.findIndex(function(m) {
-            return m.role === "user" && m._serverItemId === capturedId;
-          });
-          if (ui !== -1) {
-            self.state.messages.splice(ui + 1, 0, { role: "assistant", content: getErrorMessage(err), isError: true, isBackgroundTask: true, _serverItemId: capturedId });
+      }, function(err) {
+        self.historyItemPolls.delete(capturedId);
+        var workerDriven = self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime);
+        if (isNotExistsError(err)) {
+          self.applyTerminal(capturedId, cancelledEnvelope(capturedId), ctx);
+          if (!workerDriven) {
+            self._flipRunRecord(capturedEntry, "cancelled");
+            self._nudgeIndexingDrain();
           }
+          return;
         }
-        self.host.notify();
-        self.updateHistoryCache();
-        if (!self._isWorkerDrivenIndexing(capturedEntry.filename, capturedEntry.mime)) {
-          if (isNotExists) self._flipRunRecord(capturedEntry, "cancelled");
-          else self._flipRunRecord(capturedEntry, "error", self._runErrorText(err));
+        if (isTransportFailure(err) || isAuthExpiredError(err)) {
+          kept = true;
+          console.warn("[chat-engine] a read of indexing pass " + capturedId + " failed on the way; left as it is", err);
+          return;
+        }
+        self.applyTerminal(capturedId, pollErrorBody(err), ctx);
+        if (!workerDriven) {
+          self._flipRunRecord(capturedEntry, "error", self._runErrorText(err));
           self._nudgeIndexingDrain();
         }
+      }).catch(function(e) {
+        console.error("[chat-engine] settling indexing pass " + capturedId + " threw", e);
       }).then(function() {
-        if (wasStopped) return;
+        if (wasStopped || kept) return;
         var qi = self.bgTaskQueue.findIndex(function(q) {
           return q.id === capturedId;
         });
         if (qi !== -1) self.bgTaskQueue.splice(qi, 1);
+        var refresh = chatEngineConfig().refreshRecords;
+        if (typeof refresh === "function" && !self.bgTaskQueue.some(function(q) {
+          return !!q && q.projectId === capturedEntry.projectId;
+        })) {
+          runSettleSideEffect(capturedEntry.projectId, bgQueue, "records:" + capturedEntry.projectId + ":" + capturedId, function() {
+            try {
+              refresh(capturedEntry.projectId);
+            } catch (e) {
+            }
+          });
+        }
         self.drainBgTaskQueue();
       });
     }
@@ -9902,9 +12095,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       try {
         var mint = chatEngineConfig().mintIndexDoneMarker;
         if (!mint || !entry2 || !entry2.storagePath || !entry2.projectId) return;
-        var id = this.host.getIdentity();
-        if (!id || id.projectId !== entry2.projectId) return;
-        mint({ service: entry2.projectId, storagePath: entry2.storagePath });
+        if (!entry2.identity) {
+          var id = this.host.getIdentity();
+          if (!id || id.projectId !== entry2.projectId) return;
+        }
+        var path = entry2.storagePath;
+        runSettleSideEffect(entry2.projectId, this._bgQueueOf(entry2), "done:" + entry2.projectId + ":" + path + ":" + entry2.id, function() {
+          return mint({ service: entry2.projectId, storagePath: path });
+        });
       } catch (_e) {
       }
     }
@@ -9960,7 +12158,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!entry2 || !entry2.storagePath || !entry2.projectId) return;
       var patch = { status, finished: Date.now() };
       if (error) patch.error = error;
-      upsertIndexRunRecordSafe(entry2.projectId, entry2.storagePath, patch);
+      var projectId = entry2.projectId, path = entry2.storagePath;
+      this._forgetChain(projectId, path, entry2.id);
+      runSettleSideEffect(projectId, this._bgQueueOf(entry2), "run:" + projectId + ":" + path + ":" + entry2.id + ":" + status, function() {
+        return upsertIndexRunRecordSafe(projectId, path, patch, { report: true });
+      });
     }
     maybeResumeIndexing(entry2, response, platform) {
       var self = this;
@@ -10002,61 +12204,113 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           endOfClientChain();
           return;
         }
-        var id = this.host.getIdentity();
+        var id = entry2.identity && entry2.identity.projectId === entry2.projectId && entry2.identity.platform === entry2.platform ? entry2.identity : this.host.getIdentity();
         if (!id || id.platform === "none" || id.projectId !== entry2.projectId) {
           this._flipRunRecord(entry2, "error", "Indexing stopped: the session or project changed before the file finished.");
           endOfClientChain();
           return;
         }
-        this.trackIndexDispatch(notifyAgentContinueIndexing({
-          platform: id.platform,
-          model: id.model,
-          service: id.projectId,
-          // Without this the resume pass rebuilds its system prompt from the RAW
-          // regional id (requests.ts falls back to `service`), and the model copies
-          // that id verbatim into project_id tool calls, which the MCP schema
-          // pattern rejects - the whole continue pass saves nothing.
-          publicProjectId: id.publicProjectId,
-          owner: id.owner,
-          userId: id.userId || id.projectId,
-          serviceName: id.serviceName,
-          serviceDescription: id.serviceDescription,
-          attachment: {
-            name: entry2.filename,
-            storagePath: entry2.storagePath,
-            mime: entry2.mime,
-            size: entry2.size,
-            url: ""
-          }
-        }).then(function(ack) {
-          if (ack && typeof ack.id === "string") {
-            self.bgTaskQueue.push({
-              projectId: id.projectId,
-              platform: id.platform,
-              id: ack.id,
-              filename: entry2.filename,
-              storagePath: entry2.storagePath,
-              isReindex: entry2.isReindex,
-              mime: entry2.mime,
-              size: entry2.size,
-              status: ack.status === "running" ? "running" : "pending",
-              poll: ack.poll,
-              resumePass: pass
-              // Deliberately NOT stamped with entry.stageId. Only a batch's FIRST
-              // pass anchors to the turn; a continuation appends, which is the
-              // order the server queued it in and therefore the order
-              // promoteNextBgQueuedToRunning should spin it in. It costs nothing
-              // on screen: a continuation is folded into the run whose row
-              // already sits above the turn, and renders nothing at its own
-              // index (indexing_groups anchors a run at its FIRST loaded pass).
-            });
-            self.drainBgTaskQueue();
-          }
-        }, function(e) {
-          console.error("[chat-engine] resume-indexing dispatch failed", e);
-        }));
+        if (!claimSideEffect("next:" + entry2.projectId + ":" + entry2.storagePath + ":" + entry2.id)) return;
+        this._sendNextIndexingPass(entry2, id, pass, 0);
       } catch (e) {
       }
+    }
+    /**
+     * Send the next pass of a client-driven file (maybeResumeIndexing) and follow it. A POST
+     * that failed on the way may still have been queued, so with a cref it becomes a pending
+     * send the discovery listing looks for on the bg queue: found, it is followed like any
+     * pass; not found by two complete listings, it is sent once more with a new cref. A
+     * refusal, a second miss, or no way to look for it (no cref, no batch reads) ends the
+     * chain: run:: says NEXT_PASS_NOT_SENT_TEXT.
+     */
+    _sendNextIndexingPass(entry2, id, pass, attempt) {
+      var self = this;
+      var platform = id.platform === "openai" ? "openai" : "claude";
+      var canLook = this._recNewMode() && crefSupported();
+      var cref = canLook ? newClientRef() : void 0;
+      var queue = bgIndexingQueueName(id.userId || id.projectId, id.projectId);
+      var follow = function(rid, status, poll) {
+        for (var q = 0; q < self.bgTaskQueue.length; q++) if (self.bgTaskQueue[q] && self.bgTaskQueue[q].id === rid) return;
+        self.bgTaskQueue.push({
+          projectId: id.projectId,
+          platform,
+          id: rid,
+          identity: Object.assign({}, id),
+          owner: id.owner,
+          ownerKey: entry2.ownerKey,
+          filename: entry2.filename,
+          storagePath: entry2.storagePath,
+          isReindex: entry2.isReindex,
+          mime: entry2.mime,
+          size: entry2.size,
+          status: status === "running" ? "running" : "pending",
+          poll,
+          resumePass: pass
+          // Deliberately NOT stamped with entry.stageId. Only a batch's FIRST
+          // pass anchors to the turn; a continuation appends, which is the
+          // order the server queued it in and therefore the order
+          // promoteNextBgQueuedToRunning should spin it in. It costs nothing
+          // on screen: a continuation is folded into the run whose row
+          // already sits above the turn, and renders nothing at its own
+          // index (indexing_groups anchors a run at its FIRST loaded pass).
+        });
+        self.noteBgQueueChanged();
+        self.drainBgTaskQueue();
+      };
+      var giveUp = function() {
+        self._flipRunRecord(entry2, "error", NEXT_PASS_NOT_SENT_TEXT);
+        self._nudgeIndexingDrain();
+      };
+      this.trackIndexDispatch(notifyAgentContinueIndexing({
+        platform,
+        model: id.model,
+        service: id.projectId,
+        // Without this the resume pass rebuilds its system prompt from the RAW
+        // regional id (requests.ts falls back to `service`), and the model copies
+        // that id verbatim into project_id tool calls, which the MCP schema
+        // pattern rejects - the whole continue pass saves nothing.
+        publicProjectId: id.publicProjectId,
+        owner: id.owner,
+        userId: id.userId || id.projectId,
+        serviceName: id.serviceName,
+        serviceDescription: id.serviceDescription,
+        attachment: {
+          name: entry2.filename,
+          storagePath: entry2.storagePath,
+          mime: entry2.mime,
+          size: entry2.size,
+          url: ""
+        },
+        cref
+      }).then(function(ack) {
+        if (ack && typeof ack.id === "string") follow(ack.id, ack.status, ack.poll);
+      }, function(e) {
+        console.error("[chat-engine] resume-indexing dispatch failed", e);
+        if (!cref || !isTransportFailure(e) || isNotExistsError(e)) {
+          giveUp();
+          return;
+        }
+        self._recAddPendingSend({
+          cref,
+          key: entry2.ownerKey || chatCacheKey(id.projectId, platform, id.userId),
+          projectId: id.projectId,
+          owner: id.owner,
+          platform,
+          queue,
+          // The pass that just settled is older than the one being looked for.
+          watermark: entry2.id,
+          params: null,
+          uid: id.userId,
+          kind: "indexing",
+          onFound: function(row) {
+            follow(row.id, row.status, void 0);
+          },
+          onMissing: function() {
+            if (attempt < 1) self._sendNextIndexingPass(entry2, id, pass, attempt + 1);
+            else giveUp();
+          }
+        });
+      }));
     }
     // --- history fetch + pagination --------------------------------------
     // Initial load (fetchMore=false) replaces the list (with in-flight rescue +
@@ -10072,8 +12326,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (this.state.loadingHistory && this.state.historyRequestToken === token || id.platform === "none" || !id.projectId) {
         return Promise.resolve();
       }
+      if (!fetchMore && token === this._recFirstPageToken && this._recFirstPageDoneAt && nowMs() - this._recFirstPageDoneAt < CATCH_UP_MIN_GAP_MS) {
+        return Promise.resolve();
+      }
       this.state.historyRequestToken = token;
       this.state.loadingHistory = true;
+      if (!fetchMore) {
+        this._recFirstPageAt = nowMs();
+        this._recFirstPageToken = token;
+      }
       if (!fetchMore && loadKey !== this._liveIndexKey) {
         this._liveIndexKey = loadKey;
         this._resetLiveIndexKeys();
@@ -10105,7 +12366,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         if (isAuthExpiredError(err) && !isNonRetryableRequestError(err)) return self.host.refreshSession().then(fetchHistory);
         throw err;
       }).then(function(history) {
-        if (token !== self.state.gateRefreshToken) return;
+        if (token !== self.state.gateRefreshToken) {
+          if (!fetchMore && self._recFirstPageToken !== self.state.gateRefreshToken) {
+            self._recFirstPageOwed = true;
+            self._recFirstPageAt = 0;
+            self._recEnsure();
+          }
+          return;
+        }
         var chatList = history && Array.isArray(history.list) ? history.list : [];
         chatList.forEach(function(item) {
           if (isBgIndexingQueue(item.queue_name)) {
@@ -10387,6 +12655,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
         }
         if (!fetchMore) {
+          var followedByLook = false;
           var bgAllow = {};
           var bgHistBudget = MAX_CONCURRENT_BG_POLLS - self._countBgPolls();
           if (bgHistBudget > 0) {
@@ -10400,12 +12669,32 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }).sort();
             for (var ba = 0; ba < bgIds.length && ba < bgHistBudget; ba++) bgAllow[bgIds[ba]] = true;
           }
-          chatList.forEach(function(item) {
+          chatList.slice().sort(function(a, b) {
+            var ai = typeof a.id === "string" ? a.id : "", bi = typeof b.id === "string" ? b.id : "";
+            return ai < bi ? -1 : ai > bi ? 1 : 0;
+          }).forEach(function(item) {
             if (item.status !== "running" && item.status !== "pending") return;
             if (!item.poll || !item.id) return;
             if (self.historyItemPolls.has(item.id)) return;
+            if (self.isItemSettled(item.id) && !self._hasWaitingBubble(item.id, loadKey)) return;
+            var itemCtx = { ownerKey: loadKey, projectId, owner, platform, queue: item.queue_name };
+            self.trackOpenItem(item.id, {
+              ownerKey: loadKey,
+              projectId,
+              owner,
+              platform,
+              queue: item.queue_name,
+              kind: item._isBgTask ? "indexing" : "chat",
+              state: item.status === "running" ? "running" : "queued",
+              cref: typeof item.cref === "string" ? item.cref : void 0,
+              anonymous: !!id.anonymous,
+              uid: id.userId
+            });
             if (item._isBgTask && self.trackHistoryIndexPass(item)) return;
-            if (self.pendingAgentRequests[self.getHistoryCacheKey()] && !item._isBgTask && !item._isOnBgQueue) return;
+            if (self._recNewMode()) {
+              followedByLook = true;
+              return;
+            }
             if ((item._isBgTask || item._isOnBgQueue) && self.isPollingPaused()) return;
             if ((item._isBgTask || item._isOnBgQueue) && !bgAllow[item.id]) return;
             var capturedId = item.id;
@@ -10418,46 +12707,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               // life would be stamped.
               onResponse: function(response, meta) {
                 if (isPollStopped(response)) return;
-                self.handleHistoryItemResolution(capturedId, response, platform, meta && meta.executed);
+                self.handleHistoryItemResolution(capturedId, response, platform, meta && meta.executed, itemCtx);
               },
+              // Only the server's own answer changes the screen: NOT_EXISTS settles
+              // the item as cancelled, a failure on the way leaves it as it is (the
+              // next look settles it), and the read never sends anything again.
               onError: function(err) {
-                self.historyItemPolls.delete(capturedId);
-                var isNotExists = err && (err.code === "NOT_EXISTS" || err.body && err.body.code === "NOT_EXISTS");
-                var aIdx = self.state.messages.findIndex(function(m) {
-                  return m.isPending && m._serverItemId === capturedId;
-                });
-                if (isNotExists) {
-                  var uIdx = self.state.messages.findIndex(function(m) {
-                    return m.role === "user" && m._serverItemId === capturedId && !m.isCancelled;
-                  });
-                  var isBg2 = aIdx !== -1 && !!self.state.messages[aIdx].isBackgroundTask || uIdx !== -1 && !!self.state.messages[uIdx].isBackgroundTask;
-                  if (aIdx !== -1) self.state.messages.splice(aIdx, 1);
-                  if (!isBg2) {
-                    if (uIdx !== -1) {
-                      var ex = self.state.messages[uIdx];
-                      self.state.messages[uIdx] = { role: "user", content: ex.content, isCancelled: true, _serverItemId: ex._serverItemId };
-                    }
-                    self.cancelledServerIds.delete(capturedId);
-                    self.promoteNextQueuedToRunning();
-                  } else if (uIdx !== -1) {
-                    var bex = self.state.messages[uIdx];
-                    var bcancelled = { role: "user", content: bex.content, isCancelled: true, isBackgroundTask: true, _serverItemId: bex._serverItemId };
-                    if (bex._indexFile) bcancelled._indexFile = bex._indexFile;
-                    if (bex._useBgQueue) bcancelled._useBgQueue = true;
-                    self.state.messages[uIdx] = bcancelled;
-                    self.promoteNextBgQueuedToRunning();
-                  }
-                  self.host.notify();
-                  self.updateHistoryCache();
-                  return;
-                }
-                if (aIdx !== -1) {
-                  var wasBg = self.state.messages[aIdx].isBackgroundTask;
-                  self.state.messages[aIdx] = { role: "assistant", content: getErrorMessage(err), isError: true };
-                  if (wasBg) self.state.messages[aIdx].isBackgroundTask = true;
-                  self.host.notify();
-                  self.updateHistoryCache();
-                }
+                self.onPollFailure(capturedId, err, itemCtx);
               }
             };
             var pp = isBg ? item.poll(Object.assign({ latency: POLL_INTERVAL, notify: statusPushEnabled() }, pollOpts)) : self._fgPollWithEarlyProbe(item, capturedId, pollOpts, {
@@ -10471,11 +12727,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             });
           });
           self.drainBgTaskQueue();
+          if (followedByLook) void self._recSched().trigger("add");
         }
         if (!fetchMore) self.refreshLiveIndexState();
+        if (!fetchMore) self._recFirstPageDoneAt = nowMs();
         if (!fetchMore) return self.host.settleScroll ? self.host.settleScroll() : self.host.scrollToBottomIfSticky();
       }).catch(function(err) {
         console.warn("[chat-engine] getChatHistory failed", err);
+        if (!fetchMore && isTransportFailure(err) && token === self.state.gateRefreshToken) {
+          self._recFirstPageOwed = true;
+          self._recFirstPageAt = 0;
+          self._recEnsure();
+        }
       }).then(function() {
         if (self.state.historyRequestToken === token) {
           var wasLoading = self.state.loadingHistory || self.state.loadingOlderHistory;
@@ -10691,6 +12954,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                     projectId: id.projectId,
                     platform: id.platform,
                     id: ack.id,
+                    identity: Object.assign({}, id),
+                    owner: id.owner,
                     filename: member.file.name,
                     storagePath: member.storagePath,
                     isReindex: hadExists,
@@ -10703,6 +12968,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                     // attachment-only send, which appends.
                     stageId
                   });
+                  self.noteBgQueueChanged();
                   self.drainBgTaskQueue();
                 }
               }, function(e) {
@@ -10807,17 +13073,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.state.gateRefreshToken += 1;
     }
   };
-  /**
-   * Save where a hard search found its answer (findings.ts), through the host's
-   * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
-   * throws, never waited on.
-   *
-   * OFF since 1.20.1 (owner, 2026-11-24): the MCP's searchText now learns which page answered
-   * a question by itself (learned links, read first by every search), so the chat no longer
-   * reads "search_findings" first (that read cost 7 to 8 s at the start of every turn in
-   * production) and nothing is saved here. SAVE_SEARCH_FINDINGS turns it back on.
-   */
-  _ChatSession.SAVE_SEARCH_FINDINGS = false;
   /** How many passes one "Load more" brings into a file's row. */
   _ChatSession.RUN_PASS_PAGE = 10;
   var ChatSession = _ChatSession;
@@ -10826,7 +13081,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.20.1" ;
+    var BQ_VERSION = "1.21.0" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -11116,6 +13371,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         } : void 0,
         forwardRequestStream: canStream ? function(requestId, options) {
           return S.skapi.forwardRequestStream(requestId, options);
+        } : void 0,
+        // The reconciler's reads (skapi-js 2.7.0; agent.vue's ai_agent.ts same). With
+        // the first two the engine follows every waiting request with one batch read
+        // per look instead of a poll each; an embedder's older skapi-js hands over
+        // none of them and the widget keeps today's polls.
+        forwardRequestStatus: typeof S.skapi.forwardRequestStatus === "function" ? function(requests, opts) {
+          return S.skapi.forwardRequestStatus(requests, opts);
+        } : void 0,
+        forwardRequestRead: typeof S.skapi.forwardRequestRead === "function" ? function(params) {
+          return S.skapi.forwardRequestRead(params);
+        } : void 0,
+        forwardRequestQueueCounters: typeof S.skapi.forwardRequestQueueCounters === "function" ? function(queues, opts) {
+          return S.skapi.forwardRequestQueueCounters(queues, opts);
         } : void 0
       };
     }
@@ -12189,6 +14457,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!CS.messagesBox || !CS.chatEl || !CS.composerEl) return;
       CS.chatSettingsOpen = true;
       if (CS.settingsBtnEl) CS.settingsBtnEl.classList.add("is-active");
+      syncChatStatus();
       if (CS.composerEl.parentNode === CS.chatEl) CS.chatEl.removeChild(CS.composerEl);
       renderAccount();
     }
@@ -12611,6 +14880,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       // .bq-input textarea
       chatEl: null,
       // .bq-chat (for overflow height measurement)
+      chatStatusEl: null,
+      // .bq-chat-status ("Reconnecting..." / sign-in note)
       visibleAttachmentCount: Infinity
       // how many chips fit before "...(x) more"
     };
@@ -12697,8 +14968,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       formatIndexingLabel: function(name, mime, size, storagePath, reindex, continued) {
         return buildIndexingLabel(name, mime, size, storagePath, reindex, continued);
       },
+      // The chat's message list is in the page. CS.messagesBox stays set after the
+      // widget swaps the chat for another screen (sign-in, settings): the engine then
+      // must not load history or draw into a list nobody sees.
       isViewMounted: function() {
-        return !!CS.messagesBox;
+        return !!CS.messagesBox && CS.messagesBox.isConnected !== false;
+      },
+      // The reconciler asks for a fresh run:: sweep of files still 'working' while they
+      // are not seen live (every 30 s, no round limit); the sweep hands the working
+      // paths back through session.syncFileRuns (maybeArmStubRecheck).
+      recheckFileRuns: function(projectId) {
+        if (projectId !== S.projectId) return;
+        void refreshIndexMarkers(true);
       },
       getClearedAt: function() {
         return getClearedAt();
@@ -13365,6 +15646,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var msg = String(err && err.message || err || "");
         if (msg.indexOf("is already taken") === -1) {
           console.warn("[bunnyquery] mintIndexDoneMarker failed (non-fatal)", storagePath, msg);
+          throw err;
         }
       });
     }
@@ -13422,6 +15704,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           return null;
         }).catch(function(err) {
           console.warn("[bunnyquery] upsertIndexRunRecord update failed (non-fatal)", storagePath, String(err && err.message || err || ""));
+          throw err;
         });
       }
       function createChain() {
@@ -13437,7 +15720,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                 var msg2 = String(err2 && err2.message || err2 || "");
                 if (msg2.indexOf("is already taken") === -1) {
                   console.warn("[bunnyquery] upsertIndexRunRecord create failed (non-fatal)", storagePath, msg2);
-                  return null;
+                  throw err2;
                 }
                 return settleAsUpdate();
               });
@@ -14439,6 +16722,15 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         else if (msg.isPendingQueued) bubble.appendChild(h("span", { class: "bq-pending-note", text: "(In queue)" }));
         if (msg.isCancelled) bubble.appendChild(h("span", { class: "bq-cancel-error", text: "(cancelled)" }));
         if (msg._cancelError) bubble.appendChild(h("span", { class: "bq-cancel-error", text: msg._cancelError }));
+        if (msg._notSent && session.canRetryNotSent(msg)) {
+          var retryBtn = h("button", { class: "bq-wrong-answer-btn bq-retry-send-btn", type: "button", text: "Retry" });
+          retryBtn.addEventListener("click", function(e) {
+            e.stopPropagation();
+            retryBtn.disabled = true;
+            session.retryNotSent(msg);
+          });
+          bubble.appendChild(retryBtn);
+        }
         var ts = msg.isPending ? "" : formatChatTimestamp(msg._ts);
         if (ts && typeof msg._ts === "number" && typeof msg._tsStart === "number") {
           var dur = formatDuration(msg._ts - msg._tsStart);
@@ -14557,48 +16849,20 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       markerSweep.at = 0;
       markerSweep.gen++;
     }
-    var STUB_RECHECK_MS = 3e4;
-    var STUB_RECHECK_MAX_ROUNDS = 5;
-    var stubRecheckTimer = null;
-    var stubRecheckSig = "";
-    var stubRecheckRounds = 0;
-    function armStubRecheck() {
-      if (stubRecheckTimer !== null) return;
-      stubRecheckTimer = setTimeout(function() {
-        stubRecheckTimer = null;
-        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-        stubRecheckRounds++;
-        void refreshIndexMarkers();
-      }, STUB_RECHECK_MS);
-    }
     function maybeArmStubRecheck() {
       try {
-        if (markerSweep.svc !== S.projectId) return;
-        var lk = session && session.getLiveIndexState().keys || {};
-        var sig = [];
+        if (markerSweep.svc !== S.projectId || !session) return;
+        var working = [];
+        var info = {};
         for (var pth in markerSweep.runs) {
           var r = markerSweep.runs[pth];
-          if (!r || r.status !== "working" || lk[pth]) continue;
+          if (!r || r.status !== "working") continue;
           var fn = r.filename || pth.split("/").pop() || pth;
           if (markerSweep.done[pth] || markerSweep.done[fn]) continue;
-          sig.push(pth);
+          working.push(pth);
+          info[pth] = { owner: r.owner, filename: r.filename };
         }
-        if (!sig.length) {
-          stubRecheckSig = "";
-          stubRecheckRounds = 0;
-          if (stubRecheckTimer !== null) {
-            clearTimeout(stubRecheckTimer);
-            stubRecheckTimer = null;
-          }
-          return;
-        }
-        var s = sig.sort().join("|");
-        if (s !== stubRecheckSig) {
-          stubRecheckSig = s;
-          stubRecheckRounds = 0;
-        }
-        if (stubRecheckRounds >= STUB_RECHECK_MAX_ROUNDS) return;
-        armStubRecheck();
+        session.syncFileRuns(S.projectId, working, info);
       } catch (e) {
       }
     }
@@ -15087,8 +17351,24 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         CS.draftingEl.parentNode.removeChild(CS.draftingEl);
       }
     }
+    function chatStatusText() {
+      if (session.state.signInNeeded) return "Sign in to see the latest answers.";
+      if (session.state.reconnecting) return "Reconnecting...";
+      return "";
+    }
+    function syncChatStatus() {
+      var el = CS.chatStatusEl;
+      if (!el) return;
+      var text = CS.chatSettingsOpen ? "" : chatStatusText();
+      if (el._bqText === text) return;
+      el._bqText = text;
+      clear(el);
+      if (text) el.appendChild(h("span", { class: "bq-chat-status-inner", text }));
+      el.hidden = !text;
+    }
     function renderMessages() {
       syncStopIndexModal();
+      syncChatStatus();
       var _lk = session.getLiveIndexState().keys || {};
       var _lc = 0;
       for (var _k in _lk) _lc++;
@@ -15157,7 +17437,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               if (typeof moFirst === "number") moPatch.started = moFirst;
               if (mog.name) moPatch.filename = mog.name;
               if (S.aiPlatform === "claude" || S.aiPlatform === "openai") moPatch.platform = S.aiPlatform;
-              void upsertIndexRunRecordDb(S.projectId, mog.path, moPatch);
+              upsertIndexRunRecordDb(S.projectId, mog.path, moPatch).catch(function() {
+              });
               if (morec) morec.status = "done";
               else markerSweep.runs[mog.path] = { status: "done" };
             }
@@ -15245,6 +17526,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       CS.chatSettingsOpen = false;
       CS.settingsBtnEl = null;
       CS.composerEl = null;
+      CS.chatStatusEl = null;
       CS.gateRefreshToken += 1;
       if (CS.pollTimer) {
         clearInterval(CS.pollTimer);
@@ -15373,9 +17655,13 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           h("div", { class: "bq-input-wrap" }, attachBtn, attachFileInput, input),
           sendBtn
         );
-        chatArea = h("div", { class: "bq-chat" }, box, composer);
+        var chatStatus = h("div", { class: "bq-chat-status", role: "status", "aria-live": "polite" });
+        chatStatus.hidden = true;
+        CS.chatStatusEl = chatStatus;
+        chatArea = h("div", { class: "bq-chat" }, box, chatStatus, composer);
         CS.chatEl = chatArea;
         CS.composerEl = composer;
+        syncChatStatus();
         updateComposerControls();
         if (!attachDisabled) setupDragAndDrop(chatArea);
         return h("div", { class: "bq-meta" }, header, chatArea);
@@ -15406,11 +17692,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           renderMessages();
           scrollToBottom();
         }
-        if (loaded && !session.needsHistoryRefetch()) {
-          session.drainBgTaskQueue();
-          session.refreshLiveIndexState();
-          return;
-        }
+        session.noteViewOpened();
         return session.loadHistory(false, CS.gateRefreshToken);
       }).then(function() {
       });
@@ -15701,6 +17983,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           S.user = u;
           return u;
         });
+      }).then(function(u) {
+        if (u && session && session.noteSignedIn) session.noteSignedIn();
       }).then(function() {
         return loadServiceInfo();
       }).then(function(conn) {
@@ -15905,43 +18189,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       configureChatEngine(Object.assign({
         // Single-item csr-poll point lookup: how the engine hydrates a
         // compact history stub's real body when an indexing row expands.
-        // Saved search findings (engine findings.ts; agent.vue same): where a hard search
-        // found its answer, at the source file's own access group, one record per page.
-        saveSearchFinding: function(f) {
-          if (!S.skapi || typeof S.skapi.postRecord !== "function") return;
-          return S.skapi.getRecords({ service: f.service, unique_id: "src::" + f.storagePath }).then(function(found) {
-            var src = found && found.list && found.list[0];
-            var group = src && src.table ? src.table.access_group : void 0;
-            if (group === void 0 || group === null || group === "") return;
-            return S.skapi.postRecord(f.data, {
-              service: f.service,
-              unique_id: f.uniqueId,
-              table: { name: "search_findings", access_group: group },
-              reference: "src::" + f.storagePath,
-              tags: f.tags
-            }).catch(function(err) {
-              if (!/already taken|already exist/i.test(String(err && err.message || err))) return;
-              return S.skapi.getRecords({ service: f.service, unique_id: f.uniqueId }).then(function(r) {
-                var rec = r && r.list && r.list[0];
-                if (!rec || !rec.record_id) return;
-                var union = function(a, b) {
-                  var out = [];
-                  (Array.isArray(a) ? a : []).concat(Array.isArray(b) ? b : []).forEach(function(x) {
-                    if (out.indexOf(x) === -1) out.push(x);
-                  });
-                  return out.slice(0, 40);
-                };
-                var old = rec.data && typeof rec.data === "object" ? rec.data : {};
-                return S.skapi.postRecord(Object.assign({}, old, {
-                  question_words: union(old.question_words, f.data.question_words),
-                  search_terms: union(old.search_terms, f.data.search_terms),
-                  found_at: f.data.found_at
-                }), { service: f.service, record_id: rec.record_id, tags: union(rec.tags, f.tags) });
-              });
-            });
-          }).catch(function() {
-          });
-        },
         // A document's page progress, the MCP's prog::<path> record (agent.vue same).
         // A file's indexing pass ids, from the "pass::<path>#<id>" records the worker
         // writes as each pass starts (agent.vue same).
@@ -15974,15 +18221,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           });
         },
         csrHistoryItemLookup: function(fullId, service, owner) {
-          return S.skapi.util.request("csr-poll", { id: fullId, service, owner }, { auth: true });
+          var signedIn = !!(S.skapi && S.skapi.session);
+          return S.skapi.util.request("csr-poll", { id: fullId, service, owner }, { auth: signedIn });
         },
         // Durable index markers. Both read S lazily at call time — S.skapi /
         // S.projectId are not set yet when init() runs.
+        // Both return the write's promise: a failed write rejects, and the engine
+        // writes it again under its settle lock.
         mintIndexDoneMarker: function(info) {
-          void mintIndexDoneMarkerDb(info.service, info.storagePath);
+          return mintIndexDoneMarkerDb(info.service, info.storagePath);
         },
         upsertIndexRunRecord: function(info) {
-          void upsertIndexRunRecordDb(info.service, info.storagePath, info.patch);
+          return upsertIndexRunRecordDb(info.service, info.storagePath, info.patch);
         },
         mcpBaseUrl: mcpBaseUrl(),
         poll: 0,
@@ -16043,13 +18293,31 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             return;
           }
           if (document.visibilityState === "visible") {
-            var refreshed = S.user ? ensureMcpGrantFresh() : null;
-            Promise.resolve(refreshed).catch(function() {
-            }).then(function() {
-              if (session && session.resumePolling) session.resumePolling("hidden");
-            });
+            if (session && session.reconcileNow) void session.reconcileNow("visible");
+            if (session && session.resumePolling) void session.resumePolling("hidden");
+            if (S.user && mcpGrantNeedsRefresh(S.user)) {
+              Promise.resolve().then(ensureMcpGrantFresh).catch(function() {
+              });
+            }
           }
         });
+      }
+      if (!S._loginBound && S.skapi) {
+        var loginListeners = null;
+        try {
+          loginListeners = S.skapi.onLogin;
+        } catch (e) {
+          loginListeners = null;
+        }
+        if (Array.isArray(loginListeners)) {
+          S._loginBound = true;
+          try {
+            S.skapi.onLogin = function(u) {
+              if (u && session && session.noteSignedIn) session.noteSignedIn();
+            };
+          } catch (e) {
+          }
+        }
       }
       boot();
       return PUBLIC;

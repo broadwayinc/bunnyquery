@@ -43,6 +43,14 @@ export function extractLastUserTextFromRequest(requestBody: any): string {
 	return '';
 }
 
+/** The last user text of a listed row: the compact stub's `request_text` when the
+ *  listing was compact (the body never left the server), else read from the full
+ *  request echo (a backend without compact stubs). */
+export function listedRequestText(item: any): string {
+	if (item && typeof item.request_text === 'string') return item.request_text;
+	return extractLastUserTextFromRequest(item && item.request_body);
+}
+
 /** The two openings an indexing prompt can have. A bg-queue item that starts with
  *  neither is an ordinary chat that happened to be routed onto that queue. */
 export function isIndexingRequestText(userText: any): boolean {
@@ -129,8 +137,11 @@ export function probeBgQueue(
 	}
 	const inflight = bgProbeInflight[key];
 	if (inflight) return inflight;
+	// compact + queue_exact: the indexing rows come back as label stubs (no request echo,
+	// which can be hundreds of KB per row) from exactly this queue's range. Every reader of
+	// this answer takes the text through listedRequestText. Older backends ignore both.
 	const p = Promise.resolve(getChatHistory(
-		{ service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status },
+		{ service: params.service, owner: params.owner, platform: params.platform, queue: params.queue, status: params.status, compact: true, queue_exact: true },
 		{ limit: params.limit, fetchMore: false },
 	)).then(function (result: any) {
 		const entry: BgProbeEntry = { result: result, at: Date.now() };
@@ -167,21 +178,28 @@ export async function fetchLiveIndexingKeys(params: {
 	platform: 'claude' | 'openai';
 	/** Same value the dispatch used - see bgIndexingQueueName. */
 	userId?: string;
+}, opts?: {
+	/** Reuse a shared answer up to this old (default BG_PROBE_TTL_MS); 0 always asks. */
+	maxAgeMs?: number;
 }): Promise<{ keys: Set<string>; checked: boolean; at: number }> {
 	const queue = bgIndexingQueueName(params.userId, params.service);
 	const base = { service: params.service, owner: params.owner, platform: params.platform, queue };
+	const maxAgeMs = opts && typeof opts.maxAgeMs === 'number' ? opts.maxAgeMs : BG_PROBE_TTL_MS;
 	const [pending, running] = await Promise.all([
-		probeBgQueue({ ...base, status: 'pending', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS }),
-		probeBgQueue({ ...base, status: 'running', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs: BG_PROBE_TTL_MS }),
+		probeBgQueue({ ...base, status: 'pending', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs }),
+		probeBgQueue({ ...base, status: 'running', limit: LIVE_INDEX_PROBE_LIMIT }, { maxAgeMs }),
 	]);
 	const keys = new Set<string>();
 	let truncated = false;
 	for (const entry of [pending, running]) {
 		const res = entry.result;
 		const list: any[] = (res && Array.isArray((res as any).list)) ? (res as any).list : [];
-		if (list.length >= LIVE_INDEX_PROBE_LIMIT) truncated = true;
+		// Cut off when the page came back full OR the server says more exist: the queue
+		// filters run after the range read, so a short page can still have a cursor, and
+		// reading it as whole would show files as idle while passes remain.
+		if (list.length >= LIVE_INDEX_PROBE_LIMIT || (res && (res as any).endOfList === false)) truncated = true;
 		for (const item of list) {
-			const text = extractLastUserTextFromRequest(item && item.request_body);
+			const text = listedRequestText(item);
 			if (!text || !isIndexingRequestText(text)) continue;
 			const ref = parseIndexingRequestText(text);
 			if (!ref) continue;
@@ -989,6 +1007,14 @@ export function mapHistoryListToMessages(list: any[], platform: 'claude' | 'open
 export function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessage): boolean {
 	if (!incoming || !local || !incoming._streamPending) return false;
 	if (incoming.role !== 'assistant' || local.role !== 'assistant') return false;
+	// AN ERROR BUBBLE IS NEVER THE ANSWER. It is this client's account of a read or a
+	// send that went wrong ("Network error", "No response for 60 seconds."), written
+	// by THIS client and never by the model. Adopted, it became the turn's answer for
+	// good: the marker came off (so the real answer, still in the chunk store, was
+	// never read back), the error flag did not come across (so it rendered as a
+	// normal reply), and the model was handed it as its own words in every later
+	// turn. The row's unknown answer stays unknown and the recovery reads it back.
+	if (local.isError) return false;
 	var hasText = typeof local.content === 'string' && local.content.length > 0;
 	var isLive = !!(local.isPending || local._streaming);
 	if (!hasText && !isLive) return false;
@@ -1005,6 +1031,32 @@ export function adoptLocalAnswerIntoPage(incoming: ChatMessage, local: ChatMessa
 	if (local._localId !== undefined) incoming._localId = local._localId;
 	if (local.isPending) incoming.isPending = true;
 	if (local.isPendingInProcess) incoming.isPendingInProcess = true;
+	if (local._streaming) incoming._streaming = true;
+	return true;
+}
+
+/**
+ * Keep the LIVE TEXT of a turn the page still shows as running. Mutates `incoming`;
+ * true when it took anything.
+ *
+ * A running row maps to an empty "Thinking..." placeholder (the row has no body
+ * yet), so a first-page refetch landing while an answer streams replaced the bubble
+ * the reader was watching with an empty one. The painter only paints when the text
+ * GROWS past what it already painted, so the bubble then sat on "Thinking..." until
+ * a larger chunk arrived and jumped back, or, with every chunk already delivered,
+ * stayed blank until the settle retyped the whole answer. The local copy is the same
+ * turn (same server id), so its text and its live state come across; the settle
+ * still replaces the text with the authoritative answer.
+ */
+export function adoptLiveTextIntoRunningRow(incoming: ChatMessage, local: ChatMessage): boolean {
+	if (!incoming || !local) return false;
+	if (incoming.role !== 'assistant' || local.role !== 'assistant') return false;
+	if (!incoming.isPending || incoming.isBackgroundTask || incoming._streamPending) return false;
+	if (local.isError || !(local.isPending || local._streaming)) return false;
+	if (typeof local.content !== 'string' || !local.content) return false;
+	if (typeof incoming.content === 'string' && incoming.content.length >= local.content.length) return false;
+	incoming.content = local.content;
+	if (local._localId !== undefined) incoming._localId = local._localId;
 	if (local._streaming) incoming._streaming = true;
 	return true;
 }
@@ -1068,19 +1120,27 @@ export function shouldRescueInFlightMessage(m: ChatMessage, ctx: RescueDecisionC
 	// the painter finds THAT one on its next paint (about a second later), and rescuing
 	// as well would put the same turn on screen twice.
 	if (m._streaming && !m._serverItemId) return true;
+	// A send whose ack was lost while the reconciler looks for its row by cref, or one that
+	// says "Not sent. Retry?" (reconciler plan, section 3 item 9). It has no server id, so
+	// no page can carry a copy of it: it is kept, or its bubbles (and the Retry) vanish.
+	if (!m._serverItemId && (m._unconfirmed || m._notSent)) return true;
 	if (!m._serverItemId && ctx.pageHasPendingAssistant) return false;
 	// In flight by its own flags, id or no id. The immediate-send pair is stamped
 	// with its server id as soon as the dispatch reports one, and that id is there
 	// to let the check above recognise the server's copy — not to disqualify the
 	// bubble from being kept when there is no such copy.
 	if (m.isSendingToServer || m.isPendingQueued || m.isPendingInProcess || m.isPending) return true;
-	// An immediate-send user bubble carries no flags of its own (its in-flight-ness
-	// lives in state.sending); what identifies it is its own unanswered placeholder
-	// directly below it.
-	if (ctx.sending && m.role === 'user') {
+	// An immediate-send user bubble carries no flags of its own; what identifies it
+	// is its own unanswered placeholder directly below it. Before the ack that pair
+	// has no server id and state.sending says a send is in flight. AFTER the ack
+	// (state.sending clears there now, reconciler plan section 3 item 6) both carry
+	// the turn's id, and the shared id is the proof: a user bubble whose placeholder
+	// below names the same request is that request's question.
+	if (m.role === 'user') {
 		var next = ctx.next;
-		if (!next || next.isBackgroundTask || !next.isPending) return false;
-		return next._serverItemId === undefined || next._serverItemId === m._serverItemId;
+		if (!next || next.isBackgroundTask || !next.isPending || next.role !== 'assistant') return false;
+		if (ctx.sending && (next._serverItemId === undefined || next._serverItemId === m._serverItemId)) return true;
+		return !!m._serverItemId && next._serverItemId === m._serverItemId;
 	}
 	return false;
 }
