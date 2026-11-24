@@ -25,6 +25,14 @@ A few notes on how to read this:
 
 ---
 
+## 1.20.1 (2026-11-24, not yet published)
+
+The chat no longer starts every turn by reading saved search findings.
+
+### Engine
+
+- **SAVED FINDINGS FIRST removed from the chat prompt, and findings are no longer saved.** The MCP's searchText now learns which page answered a question by itself (learned links, which every search reads first), so the agent's own getRecords on table "search_findings" was a second copy of the same thing. In production it was the slowest call of every turn (7 to 8 s for a 3.6 KB answer). `ChatSession.SAVE_SEARCH_FINDINGS` (false) turns the saving back on; the `saveSearchFinding` hook and `findings.ts` exports are unchanged. Records already in "search_findings" stay where they are and are no longer read.
+
 ## Unreleased (book search, 2026-11-23)
 
 A "Wrong answer?" button under answers that read data, and chat prompt rules for searching long files by chapter and for checking a disputed answer. Needs an MCP with the book-search tools (searchText `page_from`, `page_to` and `question`, getFileOutline's `outline`, `correctSearchLink`).

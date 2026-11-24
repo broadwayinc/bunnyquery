@@ -798,7 +798,6 @@ Scope: Only answer questions about this project and its data. Do not answer ques
 Knowledge lookup: before saying you don't know, or that something isn't in the chat history, ALWAYS search this project's data with the tools: the project's data lives in its database, not in the earlier messages of this chat.
 ${groundingRules}
 ${webRule}
-SAVED FINDINGS FIRST: where an earlier search found an answer is saved in table "search_findings" (one record per file page; its tags are the key words of the question that led there and of the search terms, stored lowercase without spaces). Before any other search, call getRecords with table_name "search_findings", access_group ${indexGroupLiteral} and tags set to ONE specific key word of the question (a name or a term, in the user's words; when nothing comes back, try one more word, or the word in the documents' language). A finding gives data.path and data.page: read THAT page (searchText with that path and the question's words) and answer from the page itself, quoting and citing it as usual. A finding is only a pointer, never the answer: when its page does not answer the question, or nothing is found, search as below.
 FINDING THE DATA: the database is the way in, for every kind of file. Follow the search path in getTables' description, with one exception for this project: when getTables' one page is the whole list (end_of_list true), skip its table-name search even when no name fits: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Pick EVERY table that could hold the answer, not the first that fits. Read getIndexes and getTags one page each, never with fetch_all: name and tag lists can be millions of characters long and are never read whole, so when the name is not on that page, search for it with the user's words as their descriptions say. Never call getTags with neither table_name nor tag: that lists every tag of every table. Then getRecords in that table and group with the selector that matched (an index, one exact tag, or none for the whole table), always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>" (see the access group rule below); every later mention of a file's records means this call. Every stored file has a record whose unique_id is "src::<its storage path>", so getUniqueId with unique_id "src::" and condition "gte" lists every file across every table (add the start of a path to narrow it; condition "lte" with a file name alone finds it in any folder).
 NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and never from a guess. Each row of each sheet is one record in its table: reference "src::<path>", unique_id "row::<path>#<sheet>#R<n>", the cells by header name, plus "_sheet", "_row", "_grain" ("detail" or "summary") and, on a total or preamble row, "_row_type". Its tags carry the file name, the sheet, the grain and up to four key values of the row (a name, a code), so getRecords with one exact tag selects every row about that thing across all the files in the table. Workbooks state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that re-total it, plus a summary. Use rows whose "_grain" is "detail" and whose "_row_type" is not "total", pick ONE sheet per file and say which, and never add a sheet to its summary. Fetch the COMPLETE matching set, keep only the rows whose column or tag names what was asked, then add them up carefully, in groups, and check that the group sums agree with the grand total. A FILE TOTAL IS NOT A ROW'S TOTAL: the biggest number on a summary sheet is the whole file, not the thing asked about, so check every figure is scoped to what the question named (filter by the column that identifies it). Quote the row count, the sheet(s) and the file(s) the figure was made from and label it as calculated.
 ${documentRules}
@@ -9209,12 +9208,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.state.messages.splice(idx + 1, 0, placeholder);
       return true;
     }
-    /**
-     * Save where a hard search found its answer (findings.ts), through the host's
-     * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
-     * throws, never waited on.
-     */
     _saveFindings(itemId, body, answer, note) {
+      if (!_ChatSession.SAVE_SEARCH_FINDINGS) return;
       try {
         var save = chatEngineConfig().saveSearchFinding;
         if (typeof save !== "function" || !note || !body) return;
@@ -10812,6 +10807,17 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       this.state.gateRefreshToken += 1;
     }
   };
+  /**
+   * Save where a hard search found its answer (findings.ts), through the host's
+   * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
+   * throws, never waited on.
+   *
+   * OFF since 1.20.1 (owner, 2026-11-24): the MCP's searchText now learns which page answered
+   * a question by itself (learned links, read first by every search), so the chat no longer
+   * reads "search_findings" first (that read cost 7 to 8 s at the start of every turn in
+   * production) and nothing is saved here. SAVE_SEARCH_FINDINGS turns it back on.
+   */
+  _ChatSession.SAVE_SEARCH_FINDINGS = false;
   /** How many passes one "Load more" brings into a file's row. */
   _ChatSession.RUN_PASS_PAGE = 10;
   var ChatSession = _ChatSession;
@@ -10820,7 +10826,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.20.0" ;
+    var BQ_VERSION = "1.20.1" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

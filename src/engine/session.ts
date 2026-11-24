@@ -5432,8 +5432,15 @@ export class ChatSession {
 	 * Save where a hard search found its answer (findings.ts), through the host's
 	 * saveSearchFinding hook. Never for an indexing pass, never twice for one turn, never
 	 * throws, never waited on.
+	 *
+	 * OFF since 1.20.1 (owner, 2026-11-24): the MCP's searchText now learns which page answered
+	 * a question by itself (learned links, read first by every search), so the chat no longer
+	 * reads "search_findings" first (that read cost 7 to 8 s at the start of every turn in
+	 * production) and nothing is saved here. SAVE_SEARCH_FINDINGS turns it back on.
 	 */
+	static SAVE_SEARCH_FINDINGS = false;
 	private _saveFindings(itemId: string | undefined, body: any, answer: string | null | undefined, note: RetrievalNote | null | undefined): void {
+		if (!ChatSession.SAVE_SEARCH_FINDINGS) return;
 		try {
 			var save = chatEngineConfig().saveSearchFinding;
 			if (typeof save !== 'function' || !note || !body) return;
