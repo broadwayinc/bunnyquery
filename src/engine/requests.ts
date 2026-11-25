@@ -1397,8 +1397,15 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	// content arrives another way (server-side extraction, rendered pages) - the
 	// url still appears as the attachment link, and a dead link in front of the
 	// model is worth avoiding either way.
+	// index_end (2026-11-25): a file read in ONE pass (an image, or any file not rendered,
+	// windowed or paged) has no chain for the worker to end, so its done:: and run:: were
+	// written only by a page that saw the pass settle, and a page closed or opened mid-pass
+	// left it 'working' or flipped it to "the page was closed". With the flag the worker writes
+	// the ending itself (an older worker ignores the key). The client still writes its own,
+	// with the same verdict rule, so the two never disagree.
+	const singlePass = !visionFile && !windowedRead && !pagedRead && !continuing;
 	const skapiFileUrls = attachment.url && attachment.storagePath
-		? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] }
+		? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url, ...(singlePass ? { index_end: true } : {}) }] }
 		: {};
 
 	const userMessage = (visionFile && renderPlaceholder)

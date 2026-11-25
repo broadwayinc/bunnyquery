@@ -493,6 +493,16 @@ interface ChatEngineConfig {
      */
     windowedIndexing?: boolean;
     /**
+     * The worker writes the ending (done:: and run::) of a file read in ONE pass (an image,
+     * or any file not rendered, windowed or paged), as it does for paged chains: the engine
+     * then no longer marks such a run "Indexing stopped ... (the page was closed)" when no
+     * page here kept its chain. The engine always sends the request flag (index_end); this
+     * switch only stops the client-side "lost" verdict. Turn it on only once every region's
+     * worker and polling-recovery Lambda carry the 2026-11-25 change: with an older worker
+     * a page closed mid-pass would leave the run 'working'. Off unless true.
+     */
+    workerIndexEndings?: boolean;
+    /**
      * Mint the durable "indexing finished" marker record ("done::<path>",
      * reference "src::<path>", table __INDEXING__ — same shape the backend
      * worker writes via /internal/index-complete) for runs whose completion
@@ -1630,9 +1640,11 @@ declare function isTransportFailure(err: any): boolean;
  * the chat gets. A host that never attaches `_retrieval` sees byte-identical
  * requests to today.
  */
+/** sheet: the hit was on a spreadsheet's sheet page (MCP 2026-11-25), whose page number means nothing to a reader. */
 type RetrievalHit = {
     path: string;
     page: number;
+    sheet?: string;
 };
 type RetrievalNote = {
     /** Storage paths (the part after "src::") the turn read, queried or linked. */
@@ -6181,6 +6193,11 @@ declare class ChatSession {
      * worker-driven file (the worker writes its endings), another user's run (their chain is
      * in their browser), or a run whose next pass is being looked for.
      */
+    /** Files the last queue look listed pending or running, settled bubbles included. */
+    private _rawListedIndexKeys;
+    /** Runs found idle on one complete look, waiting for a second before "lost" (see below). */
+    private _lostLooks;
+    private _lostKey;
     private _flipIfChainLost;
     /** A file run the queue says is live, or that this page has a pass queued for. */
     private _fileRunLive;

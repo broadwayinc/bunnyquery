@@ -276,6 +276,9 @@ function crefSupported() {
 function windowedIndexingEnabled() {
   return _config?.windowedIndexing === true;
 }
+function workerIndexEndingsEnabled() {
+  return _config?.workerIndexEndings === true;
+}
 function statusPushEnabled() {
   return _config?.statusPush === true && typeof _config?.onRequestStatus === "function";
 }
@@ -1063,8 +1066,8 @@ WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rul
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
   const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
-  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): when the user NAMED a file, first find its storage path by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used, then find the page with searchText and that path; a spreadsheet has no page text, so read its rows instead (readFileContent, or its records). When they did not name a file, your FIRST call is searchText without a path: no table list, no file lookup before it. Either way follow searchText's description to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"); never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name. In a long file (a manual, a book), when a search of the whole file gives too many hits or none that fit, call getFileOutline and search the chapter that fits with searchText page_from and page_to. When the user asks about the content of the documents, pass searchText "question": that question in the user's own words, without names or personal details that are not about the documents. Leave "question" out for anything else.
-WRONG ANSWER: when the user says an answer is wrong (or sends "This answer seems wrong. Please check it again against the documents."), re-read the pages you cited and search again, passing searchText "question" = the user's ORIGINAL question that the disputed answer answered, never the complaint message itself. Then do exactly one of: correct the answer only; correct the answer and call correctSearchLink (when it is among your tools); or keep the answer and quote the text that supports it. Call correctSearchLink only with the page and an exact quote that prove it, and never change data on the user's word alone.`;
+  const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): when the user NAMED a file (its file name; a document title, a quote or a code they mention is NOT a file name: searchText finds those inside the files), first find its storage path by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used, then find the page with searchText and that path. A spreadsheet's sheets are page text too: a hit names its sheet and rows, and the row itself is a record (its unique_id is the hit's row_id_prefix plus the row number); a spreadsheet indexed before 2026-11-25 has no page text, so read its rows instead (readFileContent, or its records). When they did not name a file, your FIRST call is searchText without a path: no table list, no file lookup before it. Either way follow searchText's description to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"), or for a hit with "sheet" THE FILE AND THE SHEET ("quote.xlsx, sheet \uCD1D\uAD04"), never a sheet page's number; never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name. In a long file (a manual, a book), when a search of the whole file gives too many hits or none that fit, call getFileOutline and search the chapter that fits with searchText page_from and page_to. When the user asks about the content of the documents, pass searchText "question": that question in the user's own words, without names or personal details that are not about the documents. Leave "question" out for anything else.
+WRONG ANSWER: when the user says an answer is wrong (or sends "This answer seems wrong. Please check it again against the documents."), re-read the pages you cited (for a sheet hit, the rows: by its row_id_prefix, never readFileContent on a sheet page) and search again, passing searchText "question" = the user's ORIGINAL question that the disputed answer answered, never the complaint message itself. Then do exactly one of: correct the answer only; correct the answer and call correctSearchLink (when it is among your tools); or keep the answer and quote the text that supports it. Call correctSearchLink only with the page and an exact quote that prove it, and never change data on the user's word alone.`;
   const groupIsPublic = indexGroupLiteral === '"public"' || indexGroupLiteral === "0";
   const accessGroupRule = `THIS PROJECT INDEXES AT access_group ${indexGroupLiteral}: pass access_group ${indexGroupLiteral} EXPLICITLY on EVERY query that names a table_name, whether it filters by index, by tag or by nothing, and never rely on a default: a group left off is NOT "all groups", and any user but the project's owner is then answered from access_group 0 (public) alone${groupIsPublic ? "" : `, so a table indexed at ${indexGroupLiteral} would look empty with its records sitting right there`}. Files uploaded before the project's setting changed may sit at another group, so when a table query comes back empty, retry it in the other groups among 0, 1 and "private" before concluding there is nothing. Reference is the exception: reference ALONE spans EVERY table and EVERY access group, so getRecords with reference "src::<the file's storage path>" is the one call that returns a whole file's records wherever the indexer put them; adding table_name narrows it to that table, and access_group WITHOUT table_name fails.`;
   let systemPrompt = `
@@ -1073,7 +1076,7 @@ Scope: Only answer questions about this project and its data. Do not answer ques
 Knowledge lookup: before saying you don't know, or that something isn't in the chat history, ALWAYS search this project's data with the tools: the project's data lives in its database, not in the earlier messages of this chat.
 ${groundingRules}
 ${webRule}
-FINDING THE DATA: the database is the way in, for every kind of file. A question about what the documents SAY (a procedure, a passage, a definition, how to fix or do something) starts with searchText (DOCUMENTS below), not with getTables. Everything else (numbers, rows, records, lists, counts, files) follows the search path in getTables' description, with one exception for this project: when getTables' one page is the whole list (end_of_list true), skip its table-name search even when no name fits: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Pick EVERY table that could hold the answer, not the first that fits. Read getIndexes and getTags one page each, never with fetch_all: name and tag lists can be millions of characters long and are never read whole, so when the name is not on that page, search for it with the user's words as their descriptions say. Never call getTags with neither table_name nor tag: that lists every tag of every table. Then getRecords in that table and group with the selector that matched (an index, one exact tag, or none for the whole table), always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>" (see the access group rule below); every later mention of a file's records means this call. Every stored file has a record whose unique_id is "src::<its storage path>", so getUniqueId with unique_id "src::" and condition "gte" lists every file across every table (add the start of a path to narrow it; condition "lte" with a file name alone finds it in any folder).
+FINDING THE DATA: the database is the way in, for every kind of file. A question about what the documents SAY (a procedure, a passage, a definition, how to fix or do something), or one that names a code, a number or a phrase to find (a quote no., a part no., a name), starts with searchText (DOCUMENTS below), not with getTables: the sheets of spreadsheets are in page text too. searchText finds WHICH file, sheet and row holds a value; a total, count or list over rows is still computed from the full row set (NUMBERS FROM A SPREADSHEET below). Everything else (numbers, rows, records, lists, counts, files) follows the search path in getTables' description, with one exception for this project: when getTables' one page is the whole list (end_of_list true), skip its table-name search even when no name fits: you already see every table, and a table is never named after a company, a person or a single fact, so when no table fits, the answer is in a document's text: use searchText (DOCUMENTS below). Pick EVERY table that could hold the answer, not the first that fits. Read getIndexes and getTags one page each, never with fetch_all: name and tag lists can be millions of characters long and are never read whole, so when the name is not on that page, search for it with the user's words as their descriptions say. Never call getTags with neither table_name nor tag: that lists every tag of every table. Then getRecords in that table and group with the selector that matched (an index, one exact tag, or none for the whole table), always with fetch_all true. WHERE INDEXED CONTENT LIVES: a document's extracted content (PDF, Word, slides, scans) is in table "document_entries", one record per row / entry / section, with its page in "page"; spreadsheet rows are in "spreadsheet_rows". Files indexed before 2026-11-20 may still hold theirs in other tables, so a file's records are found wherever they are with getRecords reference "src::<path>" (see the access group rule below); every later mention of a file's records means this call. Every stored file has a record whose unique_id is "src::<its storage path>", so getUniqueId with unique_id "src::" and condition "gte" lists every file across every table (add the start of a path to narrow it; condition "lte" with a file name alone finds it in any folder).
 NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and never from a guess. Each row of each sheet is one record in its table: reference "src::<path>", unique_id "row::<path>#<sheet>#R<n>", the cells by header name, plus "_sheet", "_row", "_grain" ("detail" or "summary") and, on a total or preamble row, "_row_type". Its tags carry the file name, the sheet, the grain and up to four key values of the row (a name, a code), so getRecords with one exact tag selects every row about that thing across all the files in the table. Workbooks state the same money more than once: a detail sheet, then per-song, per-album and per-artist sheets that re-total it, plus a summary. Use rows whose "_grain" is "detail" and whose "_row_type" is not "total", pick ONE sheet per file and say which, and never add a sheet to its summary. Fetch the COMPLETE matching set, keep only the rows whose column or tag names what was asked, then add them up carefully, in groups, and check that the group sums agree with the grand total. A FILE TOTAL IS NOT A ROW'S TOTAL: the biggest number on a summary sheet is the whole file, not the thing asked about, so check every figure is scoped to what the question named (filter by the column that identifies it). Quote the row count, the sheet(s) and the file(s) the figure was made from and label it as calculated.
 ${documentRules}
 ${accessGroupRule}
@@ -1821,16 +1824,19 @@ function pushGroup(list, value) {
   if (typeof value === "number" && isFinite(value)) pushUnique(list, String(value));
   else pushUnique(list, value);
 }
-function pushHit(list, path, page) {
+function pushHit(list, path, page, sheet) {
   if (typeof path !== "string" || !path.trim()) return;
   var n = typeof page === "number" ? page : Number(page);
   if (!isFinite(n) || n <= 0) return;
   n = Math.floor(n);
+  var sh = typeof sheet === "string" && sheet.trim() ? sheet.trim() : "";
   for (var i = 0; i < list.length; i++) {
-    if (list[i].path === path && list[i].page === n) return;
+    if (sh ? list[i].path === path && list[i].sheet === sh : list[i].path === path && list[i].page === n) return;
   }
   if (list.length >= RETRIEVAL_NOTE_MAX_ITEMS) return;
-  list.push({ path: path.trim(), page: n });
+  var hit = { path: path.trim(), page: n };
+  if (sh) hit.sheet = sh;
+  list.push(hit);
 }
 function pathFromSrcId(value) {
   if (typeof value !== "string") return null;
@@ -1877,7 +1883,7 @@ function readHits(note, result) {
       return;
     }
     if (typeof node.path === "string" && node.page !== void 0) {
-      pushHit(note.hits, node.path, node.page);
+      pushHit(note.hits, node.path, node.page, node.sheet);
     }
     for (var k in node) {
       if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
@@ -2006,8 +2012,16 @@ function formatRetrievalNote(note) {
       }
       byFile[h.path].push(h.page);
     }
+    var sheetsOf = {};
+    for (var s2 = 0; s2 < note.hits.length; s2++) {
+      var hs = note.hits[s2];
+      if (hs.sheet) {
+        if (!sheetsOf[hs.path]) sheetsOf[hs.path] = [];
+        if (sheetsOf[hs.path].indexOf(hs.sheet) === -1) sheetsOf[hs.path].push(hs.sheet);
+      }
+    }
     parts.push("searchText hits " + order.map(function(p) {
-      return p + " p" + byFile[p].join(", p");
+      return sheetsOf[p] ? p + " sheet " + sheetsOf[p].join(", sheet ") : p + " p" + byFile[p].join(", p");
     }).join("; "));
   }
   if (note.tools.length) parts.push("tools " + note.tools.join(", "));
@@ -2861,7 +2875,8 @@ async function notifyAgentSaveAttachment(info) {
       save_media: !continuing
     }))
   } : {};
-  const skapiFileUrls = attachment.url && attachment.storagePath ? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url }] } : {};
+  const singlePass = !visionFile && !windowedRead && !pagedRead && !continuing;
+  const skapiFileUrls = attachment.url && attachment.storagePath ? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url, ...singlePass ? { index_end: true } : {} }] } : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : void 0
@@ -3769,10 +3784,20 @@ function citationsFor(note) {
   var out = [];
   var hitPaths = [];
   var byPath = {};
+  var sheetsByPath = {};
   var i;
   for (i = 0; i < note.hits.length; i++) {
     var h = note.hits[i];
     if (!h || typeof h.path !== "string" || !isMintablePath(h.path)) continue;
+    if (typeof h.sheet === "string" && h.sheet) {
+      if (!byPath[h.path]) {
+        byPath[h.path] = [];
+        hitPaths.push(h.path);
+      }
+      if (!sheetsByPath[h.path]) sheetsByPath[h.path] = [];
+      if (sheetsByPath[h.path].indexOf(h.sheet) === -1) sheetsByPath[h.path].push(h.sheet);
+      continue;
+    }
     var page = typeof h.page === "number" ? h.page : Number(h.page);
     if (!isFinite(page) || page <= 0) continue;
     page = Math.floor(page);
@@ -3784,6 +3809,10 @@ function citationsFor(note) {
   }
   for (i = 0; i < hitPaths.length; i++) {
     var p = hitPaths[i];
+    var sheets = sheetsByPath[p] || [];
+    for (var sj = 0; sj < sheets.length; sj++) {
+      out.push({ path: p, label: citationFileName(p) + " \xB7 " + sheets[sj] });
+    }
     var pages = byPath[p].slice().sort(function(a, b) {
       return a - b;
     });
@@ -5873,6 +5902,18 @@ var _ChatSession = class _ChatSession {
     this._iqWatches = [];
     this._chainsRestored = false;
     /**
+     * A run closed idle (a complete queue look found no pass of it) whose record still says
+     * 'working': when it is THIS user's run of a client-driven file and no browser tab here
+     * keeps its chain (a reload, a discarded tab, or a browser without localStorage lost
+     * it), nothing will ever send its next pass, so run:: says CHAIN_LOST_TEXT. Never for a
+     * worker-driven file (the worker writes its endings), another user's run (their chain is
+     * in their browser), or a run whose next pass is being looked for.
+     */
+    /** Files the last queue look listed pending or running, settled bubbles included. */
+    this._rawListedIndexKeys = {};
+    /** Runs found idle on one complete look, waiting for a second before "lost" (see below). */
+    this._lostLooks = {};
+    /**
      * Pick up indexing passes the WORKER minted, which no client ever dispatched.
      *
      * For a PDF (and for text/grid when windowed indexing is on) the worker writes
@@ -6267,6 +6308,7 @@ var _ChatSession = class _ChatSession {
   _recordLiveIndexKeys(lists) {
     var next = {};
     var running = {};
+    var rawListed = {};
     var truncated = false;
     var runningTruncated = false;
     var settledIds = {};
@@ -6289,6 +6331,11 @@ var _ChatSession = class _ChatSession {
       for (var i = 0; i < list.length; i++) {
         var item = list[i];
         if (!item || item.status !== "pending" && item.status !== "running") continue;
+        var rawRef = parseIndexingRequestText(listedRequestText(item));
+        if (rawRef) {
+          if (rawRef.path) rawListed[rawRef.path] = true;
+          if (rawRef.name) rawListed[rawRef.name] = true;
+        }
         if (item.id && settledIds[item.id]) continue;
         var text = listedRequestText(item);
         if (!isIndexingRequestText(text)) continue;
@@ -6330,6 +6377,7 @@ var _ChatSession = class _ChatSession {
       }
     }
     this.state.liveIndexKeys = next;
+    this._rawListedIndexKeys = rawListed;
     if (this.state.liveIndexRunningChecked !== !runningTruncated) changed = true;
     var settledNow = this.state.liveIndexSettled || {};
     var settledNext = {};
@@ -10152,33 +10200,40 @@ var _ChatSession = class _ChatSession {
       else if (!Object.keys(self._openMap()).length && !self._viewMounted()) self._stopStatusPush();
     });
   }
-  /**
-   * A run closed idle (a complete queue look found no pass of it) whose record still says
-   * 'working': when it is THIS user's run of a client-driven file and no browser tab here
-   * keeps its chain (a reload, a discarded tab, or a browser without localStorage lost
-   * it), nothing will ever send its next pass, so run:: says CHAIN_LOST_TEXT. Never for a
-   * worker-driven file (the worker writes its endings), another user's run (their chain is
-   * in their browser), or a run whose next pass is being looked for.
-   */
+  _lostKey(run) {
+    return run.projectId + "\0" + run.storagePath + "\0" + run.since;
+  }
   _flipIfChainLost(run) {
     var self = this;
-    if (!run.owner) return;
+    if (!run.owner) return false;
+    var raw = this._rawListedIndexKeys || {};
+    if (raw[run.storagePath] || run.filename && raw[run.filename]) {
+      delete this._lostLooks[this._lostKey(run)];
+      return true;
+    }
+    var lk = this._lostKey(run);
+    if (!this._lostLooks[lk]) {
+      this._lostLooks[lk] = 1;
+      return true;
+    }
+    delete this._lostLooks[lk];
     var live = null;
     try {
       live = this.host.getIdentity();
     } catch (e2) {
       live = null;
     }
-    if (!live || !live.userId || live.userId !== run.owner || live.projectId !== run.projectId) return;
+    if (!live || !live.userId || live.userId !== run.owner || live.projectId !== run.projectId) return false;
     var name = run.filename || run.storagePath.split("/").pop() || run.storagePath;
-    if (this._isWorkerDrivenIndexing(name, void 0)) return;
-    if (this._chainKept(run.projectId, run.storagePath)) return;
+    if (this._isWorkerDrivenIndexing(name, void 0)) return false;
+    if (workerIndexEndingsEnabled() && !isPagedReadFile(name, void 0)) return false;
+    if (this._chainKept(run.projectId, run.storagePath)) return false;
     for (var q = 0; q < this.bgTaskQueue.length; q++) {
       var e = this.bgTaskQueue[q];
-      if (e && e.projectId === run.projectId && e.storagePath === run.storagePath) return;
+      if (e && e.projectId === run.projectId && e.storagePath === run.storagePath) return false;
     }
     if (this._recPending) for (var c in this._recPending) {
-      if (this._recPending[c].kind === "indexing" && this._recPending[c].projectId === run.projectId) return;
+      if (this._recPending[c].kind === "indexing" && this._recPending[c].projectId === run.projectId) return false;
     }
     var projectId = run.projectId, path = run.storagePath;
     runSettleSideEffect(projectId, bgIndexingQueueName(live.userId, projectId), "lost:" + projectId + ":" + path + ":" + run.since, function() {
@@ -10191,6 +10246,7 @@ var _ChatSession = class _ChatSession {
         }
       });
     });
+    return false;
   }
   /** A file run the queue says is live, or that this page has a pass queued for. */
   _fileRunLive(run) {
@@ -10222,8 +10278,8 @@ var _ChatSession = class _ChatSession {
     var closed = [];
     for (var k in runs) {
       if (runs[k].projectId !== projectId || this._fileRunLive(runs[k])) continue;
+      if (this._flipIfChainLost(runs[k])) continue;
       closed.push(runs[k].storagePath);
-      this._flipIfChainLost(runs[k]);
       delete runs[k];
       if (!this._fileRunsIdle) this._fileRunsIdle = {};
       this._fileRunsIdle[k] = true;

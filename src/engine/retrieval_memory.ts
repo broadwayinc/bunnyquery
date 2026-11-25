@@ -39,7 +39,8 @@
 
 import { normalizeStoredPathTarget, normalizeTrailingInlineToken } from './links';
 
-export type RetrievalHit = { path: string; page: number };
+/** sheet: the hit was on a spreadsheet's sheet page (MCP 2026-11-25), whose page number means nothing to a reader. */
+export type RetrievalHit = { path: string; page: number; sheet?: string };
 
 export type RetrievalNote = {
 	/** Storage paths (the part after "src::") the turn read, queried or linked. */
@@ -97,16 +98,21 @@ function pushGroup(list: string[], value: unknown): void {
 	else pushUnique(list, value);
 }
 
-function pushHit(list: RetrievalHit[], path: unknown, page: unknown): void {
+function pushHit(list: RetrievalHit[], path: unknown, page: unknown, sheet?: unknown): void {
 	if (typeof path !== 'string' || !path.trim()) return;
 	var n = typeof page === 'number' ? page : Number(page);
 	if (!isFinite(n) || n <= 0) return;
 	n = Math.floor(n);
+	var sh = typeof sheet === 'string' && sheet.trim() ? sheet.trim() : '';
 	for (var i = 0; i < list.length; i++) {
-		if (list[i].path === path && list[i].page === n) return;
+		// one slot per sheet, whatever page of it was hit: several pages of one sheet must not
+		// crowd the document hits out of the note
+		if (sh ? (list[i].path === path && list[i].sheet === sh) : (list[i].path === path && list[i].page === n)) return;
 	}
 	if (list.length >= RETRIEVAL_NOTE_MAX_ITEMS) return;
-	list.push({ path: path.trim(), page: n });
+	var hit: RetrievalHit = { path: path.trim(), page: n };
+	if (sh) hit.sheet = sh;
+	list.push(hit);
 }
 
 /** A storage path out of a src:: id, or null when the value is not one. */
@@ -161,7 +167,7 @@ function readHits(note: RetrievalNote, result: any): void {
 			return;
 		}
 		if (typeof node.path === 'string' && node.page !== undefined) {
-			pushHit(note.hits, node.path, node.page);
+			pushHit(note.hits, node.path, node.page, node.sheet);
 		}
 		for (var k in node) {
 			if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
@@ -353,8 +359,17 @@ export function formatRetrievalNote(note: RetrievalNote | null | undefined): str
 			if (!byFile[h.path]) { byFile[h.path] = []; order.push(h.path); }
 			byFile[h.path].push(h.page);
 		}
+		// A spreadsheet hit is named by its sheet: its page number is no place a reader can open.
+		var sheetsOf: Record<string, string[]> = {};
+		for (var s2 = 0; s2 < note.hits.length; s2++) {
+			var hs = note.hits[s2];
+			if (hs.sheet) {
+				if (!sheetsOf[hs.path]) sheetsOf[hs.path] = [];
+				if (sheetsOf[hs.path].indexOf(hs.sheet) === -1) sheetsOf[hs.path].push(hs.sheet);
+			}
+		}
 		parts.push('searchText hits ' + order.map(function (p) {
-			return p + ' p' + byFile[p].join(', p');
+			return sheetsOf[p] ? p + ' sheet ' + sheetsOf[p].join(', sheet ') : p + ' p' + byFile[p].join(', p');
 		}).join('; '));
 	}
 	if (note.tools.length) parts.push('tools ' + note.tools.join(', '));

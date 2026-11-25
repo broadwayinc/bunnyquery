@@ -45,7 +45,7 @@ import {
 	type BgTaskEntry,
 } from './requests';
 import { isPagedReadFile, isImageVisionFile, isWindowedReadFile } from './office';
-import { windowedIndexingEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream, resolveSkipDuplicateFiles, statusPushEnabled, statusPushLive, resolveForwardRequestStatus, resolveForwardRequestRead, resolveForwardRequestQueueCounters, reconcilerReadsEnabled, crefSupported } from './config';
+import { windowedIndexingEnabled, workerIndexEndingsEnabled, liveStreamingEnabled, streamRecoveryEnabled, chatEngineConfig, resolveForwardRequestFinalize, resolveForwardRequestStream, resolveSkipDuplicateFiles, statusPushEnabled, statusPushLive, resolveForwardRequestStatus, resolveForwardRequestRead, resolveForwardRequestQueueCounters, reconcilerReadsEnabled, crefSupported } from './config';
 // The reconciler's clock (one timer chain per page) and the cross-tab settle lock. What a
 // look reads and applies is this file's (_reconcileLook).
 import { LookScheduler, LOOK_STALE_MS, runSettleSideEffect, claimSideEffect, sideEffectDone, newClientRef, queueNameOf, type LookRequest, type LookOutcome, type LookTrigger } from './reconciler';
@@ -1311,6 +1311,9 @@ export class ChatSession {
 	private _recordLiveIndexKeys(lists: any[]): void {
 		var next: { [k: string]: boolean } = {};
 		var running: { [k: string]: boolean } = {};
+		// Every listed pending/running indexing row, locally settled or not (see _flipIfChainLost:
+		// a run the server still lists is never "lost", whatever this page's bubbles say).
+		var rawListed: { [k: string]: boolean } = {};
 		// A page that came back FULL is not a whole-queue answer: the query is capped
 		// and ordered newest-first, so a bulk upload of 40 files returns the 20 newest
 		// and omits the 20 about to run. Absence would then read as "finished" for
@@ -1347,6 +1350,11 @@ export class ChatSession {
 			for (var i = 0; i < list.length; i++) {
 				var item = list[i];
 				if (!item || (item.status !== 'pending' && item.status !== 'running')) continue;
+				var rawRef = parseIndexingRequestText(listedRequestText(item));
+				if (rawRef) {
+					if (rawRef.path) rawListed[rawRef.path] = true;
+					if (rawRef.name) rawListed[rawRef.name] = true;
+				}
 				if (item.id && settledIds[item.id]) continue;
 				// A compact listing (probeBgQueue) carries the label as request_text.
 				var text = listedRequestText(item);
@@ -1381,6 +1389,7 @@ export class ChatSession {
 			if (!changed) for (var r2 in wasRun) if (!running[r2]) { changed = true; break; }
 		}
 		this.state.liveIndexKeys = next;
+		this._rawListedIndexKeys = rawListed;
 		if (this.state.liveIndexRunningChecked !== !runningTruncated) changed = true;
 		// Files seen to LEAVE the queue: live in the previous look, absent from a complete
 		// one. Kept until the file is live again, so a later look that comes back cut off
@@ -5955,21 +5964,43 @@ export class ChatSession {
 	 * worker-driven file (the worker writes its endings), another user's run (their chain is
 	 * in their browser), or a run whose next pass is being looked for.
 	 */
-	private _flipIfChainLost(run: FileRun): void {
+	/** Files the last queue look listed pending or running, settled bubbles included. */
+	private _rawListedIndexKeys: { [k: string]: boolean } = {};
+	/** Runs found idle on one complete look, waiting for a second before "lost" (see below). */
+	private _lostLooks: { [k: string]: number } = {};
+	private _lostKey(run: FileRun): string { return run.projectId + '\u0000' + run.storagePath + '\u0000' + run.since; }
+
+	private _flipIfChainLost(run: FileRun): boolean {
 		var self = this;
-		if (!run.owner) return;
+		if (!run.owner) return false;
+		// The server still lists a pass of it (pending or running), under its path or its file
+		// name: not lost, whatever this page's bubbles say (2026-11-25: a TIF whose pass the
+		// worker was running was flipped by a chat page that had just opened).
+		var raw = this._rawListedIndexKeys || {};
+		if (raw[run.storagePath] || (run.filename && raw[run.filename])) {
+			delete this._lostLooks[this._lostKey(run)];
+			return true;
+		}
+		// Idle on TWO complete looks in a row, not one: the status index is eventually
+		// consistent, and one look can miss a row that was just written.
+		var lk = this._lostKey(run);
+		if (!this._lostLooks[lk]) { this._lostLooks[lk] = 1; return true; }
+		delete this._lostLooks[lk];
 		var live: ChatIdentity | null = null;
 		try { live = this.host.getIdentity(); } catch (e) { live = null; }
-		if (!live || !live.userId || live.userId !== run.owner || live.projectId !== run.projectId) return;
+		if (!live || !live.userId || live.userId !== run.owner || live.projectId !== run.projectId) return false;
 		var name = run.filename || run.storagePath.split('/').pop() || run.storagePath;
-		if (this._isWorkerDrivenIndexing(name, undefined)) return;
-		if (this._chainKept(run.projectId, run.storagePath)) return;
+		if (this._isWorkerDrivenIndexing(name, undefined)) return false;
+		// A single-pass file's ending is the worker's to write (index_end) once the host says
+		// every region's worker does so: nothing here may call it lost.
+		if (workerIndexEndingsEnabled() && !isPagedReadFile(name, undefined)) return false;
+		if (this._chainKept(run.projectId, run.storagePath)) return false;
 		for (var q = 0; q < this.bgTaskQueue.length; q++) {
 			var e = this.bgTaskQueue[q];
-			if (e && e.projectId === run.projectId && e.storagePath === run.storagePath) return;
+			if (e && e.projectId === run.projectId && e.storagePath === run.storagePath) return false;
 		}
 		if (this._recPending) for (var c in this._recPending) {
-			if (this._recPending[c].kind === 'indexing' && this._recPending[c].projectId === run.projectId) return;
+			if (this._recPending[c].kind === 'indexing' && this._recPending[c].projectId === run.projectId) return false;
 		}
 		var projectId = run.projectId, path = run.storagePath;
 		runSettleSideEffect(projectId, bgIndexingQueueName(live.userId, projectId), 'lost:' + projectId + ':' + path + ':' + run.since, function () {
@@ -5980,6 +6011,7 @@ export class ChatSession {
 					}
 				});
 		});
+		return false;
 	}
 
 	/** A file run the queue says is live, or that this page has a pass queued for. */
@@ -6011,8 +6043,9 @@ export class ChatSession {
 		var closed: string[] = [];
 		for (var k in runs) {
 			if (runs[k].projectId !== projectId || this._fileRunLive(runs[k])) continue;
+			// still listed by the server, or idle on only one look so far: kept open
+			if (this._flipIfChainLost(runs[k])) continue;
 			closed.push(runs[k].storagePath);
-			this._flipIfChainLost(runs[k]);
 			delete runs[k];
 			if (!this._fileRunsIdle) this._fileRunsIdle = {};
 			this._fileRunsIdle[k] = true;

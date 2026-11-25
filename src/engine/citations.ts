@@ -74,10 +74,18 @@ export function citationsFor(note: RetrievalNote | null | undefined): Citation[]
 	var out: Citation[] = [];
 	var hitPaths: string[] = [];
 	var byPath: Record<string, number[]> = {};
+	// spreadsheet hits: one chip per sheet, "file · sheet", no page (a sheet page is no place to open)
+	var sheetsByPath: Record<string, string[]> = {};
 	var i: number;
 	for (i = 0; i < note.hits.length; i++) {
 		var h: RetrievalHit = note.hits[i];
 		if (!h || typeof h.path !== 'string' || !isMintablePath(h.path)) continue;
+		if (typeof h.sheet === 'string' && h.sheet) {
+			if (!byPath[h.path]) { byPath[h.path] = []; hitPaths.push(h.path); }
+			if (!sheetsByPath[h.path]) sheetsByPath[h.path] = [];
+			if (sheetsByPath[h.path].indexOf(h.sheet) === -1) sheetsByPath[h.path].push(h.sheet);
+			continue;
+		}
 		var page = typeof h.page === 'number' ? h.page : Number(h.page);
 		if (!isFinite(page) || page <= 0) continue;
 		page = Math.floor(page);
@@ -86,6 +94,10 @@ export function citationsFor(note: RetrievalNote | null | undefined): Citation[]
 	}
 	for (i = 0; i < hitPaths.length; i++) {
 		var p = hitPaths[i];
+		var sheets = sheetsByPath[p] || [];
+		for (var sj = 0; sj < sheets.length; sj++) {
+			out.push({ path: p, label: citationFileName(p) + ' · ' + sheets[sj] });
+		}
 		var pages = byPath[p].slice().sort(function (a, b) { return a - b; });
 		for (var j = 0; j < pages.length; j++) {
 			out.push({ path: p, page: pages[j], label: citationLabel(p, pages[j]) });

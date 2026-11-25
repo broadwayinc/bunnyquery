@@ -142,6 +142,16 @@ export interface ChatEngineConfig {
      */
     windowedIndexing?: boolean;
     /**
+     * The worker writes the ending (done:: and run::) of a file read in ONE pass (an image,
+     * or any file not rendered, windowed or paged), as it does for paged chains: the engine
+     * then no longer marks such a run "Indexing stopped ... (the page was closed)" when no
+     * page here kept its chain. The engine always sends the request flag (index_end); this
+     * switch only stops the client-side "lost" verdict. Turn it on only once every region's
+     * worker and polling-recovery Lambda carry the 2026-11-25 change: with an older worker
+     * a page closed mid-pass would leave the run 'working'. Off unless true.
+     */
+    workerIndexEndings?: boolean;
+    /**
      * Mint the durable "indexing finished" marker record ("done::<path>",
      * reference "src::<path>", table __INDEXING__ — same shape the backend
      * worker writes via /internal/index-complete) for runs whose completion
@@ -518,6 +528,10 @@ export function crefSupported(): boolean {
 /** True when the consumer has opted in to server-driven windowed indexing. */
 export function windowedIndexingEnabled(): boolean {
     return _config?.windowedIndexing === true;
+}
+
+export function workerIndexEndingsEnabled(): boolean {
+    return _config?.workerIndexEndings === true;
 }
 
 /** True when the consumer has opted in to live streaming of chat turns. */

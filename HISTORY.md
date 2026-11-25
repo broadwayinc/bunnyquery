@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.1**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.2**. The latest version on npm
   when this was written is 1.20.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,13 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.2 (2026-11-25, not yet published)
+
+Spreadsheets in search, and image indexing that survives a closed page.
+
+- **Spreadsheet hits.** With the 2026-11-25 MCP server a spreadsheet's sheets are page text too (one page per block of rows; a hit carries `sheet`, `rows`, `row_id_prefix` and `row_text`, the matching row). Citation chips name the sheet ("quote.xlsx · 총괄") instead of a page number, one chip per sheet; the retrieval note keeps the sheet and gives a sheet one slot. The chat prompt sends a question that names a code, number or phrase to `searchText` first, says a document title or quote is not a file name, cites a sheet hit by file and sheet, and keeps totals computed from the full row set.
+- **`workerIndexEndings` (new, off by default; bunnyquery.com on).** A file read in one pass (an image, or any file not rendered, windowed or paged) now carries `index_end` on its `_skapi_file_urls` entry, and a 2026-11-25 worker writes its done marker and run status itself. With the switch on, the engine no longer marks such a run "Indexing stopped ... (the page was closed)". For every file, a run the server still lists as pending or running (by path or file name) is never marked lost, and a run must be idle on two complete looks in a row before it is.
 
 ## 1.21.1 (2026-11-25, not yet published)
 

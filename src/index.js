@@ -6067,6 +6067,10 @@ import {
             // Server-driven windowed indexing; read at configureChatEngine time.
             // Listed here so the defaults object is the full opt surface.
             windowedIndexing: true,
+            // The worker writes the ending of a file read in one pass (an image); see the
+            // engine's configureChatEngine `workerIndexEndings`. Opt-in until every region's
+            // worker carries it.
+            workerIndexEndings: false,
             // Deliver the streamed reply over skapi's WEBSOCKET as well as the poll.
             // OFF unless the embedder asks, because this widget runs on someone else's
             // page with someone else's skapi instance: skapi's joinRealtime REPLACES
@@ -6219,6 +6223,8 @@ import {
             // MAX_INDEXING_RESUME_PASSES, which needs the tab kept open and stops early
             // on a big file. Pass windowedIndexing: false in init opts to opt back out.
             windowedIndexing: S.opts.windowedIndexing !== false,
+            // single-pass files: the worker writes their done:: / run:: (opt-in, see defaults)
+            workerIndexEndings: S.opts.workerIndexEndings === true,
             // Client-side attachment parsers (e.g. an .hwp parser) passed via init opts.
             attachmentParsers: S.opts.attachmentParsers || undefined,
             // Web access for chat answers. Handed over ONLY when the embedder
