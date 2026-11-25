@@ -67,6 +67,7 @@ import type { ChatMessage, IndexingFileRef } from './host';
 import { isPagedReadFile, isImageVisionFile } from './office';
 import { windowedIndexingEnabled } from './config';
 import { MAX_INDEXING_RESUME_PASSES } from './requests';
+import { messageTimeMs } from './time';
 
 export type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
 
@@ -542,8 +543,12 @@ export function buildChatDisplayList(
 			// label-only behaviour stands, so the re-index case is unchanged.
 			var openId = openRunOfKey[key];
 			var notLater = false;
-			if (openId && typeof msg._ts === 'number' && typeof newestTsOfRun[openId] === 'number') {
-				notLater = (msg._ts as number) <= newestTsOfRun[openId];
+			// A message's time is its _ts, else its request id's (messageTimeMs): a live
+			// worker pass adopted from the queue has no _ts, and without a time on both
+			// sides an OLDER first pass loaded after it split the run in two (2026-11-25).
+			var msgTime = messageTimeMs(msg);
+			if (openId && msgTime > 0 && typeof newestTsOfRun[openId] === 'number') {
+				notLater = msgTime <= newestTsOfRun[openId];
 			}
 			if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
 			runId = openRunOfKey[key];
@@ -567,9 +572,10 @@ export function buildChatDisplayList(
 		// or a response whose request is not loaded) stays an ordinary message
 		// rather than being folded into whichever group happens to be nearest.
 		if (!runId) continue;
-		if (typeof msg._ts === 'number') {
+		var memberTime = messageTimeMs(msg);
+		if (memberTime > 0) {
 			var prevTs = newestTsOfRun[runId];
-			if (typeof prevTs !== 'number' || (msg._ts as number) > prevTs) newestTsOfRun[runId] = msg._ts as number;
+			if (typeof prevTs !== 'number' || memberTime > prevTs) newestTsOfRun[runId] = memberTime;
 		}
 
 		var g = groups[runId];

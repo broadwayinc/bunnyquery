@@ -3020,6 +3020,57 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return `[POST]${url.toLowerCase()}#${service}:${itemId}`;
   }
 
+  // src/engine/time.ts
+  function wallClockNow() {
+    return Date.now();
+  }
+  function formatChatTimestamp(ms) {
+    if (typeof ms !== "number" || !isFinite(ms) || ms <= 0) return "";
+    try {
+      return new Date(ms).toLocaleString(void 0, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit"
+      });
+    } catch (e) {
+      return "";
+    }
+  }
+  function formatDuration(ms) {
+    if (typeof ms !== "number" || !isFinite(ms) || ms < 1e3) return "";
+    var total = Math.floor(ms / 1e3);
+    var h = Math.floor(total / 3600);
+    var m = Math.floor(total % 3600 / 60);
+    var s = total % 60;
+    var out = [];
+    if (h) out.push(h + "h");
+    if (m) out.push(m + "m");
+    out.push(s + "s");
+    return out.join(" ");
+  }
+  function requestIdTimeMs(rid) {
+    if (typeof rid !== "string") return 0;
+    var stamp = rid.split(":")[0] || "";
+    if (stamp.length !== 13) return 0;
+    var alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var v = 0;
+    for (var i = 0; i < stamp.length; i++) {
+      var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
+      if (d < 0) return 0;
+      v = v * 32 + d;
+    }
+    return Math.floor(v / 2 / 1e6);
+  }
+  function messageTimeMs(m) {
+    if (!m) return 0;
+    var r = typeof m._serverItemId === "string" ? requestIdTimeMs(m._serverItemId) : 0;
+    if (r > 0) return r;
+    return typeof m._ts === "number" && m._ts > 0 ? m._ts : 0;
+  }
+
   // src/engine/indexing_groups.ts
   function canonIndexKey(s) {
     return typeof s === "string" && s ? s.trim() : "";
@@ -3130,8 +3181,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var alreadySeen = !!(msg._serverItemId && runByItemId[msg._serverItemId]);
         var openId = openRunOfKey[key];
         var notLater = false;
-        if (openId && typeof msg._ts === "number" && typeof newestTsOfRun[openId] === "number") {
-          notLater = msg._ts <= newestTsOfRun[openId];
+        var msgTime = messageTimeMs(msg);
+        if (openId && msgTime > 0 && typeof newestTsOfRun[openId] === "number") {
+          notLater = msgTime <= newestTsOfRun[openId];
         }
         if (!ref.continued && !alreadySeen && !notLater && openRunOfKey[key]) delete openRunOfKey[key];
         runId = openRunOfKey[key];
@@ -3145,9 +3197,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         runId = runOfIndex[i - 1];
       }
       if (!runId) continue;
-      if (typeof msg._ts === "number") {
+      var memberTime = messageTimeMs(msg);
+      if (memberTime > 0) {
         var prevTs = newestTsOfRun[runId];
-        if (typeof prevTs !== "number" || msg._ts > prevTs) newestTsOfRun[runId] = msg._ts;
+        if (typeof prevTs !== "number" || memberTime > prevTs) newestTsOfRun[runId] = memberTime;
       }
       var g = groups[runId];
       if (!g) {
@@ -4050,38 +4103,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var closest = img.closest;
     if (typeof closest !== "function") return img;
     return closest.call(img, PREVIEW_LAYOUT_BOX_SELECTOR) || img;
-  }
-
-  // src/engine/time.ts
-  function wallClockNow() {
-    return Date.now();
-  }
-  function formatChatTimestamp(ms) {
-    if (typeof ms !== "number" || !isFinite(ms) || ms <= 0) return "";
-    try {
-      return new Date(ms).toLocaleString(void 0, {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-        second: "2-digit"
-      });
-    } catch (e) {
-      return "";
-    }
-  }
-  function formatDuration(ms) {
-    if (typeof ms !== "number" || !isFinite(ms) || ms < 1e3) return "";
-    var total = Math.floor(ms / 1e3);
-    var h = Math.floor(total / 3600);
-    var m = Math.floor(total % 3600 / 60);
-    var s = total % 60;
-    var out = [];
-    if (h) out.push(h + "h");
-    if (m) out.push(m + "m");
-    out.push(s + "s");
-    return out.join(" ");
   }
 
   // src/engine/ai_agent.ts
@@ -5647,19 +5668,6 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   }
   var LIVE_PAINT_MIN_MS = 250;
   var LIVE_TYPE_MAX_STEP = 1200;
-  function requestIdTimeMs(rid) {
-    if (typeof rid !== "string") return 0;
-    var stamp = rid.split(":")[0] || "";
-    if (stamp.length !== 13) return 0;
-    var alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    var v = 0;
-    for (var i = 0; i < stamp.length; i++) {
-      var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
-      if (d < 0) return 0;
-      v = v * 32 + d;
-    }
-    return Math.floor(v / 2 / 1e6);
-  }
   var WRONG_ANSWER_MESSAGE = "This answer seems wrong. Please check it again against the documents.";
   var WRONG_ANSWER_LABEL = "Wrong answer?";
   function canReportWrongAnswer(msg) {
@@ -11587,15 +11595,18 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         self.updateHistoryCache();
       });
     }
-    /** Insert bubbles before the first message that is newer than them (by `_ts`); messages
-     *  without a time are skipped over, and the end of the list takes them otherwise. */
+    /** Insert bubbles before the first message that is newer than them; messages whose time
+     *  is unknown are skipped over, and the end of the list takes them otherwise. A message's
+     *  time is its `_ts`, else (2026-11-25) the time in its request id: a live worker pass
+     *  adopted from the queue carries no `_ts`, and a file's older passes loaded by opening its
+     *  row (loadRunPasses) used to land AFTER it, which split one run into two rows. */
     _insertByTime(bubbles) {
-      var at = bubbles[0] && bubbles[0]._ts;
+      var at = messageTimeMs(bubbles[0]);
       var idx = this.state.messages.length;
-      if (typeof at === "number") {
+      if (at > 0) {
         for (var i = 0; i < this.state.messages.length; i++) {
-          var t = this.state.messages[i] && this.state.messages[i]._ts;
-          if (typeof t === "number" && t > at) {
+          var t = messageTimeMs(this.state.messages[i]);
+          if (t > 0 && t > at) {
             idx = i;
             break;
           }
@@ -13159,7 +13170,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
-    var BQ_VERSION = "1.21.3" ;
+    var BQ_VERSION = "1.21.4" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

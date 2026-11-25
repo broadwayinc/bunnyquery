@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.3**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.4**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.4 (2026-11-25, not yet published)
+
+- **Opening an indexing row no longer splits it in two.** A file indexed by the worker over many passes, opened while a later pass was running, showed two rows: one with the page count, Stop and "The steps of this indexing run were not recorded", and a second "N passes" row with the steps. The steps loaded on opening were placed after the live pass (which has no timestamp), and the grouping then read the older first pass as a new run. Steps and passes are now ordered by the time in their request id (the server clock; new `messageTimeMs` / `requestIdTimeMs` in the time helpers, `_ts` only for a message without one), both when loaded steps are inserted and when passes are grouped, so a live pass with no timestamp, or a browser clock ahead of the server, can no longer split or merge runs. Both clients.
 
 ## 1.21.3 (2026-11-25, not yet published)
 

@@ -61,3 +61,39 @@ export function formatDuration(ms?: number): string {
 	out.push(s + 's');
 	return out.join(' ');
 }
+
+/**
+ * Creation time (ms epoch) of a request id "stamp:entropy", whose stamp is a time_ns written
+ * as 8 bytes of base32hex without padding (the worker's and the producer's _generate_req_id).
+ * 0 when it is not one.
+ */
+export function requestIdTimeMs(rid: string): number {
+	if (typeof rid !== 'string') return 0;
+	var stamp = rid.split(':')[0] || '';
+	if (stamp.length !== 13) return 0;
+	var alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
+	var v = 0;
+	for (var i = 0; i < stamp.length; i++) {
+		var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
+		if (d < 0) return 0;
+		v = v * 32 + d;
+	}
+	// 13 digits are 65 bits for 64 of data: the last bit is padding.
+	return Math.floor(v / 2 / 1e6);
+}
+
+/**
+ * A chat message's time in epoch ms, for ORDERING and grouping (never for display): the time
+ * in its request id (`_serverItemId`, "stamp:entropy", the server's clock) when it has one,
+ * else its `_ts`, else 0 (unknown). Request-id first so every comparison uses one clock: a
+ * live-settled reply's `_ts` is the browser's Date.now(), and mixing the two let a browser
+ * running ahead of the server fold a re-index into the previous run. A request and its reply
+ * share one id, so nothing is ever ordered between them. A live background pass adopted from
+ * the queue has no `_ts` at all until it settles.
+ */
+export function messageTimeMs(m: { _ts?: number; _serverItemId?: string } | null | undefined): number {
+	if (!m) return 0;
+	var r = typeof m._serverItemId === 'string' ? requestIdTimeMs(m._serverItemId) : 0;
+	if (r > 0) return r;
+	return typeof m._ts === 'number' && m._ts > 0 ? m._ts : 0;
+}

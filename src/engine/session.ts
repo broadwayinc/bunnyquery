@@ -59,7 +59,7 @@ import { retrievalNoteOfAnswer, answerUsedNoDataTool } from './citations';
 import { createInlineLinkRegex, sanitizeAttachmentLinksForHistory } from './links';
 import { markImagePreviewStale } from './image_preview';
 import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, listedRequestText, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, fetchLiveIndexingKeys, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage, adoptLiveTextIntoRunningRow } from './history';
-import { wallClockNow } from './time';
+import { wallClockNow, requestIdTimeMs, messageTimeMs } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext, IndexQueueSnapshot } from './host';
 import type { IndexingGroup } from './indexing_groups';
@@ -839,25 +839,8 @@ type LiveStreamState = {
 	transport: { socket: number; poll: number };
 };
 
-/**
- * Creation time (ms epoch) of a request id "stamp:entropy", whose stamp is a time_ns written
- * as 8 bytes of base32hex without padding (the worker's and the producer's _generate_req_id).
- * 0 when it is not one.
- */
-export function requestIdTimeMs(rid: string): number {
-	if (typeof rid !== 'string') return 0;
-	var stamp = rid.split(':')[0] || '';
-	if (stamp.length !== 13) return 0;
-	var alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
-	var v = 0;
-	for (var i = 0; i < stamp.length; i++) {
-		var d = alphabet.indexOf(stamp.charAt(i).toUpperCase());
-		if (d < 0) return 0;
-		v = v * 32 + d;
-	}
-	// 13 digits are 65 bits for 64 of data: the last bit is padding.
-	return Math.floor(v / 2 / 1e6);
-}
+// requestIdTimeMs lives in time.ts (2026-11-25: indexing_groups.ts needs it too); re-exported here.
+export { requestIdTimeMs };
 
 /** The visible message the "Wrong answer?" button sends. The chat prompt's WRONG ANSWER rule reacts to it. */
 export var WRONG_ANSWER_MESSAGE = 'This answer seems wrong. Please check it again against the documents.';
@@ -7602,15 +7585,18 @@ export class ChatSession {
 		});
 	}
 
-	/** Insert bubbles before the first message that is newer than them (by `_ts`); messages
-	 *  without a time are skipped over, and the end of the list takes them otherwise. */
+	/** Insert bubbles before the first message that is newer than them; messages whose time
+	 *  is unknown are skipped over, and the end of the list takes them otherwise. A message's
+	 *  time is its `_ts`, else (2026-11-25) the time in its request id: a live worker pass
+	 *  adopted from the queue carries no `_ts`, and a file's older passes loaded by opening its
+	 *  row (loadRunPasses) used to land AFTER it, which split one run into two rows. */
 	private _insertByTime(bubbles: ChatMessage[]): void {
-		var at = bubbles[0] && bubbles[0]._ts;
+		var at = messageTimeMs(bubbles[0]);
 		var idx = this.state.messages.length;
-		if (typeof at === 'number') {
+		if (at > 0) {
 			for (var i = 0; i < this.state.messages.length; i++) {
-				var t = this.state.messages[i] && this.state.messages[i]._ts;
-				if (typeof t === 'number' && t > at) { idx = i; break; }
+				var t = messageTimeMs(this.state.messages[i]);
+				if (t > 0 && t > at) { idx = i; break; }
 			}
 		}
 		Array.prototype.splice.apply(this.state.messages, ([idx, 0] as any[]).concat(bubbles));
