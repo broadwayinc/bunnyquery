@@ -247,6 +247,14 @@ picture** and **reads any text in it (OCR)**. Works on both Claude and OpenAI.
 Only images referenced in the **most recent** message are inlined (older links
 may have expired).
 
+When an image file is indexed, the model transcribes every character at whatever
+angle it sits and reports how the text is turned (`text_rotation`). With the
+2026-11-25 skapi worker, a photo whose orientation tag or format the AI would
+misread (a sideways phone photo, a `.tif` or `.bmp` scan) goes out as an upright
+converted copy, a photo whose text is still turned gets one second look turned
+upright, and the transcription is stored as the file's page text, so a search for
+a serial or part number finds the photo. This applies to new and re-indexed files.
+
 ### 2. PDFs: text pages as text, the rest as page images
 
 `.pdf`
@@ -273,7 +281,7 @@ search it for an exact phrase or number and cite the page.
 
 ```
 .xls .xlsx .xlsm           grids: rows stored by the server directly, plus embedded photos
-.ods                       OpenDocument sheets: character windows, plus photos
+.ods                       OpenDocument sheets: rows stored by the server, like .xlsx
 .csv .tsv .tab             row-bounded windows with absolute row numbers
 .doc .docx .docm           word processor documents
 .ppt .pptx .pptm           slide decks
@@ -305,6 +313,12 @@ Spreadsheet rows take a shorter road still: the server reads the sheet and store
 one record per row itself, with no model call and no tokens spent on the rows.
 Word, text and e-mail windows are read in parallel lanes like PDF pages, and a
 project indexes up to three documents at once.
+
+A document whose pages are pictures (a scanned `.hwpx`, `.hwp`, `.docx`, `.pptx`,
+`.odt` and so on, with no text or only a title) is read like a scanned PDF: with
+the 2026-11-25 skapi worker, each page-sized picture is shown to the model as a
+page, and its transcription is stored as that page's text. This applies to new and
+re-indexed files.
 
 ### 4. Everything else extractable: inlined as text server-side
 

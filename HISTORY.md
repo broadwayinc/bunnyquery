@@ -5,8 +5,8 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.2**. The latest version on npm
-  when this was written is 1.20.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
+- **Published vs built.** The source tree is at **1.21.3**. The latest version on npm
+  when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
 - **Gap between 1.8.0 and 1.10.0.** Versions 1.8.1 to 1.9.12 shipped without
@@ -25,6 +25,14 @@ A few notes on how to read this:
 
 ---
 
+## 1.21.3 (2026-11-25, not yet published)
+
+Pictures read as text at indexing, and fewer lookups before a search.
+
+- **Image files.** An image file indexed in one pass is now asked to transcribe every character at whatever angle it sits, to put every identifier (serial, part number, tag) in `printed_text` or `handwritten_text`, and to report `text_rotation` and `text_legibility` on its `src::` record. A 2026-11-25 worker turns a turned or tagged photo upright for the model, stores its text as page 1 of the file's page text (so `searchText` finds it), and takes one second look when the text was turned. A .tif, .tiff, .bmp or .heic file is never claimed as attached unless the server attached a converted copy. On OpenAI the file entry carries the model's image `detail`. Applies to new and re-indexed files.
+- **Scanned documents.** No engine change: with the 2026-11-25 worker, a document whose pages are pictures (a scanned .hwpx, .docx and so on) is read page by page through vision, and its page text is searchable like a PDF's.
+- **Chat.** The chat prompt no longer lists or looks up files (`getUniqueId` on `src::`) to check whether a document, quote or title exists before searching: `searchText`'s hits name the file.
+
 ## 1.21.2 (2026-11-25, not yet published)
 
 Spreadsheets in search, and image indexing that survives a closed page.
@@ -40,7 +48,7 @@ Faster document answers in the chat.
 - **Widget: `reuseMcpToolList` on by default.** OpenAI chat turns carry the MCP tool listing an earlier turn got, so OpenAI skips the four-request tool handshake with the MCP server. Verified on a live OpenAI chat on dev: the second turn sent only `initialize` before its first tool call. Pass `reuseMcpToolList: false` to turn it off. The engine's own default stays off; bunnyquery.com turns it on in its `configureChatEngine`.
 - Works with any MCP server. With the 2026-11-25 MCP server, a glossary search result also carries the full text of its top hit pages (`page_text`), and `readFileContent` gives scanned PDF pages and image files as their indexed text.
 
-## 1.21.0 (2026-11-24, not yet published)
+## 1.21.0 (2026-11-24)
 
 The chat follows every unfinished request from the server (the reconciler), so it is right after the user comes back from sleep, other tabs or a network loss. Needs skapi-js 2.7.0 and the backend reads in infra (older ones fall back to polls).
 

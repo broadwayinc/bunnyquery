@@ -573,6 +573,19 @@ export type ClaudeMcpServerRequest = {
 const IMAGE_URL_REGEX =
 	/\bhttps?:\/\/[^\s<>"'()\[\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"'()\[\]]*)?/gi;
 
+// An IMAGE file being indexed (2026-11-25), and whether its indexing message carries it as an
+// image block. 'attached' only when the file's URL is one IMAGE_URL_REGEX turns into a block
+// (so the message never claims a picture that is not there); 'maybe' for an image format the
+// providers do not take, which a newer worker attaches as a converted copy and an older one
+// does not attach at all; undefined for every other file.
+const INDEX_IMAGE_OTHER_EXT = /\.(?:tiff?|bmp|heic|heif)$/i;
+function indexingImageFile(attachment: { name?: string; storagePath?: string; url?: string }): 'attached' | 'maybe' | undefined {
+	const url = typeof attachment.url === 'string' ? attachment.url : '';
+	if (url && new RegExp(IMAGE_URL_REGEX.source, 'i').test(url)) return 'attached';
+	if (INDEX_IMAGE_OTHER_EXT.test(attachment.name || '') || INDEX_IMAGE_OTHER_EXT.test(attachment.storagePath || '')) return 'maybe';
+	return undefined;
+}
+
 export function transformContentWithImages(
 	content: string,
 ): string | Array<Record<string, any>> {
@@ -1404,8 +1417,23 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	// the ending itself (an older worker ignores the key). The client still writes its own,
 	// with the same verdict rule, so the two never disagree.
 	const singlePass = !visionFile && !windowedRead && !pagedRead && !continuing;
+	// An IMAGE file read in this one pass (2026-11-25): its message asks for a transcription at
+	// any angle plus text_rotation, and claims an attached image only when this engine attaches
+	// one (see indexingImageFile). On OpenAI the entry also carries the image `detail` the
+	// model takes, for the image block a newer worker adds for a converted TIFF (an older
+	// worker ignores the key).
+	const imageFile = singlePass && !parsedContent && !serverExtract ? indexingImageFile(attachment) : undefined;
+	const fileUrlDetail = imageFile && platform === 'openai'
+		? getOpenAIImageDetail(info.model || DEFAULT_OPENAI_MODEL)
+		: undefined;
 	const skapiFileUrls = attachment.url && attachment.storagePath
-		? { _skapi_file_urls: [{ path: attachment.storagePath, url: attachment.url, ...(singlePass ? { index_end: true } : {}) }] }
+		? {
+			_skapi_file_urls: [{
+				path: attachment.storagePath, url: attachment.url,
+				...(singlePass ? { index_end: true } : {}),
+				...(fileUrlDetail ? { detail: fileUrlDetail } : {}),
+			}],
+		}
 		: {};
 
 	const userMessage = (visionFile && renderPlaceholder)
@@ -1422,7 +1450,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 						? { inlineContentPlaceholder: placeholder }
 						: pagedRead
 							? { pagedRead: true }
-							: undefined,
+							: imageFile
+								? { imageFile }
+								: undefined,
 			);
 
 	const systemPrompt = buildIndexingSystemPrompt({

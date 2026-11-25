@@ -56,6 +56,13 @@ export type BuildIndexingUserMessageOptions = {
 	 * message instructs the agent to page through EVERY window and datafy each.
 	 */
 	pagedRead?: boolean;
+	/**
+	 * An IMAGE file (2026-11-25). 'attached': the engine attaches it to this message as an
+	 * image block (jpg/jpeg/png/gif/webp, the ones its image-URL pattern matches). 'maybe': a
+	 * format the providers do not take (tif/tiff/bmp/heic); a newer worker attaches a
+	 * converted copy, an older one attaches nothing, so the message never claims a picture.
+	 */
+	imageFile?: 'attached' | 'maybe';
 };
 
 /**
@@ -148,6 +155,19 @@ export function buildIndexingUserMessage(
 			`Page through EVERY window: for each window SAVE records for its rows/items/pages (postRecords, one record per row/item; spreadsheet rows in "spreadsheet_rows", everything else in "document_entries"), THEN if the window says MORE REMAINS call readFileContent again with the cursor it gives you. Repeat until it says END OF FILE, so the WHOLE file is indexed. ` +
 			`Do NOT stop after the first window and do NOT just write a summary. Set every record's reference to exactly "src::" + the storage path above; that file record already exists, so enrich it with updateRecords instead of posting it again.` +
 			(attachment.url ? `\n(A temporary URL is provided ONLY as a fallback if readFileContent fails: ${attachment.url})` : '')
+		);
+	}
+
+	if (options?.imageFile) {
+		// The URL line stays: the engine builds the image block from the URL it finds in this
+		// text. The fields named here are the ones the worker writes as the image's page text.
+		return (
+			head +
+			`- temporary URL: ${attachment.url}\n` +
+			(options.imageFile === 'attached'
+				? `\nThis is an IMAGE file, attached to this message as an image: read it there, not from the URL. `
+				: `\nThis is an IMAGE file in a format the AI cannot take directly. When an image of it is attached to this message (the server converts it when it can), read it there; when none is attached, index the file from its metadata only and do not guess its contents. `) +
+			`Transcribe every character FIRST, at whatever angle the text is: "printed_text", "handwritten_text", and "part_no" / "serial_no" / "tag_id", with every identifier also written inside "printed_text" or "handwritten_text". Then set "text_rotation" and "text_legibility" on the file's "src::" record, and only then describe what the image shows.`
 		);
 	}
 

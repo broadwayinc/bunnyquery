@@ -1385,6 +1385,13 @@ type BuildIndexingUserMessageOptions = {
      * message instructs the agent to page through EVERY window and datafy each.
      */
     pagedRead?: boolean;
+    /**
+     * An IMAGE file (2026-11-25). 'attached': the engine attaches it to this message as an
+     * image block (jpg/jpeg/png/gif/webp, the ones its image-URL pattern matches). 'maybe': a
+     * format the providers do not take (tif/tiff/bmp/heic); a newer worker attaches a
+     * converted copy, an older one attaches nothing, so the message never claims a picture.
+     */
+    imageFile?: 'attached' | 'maybe';
 };
 /**
  * The access group to write this file's records at. One place, so the user
