@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.0**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.1**. The latest version on npm
   when this was written is 1.20.1. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,14 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.1 (2026-11-25, not yet published)
+
+Faster document answers in the chat.
+
+- **Chat prompt, documents.** A question about what the documents say (a procedure, a passage, a definition, how to fix or do something) now starts with `searchText`, without `getTables` or a file lookup first. A named file is found by its `src::` record and then searched with its path; a named spreadsheet is read by its rows, since it has no page text. `getFileOutline` is now a fallback, used only when a search of the whole file gives too many hits or none that fit. On the MRO DB logs those first calls cost 0.4 to 3.6 s each, plus a model step.
+- **Widget: `reuseMcpToolList` on by default.** OpenAI chat turns carry the MCP tool listing an earlier turn got, so OpenAI skips the four-request tool handshake with the MCP server. Verified on a live OpenAI chat on dev: the second turn sent only `initialize` before its first tool call. Pass `reuseMcpToolList: false` to turn it off. The engine's own default stays off; bunnyquery.com turns it on in its `configureChatEngine`.
+- Works with any MCP server. With the 2026-11-25 MCP server, a glossary search result also carries the full text of its top hit pages (`page_text`), and `readFileContent` gives scanned PDF pages and image files as their indexed text.
 
 ## 1.21.0 (2026-11-24, not yet published)
 

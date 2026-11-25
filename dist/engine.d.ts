@@ -617,8 +617,8 @@ interface ChatEngineConfig {
      * `mcp_list_tools` item and OpenAI skips asking the MCP server for its tools again
      * (four sequential requests, about 0.6 s before the model starts).
      *
-     * OFF unless set to `true`. Leave it off until one real OpenAI chat on a dev project
-     * has answered with it on: an account that refuses the item fails one turn, after
+     * OFF unless set to `true` (the widget and bunnyquery.com set it; verified on a live
+     * OpenAI chat 2026-11-25). An account that refuses the item fails one turn, after
      * which reuse stays off for that project in this browser. Costs when on: each
      * reused turn's request body, and so its stored history row, is about 31 to 34 KB
      * larger (the tool list), which also comes back with every history page.
