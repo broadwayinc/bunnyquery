@@ -316,6 +316,7 @@ export {
 	// response extraction
 	extractClaudeText,
 	extractOpenAIText,
+	providerDocument,
 	// content transforms
 	transformContentWithImages,
 	transformContentWithOpenAIImages,

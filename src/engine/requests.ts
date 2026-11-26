@@ -1609,7 +1609,27 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	}));
 }
 
+/**
+ * A provider answer that arrives as its JSON TEXT, read as the document it is. The worker
+ * stores the answer it writes itself (a linked copy's "Same content as ...", identical.ts
+ * parseLinkedReply) as a JSON string, and a status read hands that body back unparsed, so
+ * the live row read no text from it until a reload brought the server's response_text.
+ * Anything else is handed back as it came.
+ */
+export function providerDocument(response: any): any {
+	if (typeof response !== 'string') return response;
+	var t = response.trim();
+	if (t.charAt(0) !== '{' || t.charAt(t.length - 1) !== '}') return response;
+	try {
+		var doc = JSON.parse(t);
+		return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : response;
+	} catch (e) {
+		return response;
+	}
+}
+
 export function extractClaudeText(response: any) {
+	response = providerDocument(response);
 	if (!Array.isArray(response?.content)) {
 		return '';
 	}
@@ -1621,6 +1641,7 @@ export function extractClaudeText(response: any) {
 }
 
 export function extractOpenAIText(response: any) {
+	response = providerDocument(response);
 	if (
 		typeof response?.output_text === 'string' &&
 		response.output_text.length

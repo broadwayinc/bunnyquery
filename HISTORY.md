@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.11**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.12**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.12 (2026-11-26, not yet published)
+
+- **A copy linked while the widget is open says so at once.** The worker stores the answer it writes for a linked copy ("Same content as A: linked in 0.9 s, no AI used") as JSON text, and the status read hands that body back unparsed, so `extractOpenAIText` / `extractClaudeText` read no text from it: the widget's live row said "Indexed" without its "Same content as ..." line until a reload. Both now read a provider answer that arrives as its JSON text (`providerDocument`, exported), so every live path (settle, catch-up, load more, recovery) gets the text and the row its line from the shared `indexGroupLinkedLabel`.
 
 ## 1.21.11 (2026-11-26, not yet published)
 

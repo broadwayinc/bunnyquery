@@ -3041,13 +3041,26 @@ async function notifyAgentSaveAttachment(info) {
     }
   }));
 }
+function providerDocument(response) {
+  if (typeof response !== "string") return response;
+  var t = response.trim();
+  if (t.charAt(0) !== "{" || t.charAt(t.length - 1) !== "}") return response;
+  try {
+    var doc = JSON.parse(t);
+    return doc && typeof doc === "object" && !Array.isArray(doc) ? doc : response;
+  } catch (e) {
+    return response;
+  }
+}
 function extractClaudeText(response) {
+  response = providerDocument(response);
   if (!Array.isArray(response?.content)) {
     return "";
   }
   return response.content.filter((block) => block?.type === "text").map((block) => block.text).join("\n");
 }
 function extractOpenAIText(response) {
+  response = providerDocument(response);
   if (typeof response?.output_text === "string" && response.output_text.length) {
     return response.output_text;
   }
@@ -14203,6 +14216,7 @@ exports.projectUploadAccessGroup = projectUploadAccessGroup;
 exports.projectWebAccess = projectWebAccess;
 exports.promotableCopies = promotableCopies;
 exports.providerBodyWasRead = providerBodyWasRead;
+exports.providerDocument = providerDocument;
 exports.readExpiredAttachmentHref = readExpiredAttachmentHref;
 exports.readyProjectSettings = readyProjectSettings;
 exports.reconcilerReadsEnabled = reconcilerReadsEnabled;
