@@ -3203,6 +3203,16 @@ function formatDuration(ms) {
   out.push(s + "s");
   return out.join(" ");
 }
+function formatIndexDuration(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 1e3) return "";
+  var total = Math.floor(ms / 1e3);
+  var h = Math.floor(total / 3600);
+  var m = Math.floor(total % 3600 / 60);
+  var s = total % 60;
+  if (h) return h + " h" + (m ? " " + m + " min" : "");
+  if (m) return m + " min" + (s ? " " + s + " s" : "");
+  return s + " s";
+}
 function requestIdTimeMs(rid) {
   if (typeof rid !== "string") return 0;
   var stamp = rid.split(":")[0] || "";
@@ -3300,6 +3310,46 @@ function overlayRunRecordVerdict(grp, rec, liveIndexKeys) {
   grp.finished = true;
   grp.resolving = false;
   grp.resolvingReason = void 0;
+}
+function runRecordDurationMs(rec) {
+  if (!rec || rec.status !== "done") return void 0;
+  var a = rec.started;
+  var b = rec.finished;
+  if (typeof a !== "number" || typeof b !== "number" || !isFinite(a) || !isFinite(b) || b < a) return void 0;
+  return b - a;
+}
+var RUN_DURATION_CLOCK_SLACK_MS = 6e4;
+var RUN_DURATION_SERVER_SLACK_MS = 5e3;
+function runRecordGroupDurationMs(grp, rec) {
+  if (rec.status !== "done" || !grp.members.length) return void 0;
+  var fin = rec.finished;
+  if (typeof fin !== "number" || !isFinite(fin)) return void 0;
+  var firstTs = messageTimeMs(grp.members[0].msg);
+  var lastTs = messageTimeMs(grp.members[grp.members.length - 1].msg);
+  if (!firstTs || !lastTs) return void 0;
+  if (fin < firstTs || fin < lastTs - RUN_DURATION_SERVER_SLACK_MS) return void 0;
+  var firstPassTs = 0;
+  for (var i = 0; i < grp.members.length; i++) {
+    var m = grp.members[i].msg;
+    if (m.role !== "user") continue;
+    var ref = readFileRef(m);
+    if (ref && !ref.continued) firstPassTs = messageTimeMs(m);
+    break;
+  }
+  var st = typeof rec.started === "number" && isFinite(rec.started) ? rec.started : void 0;
+  var start;
+  if (st !== void 0 && st > firstTs + RUN_DURATION_CLOCK_SLACK_MS) return void 0;
+  if (firstPassTs) {
+    start = st !== void 0 && st >= firstPassTs - RUN_DURATION_CLOCK_SLACK_MS ? st : firstPassTs;
+  } else {
+    if (st === void 0) return void 0;
+    start = st;
+  }
+  return fin >= start ? fin - start : void 0;
+}
+function indexGroupDurationLabel(group) {
+  if (!group || group.status !== "done" || !group.finished || group.resolving || group.queued) return "";
+  return formatIndexDuration(group.durationMs);
 }
 function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
@@ -3656,7 +3706,9 @@ function buildChatDisplayList(messages, opts) {
         resolvingReason: reason,
         stub: true,
         queued: waitingStub || live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
-        stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0)
+        stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0),
+        // The stub IS the record, so a 'done' record's span is this run's.
+        durationMs: st === "done" ? runRecordDurationMs(rec) : void 0
       };
       stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
     }
@@ -3675,6 +3727,7 @@ function buildChatDisplayList(messages, opts) {
       tg.runKey = "run:" + (tg.path || tg.key) + "#" + trec.started;
       stubList.push({ started: trec.started, group: tg });
       overlayRunRecordVerdict(tg, trec, liveIndexKeys);
+      tg.durationMs = runRecordGroupDurationMs(tg, trec);
     }
   }
   stubList.sort(function(a, b) {
@@ -13505,6 +13558,7 @@ exports.findAttachmentParser = findAttachmentParser;
 exports.findDuplicateUpload = findDuplicateUpload;
 exports.formatChatTimestamp = formatChatTimestamp;
 exports.formatDuration = formatDuration;
+exports.formatIndexDuration = formatIndexDuration;
 exports.formatRetrievalNote = formatRetrievalNote;
 exports.getAttachmentParsers = getAttachmentParsers;
 exports.getChatHistory = getChatHistory;
@@ -13521,6 +13575,7 @@ exports.groupAttachmentFailures = groupAttachmentFailures;
 exports.hasBom = hasBom;
 exports.hydrateImagePreviews = hydrateImagePreviews;
 exports.indexDoneUniqueId = indexDoneUniqueId;
+exports.indexGroupDurationLabel = indexGroupDurationLabel;
 exports.indexScopeKey = indexScopeKey;
 exports.indexingAccessGroup = indexingAccessGroup;
 exports.isAuthExpiredError = isAuthExpiredError;
@@ -13614,6 +13669,7 @@ exports.resolveWebAccess = resolveWebAccess;
 exports.retrievalNoteFromText = retrievalNoteFromText;
 exports.retrievalNoteOfAnswer = retrievalNoteOfAnswer;
 exports.runIndexUniqueId = runIndexUniqueId;
+exports.runRecordDurationMs = runRecordDurationMs;
 exports.runSettleSideEffect = runSettleSideEffect;
 exports.safeDecodeURIComponent = safeDecodeURIComponent;
 exports.sanitizeAttachmentLinksForHistory = sanitizeAttachmentLinksForHistory;

@@ -63,6 +63,27 @@ export function formatDuration(ms?: number): string {
 }
 
 /**
+ * "45 s", "12 min 5 s", "1 h 3 min": how long a whole file took to index, from its run::
+ * record's `started` to its `finished`. Coarser than formatDuration on purpose: a file run
+ * spans many passes and often minutes, so seconds are dropped once it passes an hour, and a
+ * zero unit is left out ("12 min", "1 h"). Hours stay the largest unit for the reason
+ * formatDuration gives.
+ *
+ * Empty string for anything under a second, negative, or non-finite: a file cannot be read
+ * in no time, so those are missing data or clock skew, and callers gate on the result.
+ */
+export function formatIndexDuration(ms?: number): string {
+	if (typeof ms !== 'number' || !isFinite(ms) || ms < 1000) return '';
+	var total = Math.floor(ms / 1000);
+	var h = Math.floor(total / 3600);
+	var m = Math.floor((total % 3600) / 60);
+	var s = total % 60;
+	if (h) return h + ' h' + (m ? ' ' + m + ' min' : '');
+	if (m) return m + ' min' + (s ? ' ' + s + ' s' : '');
+	return s + ' s';
+}
+
+/**
  * Creation time (ms epoch) of a request id "stamp:entropy", whose stamp is a time_ns written
  * as 8 bytes of base32hex without padding (the worker's and the producer's _generate_req_id).
  * 0 when it is not one.

@@ -67,7 +67,7 @@ import type { ChatMessage, IndexingFileRef } from './host';
 import { isPagedReadFile, isImageVisionFile } from './office';
 import { windowedIndexingEnabled } from './config';
 import { MAX_INDEXING_RESUME_PASSES } from './requests';
-import { messageTimeMs } from './time';
+import { messageTimeMs, formatIndexDuration } from './time';
 
 export type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
 
@@ -222,6 +222,13 @@ export type IndexingGroup = {
 	stubError?: string;
 	/** A run:: row that is live with no pass running yet: waiting in the queue. */
 	queued?: boolean;
+	/** How long the file took to index (ms), from the run:: record's `started` to its
+	 *  `finished`. Set only when the record is 'done' and describes THIS run (a stub, or
+	 *  the newest run of a file whose loaded passes fall inside the record's span; there
+	 *  the first pass's server time stands in for a `started` it disagrees with). Read
+	 *  it through indexGroupDurationLabel, which also holds it back from any row that is
+	 *  not a finished 'done'. */
+	durationMs?: number;
 };
 
 export type DisplayEntry =
@@ -459,6 +466,82 @@ function overlayRunRecordVerdict(
 	grp.finished = true;
 	grp.resolving = false;
 	grp.resolvingReason = undefined;
+}
+
+/** A 'done' run:: record's span in ms (`finished - started`), or undefined when the
+ *  record is not 'done' or either stamp is missing, non-finite, or out of order. The
+ *  files page reads the same records, so it uses this too. */
+export function runRecordDurationMs(rec?: { status?: string; started?: number; finished?: number } | null): number | undefined {
+	if (!rec || rec.status !== 'done') return undefined;
+	var a = rec.started;
+	var b = rec.finished;
+	if (typeof a !== 'number' || typeof b !== 'number' || !isFinite(a) || !isFinite(b) || b < a) return undefined;
+	return b - a;
+}
+
+/** Clock slack between a run:: record's `started` (the browser that queued the run) and
+ *  a pass's time (the server's request id). */
+var RUN_DURATION_CLOCK_SLACK_MS = 60000;
+/** Slack between two SERVER stamps: a pass's request id and the record's `finished`
+ *  (the same few seconds overlayRunRecordVerdict allows). */
+var RUN_DURATION_SERVER_SLACK_MS = 5000;
+
+/**
+ * How long the run a LOADED group shows took, from its run:: record, or undefined when
+ * the record is not this run's or its numbers cannot be trusted. The record is per file
+ * and a new run rewrites it, so first: is it this run? It must have ended no earlier than
+ * the newest loaded pass (an older record is a previous run whose reopen write was lost,
+ * or a span minted from the passes themselves), and not before the first one.
+ *
+ * Then: where did the run start? `started` is the BROWSER's clock, `finished` the
+ * server's, so a browser clock that is off by an hour put that hour into the row. When
+ * the run's first pass is on screen, its request id is the same moment on the server's
+ * clock: the record's `started` is kept while the two agree (so the row says what the
+ * record-only row and the files page say), and the pass time replaces a `started` well
+ * before it (a browser clock running behind, or a `started` left over from an earlier
+ * run whose reopen write was lost). A `started` well AFTER the first loaded pass is a
+ * later run, or a browser clock running ahead; the two cannot be told apart, so the row
+ * gets no time.
+ */
+function runRecordGroupDurationMs(grp: IndexingGroup, rec: RunStubInfo): number | undefined {
+	if (rec.status !== 'done' || !grp.members.length) return undefined;
+	var fin = rec.finished;
+	if (typeof fin !== 'number' || !isFinite(fin)) return undefined;
+	var firstTs = messageTimeMs(grp.members[0].msg);
+	var lastTs = messageTimeMs(grp.members[grp.members.length - 1].msg);
+	if (!firstTs || !lastTs) return undefined;
+	if (fin < firstTs || fin < lastTs - RUN_DURATION_SERVER_SLACK_MS) return undefined;
+	var firstPassTs = 0;
+	for (var i = 0; i < grp.members.length; i++) {
+		var m = grp.members[i].msg;
+		if (m.role !== 'user') continue;
+		var ref = readFileRef(m);
+		if (ref && !ref.continued) firstPassTs = messageTimeMs(m);
+		break;
+	}
+	var st = typeof rec.started === 'number' && isFinite(rec.started) ? rec.started : undefined;
+	var start: number;
+	// A `started` after the first loaded pass is a later run's (one whose passes are not
+	// in this chat), or a browser clock running ahead: no time rather than a wrong one.
+	if (st !== undefined && st > firstTs + RUN_DURATION_CLOCK_SLACK_MS) return undefined;
+	if (firstPassTs) {
+		start = st !== undefined && st >= firstPassTs - RUN_DURATION_CLOCK_SLACK_MS ? st : firstPassTs;
+	} else {
+		if (st === undefined) return undefined;
+		start = st;
+	}
+	return fin >= start ? fin - start : undefined;
+}
+
+/**
+ * The time a row's file took to index ("12 min 5 s"), or '' when the row should not
+ * say one: only a finished, settled 'done' row with a duration from its own run::
+ * record. Active, queued, error and cancelled rows get nothing. Shared so agent.vue
+ * and the widget print the same text in the same place.
+ */
+export function indexGroupDurationLabel(group?: IndexingGroup | null): string {
+	if (!group || group.status !== 'done' || !group.finished || group.resolving || group.queued) return '';
+	return formatIndexDuration(group.durationMs);
 }
 
 export function buildChatDisplayList(
@@ -1114,6 +1197,8 @@ export function buildChatDisplayList(
 					&& !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname]) ? true : undefined,
 				stubError: rec.error || (st === 'error' && !rec.error
 					? 'Indexing did not finish.' : undefined),
+				// The stub IS the record, so a 'done' record's span is this run's.
+				durationMs: st === 'done' ? runRecordDurationMs(rec) : undefined,
 			};
 			// A record with no `started` cannot be placed in the conversation.
 			// Infinity sorts it to the END (nearest the newest turns) instead of
@@ -1155,6 +1240,7 @@ export function buildChatDisplayList(
 			tg.runKey = 'run:' + (tg.path || tg.key) + '#' + trec.started;
 			stubList.push({ started: trec.started, group: tg });
 			overlayRunRecordVerdict(tg, trec, liveIndexKeys);
+			tg.durationMs = runRecordGroupDurationMs(tg, trec);
 		}
 	}
 	stubList.sort(function (a, b) { return a.started - b.started; });

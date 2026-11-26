@@ -137,6 +137,8 @@ import {
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
+    // "N passes · 12 min 5 s": a finished file's index time, same text as agent.vue.
+    indexGroupDurationLabel,
     createHistoryFiller,
     HISTORY_FILL_SLACK_PX,
     // Holding the reader's place while the list mutates underneath them. Shared
@@ -4293,13 +4295,15 @@ import {
     // scroll-up can always reveal more. "+" marks a run whose start is unpaged.
     function indexGroupCount(group) {
         // A run:: stub has NO loaded passes — "0+ passes" is noise (agent.vue same).
-        if (group.stub) return "";
+        // Its record still knows how long a finished run took.
+        if (group.stub) return indexGroupDurationLabel(group);
         // While the file is indexing: how many of its pages are saved (the MCP's count,
         // refreshed by the engine's 10-second check), ahead of the passes.
         var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path || group.key, group.name) : null;
         var pages = prog ? (prog.total ? prog.saved + " of " + prog.total + " pages" : prog.saved + " pages") : "";
         var passes = group.passCount <= 1 && !group.mayHaveOlder ? "" : group.passCount + (group.mayHaveOlder ? "+" : "") + " passes";
-        return [pages, passes].filter(Boolean).join(" \u00b7 ");
+        // How long the file took, for a finished 'done' run only (engine helper).
+        return [pages, passes, indexGroupDurationLabel(group)].filter(Boolean).join(" \u00b7 ");
     }
 
     // Everything buildChatDisplayList needs to state a row's case, in ONE place:

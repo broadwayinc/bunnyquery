@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.4**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.5**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.5 (2026-11-26, not yet published)
+
+- **How long a file took to index.** A finished indexing row now says how long the file took beside its pass count: "11 passes · 12 min 5 s" ("45 s" under a minute, "1 h 3 min" over an hour). The time is the file's `run::` record from `started` (when the run was queued, so it includes any wait in the queue) to `finished`, and shows only on a 'done' row whose record describes that run. `started` is the browser's clock and `finished` the server's, so on a row whose first pass is loaded the pass's own server time replaces a `started` more than a minute before it (a browser clock running behind, or a `started` left from an earlier run), and a `started` more than a minute after it (a later run, or a clock running ahead) gives no time. An indexing, queued, failed or cancelled row shows none. A row drawn from the record alone (its passes not loaded) shows the time by itself. New engine exports: `formatIndexDuration(ms)`, `indexGroupDurationLabel(group)`, `runRecordDurationMs(record)` and the group field `durationMs`. Both clients.
 
 ## 1.21.4 (2026-11-25, not yet published)
 

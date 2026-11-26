@@ -261,6 +261,8 @@ export type { ChatHost, ChatIdentity, ChatState, ChatMessage, IndexingFileRef, P
 export {
 	buildChatDisplayList,
 	parseIndexingLabel,
+	indexGroupDurationLabel,
+	runRecordDurationMs,
 	type DisplayEntry,
 	type IndexingGroup,
 	type IndexingGroupStatus,

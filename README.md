@@ -59,7 +59,9 @@ release-by-release changelog is [HISTORY.md](HISTORY.md).
   across as many passes as it takes. A file's passes collapse into a single
   status row in the chat that can be expanded, and stopped: "Stop" cancels every
   queued and running pass at once and ends the continuation chain, and its confirm
-  dialog can take every other file being indexed down with it.
+  dialog can take every other file being indexed down with it. A file that
+  finished indexing says how long it took beside its passes ("11 passes ·
+  12 min 5 s"), from its `run::` record's start and finish.
 - **Stop waiting**: a reply that is taking too long can be given up on. The
   "Thinking" bubble carries a small x that cancels the running request on the
   server, marks the question as cancelled, and lets the next message go out
