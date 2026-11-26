@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.10**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.11**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,11 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.11 (2026-11-26, not yet published)
+
+- **A copy whose original now holds other content shows red.** `LinkedMarker.contentKey` (the copy's `content_key`) and `OriginalState.contentKey` (the content key the original's own done:: marker records; the MCP writes it when an original finishes): `copyStatusOf` answers "Original removed or failed" when the original finished with another key. Until now a copy the overwriting user could not send again (another user's copy) kept "Indexed via" when a promoted copy re-took the same claim id. The dashboard's "N copies" chip leaves such copies out too.
+- `identicalLinkReasonText('private_copy')`: the owner's merge never takes another user's private file (the MCP refuses it before anything is removed).
 
 ## 1.21.10 (2026-11-26, not yet published)
 

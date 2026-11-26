@@ -45,6 +45,8 @@ export type LinkedMarker = {
 	group?: string | number | null;
 	/** The copy's uploader, when recorded. */
 	owner?: string | null;
+	/** The content key the copy was linked under, when recorded. */
+	contentKey?: string;
 };
 
 /** The link a done:: or run:: record's `data` describes, or null when it is not a linked copy's. */
@@ -59,6 +61,7 @@ export function linkedMarkerOf(data: any): LinkedMarker | null {
 		linkedAt: isFinite(at) && at > 0 ? at : undefined,
 		group: data.copy_group !== undefined ? data.copy_group : undefined,
 		owner: typeof data.copy_owner === 'string' ? data.copy_owner : undefined,
+		contentKey: typeof data.content_key === 'string' && data.content_key ? data.content_key : undefined,
 	};
 }
 
@@ -89,6 +92,9 @@ export type OriginalState = {
 	done?: boolean;
 	/** Its newest run:: record's status, when there is one. */
 	run?: string;
+	/** The content key its own done:: marker records (the MCP writes it when the original
+	 *  finishes), when known. Different from the copy's: the original now holds other content. */
+	contentKey?: string;
 };
 
 /**
@@ -108,6 +114,13 @@ export function copyStatusOf(marker: LinkedMarker, original?: OriginalState | nu
 	};
 	var o = original || {};
 	var claimGone = !!(liveClaims && marker.claim && !liveClaims.has(marker.claim));
+	// The original finished with OTHER content (overwritten, and this copy was not sent again:
+	// another user's copy, or an overwrite outside the BunnyQuery clients). Its claim id may be
+	// live again under a new original of the old content, so the claim alone cannot tell.
+	if (o.done && o.contentKey && marker.contentKey && o.contentKey !== marker.contentKey && o.run !== 'working') {
+		return mk('original_removed', 'Original removed or failed',
+			'Linked to "' + name + '", which now holds other content. Reindex this file to index it on its own.', true);
+	}
 	if (claimGone && !(o.run === 'working')) {
 		return mk('original_removed', 'Original removed or failed',
 			'Linked to "' + name + '", which is no longer indexed. Reindex this file to index it on its own.', true);
@@ -424,6 +437,7 @@ export function identicalLinkReasonText(reason?: string): string {
 		case 'original_is_a_copy': return 'the original is itself a linked copy';
 		case 'less_open_original': return 'the original can be read by fewer people than the copy';
 		case 'private_original': return 'the original is private';
+		case 'private_copy': return 'the copy is another user\'s private file: it shares the index once that user indexes it again';
 		case 'content_claimed_by_another_file': return 'another file already holds this content\'s index';
 		case 'not_readable': return 'one of the files could not be read from storage';
 		case 'different_kind': return 'the files are of different kinds';

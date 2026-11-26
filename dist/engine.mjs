@@ -3260,7 +3260,8 @@ function linkedMarkerOf(data) {
     claim: typeof data.alias_claim === "string" && data.alias_claim ? data.alias_claim : void 0,
     linkedAt: isFinite(at) && at > 0 ? at : void 0,
     group: data.copy_group !== void 0 ? data.copy_group : void 0,
-    owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0
+    owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0,
+    contentKey: typeof data.content_key === "string" && data.content_key ? data.content_key : void 0
   };
 }
 function fileNameOf(path) {
@@ -3275,6 +3276,14 @@ function copyStatusOf(marker, original, liveClaims) {
   };
   var o = original || {};
   var claimGone = !!(liveClaims && marker.claim && !liveClaims.has(marker.claim));
+  if (o.done && o.contentKey && marker.contentKey && o.contentKey !== marker.contentKey && o.run !== "working") {
+    return mk(
+      "original_removed",
+      "Original removed or failed",
+      'Linked to "' + name + '", which now holds other content. Reindex this file to index it on its own.',
+      true
+    );
+  }
   if (claimGone && !(o.run === "working")) {
     return mk(
       "original_removed",
@@ -3526,6 +3535,8 @@ function identicalLinkReasonText(reason) {
       return "the original can be read by fewer people than the copy";
     case "private_original":
       return "the original is private";
+    case "private_copy":
+      return "the copy is another user's private file: it shares the index once that user indexes it again";
     case "content_claimed_by_another_file":
       return "another file already holds this content's index";
     case "not_readable":

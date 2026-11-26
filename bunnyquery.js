@@ -3108,7 +3108,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       claim: typeof data.alias_claim === "string" && data.alias_claim ? data.alias_claim : void 0,
       linkedAt: isFinite(at) && at > 0 ? at : void 0,
       group: data.copy_group !== void 0 ? data.copy_group : void 0,
-      owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0
+      owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0,
+      contentKey: typeof data.content_key === "string" && data.content_key ? data.content_key : void 0
     };
   }
   function fileNameOf(path) {
@@ -13558,7 +13559,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp.broadwayinc.computer";
-    var BQ_VERSION = "1.21.10" ;
+    var BQ_VERSION = "1.21.11" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

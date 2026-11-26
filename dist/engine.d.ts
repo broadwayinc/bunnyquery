@@ -6839,6 +6839,8 @@ type LinkedMarker = {
     group?: string | number | null;
     /** The copy's uploader, when recorded. */
     owner?: string | null;
+    /** The content key the copy was linked under, when recorded. */
+    contentKey?: string;
 };
 /** The link a done:: or run:: record's `data` describes, or null when it is not a linked copy's. */
 declare function linkedMarkerOf(data: any): LinkedMarker | null;
@@ -6862,6 +6864,9 @@ type OriginalState = {
     done?: boolean;
     /** Its newest run:: record's status, when there is one. */
     run?: string;
+    /** The content key its own done:: marker records (the MCP writes it when the original
+     *  finishes), when known. Different from the copy's: the original now holds other content. */
+    contentKey?: string;
 };
 /**
  * A linked copy's status for the Files page and the widget:
