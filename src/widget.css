@@ -988,6 +988,16 @@
     font-size: 0.75rem;
     line-height: 1.3;
 }
+/* Informational, not an error: what the user just cancelled (uploads). Muted
+   ink on the paper, the chip row's own neutral look; the x dismisses it. */
+.bq-attachment-warning.is-notice {
+    align-items: center;
+    border-color: var(--bq-line);
+    background: var(--bq-paper);
+    color: var(--bq-muted);
+}
+.bq-attachment-warning.is-notice > span { flex: 1 1 auto; min-width: 0; }
+.bq-attachment-warning.is-notice .bq-attachment-remove { flex: none; margin-left: 0; }
 
 /* ============================================================================
  * MODALS (appended to <body> under .bq-modal-root)

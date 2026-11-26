@@ -57,6 +57,41 @@ export interface InlineLinkMarkupOptions {
 	 * isLinkUnavailable). Renders a dead chip: ✕, greyed, no href.
 	 */
 	unavailable?: boolean;
+	/**
+	 * Render the FULL name and let CSS shorten it to the room it has, instead of
+	 * the fixed LINK_LABEL_MAX_DISPLAY_CHARS cut. Used by the collapsed indexing
+	 * row head, which is one line with the whole chat width to spend: a 32
+	 * character cap left most of that line empty and cut names that would have
+	 * fit. The name is split into a stem that ellipsizes and a tail (the end of
+	 * the name plus its extension) that never shrinks, so a name too long for the
+	 * row still shows what kind of file it is. Ignored on an image preview.
+	 */
+	fitLabel?: boolean;
+}
+
+/** Characters of the name kept beside the extension in a fitted label's tail. */
+var FIT_LABEL_TAIL_CHARS = 8;
+
+/**
+ * Split a file name into the part a fitted chip may cut (stem) and the part it
+ * always shows (tail): the last few characters of the name plus its extension,
+ * e.g. "4500.00.0265.001_Non-ret" + "urn Valve.tiff". Counted in code points so a
+ * surrogate pair (emoji, rare CJK) is never split in half. Pure: the two halves
+ * concatenate back to the input exactly.
+ */
+export function splitLabelForFit(name: string): { stem: string; tail: string } {
+	var chars = Array.from(String(name == null ? '' : name));
+	var dot = -1;
+	for (var i = chars.length - 1; i > 0; i--) {
+		if (chars[i] === '.') { dot = i; break; }
+		if (chars[i] === ' ' || chars[i] === '/' || chars.length - i > 10) break;
+	}
+	// A short name has nothing worth keeping apart: one stem cut at the end reads
+	// the same, and an all-tail name could never shrink.
+	var extStart = dot > 0 && dot < chars.length - 1 ? dot : chars.length;
+	var tailStart = Math.max(0, extStart - FIT_LABEL_TAIL_CHARS);
+	if (tailStart < 4) return { stem: chars.join(''), tail: '' };
+	return { stem: chars.slice(0, tailStart).join(''), tail: chars.slice(tailStart).join('') };
 }
 
 export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLinkMarkupOptions): string {
@@ -84,8 +119,22 @@ export function renderInlineLinkHtml(link: RenderableInlineLink, opts?: InlineLi
 	// margin on the span for the same reason (a space is decorated too).
 	var glyphHtml = '<span class="bq-link-glyph" translate="no">'
 		+ (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + '</span>';
-	var labelHtml = glyphHtml + escapeInlineHtml(link.label
-		+ (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? ' (fetching...)' : ''));
+	var stateSuffix = unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? ' (fetching...)' : '';
+	var fit = !!o.fitLabel && !preview;
+	if (fit) cls.push('bq-link-fit');
+	var labelHtml;
+	if (fit) {
+		// Three flex items (see .bq-link-fit in chat.css): the stem shrinks with an
+		// ellipsis, the tail and the state suffix never do. The full name is also
+		// the anchor's title, so a cut name is one hover away.
+		var split = splitLabelForFit(full);
+		labelHtml = glyphHtml
+			+ '<span class="bq-link-stem">' + escapeInlineHtml(split.stem) + '</span>'
+			+ (split.tail ? '<span class="bq-link-tail">' + escapeInlineHtml(split.tail) + '</span>' : '')
+			+ (stateSuffix ? '<span class="bq-link-tail">' + escapeInlineHtml(stateSuffix) + '</span>' : '');
+	} else {
+		labelHtml = glyphHtml + escapeInlineHtml(link.label + stateSuffix);
+	}
 	var attrs = ['class="' + cls.join(' ') + '"'];
 	// NO href when the file is unavailable. That is what disables the click:
 	// an anchor with no href does not navigate, is not a tab stop and takes the

@@ -859,6 +859,13 @@ export function canReportWrongAnswer(msg: ChatMessage | null | undefined): boole
 	return !!note && !answerUsedNoDataTool(note) && !(msg as any).isCancelled;
 }
 
+/** The message of the error an attachment upload rejects with when the user cancelled it. */
+export var UPLOAD_CANCELLED_MESSAGE = 'Upload cancelled';
+/** True for the rejection of an attachment upload the user cancelled (cancelAttachmentUpload). */
+export function isUploadCancelledError(err: any): boolean {
+	return !!err && (err.code === 'CANCELLED' || err.message === UPLOAD_CANCELLED_MESSAGE);
+}
+
 export class ChatSession {
 	host: ChatHost;
 	state: ChatState;
@@ -9246,6 +9253,25 @@ export class ChatSession {
 	}
 
 	// --- attachment upload orchestration ---------------------------------
+	/**
+	 * The user cancelled this chip's upload (the widget's per-chip x or "Cancel all
+	 * uploads"). Stops the bytes now when they are moving (the host's abort), and
+	 * leaves a flag every later step of uploadSingleAttachment checks, so a cancel
+	 * that lands between steps (the get-signed-url round trip before the bytes, or
+	 * the src:: record and the indexing request after them) still stops the file
+	 * from being indexed and from being attached to the chat turn. A member whose
+	 * indexing request has already gone out is past cancelling: it shows as an
+	 * indexing row with its own Stop. Returns false for a chip that is not being
+	 * uploaded by this session any more.
+	 */
+	cancelAttachmentUpload(att: any): boolean {
+		if (!att || att._cancelled) return false;
+		if (att.status !== 'uploading' && !att._batchId) return false;
+		att._cancelled = true;
+		if (typeof att._abort === 'function') { try { att._abort(); } catch (e) { } }
+		return true;
+	}
+
 	// Upload one attachment (a file = 1 member, a folder = N) to db storage and
 	// queue indexing per member. The bytes I/O + chip rendering go through host
 	// hooks; the overwrite/reindex flow, status lifecycle, and indexing live here.
@@ -9277,6 +9303,18 @@ export class ChatSession {
 		// below). Counted so a folder chip can say how many it reused.
 		var reusedCount = 0;
 		att.reused = false;
+		// Cancel bookkeeping (see cancelAttachmentUpload): which members' bytes are
+		// confirmed stored and which have had their indexing request sent, so the
+		// view can say honestly what a cancel did and did not undo. A retry starts
+		// clean. `_cancelled` is NOT reset: a cancelled chip leaves the list and is
+		// never retried, and a cancel that raced the start must still stop it.
+		att._storedCount = 0; att._indexQueuedCount = 0; att._indexQueued = false;
+		var cancelError = function (): Error {
+			var e: any = new Error(UPLOAD_CANCELLED_MESSAGE);
+			e.code = 'CANCELLED';
+			return e;
+		};
+		var checkCancel = function (): void { if (att._cancelled) throw cancelError(); };
 		// The members skipped as duplicates, with the STORED copy each one matched, so
 		// the host can report them after the send and offer to reindex the stored
 		// copies (reindexStoredFiles). A retry decides afresh.
@@ -9300,6 +9338,9 @@ export class ChatSession {
 		};
 		members.forEach(function (member: any, idx: number) {
 			chain = chain.then(function () {
+				// Cancelled while an earlier member of this folder was uploading: the
+				// rest are never started.
+				checkCancel();
 				var hadExists = false;
 				var skipped = false;
 				// The storage path of the file this member DUPLICATES, when the user
@@ -9312,6 +9353,10 @@ export class ChatSession {
 				// from hadExists, which must keep driving ONLY the Reindexing/Indexing
 				// label (isReindex) — overwrite still labels as "Indexing:".
 				var existedBefore = false;
+				// This upload made a NEW file's record (the no-access retry of the url
+				// mint, or the step before the indexing request): a cancel that lands
+				// after it drops that record again.
+				var madeRecord = false;
 				var onProg = function (p: any) {
 					if (p && p.total) {
 						att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
@@ -9319,9 +9364,29 @@ export class ChatSession {
 					}
 				};
 				var doMemberUpload = function (checkExistence: boolean) {
+					// Cancelled during the EXISTS prompt or between members: no bytes.
+					checkCancel();
 					return self.host.uploadFile({
 						file: member.file, storagePath: member.storagePath, checkExistence: checkExistence,
-						onProgress: onProg, setAbort: function (abort) { att._abort = abort; },
+						onProgress: onProg,
+						// The host hands its abort over just before the bytes start. A
+						// cancel made during the get-signed-url round trip had nothing to
+						// abort yet, so it is applied here, before anything is sent: a
+						// storage POST that never completes leaves no object behind.
+						setAbort: function (abort) {
+							att._abort = abort;
+							if (att._cancelled) { try { abort(); } catch (e) { } }
+						},
+					}).then(function (r: any) {
+						att._abort = null;
+						att._storedCount = (att._storedCount || 0) + 1;
+						return r;
+					}, function (err: any) {
+						att._abort = null;
+						// An abort the user asked for reads as the cancel it is, not as
+						// a failed upload.
+						if (att._cancelled) throw cancelError();
+						throw err;
 					});
 				};
 				if (isIndexRetry) { hadExists = true; existedBefore = true; }
@@ -9353,6 +9418,9 @@ export class ChatSession {
 						hadExists = true; existedBefore = true; // keep it; Reindex
 					});
 				}).then(function () {
+					// Cancelled while the bytes were finishing or during the EXISTS
+					// prompt: no url, no file record, no indexing request.
+					checkCancel();
 					if (skipped) return; // user skipped this member — no url, no index request
 					// A duplicate takes the STORED copy's url: the same reuse an EXISTS
 					// answer gets when the user keeps the file, minus the prompt and
@@ -9369,11 +9437,21 @@ export class ChatSession {
 						var emsg = String((err && (err.message || (err.body && err.body.message))) || err || '');
 						var refused = /no access to this file/i.test(emsg) || (ecode === 'INVALID_REQUEST' && /access/i.test(emsg));
 						if (duplicateOf || !refused || typeof self.host.ensureFileIndexRecord !== 'function') throw err;
+						madeRecord = !existedBefore;
 						return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
 							name: member.file.name, mime: member.file.type || self.host.getMimeType(member.file.name), size: member.file.size,
 						})).then(function () { return self.host.getTemporaryUrl(member.storagePath); });
 					});
 				}).then(function (url: string) {
+					// Cancelled during the url mint. For an uploader who is not the
+					// project owner the mint above made the file record first (the
+					// no-access retry); a file this upload created must not keep it.
+					if (att._cancelled) {
+						var dropEarly = (madeRecord && typeof self.host.deleteExistingFileRecord === 'function')
+							? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { })
+							: Promise.resolve();
+						return dropEarly.then(function () { throw cancelError(); });
+					}
 					if (skipped) return; // guard the indexing branch for a skipped member
 					if (duplicateOf) {
 						urls.push({ name: member.relPath, url: url, storagePath: duplicateOf });
@@ -9418,13 +9496,20 @@ export class ChatSession {
 					// delete below destroys it: a re-index or an overwrite keeps the file's
 					// visibility instead of re-deciding it (host.readFileAccessGroup).
 					var existingGroup: 'public' | 'authorized' | 'private' | null = null;
+					// True once the old index of a file that was already here has been
+					// cleared. A cancel that lands BEFORE that leaves the old index as it
+					// is (a file the user chose to keep and Reindex must not end up with
+					// no index at all because the reindex was cancelled); one that lands
+					// after it still re-creates the file record, which describes a file
+					// that is stored either way.
+					var clearedOld = false;
 					var preIndex = self.claimIndexRun(member.storagePath).then(function (claimed) {
 						alreadyIndexing = !claimed;
 						if (alreadyIndexing) {
 							console.log('[chat-engine] skipping a duplicate index request for', member.storagePath);
 							return;
 						}
-						if (!existedBefore) return;
+						if (!existedBefore || att._cancelled) return;
 						var readGroup = typeof self.host.readFileAccessGroup === 'function'
 							? Promise.resolve(self.host.readFileAccessGroup(member.storagePath)).then(function (g) { existingGroup = g || null; }, function (err: any) {
 								// Unknown is not "no group": deleting now would destroy the only
@@ -9435,14 +9520,20 @@ export class ChatSession {
 							})
 							: Promise.resolve();
 						return readGroup.then(function () {
+							if (att._cancelled) return;
 							if (typeof self.host.deleteExistingFileRecord === 'function') {
+								clearedOld = true;
 								return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { });
 							}
 						});
 					});
 					preIndex = preIndex.then(function () {
 						if (alreadyIndexing) return;
+						// Cancelled before anything was cleared: no record to make (the
+						// cancel below drops any made early for a new file).
+						if (att._cancelled && !clearedOld) return;
 						if (typeof self.host.ensureFileIndexRecord !== 'function') return;
+						if (!existedBefore) madeRecord = true;
 						return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
 							name: member.file.name,
 							mime: mime || undefined,
@@ -9461,13 +9552,36 @@ export class ChatSession {
 							.then(function (g) { accessGroup = g || undefined; })
 							.catch(function () { });
 					});
-					// Run a client-side attachment parser (e.g. .hwp) if one matches; its
-					// output is inlined into the indexing request (falls back to office
-					// extraction / web_fetch when no parser matches or it yields nothing).
+					// Cancelled while the file record was being made: hand the indexing
+					// claim back and, for a file this upload created, drop the record
+					// that was just made for it, so nothing points at a file the user
+					// took back. A file that was already here keeps its record (it
+					// still describes a stored file).
+					var abandonIfCancelled = function (): Promise<void> | void {
+						if (!att._cancelled) return;
+						if (!alreadyIndexing) self.releaseIndexRun(member.storagePath);
+						var drop = (!existedBefore && !alreadyIndexing && madeRecord && typeof self.host.deleteExistingFileRecord === 'function')
+							? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function () { })
+							: Promise.resolve();
+						return drop.then(function () { throw cancelError(); });
+					};
 					return preIndex.then(function () {
+						return abandonIfCancelled();
+					}).then(function () {
+						// Run a client-side attachment parser (e.g. .hwp) if one matches; its
+						// output is inlined into the indexing request (falls back to office
+						// extraction / web_fetch when no parser matches or it yields nothing).
 						return parseAttachmentContent(member.file, member.file.name, mime || undefined);
 					}).then(function (parsedContent: string | null) {
+						return Promise.resolve(abandonIfCancelled()).then(function () { return parsedContent; });
+					}).then(function (parsedContent: string | null) {
 					if (alreadyIndexing) return;
+					// Past this point the file is on the indexing queue, and a cancel can
+					// no longer take it back: the row it gets has its own Stop. Told to
+					// the view so it stops offering a cancel it cannot honour.
+					att._indexQueuedCount = (att._indexQueuedCount || 0) + 1;
+					if (att.kind !== 'folder') att._indexQueued = true;
+					self.host.renderAttachmentChips();
 					// Tracked so a chat waiting on awaitIndexingDrained cannot be sent
 					// in the window between this call and the queue accepting it.
 					return self.trackIndexDispatch(notifyAgentSaveAttachment({
@@ -9524,6 +9638,10 @@ export class ChatSession {
 			});
 		});
 		return chain.then(function () {
+			// Cancelled after its last member's indexing request went out (a folder
+			// whose cancel came too late for every member): the turn still must not
+			// carry its urls. The members already queued keep their rows and Stop.
+			checkCancel();
 			att._abort = null; att.progress = 100;
 			if (att.kind === 'folder') att.uploadedUrls = urls.map(function (u) { return { path: u.name, url: u.url, storagePath: u.storagePath }; });
 			att.status = anyIndexFailed ? 'indexError' : 'done';
@@ -9575,6 +9693,14 @@ export class ChatSession {
 				}).catch(function (err: any) {
 					var removed = !self.state.attachments.some(function (a: any) { return a.id === att.id; });
 					var aborted = err && (err.message === 'Aborted' || err === 'Aborted');
+					// Cancelled by the user: none of its urls reach the chat turn, and
+					// it is not a failure to report or retry.
+					if (att._cancelled || isUploadCancelledError(err)) {
+						att.status = 'cancelled';
+						att._abort = null;
+						self.host.renderAttachmentChips();
+						return;
+					}
 					if (removed || aborted) return;
 					att.status = 'error';
 					att.errorMessage = 'File upload has failed';
@@ -9582,6 +9708,12 @@ export class ChatSession {
 					att.errorCode = (err && (err.code || (err.body && err.body.code))) || '';
 					att.errorDetail = (err && (err.message || (err.body && err.body.message))) || (typeof err === 'string' ? err : '');
 					self.host.renderAttachmentChips();
+				}).then(function () {
+					// This batch is done with the chip (whatever came of it), so a view
+					// stops offering to cancel its upload while the rest of the batch
+					// runs. Keyed by batch: a failed chip handed back and sent again
+					// is in flight once more.
+					att._settledBatch = att._batchId || true;
 				});
 			});
 		});

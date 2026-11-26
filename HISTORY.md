@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.5**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.7**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,16 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.7 (2026-11-26, not yet published)
+
+- **Image indexing marks where the text is.** A phone photo of a packing label was indexed as "Заводской номер [?]": the small handwritten serial next to the label was never read, so a search for it found nothing. The indexing message for an image file (and the image rule of the indexing system prompt) now also asks for "text_regions" on the file's "src::" record: up to 4 boxes [left, top, right, bottom], fractions from 0 to 1 of the image as the model was shown it, each tightly around a label, plate or handwritten area whose characters matter, [] when there is none. The worker reads these boxes. The model is also told to write each label's value right after its label in "printed_text" / "handwritten_text", as "<label>: <value>", and to keep [?] for characters that are truly unreadable, never a guessed character. The example is a pattern, not a real value, so no sample serial can be copied into an index. Applies to images indexed or re-indexed from now on; nothing already indexed changes.
+- **A code the search did not find is said plainly.** When searchText answers search_complete with no hit for a code, number or phrase, the chat prompt now asks for a short answer that says it was not found, names what was searched (the file and, for a page range, its pages, or the files and pages counted in the reply), once the files and records the reply says it did not cover have been checked, and, when a recently uploaded file or a photo should hold it, suggests re-indexing that file (Files page and Reindex in the console; attaching the same file again and reindexing it in the widget; asking the project's owner when the user cannot upload). It never presents a different file as the match and never guesses the value. Both clients.
+
+## 1.21.6 (2026-11-26, not yet published)
+
+- **Indexing rows show the whole file name.** The file name in a collapsed indexing row was cut to 32 characters with a leading ellipsis ("…0.0265.001_Non-return Valve.tiff") however much room the row had. The row head now renders the full name and lets the row's width decide: the whole name when it fits, and when it does not, the start of the name ellipsized with the last few characters and the extension always visible ("4500.00.0265.0…rn Valve.tiff"). The counts, the Stop button and the chevron never shrink, so a narrow screen cuts the name, not them. The full name stays in the link's tooltip. New `renderInlineLinkHtml` option `fitLabel` (and engine export `splitLabelForFit(name)`); both clients pass it for the row head only (`parseMsgParts` / `parseMsgPartsHtml` option `fitLinkLabels`), so chips inside bubbles and citations keep the 32 character cut. Both clients.
+- **Cancel an attachment upload in the widget.** A file of a sent message can now be cancelled while it uploads: the chip's x (shown while it is uploading or queued behind another file) reads "Cancel upload", and when two or more files are in flight a "Cancel all uploads" control cancels every one of them, hidden chips included. A cancelled file is not indexed and not attached to the chat turn (the turn's text still goes); the chip leaves the row and a muted notice says what was cancelled, dismissable with its x. The bytes in flight are aborted, and a cancel made before they start sends none, so an upload cut short leaves no stored object. A cancel that lands after the bytes were stored still stops the indexing and drops the file record just made for it (also the one the url step makes first for an uploader who is not the project owner), and the notice says the file may stay in storage (an end user's page has no way to delete it). A Reindex or Overwrite of a file already here that is cancelled before its old index is cleared keeps that index as it was. A folder's members whose indexing request had already gone out keep their rows (each has its own Stop), and the notice says how many. Engine: `ChatSession.cancelAttachmentUpload(att)`, `UPLOAD_CANCELLED_MESSAGE`, `isUploadCancelledError(err)`; a cancelled chip ends as status `'cancelled'` and its urls are never collected. The dashboard (agent.vue) uploads through its own pipeline and is unchanged. Widget only.
 
 ## 1.21.5 (2026-11-26, not yet published)
 

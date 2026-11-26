@@ -993,6 +993,16 @@
     font-size: 0.75rem;
     line-height: 1.3;
 }
+/* Informational, not an error: what the user just cancelled (uploads). Muted
+   ink on the paper, the chip row's own neutral look; the x dismisses it. */
+.bq-attachment-warning.is-notice {
+    align-items: center;
+    border-color: var(--bq-line);
+    background: var(--bq-paper);
+    color: var(--bq-muted);
+}
+.bq-attachment-warning.is-notice > span { flex: 1 1 auto; min-width: 0; }
+.bq-attachment-warning.is-notice .bq-attachment-remove { flex: none; margin-left: 0; }
 
 /* ============================================================================
  * MODALS (appended to <body> under .bq-modal-root)
@@ -1564,6 +1574,28 @@
    in a block <p>. Inline it so the row stays one line high. */
 .bq-index-label .bq-md,
 .bq-index-label .bq-md p { display: inline; margin: 0; }
+/* A row whose file name is a fitted chip (renderInlineLinkHtml fitLabel) lays
+   the label out as a flex line instead: the verb keeps its width and the chip
+   takes whatever is left, so the name shows in full when the row has room and is
+   cut to the row (stem ellipsis, end of the name and extension kept) only when it
+   does not. The counts and the Stop button are siblings of .bq-index-label and
+   never shrink, so a narrow screen cuts the name, not them. A label with no chip
+   (a file without a stored path) keeps the inline layout and the label's own
+   ellipsis above. */
+.bq-index-label .bq-md:has(.bq-link-fit),
+.bq-index-label .bq-md:has(.bq-link-fit) > p {
+    display: flex;
+    align-items: baseline;
+    min-width: 0;
+    column-gap: 0.35em;
+    /* The bubble's break-anywhere wrapping would let the verb ("Indexed") give
+       up its width a letter at a time before the name shrinks. Only the name's
+       stem may give way. */
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: normal;
+}
+.bq-index-label .bq-md:has(.bq-link-fit) > p { flex: 1 1 auto; }
 /* Passes LOADED, never a server-side total: history pages newest-first, so any
    total derived from what is on screen is a lower bound. */
 .bq-index-count { flex: 0 0 auto; opacity: 0.75; font-size: 0.72rem; }
@@ -1712,6 +1744,44 @@
 .bq-md a.bq-link-button { text-decoration: none; }
 .bq-md a.bq-link-button:hover { text-decoration: underline; }
 .bq-md a.bq-link-button.is-unavailable:hover { text-decoration: none; }
+/* A fitted chip (renderInlineLinkHtml fitLabel): the full name as a stem that
+   ellipsizes and a tail (end of the name + extension) that never shrinks. Flex
+   items are not atomic inlines, so an underline on the anchor would run under the
+   glyph too; the hover underline goes on the two name parts instead. */
+.bq-link-button.bq-link-fit {
+    display: inline-flex;
+    align-items: baseline;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+}
+.bq-link-fit .bq-link-glyph { flex: none; }
+.bq-link-fit .bq-link-stem {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: pre;
+}
+/* The tail never shrinks while there is stem left to cut. Only a row too narrow
+   for even the end of the name caps it (the chip's width less the glyph), and
+   then with an ellipsis instead of a hard clip. A max-width, not a small
+   flex-shrink: any shrink at all takes a fraction of a pixel off the tail and
+   puts an ellipsis on a name that fits. */
+.bq-link-fit .bq-link-tail {
+    flex: none;
+    max-width: calc(100% - 1.2em);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: pre;
+}
+.bq-link-button.bq-link-fit:hover,
+.bq-md a.bq-link-button.bq-link-fit:hover { text-decoration: none; }
+.bq-link-button.bq-link-fit:hover .bq-link-stem,
+.bq-link-button.bq-link-fit:hover .bq-link-tail { text-decoration: underline; }
+.bq-link-button.bq-link-fit.is-unavailable:hover .bq-link-stem,
+.bq-link-button.bq-link-fit.is-unavailable:hover .bq-link-tail { text-decoration: none; }
 /* The ↗ / ✕ glyph is never underlined, at rest or on hover. Underlines propagate
    into every in-flow inline descendant and a descendant cannot cancel them, so
    `text-decoration: none` on the glyph alone does nothing; an atomic inline

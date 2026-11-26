@@ -1063,10 +1063,12 @@ function buildChatSystemPrompt(params) {
   const webAccess = params.webAccess === true;
   const g = params.indexAccessGroup;
   const indexGroupLiteral = typeof g === "number" ? String(g) : g === "public" || g === "private" || g === "authorized" || g === "admin" ? `"${g}"` : '"authorized"';
+  const reindexHint = canUpload === false ? `asking the project's owner to re-index that file` : client === "console" ? `re-indexing that file (select it on the Files page and choose Reindex)` : `re-indexing that file (attach the same file again and choose to reindex it)`;
   const groundingRules = `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
+A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files, the records when the value could be in a table), keep the answer short: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
-These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
+These rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
   const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
   const documentRules = `DOCUMENTS (a contract, a report, a manual, a letter, any uploaded file the user asks about the content of): when the user NAMED a file (its file name; a document title, a quote or a code they mention is NOT a file name: searchText finds those inside the files), first find its storage path by its "src::" record (see WHERE INDEXED CONTENT LIVES) using the name the user used, then find the page with searchText and that path. A spreadsheet's sheets are page text too: a hit names its sheet and rows, and the row itself is a record (its unique_id is the hit's row_id_prefix plus the row number); a spreadsheet indexed before 2026-11-25 has no page text, so read its rows instead (readFileContent, or its records). When they did not name a file, your FIRST call is searchText without a path: no table list, no file lookup before it. Never list or look up files (getUniqueId on "src::") to find out whether a document, quote or title exists before searching: searchText's hits name the file, and a search that finds nothing says what it could not cover. Either way follow searchText's description to the end, including asking the user once, after quick results, before it searches all files. QUOTE THE EXACT TEXT it returned and CITE THE FILE AND THE PAGE ("report.pdf, page 7"), or for a hit with "sheet" THE FILE AND THE SHEET ("quote.xlsx, sheet \uCD1D\uAD04"), never a sheet page's number; never present a paraphrase as a quote. A file with no page text is read with readFileContent instead and cited by its file name. In a long file (a manual, a book), when a search of the whole file gives too many hits or none that fit, call getFileOutline and search the chapter that fits with searchText page_from and page_to. When the user asks about the content of the documents, pass searchText "question": that question in the user's own words, without names or personal details that are not about the documents. Leave "question" out for anything else.
 WRONG ANSWER: when the user says an answer is wrong (or sends "This answer seems wrong. Please check it again against the documents."), re-read the pages you cited (for a sheet hit, the rows: by its row_id_prefix, never readFileContent on a sheet page) and search again, passing searchText "question" = the user's ORIGINAL question that the disputed answer answered, never the complaint message itself. Then do exactly one of: correct the answer only; correct the answer and call correctSearchLink (when it is among your tools); or keep the answer and quote the text that supports it. Call correctSearchLink only with the page and an exact quote that prove it, and never change data on the user's word alone.`;
@@ -1135,7 +1137,7 @@ function buildIndexingSystemPrompt(params) {
 - PDFs (scanned or not): you do NOT read a PDF with a tool or a URL. Its pages are RENDERED and embedded directly in the user message as IMAGE blocks, a WINDOW of pages at a time. LOOK at the embedded page images and datafy every one. The note beside them tells you whether MORE pages remain: if so, save this window's records and stop (a follow-up pass shows the next window automatically); only when the note says it was the LAST window is the PDF fully seen. Do NOT call readFileContent or web_fetch for a PDF.
 - VISION: when the message (a readFileContent window, an embedded PDF page, or an inline attachment) includes IMAGES - scanned/rendered PDF pages, or photos embedded in a spreadsheet next to a row/block - LOOK at them and capture what they show as record data (the reading/values in a scanned table, the part/defect/condition visible in a photo). The image IS part of the data; correlate each photo with its labelled block ("PHOTO A3" markers tie a photo to that grid row).
 - TRANSCRIBE, DO NOT DESCRIBE. When an image contains ANY text - a label, tag, stamp, form field, serial/part number, handwriting - your FIRST job is to read the characters out and store them VERBATIM, not to describe the scene. A record saying "a red inspection tag with handwritten markings" is worthless: it is unsearchable and every such photo produces the same sentence. Put the characters you can actually read into these EXACT fields, not variations of them: "printed_text" (the pre-printed wording), "handwritten_text" (what a person wrote by hand), and, when you can resolve one, "part_no", "serial_no", "tag_id" and "date". Every identifier you read (a serial number, a part number, a tag id, a model code) ALSO goes into "printed_text" or "handwritten_text", exactly as it appears, because those two fields are the image's searchable text. Text can appear at ANY angle (sideways, upside down, mirrored, along a curve): read it in its own orientation, and never call text unreadable only because it is turned. When it is upside down or sideways, watch the look-alikes (6 and 9, 0 and O, 1 and I, Latin and Cyrillic letters of the same shape). Same reason as the fixed table names: a field called photo_text in one pass and visible_text_notes in the next cannot be queried together. Read PARTIAL values rather than skipping: "500.7402.5[?][?]" beats nothing. Write [?] for each character that is genuinely unreadable and copy handwriting character for character - do NOT invent a character, and do NOT replace the whole transcription with a description of what the object looks like. A scene description is a nice extra AFTER the text, never instead of it.
-- IMAGE FILES uploaded as the file itself: if ANY readable character appears ANYWHERE in the image (a label, a stamp, a sign in the background) it counts as an image WITH text - transcribe it per the rule above, and also capture the layout (what appears where) and every entity named. Only a truly text-free image gets description first: a one-line caption, then the objects present with their attributes (type, color, count, condition, position). Either way, save what you extract onto the file's "src::" record with updateRecords, TAG every entity and identifier visible, and INDEX the one number the image offers (a measured value, an amount, a count). On that same record ALSO set "text_rotation" and "text_legibility". "text_rotation" is the CLOCKWISE turn, 0, 90, 180 or 270, that would make the image's main text upright AS THE IMAGE IS SHOWN TO YOU: 0 when it already reads normally; 180 when it is upside down; 90 when its lines run from bottom to top (the tops of the letters face left); 270 when its lines run from top to bottom (the tops of the letters face right). "text_legibility" is "clear", "partial" or "unreadable" ("none" when there is no text).
+- IMAGE FILES uploaded as the file itself: if ANY readable character appears ANYWHERE in the image (a label, a stamp, a sign in the background) it counts as an image WITH text - transcribe it per the rule above, and also capture the layout (what appears where) and every entity named. Only a truly text-free image gets description first: a one-line caption, then the objects present with their attributes (type, color, count, condition, position). Either way, save what you extract onto the file's "src::" record with updateRecords, TAG every entity and identifier visible, and INDEX the one number the image offers (a measured value, an amount, a count). On that same record ALSO set "text_rotation" and "text_legibility". "text_rotation" is the CLOCKWISE turn, 0, 90, 180 or 270, that would make the image's main text upright AS THE IMAGE IS SHOWN TO YOU: 0 when it already reads normally; 180 when it is upside down; 90 when its lines run from bottom to top (the tops of the letters face left); 270 when its lines run from top to bottom (the tops of the letters face right). "text_legibility" is "clear", "partial" or "unreadable" ("none" when there is no text). ALSO set "text_regions" on that record: a list of up to 4 boxes [left, top, right, bottom], each a fraction from 0 to 1 of the image AS IT IS SHOWN TO YOU (not turned upright), drawn tightly around a label, plate or handwritten area whose characters matter (a serial number, a part number, a tag id); [] when there is none. Where a label names a value (a form field, a plate line), write the value right after its label in "printed_text" or "handwritten_text", as "<label>: <value>" (the label's own words, then the characters written beside it), so the label and its value are found together.
 - Whatever the file type, this file's identity is "src::" + its storage path (the "storage path" metadata line) - never the inline content or a temporary URL. That record ALREADY EXISTS: the upload pipeline creates it in table "file_summaries" (access group "${accessGroup}") before indexing starts, so posting it again is rejected as a duplicate unique_id. Reference it from every record you write, and add what you learn to it with updateRecords. If that update unexpectedly reports the record does not exist, post it yourself ONCE with that exact "src::" unique_id (table "file_summaries", access group "${accessGroup}") and carry on; this is the ONE exception to the do-NOT-post-the-file-record rules elsewhere in these instructions, because the source identity must never be dropped just because an update failed.
 - ACCESS GROUP (hard rule): every record you write for this file - the file record, per-row records, chapters, summaries, intermediates - MUST be posted with access group "${accessGroup}". Pass it explicitly on every postRecords call; do not leave it out and do not vary it between passes of the same file. An access group is part of a record's table key, so records saved under a different group than the file are in a different table and will not come back with the rest of it: a "public" file whose rows were saved as "authorized" is one an anonymous visitor can see the name of and none of the contents of, and a re-index cannot find the strays to clean them up. The one exception is the EXTRACTED MEDIA records in "__MEDIA__", which the pipeline creates for you - leave their group alone and only enrich them.
 - REACHABILITY (hard rule): every record you write while indexing this file MUST be reachable from the file's "src::<storage path>" record by following reference - either reference that record directly, or reference something that already reaches it. A record with no reference, or one pointing outside this file's chain, is an ORPHAN: deleting or re-indexing the file removes the reachable records and leaves the orphan behind forever, where it keeps turning up in later answers as stale data. If you create an intermediate record that OTHER records reference (a page record that rows hang off, a sheet or section record), set source.can_remove_referencing_records to true on it; the delete cascade passes a delete through a record only when that record carries the flag OR a unique_id starting "src::" (the file record cascades because its unique_id starts with "src::"; the intermediates you create carry no "src::" id, so they need the flag), and it cascades ONE LEVEL AT A TIME, so EVERY intermediate record in a chain needs its own marker - an unmarked link stops the cascade there and everything below it survives as orphans. When in doubt, reference the file record directly and keep the chain flat.
@@ -1212,7 +1214,7 @@ Read this file with the readFileContent tool, using the storage path above - do 
     return head + `- temporary URL: ${attachment.url}
 ` + (options.imageFile === "attached" ? `
 This is an IMAGE file, attached to this message as an image: read it there, not from the URL. ` : `
-This is an IMAGE file in a format the AI cannot take directly. When an image of it is attached to this message (the server converts it when it can), read it there; when none is attached, index the file from its metadata only and do not guess its contents. `) + `Transcribe every character FIRST, at whatever angle the text is: "printed_text", "handwritten_text", and "part_no" / "serial_no" / "tag_id", with every identifier also written inside "printed_text" or "handwritten_text". Then set "text_rotation" and "text_legibility" on the file's "src::" record, and only then describe what the image shows.`;
+This is an IMAGE file in a format the AI cannot take directly. When an image of it is attached to this message (the server converts it when it can), read it there; when none is attached, index the file from its metadata only and do not guess its contents. `) + `Transcribe every character FIRST, at whatever angle the text is: "printed_text", "handwritten_text", and "part_no" / "serial_no" / "tag_id", with every identifier also written inside "printed_text" or "handwritten_text". Write each label's value right after its label, as "<label>: <value>" (the label's own words, then the characters written beside it), reading small and handwritten characters closely; use [?] only for a character that is truly unreadable, and never put a guessed character in its place. Then set "text_rotation", "text_legibility" and "text_regions" on the file's "src::" record, and only then describe what the image shows. "text_regions" is a list of up to 4 boxes [left, top, right, bottom], each a fraction from 0 to 1 of the image exactly as it is shown to you here (not turned upright), drawn tightly around a label, plate or handwritten area whose characters matter (a serial number, a part number, a tag); [] when there is none.`;
   }
   return head + `- temporary URL (fetch this to read the file contents): ${attachment.url}`;
 }
@@ -4166,6 +4168,22 @@ var IMAGE_PREVIEWS_PER_MESSAGE = 8;
 var INLINE_LINK_GLYPH = "\u2197";
 var INLINE_LINK_UNAVAILABLE_GLYPH = "\u2715";
 var INLINE_LINK_UNAVAILABLE_SUFFIX = " (unavailable)";
+var FIT_LABEL_TAIL_CHARS = 8;
+function splitLabelForFit(name) {
+  var chars = Array.from(String(name == null ? "" : name));
+  var dot = -1;
+  for (var i = chars.length - 1; i > 0; i--) {
+    if (chars[i] === ".") {
+      dot = i;
+      break;
+    }
+    if (chars[i] === " " || chars[i] === "/" || chars.length - i > 10) break;
+  }
+  var extStart = dot > 0 && dot < chars.length - 1 ? dot : chars.length;
+  var tailStart = Math.max(0, extStart - FIT_LABEL_TAIL_CHARS);
+  if (tailStart < 4) return { stem: chars.join(""), tail: "" };
+  return { stem: chars.slice(0, tailStart).join(""), tail: chars.slice(tailStart).join("") };
+}
 function renderInlineLinkHtml(link, opts) {
   var o = opts || {};
   var unavailable = !!o.unavailable;
@@ -4178,7 +4196,16 @@ function renderInlineLinkHtml(link, opts) {
   if (unavailable) cls.push("is-unavailable");
   if (preview) cls.push("is-image-preview");
   var glyphHtml = '<span class="bq-link-glyph" translate="no">' + (unavailable ? INLINE_LINK_UNAVAILABLE_GLYPH : INLINE_LINK_GLYPH) + "</span>";
-  var labelHtml = glyphHtml + escapeInlineHtml(link.label + (unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : ""));
+  var stateSuffix = unavailable ? INLINE_LINK_UNAVAILABLE_SUFFIX : refreshing ? " (fetching...)" : "";
+  var fit = !!o.fitLabel && !preview;
+  if (fit) cls.push("bq-link-fit");
+  var labelHtml;
+  if (fit) {
+    var split = splitLabelForFit(full);
+    labelHtml = glyphHtml + '<span class="bq-link-stem">' + escapeInlineHtml(split.stem) + "</span>" + (split.tail ? '<span class="bq-link-tail">' + escapeInlineHtml(split.tail) + "</span>" : "") + (stateSuffix ? '<span class="bq-link-tail">' + escapeInlineHtml(stateSuffix) + "</span>" : "");
+  } else {
+    labelHtml = glyphHtml + escapeInlineHtml(link.label + stateSuffix);
+  }
   var attrs = ['class="' + cls.join(" ") + '"'];
   if (unavailable) attrs.push('aria-disabled="true"', 'data-bq-unavailable="1"');
   else attrs.push('href="' + escapeInlineHtml(link.href) + '"', 'target="_blank"', 'rel="noopener noreferrer"');
@@ -5905,6 +5932,10 @@ var WRONG_ANSWER_LABEL = "Wrong answer?";
 function canReportWrongAnswer(msg) {
   var note = retrievalNoteOfAnswer(msg);
   return !!note && !answerUsedNoDataTool(note) && !msg.isCancelled;
+}
+var UPLOAD_CANCELLED_MESSAGE = "Upload cancelled";
+function isUploadCancelledError(err) {
+  return !!err && (err.code === "CANCELLED" || err.message === UPLOAD_CANCELLED_MESSAGE);
 }
 var _ChatSession = class _ChatSession {
   constructor(host) {
@@ -13071,6 +13102,29 @@ var _ChatSession = class _ChatSession {
     });
   }
   // --- attachment upload orchestration ---------------------------------
+  /**
+   * The user cancelled this chip's upload (the widget's per-chip x or "Cancel all
+   * uploads"). Stops the bytes now when they are moving (the host's abort), and
+   * leaves a flag every later step of uploadSingleAttachment checks, so a cancel
+   * that lands between steps (the get-signed-url round trip before the bytes, or
+   * the src:: record and the indexing request after them) still stops the file
+   * from being indexed and from being attached to the chat turn. A member whose
+   * indexing request has already gone out is past cancelling: it shows as an
+   * indexing row with its own Stop. Returns false for a chip that is not being
+   * uploaded by this session any more.
+   */
+  cancelAttachmentUpload(att) {
+    if (!att || att._cancelled) return false;
+    if (att.status !== "uploading" && !att._batchId) return false;
+    att._cancelled = true;
+    if (typeof att._abort === "function") {
+      try {
+        att._abort();
+      } catch (e) {
+      }
+    }
+    return true;
+  }
   // Upload one attachment (a file = 1 member, a folder = N) to db storage and
   // queue indexing per member. The bytes I/O + chip rendering go through host
   // hooks; the overwrite/reindex flow, status lifecycle, and indexing live here.
@@ -13093,6 +13147,17 @@ var _ChatSession = class _ChatSession {
     var anyIndexFailed = false;
     var reusedCount = 0;
     att.reused = false;
+    att._storedCount = 0;
+    att._indexQueuedCount = 0;
+    att._indexQueued = false;
+    var cancelError = function() {
+      var e = new Error(UPLOAD_CANCELLED_MESSAGE);
+      e.code = "CANCELLED";
+      return e;
+    };
+    var checkCancel = function() {
+      if (att._cancelled) throw cancelError();
+    };
     delete att.duplicates;
     var chain = Promise.resolve();
     var findDuplicate = function(member) {
@@ -13109,10 +13174,12 @@ var _ChatSession = class _ChatSession {
     };
     members.forEach(function(member, idx) {
       chain = chain.then(function() {
+        checkCancel();
         var hadExists = false;
         var skipped = false;
         var duplicateOf = null;
         var existedBefore = false;
+        var madeRecord = false;
         var onProg = function(p) {
           if (p && p.total) {
             att.progress = Math.floor((idx + p.loaded / p.total) / total * 100);
@@ -13120,14 +13187,33 @@ var _ChatSession = class _ChatSession {
           }
         };
         var doMemberUpload = function(checkExistence) {
+          checkCancel();
           return self.host.uploadFile({
             file: member.file,
             storagePath: member.storagePath,
             checkExistence,
             onProgress: onProg,
+            // The host hands its abort over just before the bytes start. A
+            // cancel made during the get-signed-url round trip had nothing to
+            // abort yet, so it is applied here, before anything is sent: a
+            // storage POST that never completes leaves no object behind.
             setAbort: function(abort) {
               att._abort = abort;
+              if (att._cancelled) {
+                try {
+                  abort();
+                } catch (e) {
+                }
+              }
             }
+          }).then(function(r) {
+            att._abort = null;
+            att._storedCount = (att._storedCount || 0) + 1;
+            return r;
+          }, function(err) {
+            att._abort = null;
+            if (att._cancelled) throw cancelError();
+            throw err;
           });
         };
         if (isIndexRetry) {
@@ -13161,12 +13247,14 @@ var _ChatSession = class _ChatSession {
             existedBefore = true;
           });
         }).then(function() {
+          checkCancel();
           if (skipped) return;
           return Promise.resolve(self.host.getTemporaryUrl(duplicateOf || member.storagePath)).catch(function(err) {
             var ecode = err && (err.code || err.body && err.body.code);
             var emsg = String(err && (err.message || err.body && err.body.message) || err || "");
             var refused = /no access to this file/i.test(emsg) || ecode === "INVALID_REQUEST" && /access/i.test(emsg);
             if (duplicateOf || !refused || typeof self.host.ensureFileIndexRecord !== "function") throw err;
+            madeRecord = !existedBefore;
             return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
               name: member.file.name,
               mime: member.file.type || self.host.getMimeType(member.file.name),
@@ -13176,6 +13264,13 @@ var _ChatSession = class _ChatSession {
             });
           });
         }).then(function(url) {
+          if (att._cancelled) {
+            var dropEarly = madeRecord && typeof self.host.deleteExistingFileRecord === "function" ? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+            }) : Promise.resolve();
+            return dropEarly.then(function() {
+              throw cancelError();
+            });
+          }
           if (skipped) return;
           if (duplicateOf) {
             urls.push({ name: member.relPath, url, storagePath: duplicateOf });
@@ -13204,13 +13299,14 @@ var _ChatSession = class _ChatSession {
           var mime = member.file.type || self.host.getMimeType(member.file.name);
           var alreadyIndexing = false;
           var existingGroup = null;
+          var clearedOld = false;
           var preIndex = self.claimIndexRun(member.storagePath).then(function(claimed) {
             alreadyIndexing = !claimed;
             if (alreadyIndexing) {
               console.log("[chat-engine] skipping a duplicate index request for", member.storagePath);
               return;
             }
-            if (!existedBefore) return;
+            if (!existedBefore || att._cancelled) return;
             var readGroup = typeof self.host.readFileAccessGroup === "function" ? Promise.resolve(self.host.readFileAccessGroup(member.storagePath)).then(function(g) {
               existingGroup = g || null;
             }, function(err) {
@@ -13218,7 +13314,9 @@ var _ChatSession = class _ChatSession {
               throw err;
             }) : Promise.resolve();
             return readGroup.then(function() {
+              if (att._cancelled) return;
               if (typeof self.host.deleteExistingFileRecord === "function") {
+                clearedOld = true;
                 return Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
                 });
               }
@@ -13226,7 +13324,9 @@ var _ChatSession = class _ChatSession {
           });
           preIndex = preIndex.then(function() {
             if (alreadyIndexing) return;
+            if (att._cancelled && !clearedOld) return;
             if (typeof self.host.ensureFileIndexRecord !== "function") return;
+            if (!existedBefore) madeRecord = true;
             return Promise.resolve(self.host.ensureFileIndexRecord(member.storagePath, {
               name: member.file.name,
               mime: mime || void 0,
@@ -13247,10 +13347,28 @@ var _ChatSession = class _ChatSession {
             }).catch(function() {
             });
           });
+          var abandonIfCancelled = function() {
+            if (!att._cancelled) return;
+            if (!alreadyIndexing) self.releaseIndexRun(member.storagePath);
+            var drop = !existedBefore && !alreadyIndexing && madeRecord && typeof self.host.deleteExistingFileRecord === "function" ? Promise.resolve(self.host.deleteExistingFileRecord(member.storagePath)).catch(function() {
+            }) : Promise.resolve();
+            return drop.then(function() {
+              throw cancelError();
+            });
+          };
           return preIndex.then(function() {
+            return abandonIfCancelled();
+          }).then(function() {
             return parseAttachmentContent(member.file, member.file.name, mime || void 0);
           }).then(function(parsedContent) {
+            return Promise.resolve(abandonIfCancelled()).then(function() {
+              return parsedContent;
+            });
+          }).then(function(parsedContent) {
             if (alreadyIndexing) return;
+            att._indexQueuedCount = (att._indexQueuedCount || 0) + 1;
+            if (att.kind !== "folder") att._indexQueued = true;
+            self.host.renderAttachmentChips();
             return self.trackIndexDispatch(notifyAgentSaveAttachment({
               platform: id.platform,
               model: id.model,
@@ -13306,6 +13424,7 @@ var _ChatSession = class _ChatSession {
       });
     });
     return chain.then(function() {
+      checkCancel();
       att._abort = null;
       att.progress = 100;
       if (att.kind === "folder") att.uploadedUrls = urls.map(function(u) {
@@ -13366,12 +13485,20 @@ var _ChatSession = class _ChatSession {
             return a.id === att.id;
           });
           var aborted = err && (err.message === "Aborted" || err === "Aborted");
+          if (att._cancelled || isUploadCancelledError(err)) {
+            att.status = "cancelled";
+            att._abort = null;
+            self.host.renderAttachmentChips();
+            return;
+          }
           if (removed || aborted) return;
           att.status = "error";
           att.errorMessage = "File upload has failed";
           att.errorCode = err && (err.code || err.body && err.body.code) || "";
           att.errorDetail = err && (err.message || err.body && err.body.message) || (typeof err === "string" ? err : "");
           self.host.renderAttachmentChips();
+        }).then(function() {
+          att._settledBatch = att._batchId || true;
         });
       });
     });
@@ -13486,6 +13613,7 @@ exports.UPLOAD_ACCESS_GROUPS = UPLOAD_ACCESS_GROUPS;
 exports.UPLOAD_ACCESS_HINTS = UPLOAD_ACCESS_HINTS;
 exports.UPLOAD_ACCESS_LABELS = UPLOAD_ACCESS_LABELS;
 exports.UPLOAD_ACCESS_OPTIONS = UPLOAD_ACCESS_OPTIONS;
+exports.UPLOAD_CANCELLED_MESSAGE = UPLOAD_CANCELLED_MESSAGE;
 exports.XML_EXTS = XML_EXTS;
 exports.__resetSplitHistoryState = __resetSplitHistoryState;
 exports.accessSettingFrom = accessSettingFrom;
@@ -13600,6 +13728,7 @@ exports.isReturnTrigger = isReturnTrigger;
 exports.isServerExtractable = isServerExtractable;
 exports.isServiceDbAttachmentHref = isServiceDbAttachmentHref;
 exports.isTransportFailure = isTransportFailure;
+exports.isUploadCancelledError = isUploadCancelledError;
 exports.isWindowedReadFile = isWindowedReadFile;
 exports.linkUnavailableKeyForHref = linkUnavailableKeyForHref;
 exports.linkUnavailableKeyForPath = linkUnavailableKeyForPath;
@@ -13680,6 +13809,7 @@ exports.sideEffectDone = sideEffectDone;
 exports.skapiSupportsStreaming = skapiSupportsStreaming;
 exports.skipDuplicateFilesEnabled = skipDuplicateFilesEnabled;
 exports.skipDuplicateFilesFrom = skipDuplicateFilesFrom;
+exports.splitLabelForFit = splitLabelForFit;
 exports.statusPushEnabled = statusPushEnabled;
 exports.statusPushLive = statusPushLive;
 exports.streamRecoveryEnabled = streamRecoveryEnabled;

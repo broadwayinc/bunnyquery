@@ -96,13 +96,25 @@ export function buildChatSystemPrompt(params: ChatSystemPromptParams): string {
 	// a claim about the project's data (product help, a greeting, authored text).
 	// The upload suggestion follows canUpload for the same reason the About section
 	// does: a visitor who cannot upload must never be told to.
+	//
+	// NOT FOUND BY searchText (2026-11-26): a photo's serial read as "[?]" at indexing
+	// is not in the page text, so the search honestly finds nothing. The answer must
+	// then say so, say how much was searched, and point at re-indexing the file (a
+	// photo or a recent upload is where a misread is likely), never offer another
+	// file as the match. The re-index direction follows canUpload and the client.
+	const reindexHint = canUpload === false
+		? `asking the project's owner to re-index that file`
+		: client === 'console'
+			? `re-indexing that file (select it on the Files page and choose Reindex)`
+			: `re-indexing that file (attach the same file again and choose to reindex it)`;
 	const groundingRules =
 `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false
 			? `another name or file to look under, or asking the project's owner to add it`
 			: `the document to upload, or another name or file to look under`}.
+A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files, the records when the value could be in a table), keep the answer short: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
-These three rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
+These rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
 
 	// ---- Web switch ---------------------------------------------------------
 	// Follows the tool list: with the web off the chat has no such tool, with it on

@@ -1928,6 +1928,7 @@ import {
         uploadingAttachments: false,
         attachmentWarning: "",
         attachmentCapNotice: "",  // informational "N files not added" when an add hit MAX_ATTACHMENT_FILE_COUNT
+        attachmentCancelNotice: "", // "Upload cancelled: <file>." after the user cancelled uploads
         attachmentsRow: null,     // .bq-attachments DOM node
         attachBtnEl: null,
         sendBtnEl: null,
@@ -2305,6 +2306,8 @@ import {
         // it. The warning clears when the user removes files or clears the text.
         recomputeAttachmentWarning();
         if (CS.attachmentWarning) { renderAttachmentChips(); updateComposerControls(); return; }
+        // A new send: the notice about an earlier cancel has done its job.
+        if (CS.attachmentCancelNotice) { CS.attachmentCancelNotice = ""; renderAttachmentChips(); }
 
         // Hand the composer back to the user before a single byte moves. The
         // input is empty again, so Send drops back to disabled.
@@ -2516,11 +2519,12 @@ import {
     // The markup is the ENGINE's (renderInlineLinkHtml): this used to be a byte
     // for byte copy of agent.vue's emitter, and the image preview would have had
     // to be written into both. This view supplies only what is local to it.
-    function linkToAnchorHtml(link, allowImagePreview) {
+    function linkToAnchorHtml(link, allowImagePreview, fitLabel) {
         return renderInlineLinkHtml(link, {
             refreshing: !!refreshingLinkMap[link.expiredHref || link.href],
             allowImagePreview: allowImagePreview,
             unavailable: isLinkUnavailable(link, unavailableLinkMap),
+            fitLabel: !!fitLabel,
         });
     }
     // The citation chips of one answer's retrieval note, as the SAME markup an
@@ -2549,6 +2553,8 @@ import {
     // opts.imagePreviews: false — used by the collapsed indexing-row HEADER,
     // whose file chip must stay a plain inline chip: an is-image-preview block
     // there breaks the header's horizontal alignment (mirror of agent.vue).
+    // opts.fitLinkLabels: true: the same header shows each file chip's FULL
+    // name and lets CSS cut it to the row (renderInlineLinkHtml fitLabel).
     // Drives the dots in [generating file.ext...] placeholders: one 400 ms ticker,
     // running only while a reply is being typed and a placeholder is on screen.
     var genDotTick = 0, genDotTimer = null;
@@ -2563,6 +2569,7 @@ import {
     }
     function parseMsgPartsHtml(content, opts) {
         var noPreviews = !!(opts && opts.imagePreviews === false);
+        var fitLinks = !!(opts && opts.fitLinkLabels);
         var placeholderHtml = [];
         var PH = function (idx) { return "BQ" + idx + ""; };
         var pushPlaceholder = function (anchorHtml) { var idx = placeholderHtml.length; placeholderHtml.push(anchorHtml); return PH(idx); };
@@ -2593,7 +2600,7 @@ import {
             var built = buildLinkPartFromGroups(full, args[0], args[1], args[2], args[3], args[4], args[5]);
             if (!built) return full;
             var allow = previewsLeft > 0;
-            var html = linkToAnchorHtml(built.part, allow);
+            var html = linkToAnchorHtml(built.part, allow, fitLinks);
             if (allow && built.part.image) previewsLeft--;
             return pushPlaceholder(html) + (built.tail || "");
         });
@@ -2731,9 +2738,13 @@ import {
                 xhr.upload.addEventListener("load", function () { bodySent = true; touch(); });
             }
             if (xhr.upload && typeof onProgress === "function") xhr.upload.onprogress = onProgress;
-            if (typeof setAbort === "function") setAbort(function () { try { xhr.abort(); } catch (e) {} });
             touch();
             xhr.send(form);
+            // Handed over AFTER send(): the engine aborts at once when the user
+            // cancelled during the get-signed-url round trip, and an abort before
+            // send() would leave send() throwing on an unsent request instead of
+            // ending in onabort like every other cancel.
+            if (typeof setAbort === "function") setAbort(function () { clearIdle(); try { xhr.abort(); } catch (e) {} });
         });
     }
     // Upload one File to db host storage. Resolves on success; rejects with
@@ -3254,6 +3265,7 @@ import {
         // Over-cap adds are truncated (not rejected) and reported informationally:
         // show how many files were left out, but do NOT block the composer. The
         // user can still send with the files that were attached.
+        CS.attachmentCancelNotice = "";
         CS.attachmentCapNotice = dropped > 0
             ? "You can attach up to " + MAX_ATTACHMENT_FILE_COUNT + " files per message. " +
               dropped + " file" + (dropped === 1 ? " was" : "s were") + " not added."
@@ -3334,7 +3346,17 @@ import {
     function removeAttachments(ids) {
         var idset = {};
         ids.forEach(function (id) { idset[id] = true; });
+        // Chips of a send that is still uploading are CANCELLED, not just dropped:
+        // the engine must also stop them from being indexed or posted.
+        var inFlight = inFlightUploadAttachments().filter(function (a) { return idset[a.id]; });
+        if (inFlight.length) {
+            cancelAttachmentUploads(inFlight);
+            inFlight.forEach(function (a) { delete idset[a.id]; });
+        }
         CS.attachments = CS.attachments.filter(function (a) {
+            // A file of a sent message that is past cancelling (its indexing request
+            // has gone out) stays: dropping its chip would not stop it being posted.
+            if (idset[a.id] && a._batchId && a.status === "uploading") return true;
             if (idset[a.id]) { if (a._abort) { try { a._abort(); } catch (e) {} } return false; }
             return true;
         });
@@ -3349,6 +3371,7 @@ import {
         var i = CS.attachments.findIndex(function (a) { return a.id === id; });
         if (i === -1) return;
         var att = CS.attachments[i];
+        if (isInFlightUpload(att)) { cancelAttachmentUploads([att]); return; }
         if (att._abort) { try { att._abort(); } catch (e) {} }
         CS.attachments.splice(i, 1);
         CS.attachmentCapNotice = ""; // removing files clears the "N not added" notice
@@ -3357,9 +3380,81 @@ import {
         updateComposerControls();
         scheduleAttachmentOverflowRecompute();
     }
+    // ---- cancelling uploads -------------------------------------------------
+    // A chip of a send that is still uploading: the one whose bytes are moving,
+    // and the ones queued behind it in a batch. Not a single file whose indexing
+    // request has already gone out: that cannot be taken back here any more (its
+    // indexing row has a Stop), so it is not offered a cancel at all.
+    function isInFlightUpload(a) {
+        if (!a || a._cancelled) return false;
+        if (a.kind !== "folder" && a._indexQueued) return false;
+        if (a.status === "uploading") return true;
+        // Its batch already finished with it (a failure waiting for the batch to end).
+        if (a._settledBatch && a._settledBatch === a._batchId) return false;
+        return !!a._batchId && a.status !== "done" && a.status !== "cancelled";
+    }
+    function inFlightUploadAttachments() {
+        return CS.attachments.filter(isInFlightUpload);
+    }
+    // Cancel these chips' uploads. The engine aborts the bytes in flight and stops
+    // every later step (file record, indexing request, the chat turn's link), so a
+    // cancelled file is neither indexed nor posted. The chips leave the row and a
+    // notice says what was cancelled, and what a cancel could not undo.
+    function cancelAttachmentUploads(atts) {
+        var cancelled = (atts || []).filter(isInFlightUpload);
+        if (!cancelled.length) return;
+        var ids = {};
+        cancelled.forEach(function (a) {
+            // A chip queued behind another one has nothing to abort yet: the flag
+            // alone stops it (and the batch skips a chip that left the list).
+            if (!session.cancelAttachmentUpload(a)) a._cancelled = true;
+            ids[a.id] = true;
+        });
+        CS.attachments = CS.attachments.filter(function (a) { return !ids[a.id]; });
+        CS.attachmentCancelNotice = uploadCancelNotice(cancelled);
+        CS.attachmentCapNotice = "";
+        CS.visibleAttachmentCount = Infinity;
+        recomputeAttachmentWarning();
+        renderAttachmentChips();
+        updateComposerControls();
+        scheduleAttachmentOverflowRecompute();
+    }
+    function uploadCancelNotice(list) {
+        var names = list.map(function (a) { return a.kind === "folder" ? a.name + "/" : a.name; });
+        var text = list.length === 1
+            ? "Upload cancelled: " + names[0] + "."
+            : list.length + " uploads cancelled: " + names.slice(0, 3).join(", ")
+                + (names.length > 3 ? " and " + (names.length - 3) + " more." : ".");
+        // What the cancel could not undo, said plainly rather than implied away.
+        // Queued: a folder member whose indexing request had already gone out.
+        // Stored: a member whose bytes had already landed (or were all sent and
+        // only the answer was outstanding), which this page has no way to delete.
+        var queued = 0, stored = 0;
+        list.forEach(function (a) {
+            var q = a._indexQueuedCount || 0;
+            queued += q;
+            var landed = Math.max(0, (a._storedCount || 0) - q);
+            if (!landed && a.status === "uploading" && (a.progress || 0) >= 100) landed = 1;
+            stored += landed;
+        });
+        if (queued) {
+            text += " " + queued + (queued === 1 ? " file had" : " files had") + " already gone to indexing; stop "
+                + (queued === 1 ? "it from its row" : "them from their rows") + " in the chat.";
+        }
+        if (stored) {
+            var subject = list.length === 1 && stored === 1 && !queued ? "Its"
+                : stored === 1 ? "One file's" : stored + " files'";
+            text += " " + subject + " bytes had already been sent, so "
+                + (stored === 1 ? "it" : "they") + " may stay in storage, but " + (stored === 1 ? "it was" : "they were")
+                + " not indexed or added to the chat.";
+        }
+        return text;
+    }
+
     // "Remove all" is a composer affordance: it drops what the user has staged for
     // the NEXT message and leaves in-flight batches alone (those files belong to a
-    // message that is already sent — their own chip × cancels them individually).
+    // message that is already sent: their own chip x cancels them individually,
+    // and "Cancel all uploads" cancels all of them).
     function clearAttachments() {
         CS.attachments = CS.attachments.filter(function (a) { return !!a._batchId; });
         CS.attachmentWarning = "";
@@ -3378,6 +3473,10 @@ import {
             if (a.status !== "error" && a.status !== "indexError") return false;
             a._abort = null;
             delete a._batchId;
+            // Handed back for a retry: the cancel bookkeeping of the run that failed
+            // must not decide whether the retry can be cancelled (an indexError
+            // chip had its indexing request sent, which made it uncancellable).
+            delete a._indexQueued; delete a._settledBatch;
             return true;
         });
         CS.attachmentCapNotice = "";
@@ -3413,8 +3512,22 @@ import {
         var row = CS.attachmentsRow;
         if (!row) return;
         row.innerHTML = "";
-        if (!CS.attachments.length && !CS.attachmentWarning && !CS.attachmentCapNotice) { row.style.display = "none"; return; }
+        if (!CS.attachments.length && !CS.attachmentWarning && !CS.attachmentCapNotice && !CS.attachmentCancelNotice) { row.style.display = "none"; return; }
         row.style.display = "";
+        // What the user just cancelled: informational, muted (a cancel is not an
+        // error). Its x dismisses it; adding files or sending clears it too.
+        if (CS.attachmentCancelNotice) {
+            var cancelNoticeClose = h("button", { class: "bq-attachment-remove", type: "button",
+                title: "Dismiss", "aria-label": "Dismiss", text: "×" });
+            cancelNoticeClose.addEventListener("click", function (e) {
+                e.stopPropagation();
+                CS.attachmentCancelNotice = "";
+                renderAttachmentChips();
+                scheduleAttachmentOverflowRecompute();
+            });
+            row.appendChild(h("div", { class: "bq-attachment-warning is-notice", role: "status" },
+                h("span", { text: CS.attachmentCancelNotice }), cancelNoticeClose));
+        }
         // Informational cap notice ("N files not added"): shown but non-blocking.
         if (CS.attachmentCapNotice) {
             row.appendChild(h("div", { class: "bq-attachment-warning" }, h("span", { text: CS.attachmentCapNotice })));
@@ -3478,7 +3591,15 @@ import {
             // for finished (done) chips (the ↗ replaces it). Shown for pending +
             // persisted failures so the user can clear them — including a chip
             // queued behind a big upload in the same batch.
-            if (att.status !== "uploading" && att.status !== "done") {
+            // While its upload is in flight (bytes moving, or queued behind another
+            // file of a sent message) the same x CANCELS the upload instead: the
+            // file is then neither indexed nor attached to the message.
+            if (isInFlightUpload(att)) {
+                var cancelBtn = h("button", { class: "bq-attachment-remove", type: "button",
+                    title: "Cancel upload", "aria-label": "Cancel upload of " + att.name, text: "×" });
+                cancelBtn.addEventListener("click", function (e) { e.stopPropagation(); cancelAttachmentUploads([att]); });
+                chip.appendChild(cancelBtn);
+            } else if (att.status !== "uploading" && att.status !== "done") {
                 var rm = h("button", { class: "bq-attachment-remove", type: "button", title: "Remove", text: "×" });
                 rm.addEventListener("click", function (e) { e.stopPropagation(); removeAttachment(att.id); });
                 chip.appendChild(rm);
@@ -3503,6 +3624,15 @@ import {
                 title: "Remove all attachments" }, "Remove all ×");
             removeAll.addEventListener("click", function (e) { e.stopPropagation(); clearAttachments(); });
             row.appendChild(removeAll);
+        }
+        // More than one file of a sent message still uploading (the one moving and
+        // the ones queued behind it): one control cancels them all, hidden ones too.
+        var inFlight = inFlightUploadAttachments();
+        if (inFlight.length >= 2) {
+            var cancelAll = h("button", { class: "bq-attachment-remove-all", type: "button",
+                title: "Cancel all " + inFlight.length + " uploads" }, "Cancel all uploads ×");
+            cancelAll.addEventListener("click", function (e) { e.stopPropagation(); cancelAttachmentUploads(inFlightUploadAttachments()); });
+            row.appendChild(cancelAll);
         }
     }
     // Uploads are blocked for non-admin users when the service database is
@@ -3811,7 +3941,12 @@ import {
         // bubble off refreshingLinkMap; the same class and suffix
         // renderInlineLinkHtml gives a refreshing chip, applied in place so the
         // anchor clicked below is still the one on screen).
-        var busy = document.createTextNode(" (fetching...)");
+        // A span, not a bare text node: in a fitted chip (an indexing row's file
+        // name, a flex line) a bare text node is an anonymous flex item whose
+        // leading space collapses, gluing "(fetching...)" to the name.
+        var busy = document.createElement("span");
+        busy.className = "bq-link-tail";
+        busy.textContent = " (fetching...)";
         anchor.classList.add("is-refreshing");
         anchor.appendChild(busy);
         var unbusy = function () {
@@ -4813,7 +4948,7 @@ import {
         // on the label span left a bare <p> carrying the host page's default
         // margins, which made the collapsed row tall in the widget only.
         var label = h("span", { class: "bq-index-label" },
-            h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group), { imagePreviews: false }) }));
+            h("span", { class: "bq-md", html: parseMsgPartsHtml(indexGroupLabel(group), { imagePreviews: false, fitLinkLabels: true }) }));
         label.addEventListener("click", function (e) {
             // A click on the file name is a download, not a collapse toggle.
             if (e.target && e.target.closest && e.target.closest("a")) e.stopPropagation();
@@ -5374,7 +5509,7 @@ import {
         CS.messages = []; CS.messageEls = []; CS.indexGroupsOpen = {}; CS.sending = false; CS.typing = false; CS.typingAbort = true;
         CS.drafting = false; CS.draftingEl = null;
         CS.historyEndOfList = false; CS.historyStartKeyHistory = []; CS.stickToBottom = true;
-        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = "";
+        CS.attachments = []; CS.uploadingAttachments = false; CS.attachmentWarning = ""; CS.attachmentCapNotice = ""; CS.attachmentCancelNotice = "";
         CS.attachmentsRow = null; CS.attachBtnEl = null; CS.sendBtnEl = null; CS.inputEl = null;
         CS.chatEl = null; CS.visibleAttachmentCount = Infinity;
         CS.chatSettingsOpen = false; CS.settingsBtnEl = null; CS.composerEl = null; CS.chatStatusEl = null;

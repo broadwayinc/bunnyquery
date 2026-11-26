@@ -161,13 +161,18 @@ export function buildIndexingUserMessage(
 	if (options?.imageFile) {
 		// The URL line stays: the engine builds the image block from the URL it finds in this
 		// text. The fields named here are the ones the worker writes as the image's page text.
+		// "text_regions" (2026-11-26) is the worker's contract: up to 4 boxes, fractions of the
+		// image as the model saw it, that the worker can crop and read again at full resolution.
 		return (
 			head +
 			`- temporary URL: ${attachment.url}\n` +
 			(options.imageFile === 'attached'
 				? `\nThis is an IMAGE file, attached to this message as an image: read it there, not from the URL. `
 				: `\nThis is an IMAGE file in a format the AI cannot take directly. When an image of it is attached to this message (the server converts it when it can), read it there; when none is attached, index the file from its metadata only and do not guess its contents. `) +
-			`Transcribe every character FIRST, at whatever angle the text is: "printed_text", "handwritten_text", and "part_no" / "serial_no" / "tag_id", with every identifier also written inside "printed_text" or "handwritten_text". Then set "text_rotation" and "text_legibility" on the file's "src::" record, and only then describe what the image shows.`
+			`Transcribe every character FIRST, at whatever angle the text is: "printed_text", "handwritten_text", and "part_no" / "serial_no" / "tag_id", with every identifier also written inside "printed_text" or "handwritten_text". ` +
+			`Write each label's value right after its label, as "<label>: <value>" (the label's own words, then the characters written beside it), reading small and handwritten characters closely; use [?] only for a character that is truly unreadable, and never put a guessed character in its place. ` +
+			`Then set "text_rotation", "text_legibility" and "text_regions" on the file's "src::" record, and only then describe what the image shows. ` +
+			`"text_regions" is a list of up to 4 boxes [left, top, right, bottom], each a fraction from 0 to 1 of the image exactly as it is shown to you here (not turned upright), drawn tightly around a label, plate or handwritten area whose characters matter (a serial number, a part number, a tag); [] when there is none.`
 		);
 	}
 

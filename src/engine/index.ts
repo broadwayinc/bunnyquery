@@ -253,6 +253,9 @@ export {
 	// A page that draws indexing state from the queue, with or without a chat view
 	// (ChatSession.watchIndexQueue; the answer is in state.indexQueues).
 	type IndexQueueIdentity, type IndexQueueWatchOptions, type IndexQueueWatchHandle,
+	// A cancelled attachment upload (ChatSession.cancelAttachmentUpload) rejects
+	// with this, so a view can tell it from a failed one.
+	UPLOAD_CANCELLED_MESSAGE, isUploadCancelledError,
 } from './session';
 export type { ChatHost, ChatIdentity, ChatState, ChatMessage, IndexingFileRef, PinnedDispatchContext, IndexQueueSnapshot } from './host';
 
