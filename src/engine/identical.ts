@@ -189,11 +189,38 @@ export function parseLinkedReply(text: any): { original: string; ms?: number } |
 
 // ------------------------------------------------------------------- promotion
 
+/** Who sends the copies again: the signed-in user, and whether they own the project. */
+export type PromotionActor = { userId?: string | null; isProjectOwner?: boolean };
+
+/**
+ * The linked copies `actor` may send to indexing again (review 2026-11-26): every copy for the
+ * project owner, otherwise only the copies the actor uploaded (the marker's copy_owner). Another
+ * user's copy is never re-indexed from this user's session: it would read that user's file
+ * (perhaps a private one) and write its index under this user's records and upload group. A copy
+ * left out keeps its link; once the original holds other content the server answers it as having
+ * no index, the Files page shows it red ("Original removed or failed") and its Reindex fixes it.
+ */
+export function promotableCopies(
+	linked: Map<string, LinkedMarker> | { [path: string]: LinkedMarker },
+	actor: PromotionActor,
+): Map<string, LinkedMarker> {
+	var entries: [string, LinkedMarker][] = linked instanceof Map
+		? Array.from(linked.entries())
+		: Object.keys(linked).map(function (k) { return [k, (linked as any)[k]] as [string, LinkedMarker]; });
+	var out = new Map<string, LinkedMarker>();
+	for (var i = 0; i < entries.length; i++) {
+		var m = entries[i][1];
+		if (actor.isProjectOwner || (!!actor.userId && !!m && m.owner === actor.userId)) out.set(entries[i][0], m);
+	}
+	return out;
+}
+
 /**
  * The copies to send again when originals go away (a delete, a folder delete, an Overwrite
  * of an original), per original, oldest first. The first copy of each list becomes the new
  * original (one real AI run, sent with the share flag so it claims the content); the others
- * are sent after it and link to it. Copies that are themselves being removed are left out.
+ * are sent after it and link to it. Copies that are themselves being removed are left out, and
+ * with `actor`, the copies that user may not re-index (promotableCopies).
  * `removed`: the storage paths going away; `removedFolders`: folder paths whose whole
  * content goes away.
  */
@@ -201,7 +228,9 @@ export function copiesToPromote(
 	linked: Map<string, LinkedMarker> | { [path: string]: LinkedMarker },
 	removed: string[],
 	removedFolders?: string[],
+	actor?: PromotionActor | null,
 ): { original: string; copies: string[] }[] {
+	if (actor) linked = promotableCopies(linked, actor);
 	var gone = new Set<string>(removed || []);
 	var folders = (removedFolders || []).filter(Boolean).map(function (f) { return f.replace(/\/+$/, '') + '/'; });
 	var isGone = function (p: string): boolean {

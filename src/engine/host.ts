@@ -480,7 +480,7 @@ export interface ChatHost {
 	 * With it, an Overwrite of an ORIGINAL sends its copies again afterwards (the oldest
 	 * becomes the new original, the others link to it). Missing or null: nothing is sent.
 	 */
-	findLinkedCopies?(): Promise<Map<string, { original: string; claim?: string; linkedAt?: number }> | null>;
+	findLinkedCopies?(): Promise<Map<string, { original: string; claim?: string; linkedAt?: number; owner?: string | null }> | null>;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;

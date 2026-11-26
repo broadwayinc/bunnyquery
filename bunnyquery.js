@@ -3147,7 +3147,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var secs = m[2] !== void 0 ? Number(m[2]) : NaN;
     return { original: m[1], ms: isFinite(secs) ? Math.round(secs * 1e3) : void 0 };
   }
-  function copiesToPromote(linked, removed, removedFolders) {
+  function promotableCopies(linked, actor) {
+    var entries = linked instanceof Map ? Array.from(linked.entries()) : Object.keys(linked).map(function(k) {
+      return [k, linked[k]];
+    });
+    var out = /* @__PURE__ */ new Map();
+    for (var i = 0; i < entries.length; i++) {
+      var m = entries[i][1];
+      if (actor.isProjectOwner || !!actor.userId && !!m && m.owner === actor.userId) out.set(entries[i][0], m);
+    }
+    return out;
+  }
+  function copiesToPromote(linked, removed, removedFolders, actor) {
+    if (actor) linked = promotableCopies(linked, actor);
     var gone = new Set(removed || []);
     var folders = (removedFolders || []).filter(Boolean).map(function(f) {
       return f.replace(/\/+$/, "") + "/";
@@ -6321,8 +6333,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      */
     collectLinkedCopies(removed, folders) {
       if (typeof this.host.findLinkedCopies !== "function") return Promise.resolve([]);
+      var id = this.host.getIdentity();
+      var actor = { userId: id && !id.anonymous ? id.userId : null, isProjectOwner: !!(id && !id.anonymous && id.owner && id.userId === id.owner) };
       return Promise.resolve(this.host.findLinkedCopies()).then(function(map) {
-        return map ? copiesToPromote(map, removed || [], folders) : [];
+        return map ? copiesToPromote(map, removed || [], folders, actor) : [];
       }).catch(function() {
         return [];
       });
@@ -13544,7 +13558,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp.broadwayinc.computer";
-    var BQ_VERSION = "1.21.9" ;
+    var BQ_VERSION = "1.21.10" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";

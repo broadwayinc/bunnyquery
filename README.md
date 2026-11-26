@@ -423,11 +423,15 @@ and BunnyQuery's MCP reads the key again before it links anything. There is no
   than naming it.
 - **Overwriting an original** sends its copies to indexing again: the oldest becomes
   the new original (one real AI run) and the others link to it. A copy overwritten with
-  different bytes simply gets its own index.
+  different bytes simply gets its own index. Only the copies the overwriting user may
+  re-index are sent (their own uploads; every copy for the project owner). Another
+  user's copy keeps its link, the server answers it as having no index once the
+  original holds other content (never the new content), and the Files page shows it
+  red with a Reindex.
 
 The engine's `identical.ts` exports what both clients use: `copyStatusOf` (a copy's
 "Indexed via", "Waiting for", "Original removed or failed" state from its markers and
-the live claim ids), `listLinkedCopies`, `listContentClaims`, `copiesToPromote`,
+the live claim ids), `listLinkedCopies`, `listContentClaims`, `copiesToPromote` (with `promotableCopies`),
 `indexGroupLinkedLabel`, and the owner's `findIdenticalFiles` / `linkIdenticalFile`.
 
 ### Filenames

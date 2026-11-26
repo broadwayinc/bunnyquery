@@ -1243,8 +1243,11 @@ export class ChatSession {
 	 */
 	collectLinkedCopies(removed: string[], folders?: string[]): Promise<{ original: string; copies: string[] }[]> {
 		if (typeof this.host.findLinkedCopies !== 'function') return Promise.resolve([]);
+		// only copies this user may re-index: their own, or every copy for the project owner
+		var id = this.host.getIdentity();
+		var actor = { userId: id && !id.anonymous ? id.userId : null, isProjectOwner: !!(id && !id.anonymous && id.owner && id.userId === id.owner) };
 		return Promise.resolve(this.host.findLinkedCopies())
-			.then(function (map) { return map ? copiesToPromote(map, removed || [], folders) : []; })
+			.then(function (map) { return map ? copiesToPromote(map, removed || [], folders, actor) : []; })
 			.catch(function () { return []; });
 	}
 

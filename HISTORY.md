@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.9**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.10**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.10 (2026-11-26, not yet published)
+
+- **Promotion only re-indexes copies the user may re-index.** When an original is overwritten, `copiesToPromote` now takes the acting user (`PromotionActor`: user id, project owner or not) and keeps only their own copies, or every copy for the project owner (`promotableCopies`, from the marker's `copy_owner`). Until now a widget user overwriting an authorized original also sent another user's private copy to indexing from their own session, which would read that file and write its index under their records and upload group. `ChatSession.collectLinkedCopies` passes the identity; the dashboard passes its own. A copy left out keeps its link; the MCP answers it as having no index once the original holds other content, and the Files page shows it red with a Reindex.
 
 ## 1.21.9 (2026-11-26, not yet published)
 
