@@ -100,7 +100,7 @@ const mcpUrl = () => chatEngineConfig().mcpBaseUrl;
  * Append query parameters to an MCP endpoint, preserving any the base already carries.
  *
  * An explicit path before the query. The configured base has no trailing slash
- * ("https://mcp-dev.broadwayinc.computer"), and appending "?profile=index" straight onto an
+ * ("https://mcp.broadwayinc.computer"), and appending "?profile=index" straight onto an
  * authority with no path yields a URL that is legal but that intermediaries and clients
  * normalise inconsistently. "/?profile=index" is unambiguous everywhere.
  *

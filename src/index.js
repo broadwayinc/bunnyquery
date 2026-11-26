@@ -164,7 +164,7 @@ import {
     // bunnyquery.com page). Override the base via `opts.mcpBaseUrl`, or toggle
     // the dev host with `opts.dev`.
     var MCP_PROD = "https://mcp.skapi.com";
-    var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
+    var MCP_DEV = "https://mcp.broadwayinc.computer";
     var MCP_NAME = "BunnyQuery";
 
     // Package version, injected at build time by tsup (define: __BQ_VERSION__).
@@ -6172,7 +6172,7 @@ import {
             // chat.css reads with the default as its fallback.
             bubbleFace: null,
             signup: false,        // include signup (and thus delete/recover account)
-            dev: false,          // use the MCP dev host (mcp-dev.broadwayinc.computer)
+            dev: false,          // use the MCP dev host (mcp.broadwayinc.computer)
             mcpBaseUrl: null,    // override the MCP OAuth server base entirely
             googleClientId: null,
             googleClientSecretName: "ggl",

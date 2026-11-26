@@ -13349,7 +13349,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   // src/index.js
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
-    var MCP_DEV = "https://mcp-dev.broadwayinc.computer";
+    var MCP_DEV = "https://mcp.broadwayinc.computer";
     var BQ_VERSION = "1.21.7" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -18499,7 +18499,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         signup: false,
         // include signup (and thus delete/recover account)
         dev: false,
-        // use the MCP dev host (mcp-dev.broadwayinc.computer)
+        // use the MCP dev host (mcp.broadwayinc.computer)
         mcpBaseUrl: null,
         // override the MCP OAuth server base entirely
         googleClientId: null,

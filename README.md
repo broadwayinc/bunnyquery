@@ -695,7 +695,7 @@ page waits for a second look, and puts the answer in `state.indexQueues[projectI
 ## OAuth & redirects
 
 BunnyQuery connects to your AI agent through an MCP OAuth server
-(`mcp.skapi.com` in production, `mcp-dev.broadwayinc.computer` when
+(`mcp.skapi.com` in production, `mcp.broadwayinc.computer` when
 `dev: true`). After authorization, the OAuth server redirects back to **the current
 host page**: BunnyQuery reads the `?code=…&state=…` parameters, completes the
 exchange, and cleans them from the URL automatically. No dedicated callback page is
