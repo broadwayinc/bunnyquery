@@ -68,6 +68,13 @@
   function skipDuplicateFilesFrom(data) {
     return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
   }
+  var DEFAULT_SHARE_IDENTICAL_FILES = true;
+  function normalizeShareIdenticalFiles(value) {
+    return value !== false;
+  }
+  function shareIdenticalFilesFrom(data) {
+    return data ? normalizeShareIdenticalFiles(data.share_identical_files) : DEFAULT_SHARE_IDENTICAL_FILES;
+  }
   var DEFAULT_ANSWER_MODE = "standard";
   function normalizeAnswerMode(value) {
     return value === "fast" || value === "thorough" ? value : DEFAULT_ANSWER_MODE;
@@ -150,6 +157,9 @@
   }
   function projectChatGreeting(service) {
     return chatGreetingFrom(cachedProjectSettings(service));
+  }
+  function projectShareIdenticalFiles(service) {
+    return shareIdenticalFilesFrom(cachedProjectSettings(service));
   }
 
   // src/engine/config.ts
@@ -1018,6 +1028,7 @@ NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and n
 ${documentRules}
 ${accessGroupRule}
 COMPLETE ANSWERS: ONE file is routinely SPLIT ACROSS SEVERAL TABLES (a summary row in one, its page or row content in another, its extracted pictures in "__MEDIA__"), so for anything not scoped to a single file run the query in EVERY table that could hold the answer and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), read the COMPLETE matching set across every such table and file before answering. Never assert absence ("there is no X", "none", "not found", "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4") until a complete scan has come back empty: a confident "no" that later turns out wrong is worse than telling the user you are still checking. If you answered from one table and then find another holds more, re-run the sweep and give the complete answer instead of only apologising.
+LINKED COPIES: files with the same content are indexed once. A file a tool reports as a linked copy (linked_copy, or listed in a hit's also_at) has no rows or pages of its own: its content is the original's, stored and tagged under the original's name. Cite the original file and say that the copy is the same file; never count the two as two documents.
 Embedded values: a search term is often stored inside a larger string (a merchant "BAKSA" as "DNH*BAKSA#4070277042", a card as "5860****5173"), which no index or tag filter matches. When the value may be embedded, fetch the full set with fetch_all and match the substring yourself.
 File attachments: an "Attached files:" section with markdown links in a user message points at short-lived signed URLs in this project's storage. Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY in the message as image blocks: look at them directly. Every other attached file (office documents such as .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, PDFs, email (.eml), text/data/code files such as .csv/.tsv/.json/.xml/.txt/.md) is ALREADY INDEXED: it was read end to end when it was uploaded, before this message reached you, so answer from its records (reference "src::<the storage path from the attachment link>"), and for its exact wording use searchText or readFileContent on that same path (see DOCUMENTS). Some turns instead carry the file text between "BEGIN FILE CONTENT" / "END FILE CONTENT" markers: read that block directly; a "[skapi: ...]" note inside it means that file could not be extracted. ${webAccess ? `Never web_fetch an attachment link (the picture is already in the message, everything else is in the database); a file the user gives as an outside web address may be fetched under the web rule above.` : `This chat has no web tool: never try to download or fetch an attachment link.`}
 Stored files: a file already in this project's storage was read end to end at upload time, so its records come first. For its exact wording find the page with searchText (DOCUMENTS); readFileContent re-reads the raw file (an older file without page text, a data file), and you read it to the end before concluding anything is absent there. If its pictures do not reach you, say so plainly and fall back to the indexed records; never call a file unreadable when its content is in the database.
@@ -2768,12 +2779,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const singlePass = !visionFile && !windowedRead && !pagedRead && !continuing;
     const imageFile = singlePass && !parsedContent && !serverExtract ? indexingImageFile(attachment) : void 0;
     const fileUrlDetail = imageFile && platform === "openai" ? getOpenAIImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
+    const shareIdentical = !continuing && info.shareIdentical !== false && (info.shareIdentical === true || projectShareIdenticalFiles(service));
     const skapiFileUrls = attachment.url && attachment.storagePath ? {
       _skapi_file_urls: [{
         path: attachment.storagePath,
         url: attachment.url,
         ...singlePass ? { index_end: true } : {},
-        ...fileUrlDetail ? { detail: fileUrlDetail } : {}
+        ...fileUrlDetail ? { detail: fileUrlDetail } : {},
+        ...shareIdentical ? { share_identical: true } : {}
       }]
     } : {};
     const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
@@ -3083,6 +3096,109 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     return typeof m._ts === "number" && m._ts > 0 ? m._ts : 0;
   }
 
+  // src/engine/identical.ts
+  var LINKED_COPY_TAG = "bq_linked";
+  function linkedMarkerOf(data) {
+    if (!data || typeof data !== "object" || data.linked !== true) return null;
+    var original = typeof data.alias_of === "string" ? data.alias_of : "";
+    if (!original) return null;
+    var at = Number(data.completed_at || data.finished || data.linked_at);
+    return {
+      original,
+      claim: typeof data.alias_claim === "string" && data.alias_claim ? data.alias_claim : void 0,
+      linkedAt: isFinite(at) && at > 0 ? at : void 0,
+      group: data.copy_group !== void 0 ? data.copy_group : void 0,
+      owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0
+    };
+  }
+  function fileNameOf(path) {
+    var s = String(path || "");
+    var at = s.lastIndexOf("/");
+    return at === -1 ? s : s.slice(at + 1);
+  }
+  function copiesByOriginal(linked) {
+    var entries = linked instanceof Map ? Array.from(linked.entries()) : Object.keys(linked).map(function(k) {
+      return [k, linked[k]];
+    });
+    entries.sort(function(a, b) {
+      return (a[1].linkedAt || 0) - (b[1].linkedAt || 0) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    });
+    var out = /* @__PURE__ */ new Map();
+    for (var i = 0; i < entries.length; i++) {
+      var o = entries[i][1].original;
+      if (!out.has(o)) out.set(o, []);
+      out.get(o).push(entries[i][0]);
+    }
+    return out;
+  }
+  function formatLinkDuration(ms) {
+    if (typeof ms !== "number" || !isFinite(ms) || ms < 0) return "";
+    if (ms < 1e4) return (Math.max(ms, 100) / 1e3).toFixed(1) + " s";
+    return formatIndexDuration(ms);
+  }
+  function linkedRowLabel(original, ms) {
+    var took = formatLinkDuration(ms);
+    return "Same content as " + fileNameOf(original) + ": linked" + (took ? " in " + took : "") + ", no AI used";
+  }
+  function parseLinkedReply(text) {
+    if (typeof text !== "string" || text.indexOf('[skapi] Same content as "') === -1) return null;
+    var m = /\[skapi\] Same content as "([^"]+)": linked to its index(?: in ([0-9]+(?:\.[0-9]+)?) s)?/.exec(text);
+    if (!m) return null;
+    var secs = m[2] !== void 0 ? Number(m[2]) : NaN;
+    return { original: m[1], ms: isFinite(secs) ? Math.round(secs * 1e3) : void 0 };
+  }
+  function copiesToPromote(linked, removed, removedFolders) {
+    var gone = new Set(removed || []);
+    var folders = (removedFolders || []).filter(Boolean).map(function(f) {
+      return f.replace(/\/+$/, "") + "/";
+    });
+    var isGone = function(p) {
+      if (gone.has(p)) return true;
+      for (var i = 0; i < folders.length; i++) if (p.indexOf(folders[i]) === 0) return true;
+      return false;
+    };
+    var out = [];
+    copiesByOriginal(linked).forEach(function(copies, original) {
+      if (!isGone(original)) return;
+      var keep = copies.filter(function(c) {
+        return !isGone(c);
+      });
+      if (keep.length) out.push({ original, copies: keep });
+    });
+    return out;
+  }
+  function listOf(res) {
+    return res && Array.isArray(res.list) ? res.list : [];
+  }
+  async function listLinkedCopies(skapi, service, maxPages = 10) {
+    if (!skapi || typeof skapi.getRecords !== "function" || !service) return null;
+    var out = /* @__PURE__ */ new Map();
+    try {
+      var fetchMore = false;
+      for (var page = 0; page < maxPages; page++) {
+        var res = await skapi.getRecords(
+          { service, table: { name: "__INDEXING__", access_group: "authorized" }, tag: LINKED_COPY_TAG },
+          { limit: 1e3, fetchMore }
+        );
+        var list = listOf(res);
+        for (var i = 0; i < list.length; i++) {
+          var r = list[i] || {};
+          var uid = String(r.unique_id || "");
+          if (uid.indexOf("done::") !== 0) continue;
+          var mk = linkedMarkerOf(r.data);
+          if (mk) out.set(uid.slice(6), mk);
+        }
+        if (!res || res.endOfList !== false) return out;
+        fetchMore = true;
+      }
+      return out;
+    } catch (err) {
+      var msg = String(err && (err.code || err.message) || err || "");
+      if (/NOT_EXISTS|not exist/i.test(msg)) return out;
+      return null;
+    }
+  }
+
   // src/engine/indexing_groups.ts
   function canonIndexKey(s) {
     return typeof s === "string" && s ? s.trim() : "";
@@ -3200,6 +3316,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   function indexGroupDurationLabel(group) {
     if (!group || group.status !== "done" || !group.finished || group.resolving || group.queued) return "";
     return formatIndexDuration(group.durationMs);
+  }
+  function indexGroupLinkedLabel(group) {
+    if (!group || !group.linked || group.status !== "done") return "";
+    return linkedRowLabel(group.linked.original, group.linked.ms);
   }
   function buildChatDisplayList(messages, opts) {
     var list = Array.isArray(messages) ? messages : [];
@@ -3396,6 +3516,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var vm = grp.members[vi];
         if (vm.msg._indexComplete) sawComplete = true;
         if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+        if (vm.msg.role === "assistant" && !vm.msg.isError && !grp.linked) {
+          var linkedReply = parseLinkedReply(vm.msg.content);
+          if (linkedReply) grp.linked = linkedReply;
+        }
+      }
+      if (grp.linked && grp.status !== "active" && grp.status !== "cancelled") {
+        grp.status = "done";
+        sawComplete = true;
       }
       grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
       if (grp.status === "active") {
@@ -3407,7 +3535,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       } else if (grp.driver === "client") {
         grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
       } else {
-        grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
+        grp.finished = !newestRunOfKey[order[oi]] || !!grp.linked || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
       }
       if (grp.status !== "done") {
         grp.resolving = false;
@@ -3558,7 +3686,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           queued: waitingStub || live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
           stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0),
           // The stub IS the record, so a 'done' record's span is this run's.
-          durationMs: st === "done" ? runRecordDurationMs(rec) : void 0
+          durationMs: st === "done" ? runRecordDurationMs(rec) : void 0,
+          linked: st === "done" && rec.linked && rec.alias_of ? { original: rec.alias_of, ms: typeof rec.link_ms === "number" ? rec.link_ms : void 0 } : void 0
         };
         stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
       }
@@ -3578,6 +3707,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         stubList.push({ started: trec.started, group: tg });
         overlayRunRecordVerdict(tg, trec, liveIndexKeys);
         tg.durationMs = runRecordGroupDurationMs(tg, trec);
+        if (trec.linked && trec.alias_of && trec.status === "done") {
+          tg.linked = { original: trec.alias_of, ms: tg.linked && tg.linked.ms !== void 0 ? tg.linked.ms : typeof trec.link_ms === "number" ? trec.link_ms : void 0 };
+        }
       }
     }
     stubList.sort(function(a, b) {
@@ -3619,7 +3751,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const tail = "/" + name;
     return uniqueId.length > SRC_PREFIX2.length + tail.length && uniqueId.slice(-tail.length) === tail;
   }
-  function listOf(res) {
+  function listOf2(res) {
     if (!res) return [];
     if (Array.isArray(res)) return res;
     return Array.isArray(res.list) ? res.list : [];
@@ -3636,14 +3768,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   async function storedCopyIndexing(skapi, storagePath, service) {
     const doneId = "done::" + storagePath;
     try {
-      const done = listOf(await skapi.getUniqueId(Object.assign({ unique_id: doneId }, service), { fetchMore: false, limit: 1 }));
+      const done = listOf2(await skapi.getUniqueId(Object.assign({ unique_id: doneId }, service), { fetchMore: false, limit: 1 }));
       if (done.some(function(it) {
         return (it && typeof it === "object" ? it.unique_id : it) === doneId;
       })) return "done";
     } catch {
     }
     try {
-      const run = listOf(await skapi.getRecords(Object.assign({ unique_id: "run::" + storagePath }, service)))[0];
+      const run = listOf2(await skapi.getRecords(Object.assign({ unique_id: "run::" + storagePath }, service)))[0];
       const data = run && run.data && typeof run.data === "object" ? run.data : null;
       if (data && data.status === "working" && typeof data.started === "number" && Date.now() - data.started < RUN_RECORD_WORKING_STALE_MS) return "running";
     } catch {
@@ -3672,7 +3804,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     const size = file && typeof file.size === "number" ? file.size : NaN;
     if (!name || !(size >= 0) || !userId) return null;
     const service = opts && opts.service ? { service: opts.service } : {};
-    const found = listOf(await skapi.getUniqueId(
+    const found = listOf2(await skapi.getUniqueId(
       Object.assign({ unique_id: name, condition: "<=" }, service),
       { fetchMore: false, limit: DUPLICATE_LOOKUP_LIMIT }
     ));
@@ -3685,7 +3817,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     for (const uniqueId of ids) {
       let record = null;
       try {
-        record = listOf(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
+        record = listOf2(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
       } catch {
         continue;
       }
@@ -6178,6 +6310,41 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         self.drainBgTaskQueue();
         return queued;
       });
+    }
+    /**
+     * ONE SHARED INDEX FOR IDENTICAL FILES: the linked copies that lose their original when
+     * `removed` files (or every file under `folders`) go away, per original, oldest first
+     * (identical.ts copiesToPromote). Read through host.findLinkedCopies, fresh, and it has
+     * to be read BEFORE the delete or reset: those remove nothing from the copies' markers,
+     * but a later sweep could no longer tell whose copies they were once a new original
+     * exists. Never rejects; [] without the hook or on any failure.
+     */
+    collectLinkedCopies(removed, folders) {
+      if (typeof this.host.findLinkedCopies !== "function") return Promise.resolve([]);
+      return Promise.resolve(this.host.findLinkedCopies()).then(function(map) {
+        return map ? copiesToPromote(map, removed || [], folders) : [];
+      }).catch(function() {
+        return [];
+      });
+    }
+    /**
+     * Send the copies of a removed or overwritten original again (owner decision
+     * 2026-11-26): each list's oldest copy first, so its first pass claims the content and
+     * is indexed for real (one AI run), then the others, which link to it with no AI call.
+     * The share flag rides on every first pass while the project's switch is on (requests.ts
+     * notifyAgentSaveAttachment). Through reindexStoredFiles, so each copy keeps its access
+     * group and shows as a "Reindexing" row. Resolves to the number of files queued.
+     */
+    promoteLinkedCopies(plan) {
+      var list = [];
+      (plan || []).forEach(function(g) {
+        (g && g.copies || []).forEach(function(c) {
+          if (c) list.push({ storagePath: c });
+        });
+      });
+      if (!list.length) return Promise.resolve(0);
+      console.log("[chat-engine] identical files: sending " + list.length + " linked cop" + (list.length === 1 ? "y" : "ies") + " again, their original is gone:", plan);
+      return this.reindexStoredFiles(list);
     }
     /**
      * The same question, asked of the SERVER when this page cannot answer it.
@@ -12999,6 +13166,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           checkCancel();
           var hadExists = false;
           var skipped = false;
+          var promotion = null;
           var duplicateOf = null;
           var existedBefore = false;
           var madeRecord = false;
@@ -13065,6 +13233,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             return self.host.promptOverwrite(member.file.name).then(function(choice) {
               if (choice === "overwrite") {
                 existedBefore = true;
+                promotion = self.collectLinkedCopies([member.storagePath]);
                 markImagePreviewStale(self.host.getIdentity().projectId || "default", member.storagePath);
                 return doMemberUpload(false);
               }
@@ -13241,6 +13410,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                   });
                   self.noteBgQueueChanged();
                   self.drainBgTaskQueue();
+                  if (promotion) {
+                    var plan = promotion;
+                    promotion = null;
+                    plan.then(function(pl) {
+                      return self.promoteLinkedCopies(pl);
+                    }).catch(function() {
+                    });
+                  }
                 }
               }, function(e) {
                 console.error("[chat-engine] indexing request failed", e);
@@ -13367,7 +13544,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp.broadwayinc.computer";
-    var BQ_VERSION = "1.21.8" ;
+    var BQ_VERSION = "1.21.9" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -15302,6 +15479,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var uid = S.user && S.user.user_id;
         if (!uid) return Promise.resolve(null);
         return findDuplicateUpload(S.skapi, file, uid, { service: S.projectId });
+      },
+      // Every linked copy of the project (one shared index for identical files): an
+      // Overwrite of an original sends its copies again (engine collectLinkedCopies).
+      findLinkedCopies: function() {
+        if (!S.skapi || !S.projectId || isAnonymousSession()) return Promise.resolve(null);
+        return listLinkedCopies(S.skapi, S.projectId);
       },
       storagePathFor: function(relPath) {
         return attachmentStoragePath(relPath);
@@ -17266,6 +17449,8 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       return indexGroupVerb(group) + " " + nameLabel;
     }
     function indexGroupCount(group) {
+      var linkedLine = indexGroupLinkedLabel(group);
+      if (linkedLine) return linkedLine;
       if (group.stub) return indexGroupDurationLabel(group);
       var prog = group.status === "active" && session && session.pageProgressFor ? session.pageProgressFor(group.path || group.key, group.name) : null;
       var pages = prog ? prog.total ? prog.saved + " of " + prog.total + " pages" : prog.saved + " pages" : "";
@@ -17315,7 +17500,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
                   finished: typeof d.finished === "number" ? d.finished : void 0,
                   error: typeof d.error === "string" ? d.error : void 0,
                   platform: d.platform === "claude" || d.platform === "openai" ? d.platform : void 0,
-                  owner: list[i] && typeof list[i].user_id === "string" ? list[i].user_id : void 0
+                  owner: list[i] && typeof list[i].user_id === "string" ? list[i].user_id : void 0,
+                  // a run LINKED to an identical file's index (engine identical.ts)
+                  linked: d.linked === true ? true : void 0,
+                  alias_of: d.linked === true && typeof d.alias_of === "string" ? d.alias_of : void 0,
+                  link_ms: d.linked === true && typeof d.link_ms === "number" ? d.link_ms : void 0
                 };
               }
             }
@@ -17395,7 +17584,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             finished: rr.finished,
             error: rr.error,
             platform: rr.platform,
-            owner: rr.owner
+            owner: rr.owner,
+            linked: rr.linked,
+            alias_of: rr.alias_of,
+            link_ms: rr.link_ms
           };
         }
       }

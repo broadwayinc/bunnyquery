@@ -400,6 +400,36 @@ knowledge rather than duplicating it. That includes the file's contents list, it
 search glossary and everything search has learned about it from people's
 questions and corrections, which the dialog says.
 
+### Files with the same content
+
+Files whose stored bytes are identical (same md5 and size, same kind of file, whoever
+uploaded them and whatever they are called) share **one index**. The first one is
+indexed as usual and becomes the original; every later one is linked to it on the
+server in a second or two, with no AI call, and search, outlines and totals count the
+content once. The project's **Share one index for identical files** setting (the
+`share_identical_files` key of `bq::settings`, **on** unless the owner turned it off)
+decides it: while it is on, the engine adds `share_identical: true` to the
+`_skapi_file_urls` entry of every file's FIRST indexing pass (never a continue pass),
+and BunnyQuery's MCP reads the key again before it links anything. There is no
+`init()` option for it.
+
+- **In the chat** a linked file's row reads "Indexed <file>" with "Same content as
+  <original>: linked in 1.2 s, no AI used" in place of the pass count. When the model
+  cites it, it cites the original and says the copy is the same file.
+- **A copy only links to a file at least as open as itself** (private to the same
+  uploader's private files, authorized or public; authorized to authorized or public;
+  public to public), so a link never points a reader at rows they could not read, and
+  the server answers a reader who cannot read the original as having no index rather
+  than naming it.
+- **Overwriting an original** sends its copies to indexing again: the oldest becomes
+  the new original (one real AI run) and the others link to it. A copy overwritten with
+  different bytes simply gets its own index.
+
+The engine's `identical.ts` exports what both clients use: `copyStatusOf` (a copy's
+"Indexed via", "Waiting for", "Original removed or failed" state from its markers and
+the live claim ids), `listLinkedCopies`, `listContentClaims`, `copiesToPromote`,
+`indexGroupLinkedLabel`, and the owner's `findIdenticalFiles` / `linkIdenticalFile`.
+
 ### Filenames
 
 Storage keys preserve Unicode letters, digits and spaces, NFC-normalized, so

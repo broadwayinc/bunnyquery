@@ -15,7 +15,7 @@
 import { buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingContinueMessage, buildIndexingRenderMessage, buildIndexingRenderContinueTemplate, buildIndexingWindowMessage } from './prompts';
 import { isServerExtractable, isPagedReadFile, isImageVisionFile, isWindowedReadFile, makeExtractPlaceholder, makeRenderPlaceholder, makeWindowPlaceholder, RENDER_PAGES_PER_WINDOW, type ExtractDirective, type FileUrlDirective } from './office';
 import { chatEngineConfig, resolveForwardRequest, resolveForwardRequestHistory, pollOpt, windowedIndexingEnabled, liveStreamingEnabled, liveStreamingSocketEnabled, resolveWebAccess, resolveAnswerMode, statusPushEnabled } from './config';
-import { type AnswerMode } from './project_settings';
+import { type AnswerMode, projectShareIdenticalFiles } from './project_settings';
 import { csrEnvelopeError } from './errors';
 import type { ChatIdentity } from './host';
 // Output sizing lives in budget.ts so the request cap and the reserve the input
@@ -1246,6 +1246,13 @@ export type AttachmentSaveInfo = {
 	 * as image blocks; the resume loop advances this by a window each pass.
 	 */
 	renderFrom?: number;
+	/**
+	 * One shared index for identical files: whether this FIRST pass may be linked to an
+	 * already indexed file with the same bytes (the worker then runs no AI for it).
+	 * Omitted: the project's `share_identical_files` setting decides (on unless the owner
+	 * turned it off). `false` never asks. Never sent on a continue pass.
+	 */
+	shareIdentical?: boolean;
 };
 
 // RESUME pass: continue indexing a large file a previous pass could not finish. Same
@@ -1426,12 +1433,20 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 	const fileUrlDetail = imageFile && platform === 'openai'
 		? getOpenAIImageDetail(info.model || DEFAULT_OPENAI_MODEL)
 		: undefined;
+	// ONE SHARED INDEX FOR IDENTICAL FILES (owner, 2026-11-26): on a run's FIRST pass only,
+	// and only while the project's switch is on, the entry asks the worker to link this file
+	// to an already indexed file with the same stored bytes instead of reading it (no AI
+	// call; the MCP's content-dedup.js decides and writes the markers). A continue pass never
+	// carries it, and the worker ignores it there anyway. An older worker ignores the key.
+	const shareIdentical = !continuing && info.shareIdentical !== false
+		&& (info.shareIdentical === true || projectShareIdenticalFiles(service));
 	const skapiFileUrls = attachment.url && attachment.storagePath
 		? {
 			_skapi_file_urls: [{
 				path: attachment.storagePath, url: attachment.url,
 				...(singlePass ? { index_end: true } : {}),
 				...(fileUrlDetail ? { detail: fileUrlDetail } : {}),
+				...(shareIdentical ? { share_identical: true } : {}),
 			}],
 		}
 		: {};

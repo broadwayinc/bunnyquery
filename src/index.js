@@ -139,6 +139,8 @@ import {
     buildChatDisplayList,
     // "N passes · 12 min 5 s": a finished file's index time, same text as agent.vue.
     indexGroupDurationLabel,
+    indexGroupLinkedLabel,
+    listLinkedCopies,
     createHistoryFiller,
     HISTORY_FILL_SLACK_PX,
     // Holding the reader's place while the list mutates underneath them. Shared
@@ -2056,6 +2058,12 @@ import {
             var uid = S.user && S.user.user_id;
             if (!uid) return Promise.resolve(null);
             return findDuplicateUpload(S.skapi, file, uid, { service: S.projectId });
+        },
+        // Every linked copy of the project (one shared index for identical files): an
+        // Overwrite of an original sends its copies again (engine collectLinkedCopies).
+        findLinkedCopies: function () {
+            if (!S.skapi || !S.projectId || isAnonymousSession()) return Promise.resolve(null);
+            return listLinkedCopies(S.skapi, S.projectId);
         },
         storagePathFor: function (relPath) { return attachmentStoragePath(relPath); },
         getMimeType: function (name) { return mimeGetType(name); },
@@ -4525,6 +4533,10 @@ import {
     // Passes LOADED, never a server-side total: history pages newest-first, so a
     // scroll-up can always reveal more. "+" marks a run whose start is unpaged.
     function indexGroupCount(group) {
+        // A file LINKED to an identical file's index: no passes, no AI; one line says
+        // so (engine indexGroupLinkedLabel, agent.vue same).
+        var linkedLine = indexGroupLinkedLabel(group);
+        if (linkedLine) return linkedLine;
         // A run:: stub has NO loaded passes — "0+ passes" is noise (agent.vue same).
         // Its record still knows how long a finished run took.
         if (group.stub) return indexGroupDurationLabel(group);
@@ -4596,6 +4608,10 @@ import {
                                 error: typeof d.error === "string" ? d.error : undefined,
                                 platform: (d.platform === "claude" || d.platform === "openai") ? d.platform : undefined,
                                 owner: (list[i] && typeof list[i].user_id === "string") ? list[i].user_id : undefined,
+                                // a run LINKED to an identical file's index (engine identical.ts)
+                                linked: d.linked === true ? true : undefined,
+                                alias_of: d.linked === true && typeof d.alias_of === "string" ? d.alias_of : undefined,
+                                link_ms: d.linked === true && typeof d.link_ms === "number" ? d.link_ms : undefined,
                             };
                         }
                     }
@@ -4690,7 +4706,8 @@ import {
                 // Copy: the sweep cache owns these objects and patches them in
                 // place, which would change a rendered row invisibly.
                 stubs[rp] = { status: rr.status, filename: rr.filename, started: rr.started,
-                    finished: rr.finished, error: rr.error, platform: rr.platform, owner: rr.owner };
+                    finished: rr.finished, error: rr.error, platform: rr.platform, owner: rr.owner,
+                    linked: rr.linked, alias_of: rr.alias_of, link_ms: rr.link_ms };
             }
         }
         return {

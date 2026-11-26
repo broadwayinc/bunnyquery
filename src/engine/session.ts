@@ -61,6 +61,7 @@ import { markImagePreviewStale } from './image_preview';
 import { chatCacheKey, indexScopeKey, mapHistoryListToMessages, extractLastUserTextFromRequest, listedRequestText, isIndexingRequestText, parseIndexingRequestText, probeBgQueue, BG_PROBE_TTL_MS, fetchLiveIndexingKeys, getSplitChatHistory, shouldRescueInFlightMessage, adoptLocalAnswerIntoPage, adoptLiveTextIntoRunningRow } from './history';
 import { wallClockNow, requestIdTimeMs, messageTimeMs } from './time';
 import { parseAttachmentContent } from './attachment_parsers';
+import { copiesToPromote } from './identical';
 import type { ChatHost, ChatState, ChatMessage, ChatIdentity, PinnedDispatchContext, IndexQueueSnapshot } from './host';
 import type { IndexingGroup } from './indexing_groups';
 
@@ -1230,6 +1231,39 @@ export class ChatSession {
 			});
 		});
 		return chain.then(function () { self.drainBgTaskQueue(); return queued; });
+	}
+
+	/**
+	 * ONE SHARED INDEX FOR IDENTICAL FILES: the linked copies that lose their original when
+	 * `removed` files (or every file under `folders`) go away, per original, oldest first
+	 * (identical.ts copiesToPromote). Read through host.findLinkedCopies, fresh, and it has
+	 * to be read BEFORE the delete or reset: those remove nothing from the copies' markers,
+	 * but a later sweep could no longer tell whose copies they were once a new original
+	 * exists. Never rejects; [] without the hook or on any failure.
+	 */
+	collectLinkedCopies(removed: string[], folders?: string[]): Promise<{ original: string; copies: string[] }[]> {
+		if (typeof this.host.findLinkedCopies !== 'function') return Promise.resolve([]);
+		return Promise.resolve(this.host.findLinkedCopies())
+			.then(function (map) { return map ? copiesToPromote(map, removed || [], folders) : []; })
+			.catch(function () { return []; });
+	}
+
+	/**
+	 * Send the copies of a removed or overwritten original again (owner decision
+	 * 2026-11-26): each list's oldest copy first, so its first pass claims the content and
+	 * is indexed for real (one AI run), then the others, which link to it with no AI call.
+	 * The share flag rides on every first pass while the project's switch is on (requests.ts
+	 * notifyAgentSaveAttachment). Through reindexStoredFiles, so each copy keeps its access
+	 * group and shows as a "Reindexing" row. Resolves to the number of files queued.
+	 */
+	promoteLinkedCopies(plan: { original: string; copies: string[] }[]): Promise<number> {
+		var list: Array<{ storagePath: string }> = [];
+		(plan || []).forEach(function (g) {
+			(g && g.copies || []).forEach(function (c) { if (c) list.push({ storagePath: c }); });
+		});
+		if (!list.length) return Promise.resolve(0);
+		console.log('[chat-engine] identical files: sending ' + list.length + ' linked cop' + (list.length === 1 ? 'y' : 'ies') + ' again, their original is gone:', plan);
+		return this.reindexStoredFiles(list);
 	}
 
 	/**
@@ -9349,6 +9383,9 @@ export class ChatSession {
 				checkCancel();
 				var hadExists = false;
 				var skipped = false;
+				// Overwrite of an original: its linked copies, read before the reset and
+				// sent again once this member is queued (collectLinkedCopies).
+				var promotion: Promise<{ original: string; copies: string[] }[]> | null = null;
 				// The storage path of the file this member DUPLICATES, when the user
 				// already has it here: nothing is uploaded or indexed for it, and the
 				// turn takes the stored copy's url instead.
@@ -9421,6 +9458,10 @@ export class ChatSession {
 					return self.host.promptOverwrite(member.file.name).then(function (choice) {
 						if (choice === 'overwrite') {
 							existedBefore = true;
+							// One shared index for identical files: if this file is an ORIGINAL,
+							// its linked copies lose their index with its old bytes. Read now,
+							// before the reset; sent again once this file is queued.
+							promotion = self.collectLinkedCopies([member.storagePath]);
 							// The bytes at this path are about to change while the
 							// path itself does not, so the browser-cached mint for
 							// it would keep handing back the old signed url and the
@@ -9636,6 +9677,12 @@ export class ChatSession {
 							// Followed with or without a chat view (the drain needs one).
 							self.noteBgQueueChanged();
 							self.drainBgTaskQueue(); // surface "Indexing: <file>" as soon as THIS file uploads
+							// an overwritten original's copies, after the file itself
+							if (promotion) {
+								var plan = promotion;
+								promotion = null;
+								plan.then(function (pl) { return self.promoteLinkedCopies(pl); }).catch(function () { });
+							}
 						}
 					}, function (e: any) {
 						console.error('[chat-engine] indexing request failed', e);

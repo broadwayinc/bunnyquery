@@ -265,6 +265,7 @@ export {
 	buildChatDisplayList,
 	parseIndexingLabel,
 	indexGroupDurationLabel,
+	indexGroupLinkedLabel,
 	runRecordDurationMs,
 	type DisplayEntry,
 	type IndexingGroup,
@@ -366,6 +367,12 @@ export {
 	normalizeSkipDuplicateFiles,
 	skipDuplicateFilesFrom,
 	projectSkipDuplicateFiles,
+	// one shared index for identical files (same record, its own key, on by default)
+	SHARE_IDENTICAL_FILES_KEY,
+	DEFAULT_SHARE_IDENTICAL_FILES,
+	normalizeShareIdenticalFiles,
+	shareIdenticalFilesFrom,
+	projectShareIdenticalFiles,
 	// chat answer mode (same record, its own `answer_mode` key, standard by default)
 	ANSWER_MODES,
 	DEFAULT_ANSWER_MODE,
@@ -402,3 +409,34 @@ export {
 	type ProjectSettingsReader,
 	type AnswerMode,
 } from './project_settings';
+
+// One shared index for identical files (identical.ts): a linked copy's status and words,
+// which copies to send again when an original goes away, and the owner's "Find identical
+// files" calls. Both clients render from these, so the Files page, agent.vue and the
+// widget say the same thing.
+export {
+	LINKED_COPY_TAG,
+	CONTENT_CLAIM_PREFIX,
+	linkedMarkerOf,
+	fileNameOf,
+	copyStatusOf,
+	copyCountLabel,
+	copyCountTitle,
+	copiesByOriginal,
+	formatLinkDuration,
+	linkedRowLabel,
+	parseLinkedReply,
+	copiesToPromote,
+	listContentClaims,
+	listLinkedCopies,
+	findIdenticalFiles,
+	linkIdenticalFile,
+	identicalLinkReasonText,
+	type LinkedMarker,
+	type CopyStatus,
+	type CopyStatusKind,
+	type OriginalState,
+	type IdenticalFileEntry,
+	type IdenticalGroup,
+	type IdenticalScan,
+} from './identical';

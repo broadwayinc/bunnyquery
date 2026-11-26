@@ -97,6 +97,7 @@ export type ProjectSettingsData = {
 	chat_greeting?: unknown;
 	web_access?: unknown;
 	skip_duplicate_files?: unknown;
+	share_identical_files?: unknown;
 	answer_mode?: unknown;
 	[key: string]: unknown;
 };
@@ -159,6 +160,34 @@ export function normalizeSkipDuplicateFiles(value: any): boolean {
 /** The switch held in a settings-record `data`, true when unset. */
 export function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean {
 	return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
+}
+
+/**
+ * Whether files with the same CONTENT share one index (owner, 2026-11-26). Same record,
+ * its own `share_identical_files` key. Not the skip above, which is about one uploader's
+ * same-named file: this compares stored bytes, whoever uploaded them and whatever they are
+ * called. The first such file is indexed as usual (the original); every later one is
+ * LINKED to it on the server with no AI call (the MCP's content-dedup.js), and search,
+ * outlines and totals count the content once.
+ *
+ * ON BY DEFAULT, for the same reason as skip_duplicate_files: a second index of the same
+ * bytes costs a second AI run and doubles every row. Only the literal `false` turns it
+ * off. The clients send `share_identical: true` on a run's FIRST pass while it is on
+ * (requests.ts notifyAgentSaveAttachment), and the MCP reads this key again before it
+ * links anything, so a client holding an old copy of the settings cannot link against
+ * the owner's choice.
+ */
+export const SHARE_IDENTICAL_FILES_KEY = 'share_identical_files';
+export const DEFAULT_SHARE_IDENTICAL_FILES = true;
+
+/** Narrow a stored value to the switch: only the literal `false` is off. */
+export function normalizeShareIdenticalFiles(value: any): boolean {
+	return value !== false;
+}
+
+/** The switch held in a settings-record `data`, true when unset. */
+export function shareIdenticalFilesFrom(data: ProjectSettingsData | null | undefined): boolean {
+	return data ? normalizeShareIdenticalFiles(data.share_identical_files) : DEFAULT_SHARE_IDENTICAL_FILES;
 }
 
 /**
@@ -454,6 +483,14 @@ export function projectWebAccess(service: string): boolean {
  */
 export function projectSkipDuplicateFiles(service: string): boolean {
 	return skipDuplicateFilesFrom(cachedProjectSettings(service));
+}
+
+/**
+ * Sync convenience: the project's share-identical-files setting, true until the fetch
+ * settles or when the project never set it (the MCP checks the stored value again).
+ */
+export function projectShareIdenticalFiles(service: string): boolean {
+	return shareIdenticalFilesFrom(cachedProjectSettings(service));
 }
 
 /**

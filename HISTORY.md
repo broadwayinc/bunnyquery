@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.8**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.9**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,14 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.9 (2026-11-26, not yet published)
+
+- **One shared index for identical files (clients).** Files whose stored bytes are the same (same md5 and size, same kind of file, whoever uploaded them and whatever they are called) are indexed once: the server links every later one to the first with no AI call (BunnyQuery's MCP, content-dedup.js). New project setting **Share one index for identical files** (`share_identical_files` in `bq::settings`, on unless literally `false`; `SHARE_IDENTICAL_FILES_KEY`, `shareIdenticalFilesFrom`, `projectShareIdenticalFiles`). While it is on, `notifyAgentSaveAttachment` adds `share_identical: true` to the `_skapi_file_urls` entry of a run's FIRST pass (never a continue pass; `AttachmentSaveInfo.shareIdentical` overrides). New module `identical.ts`: `copyStatusOf` (a copy's "Indexed via A", "Waiting for A", "Original removed or failed" from its done:: and run:: markers and the live claim ids), `listContentClaims` (one prefix listing of "cas::"), `listLinkedCopies`, `copiesByOriginal`, `copyCountLabel`, `copiesToPromote`, `parseLinkedReply`, `linkedRowLabel`, `formatLinkDuration` (tenths of a second, which `formatIndexDuration` would print as nothing), and the owner's `findIdenticalFiles` / `linkIdenticalFile`. Both clients.
+- **The chat row of a linked file** reads "Indexed <file>" with "Same content as <original>: linked in 1.9 s, no AI used" where the pass count would be (`IndexingGroup.linked`, `indexGroupLinkedLabel`), from the linked pass's answer or from the run:: record (`RunStubInfo.linked` / `alias_of`), so a stub row says it too. A linked pass ends its run whoever would have driven it. The widget's marker sweep carries the two run:: fields.
+- **The owner's "Find identical files" calls survive the request relay's time limit:** `findIdenticalFiles` asks for 8 s of scanning per call and calls again until the server says the scan is complete (a call that timed out at the relay is simply repeated; the server keeps what it read), and `linkIdenticalFile` repeats a merge whose call timed out (the server finishes it, and a repeated call waits for the same merge).
+- **The chat prompt** says a linked file has no rows or pages of its own, that its content is the original's, and to cite the original and say the copy is the same file.
+- **Overwrite of an original sends its copies again** (owner decision 2026-11-26): the engine reads the project's linked copies before the reset (`ChatHost.findLinkedCopies`, `ChatSession.collectLinkedCopies`) and, once the overwritten file is queued, re-indexes them through `reindexStoredFiles` (`promoteLinkedCopies`): the oldest becomes the new original with one real AI run, the others link to it. A copy overwritten with different bytes gets its own index through the normal path. The widget wires the hook; the dashboard does the same from its own upload paths.
 
 ## 1.21.8 (2026-11-26, not yet published)
 

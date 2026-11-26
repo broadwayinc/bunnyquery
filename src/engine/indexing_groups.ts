@@ -68,6 +68,7 @@ import { isPagedReadFile, isImageVisionFile } from './office';
 import { windowedIndexingEnabled } from './config';
 import { MAX_INDEXING_RESUME_PASSES } from './requests';
 import { messageTimeMs, formatIndexDuration } from './time';
+import { parseLinkedReply, linkedRowLabel } from './identical';
 
 export type IndexingGroupStatus = 'active' | 'done' | 'error' | 'cancelled';
 
@@ -229,6 +230,12 @@ export type IndexingGroup = {
 	 *  it through indexGroupDurationLabel, which also holds it back from any row that is
 	 *  not a finished 'done'. */
 	durationMs?: number;
+	/** This run LINKED the file to an already indexed file with the same content (one
+	 *  shared index for identical files, identical.ts): no AI ran and the file has no
+	 *  rows or pages of its own. `original` is the original's storage path when the run::
+	 *  record named it, else the file name the linked pass's answer gave; `ms` how long
+	 *  the link took. Read it through indexGroupLinkedLabel. */
+	linked?: { original: string; ms?: number };
 };
 
 export type DisplayEntry =
@@ -318,6 +325,13 @@ export type RunStubInfo = {
 	/** Chat that owns this run. Absent on records minted before it was
 	 *  stamped; see BuildDisplayListOptions.stubPlatform. */
 	platform?: 'claude' | 'openai';
+	/** The run linked the file to an identical file's index (identical.ts): the record's
+	 *  `linked: true` and the original's storage path (`alias_of`). */
+	linked?: boolean;
+	alias_of?: string;
+	/** How long the link itself took on the server (ms); the record's started..finished
+	 *  span also holds the time the pass waited in the queue, so it is not used. */
+	link_ms?: number;
 };
 
 /** Canonical form of an indexing key for COMPARISON only (never for storage).
@@ -542,6 +556,16 @@ function runRecordGroupDurationMs(grp: IndexingGroup, rec: RunStubInfo): number 
 export function indexGroupDurationLabel(group?: IndexingGroup | null): string {
 	if (!group || group.status !== 'done' || !group.finished || group.resolving || group.queued) return '';
 	return formatIndexDuration(group.durationMs);
+}
+
+/**
+ * A linked copy's row line ("Same content as A.tif: linked in 0.4 s, no AI used"), or ''
+ * for any other row. Shared so agent.vue and the widget print the same text in the same
+ * place (they show it instead of the pass count and duration).
+ */
+export function indexGroupLinkedLabel(group?: IndexingGroup | null): string {
+	if (!group || !group.linked || group.status !== 'done') return '';
+	return linkedRowLabel(group.linked.original, group.linked.ms);
 }
 
 export function buildChatDisplayList(
@@ -876,6 +900,17 @@ export function buildChatDisplayList(
 			var vm = grp.members[vi];
 			if (vm.msg._indexComplete) sawComplete = true;
 			if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+			// A pass the worker LINKED to an identical file's index answers in a fixed
+			// form (identical.ts parseLinkedReply): no AI ran, and nothing follows it.
+			if (vm.msg.role === 'assistant' && !vm.msg.isError && !grp.linked) {
+				var linkedReply = parseLinkedReply(vm.msg.content);
+				if (linkedReply) grp.linked = linkedReply;
+			}
+		}
+		if (grp.linked && grp.status !== 'active' && grp.status !== 'cancelled') {
+			// the link IS the end of the run, whoever would have driven it
+			grp.status = 'done';
+			sawComplete = true;
 		}
 		// Mirrors ChatSession.maybeResumeIndexing's own routing, which is what makes
 		// the answer match who will actually dispatch the next pass.
@@ -923,7 +958,7 @@ export function buildChatDisplayList(
 			// deterministic completion), it answers without any queue round
 			// trip. Gated on the queue NOT claiming the file live, so a
 			// re-index whose marker-cascade delete lagged still shows yellow.
-			grp.finished = !newestRunOfKey[order[oi]] ||
+			grp.finished = !newestRunOfKey[order[oi]] || !!grp.linked ||
 				(!!doneKeys[grp.key] && !liveIndexKeys[grp.key]) ||
 				(liveIndexChecked && !liveIndexKeys[grp.key]);
 		}
@@ -1199,6 +1234,8 @@ export function buildChatDisplayList(
 					? 'Indexing did not finish.' : undefined),
 				// The stub IS the record, so a 'done' record's span is this run's.
 				durationMs: st === 'done' ? runRecordDurationMs(rec) : undefined,
+				linked: st === 'done' && rec.linked && rec.alias_of
+					? { original: rec.alias_of, ms: typeof rec.link_ms === 'number' ? rec.link_ms : undefined } : undefined,
 			};
 			// A record with no `started` cannot be placed in the conversation.
 			// Infinity sorts it to the END (nearest the newest turns) instead of
@@ -1241,6 +1278,10 @@ export function buildChatDisplayList(
 			stubList.push({ started: trec.started, group: tg });
 			overlayRunRecordVerdict(tg, trec, liveIndexKeys);
 			tg.durationMs = runRecordGroupDurationMs(tg, trec);
+			// the record names the original by its storage path; the answer only by name
+			if (trec.linked && trec.alias_of && trec.status === 'done') {
+				tg.linked = { original: trec.alias_of, ms: tg.linked && tg.linked.ms !== undefined ? tg.linked.ms : (typeof trec.link_ms === 'number' ? trec.link_ms : undefined) };
+			}
 		}
 	}
 	stubList.sort(function (a, b) { return a.started - b.started; });

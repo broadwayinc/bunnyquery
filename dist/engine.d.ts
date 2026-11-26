@@ -130,6 +130,7 @@ type ProjectSettingsData = {
     chat_greeting?: unknown;
     web_access?: unknown;
     skip_duplicate_files?: unknown;
+    share_identical_files?: unknown;
     answer_mode?: unknown;
     [key: string]: unknown;
 };
@@ -179,6 +180,27 @@ declare const DEFAULT_SKIP_DUPLICATE_FILES = true;
 declare function normalizeSkipDuplicateFiles(value: any): boolean;
 /** The switch held in a settings-record `data`, true when unset. */
 declare function skipDuplicateFilesFrom(data: ProjectSettingsData | null | undefined): boolean;
+/**
+ * Whether files with the same CONTENT share one index (owner, 2026-11-26). Same record,
+ * its own `share_identical_files` key. Not the skip above, which is about one uploader's
+ * same-named file: this compares stored bytes, whoever uploaded them and whatever they are
+ * called. The first such file is indexed as usual (the original); every later one is
+ * LINKED to it on the server with no AI call (the MCP's content-dedup.js), and search,
+ * outlines and totals count the content once.
+ *
+ * ON BY DEFAULT, for the same reason as skip_duplicate_files: a second index of the same
+ * bytes costs a second AI run and doubles every row. Only the literal `false` turns it
+ * off. The clients send `share_identical: true` on a run's FIRST pass while it is on
+ * (requests.ts notifyAgentSaveAttachment), and the MCP reads this key again before it
+ * links anything, so a client holding an old copy of the settings cannot link against
+ * the owner's choice.
+ */
+declare const SHARE_IDENTICAL_FILES_KEY = "share_identical_files";
+declare const DEFAULT_SHARE_IDENTICAL_FILES = true;
+/** Narrow a stored value to the switch: only the literal `false` is off. */
+declare function normalizeShareIdenticalFiles(value: any): boolean;
+/** The switch held in a settings-record `data`, true when unset. */
+declare function shareIdenticalFilesFrom(data: ProjectSettingsData | null | undefined): boolean;
 /**
  * How much the model thinks before a CHAT answer. Same record, its own
  * `answer_mode` key. Optional, and absent on almost every project.
@@ -326,6 +348,11 @@ declare function projectWebAccess(service: string): boolean;
  * awaiting form (config.ts resolveSkipDuplicateFiles).
  */
 declare function projectSkipDuplicateFiles(service: string): boolean;
+/**
+ * Sync convenience: the project's share-identical-files setting, true until the fetch
+ * settles or when the project never set it (the MCP checks the stored value again).
+ */
+declare function projectShareIdenticalFiles(service: string): boolean;
 /**
  * Sync convenience: the project's answer mode, 'standard' until the fetch
  * settles or when the project never set it. The request builders use the
@@ -1142,6 +1169,8 @@ type FileUrlDirective = {
     path: string;
     /** The exact baked url string in the request body to replace with a fresh one. */
     url: string;
+    /** Indexing first pass only: link to an indexed file with the same bytes (see requests.ts). */
+    share_identical?: boolean;
 };
 /**
  * True when a file should be EXTRACTED SERVER-SIDE (text inlined for indexing)
@@ -3385,6 +3414,17 @@ interface ChatHost {
     } | null> | {
         storagePath: string;
     } | null;
+    /**
+     * Optional. Every linked copy of the project, read fresh (one shared index for
+     * identical files; the engine's listLinkedCopies is the ready-made implementation).
+     * With it, an Overwrite of an ORIGINAL sends its copies again afterwards (the oldest
+     * becomes the new original, the others link to it). Missing or null: nothing is sent.
+     */
+    findLinkedCopies?(): Promise<Map<string, {
+        original: string;
+        claim?: string;
+        linkedAt?: number;
+    }> | null>;
     /** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
     storagePathFor(relPath: string): string;
     getMimeType(name: string): string | null;
@@ -3622,6 +3662,13 @@ type AttachmentSaveInfo = {
      * as image blocks; the resume loop advances this by a window each pass.
      */
     renderFrom?: number;
+    /**
+     * One shared index for identical files: whether this FIRST pass may be linked to an
+     * already indexed file with the same bytes (the worker then runs no AI for it).
+     * Omitted: the project's `share_identical_files` setting decides (on unless the owner
+     * turned it off). `false` never asks. Never sent on a continue pass.
+     */
+    shareIdentical?: boolean;
 };
 declare function notifyAgentSaveAttachment(info: AttachmentSaveInfo): Promise<any>;
 declare function extractClaudeText(response: any): any;
@@ -4549,6 +4596,15 @@ type IndexingGroup = {
      *  it through indexGroupDurationLabel, which also holds it back from any row that is
      *  not a finished 'done'. */
     durationMs?: number;
+    /** This run LINKED the file to an already indexed file with the same content (one
+     *  shared index for identical files, identical.ts): no AI ran and the file has no
+     *  rows or pages of its own. `original` is the original's storage path when the run::
+     *  record named it, else the file name the linked pass's answer gave; `ms` how long
+     *  the link took. Read it through indexGroupLinkedLabel. */
+    linked?: {
+        original: string;
+        ms?: number;
+    };
 };
 type DisplayEntry = {
     kind: 'message';
@@ -4651,6 +4707,13 @@ type RunStubInfo = {
     /** Chat that owns this run. Absent on records minted before it was
      *  stamped; see BuildDisplayListOptions.stubPlatform. */
     platform?: 'claude' | 'openai';
+    /** The run linked the file to an identical file's index (identical.ts): the record's
+     *  `linked: true` and the original's storage path (`alias_of`). */
+    linked?: boolean;
+    alias_of?: string;
+    /** How long the link itself took on the server (ms); the record's started..finished
+     *  span also holds the time the pass waited in the queue, so it is not used. */
+    link_ms?: number;
 };
 /** A 'working' run record older than this with no live-queue confirmation is
  *  treated as unknown rather than live: a chain that died without reaching any
@@ -4678,6 +4741,12 @@ declare function runRecordDurationMs(rec?: {
  * and the widget print the same text in the same place.
  */
 declare function indexGroupDurationLabel(group?: IndexingGroup | null): string;
+/**
+ * A linked copy's row line ("Same content as A.tif: linked in 0.4 s, no AI used"), or ''
+ * for any other row. Shared so agent.vue and the widget print the same text in the same
+ * place (they show it instead of the pass count and duration).
+ */
+declare function indexGroupLinkedLabel(group?: IndexingGroup | null): string;
 declare function buildChatDisplayList(messages: ChatMessage[], opts?: BuildDisplayListOptions): DisplayEntry[];
 
 /**
@@ -5178,6 +5247,30 @@ declare class ChatSession {
         size?: number;
         mime?: string;
     }>): Promise<number>;
+    /**
+     * ONE SHARED INDEX FOR IDENTICAL FILES: the linked copies that lose their original when
+     * `removed` files (or every file under `folders`) go away, per original, oldest first
+     * (identical.ts copiesToPromote). Read through host.findLinkedCopies, fresh, and it has
+     * to be read BEFORE the delete or reset: those remove nothing from the copies' markers,
+     * but a later sweep could no longer tell whose copies they were once a new original
+     * exists. Never rejects; [] without the hook or on any failure.
+     */
+    collectLinkedCopies(removed: string[], folders?: string[]): Promise<{
+        original: string;
+        copies: string[];
+    }[]>;
+    /**
+     * Send the copies of a removed or overwritten original again (owner decision
+     * 2026-11-26): each list's oldest copy first, so its first pass claims the content and
+     * is indexed for real (one AI run), then the others, which link to it with no AI call.
+     * The share flag rides on every first pass while the project's switch is on (requests.ts
+     * notifyAgentSaveAttachment). Through reindexStoredFiles, so each copy keeps its access
+     * group and shows as a "Reindexing" row. Resolves to the number of files queued.
+     */
+    promoteLinkedCopies(plan: {
+        original: string;
+        copies: string[];
+    }[]): Promise<number>;
     /**
      * The same question, asked of the SERVER when this page cannot answer it.
      *
@@ -6729,4 +6822,159 @@ declare class ChatSession {
     bumpGate(): void;
 }
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type ImagePreviewContext, type IndexQueueIdentity, type IndexQueueSnapshot, type IndexQueueWatchHandle, type IndexQueueWatchOptions, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, type LiveStreamUpdate, type LookOutcome, type LookRequest, LookScheduler, type LookTrigger, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, type OpenItem, type OpenItemInit, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, type TerminalContext, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, formatChatTimestamp, formatDuration, formatIndexDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexGroupDurationLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+/** Tag on every linked copy's done:: marker. */
+declare const LINKED_COPY_TAG = "bq_linked";
+/** unique_id prefix of the content claims. */
+declare const CONTENT_CLAIM_PREFIX = "cas::";
+/** What a linked copy's done:: (or run::) record says about its link. */
+type LinkedMarker = {
+    /** Storage path of the original whose index this copy shares. */
+    original: string;
+    /** The claim id the link was made under ("cas::<scope>::<key>"), when recorded. */
+    claim?: string;
+    /** When the link was written (ms), when recorded. */
+    linkedAt?: number;
+    /** The copy's own access group, when recorded. */
+    group?: string | number | null;
+    /** The copy's uploader, when recorded. */
+    owner?: string | null;
+};
+/** The link a done:: or run:: record's `data` describes, or null when it is not a linked copy's. */
+declare function linkedMarkerOf(data: any): LinkedMarker | null;
+/** The last segment of a storage path. */
+declare function fileNameOf(path: string): string;
+type CopyStatusKind = 'linked' | 'waiting' | 'original_failed' | 'original_removed';
+type CopyStatus = {
+    kind: CopyStatusKind;
+    /** Storage path of the original. */
+    original: string;
+    /** The chip's text. */
+    label: string;
+    /** The chip's tooltip. */
+    title: string;
+    /** True for the two states in which the copy has no index anyone can search (red). */
+    broken: boolean;
+};
+/** What the original's own markers say, for copyStatusOf. */
+type OriginalState = {
+    /** The original has a done:: marker of its own (not a linked one). */
+    done?: boolean;
+    /** Its newest run:: record's status, when there is one. */
+    run?: string;
+};
+/**
+ * A linked copy's status for the Files page and the widget:
+ *   'original_removed'  its claim id is not among the live claims (the original was deleted,
+ *                       or reset and not indexed again), or the original has no markers left;
+ *   'original_failed'   the original's newest run ended in an error or was cancelled;
+ *   'waiting'           the original is still being indexed;
+ *   'linked'            the original is indexed: search and totals count the content once.
+ * `liveClaims` is the set of live "cas::" ids (listContentClaims), or null when it could not
+ * be read: then the claim is not used as evidence either way.
+ */
+declare function copyStatusOf(marker: LinkedMarker, original?: OriginalState | null, liveClaims?: Set<string> | null): CopyStatus;
+/** "1 copy" / "3 copies": the chip on an original. */
+declare function copyCountLabel(n: number): string;
+/** The tooltip of an original's copy chip, naming the copies. */
+declare function copyCountTitle(copies: string[]): string;
+/** Copies per original, oldest link first: Map(original path -> copy paths). */
+declare function copiesByOriginal(linked: Map<string, LinkedMarker> | {
+    [path: string]: LinkedMarker;
+}): Map<string, string[]>;
+/**
+ * A short duration for a link ("0.4 s", "1.9 s", "12 s", then formatIndexDuration's words).
+ * A link takes about a second, so the whole-second helper would print nothing for it.
+ */
+declare function formatLinkDuration(ms?: number): string;
+/** The chat indexing row's line for a linked copy: "Same content as A: linked in 0.4 s, no AI used". */
+declare function linkedRowLabel(original: string, ms?: number): string;
+/**
+ * A linked pass's answer, as the worker writes it ("[skapi] Same content as "A.tif": linked
+ * to its index in 1.9 s, no AI used. ..."), read back: { original (the file NAME it gives),
+ * ms }, or null for any other text.
+ */
+declare function parseLinkedReply(text: any): {
+    original: string;
+    ms?: number;
+} | null;
+/**
+ * The copies to send again when originals go away (a delete, a folder delete, an Overwrite
+ * of an original), per original, oldest first. The first copy of each list becomes the new
+ * original (one real AI run, sent with the share flag so it claims the content); the others
+ * are sent after it and link to it. Copies that are themselves being removed are left out.
+ * `removed`: the storage paths going away; `removedFolders`: folder paths whose whole
+ * content goes away.
+ */
+declare function copiesToPromote(linked: Map<string, LinkedMarker> | {
+    [path: string]: LinkedMarker;
+}, removed: string[], removedFolders?: string[]): {
+    original: string;
+    copies: string[];
+}[];
+/**
+ * The live content claim ids of a project ("cas::..."), from one prefix listing of unique
+ * ids (open to every signed-in caller, whatever group the claim is in), or null when it
+ * could not be read or was cut off (then absence proves nothing).
+ */
+declare function listContentClaims(skapi: any, service: string, maxPages?: number): Promise<Set<string> | null>;
+/**
+ * Every linked copy of a project, fresh: Map(copy path -> LinkedMarker), from the done::
+ * markers tagged "bq_linked". Null when it could not be read. Used before a delete or an
+ * Overwrite, where a 30-second-old sweep could miss a copy linked a moment ago.
+ */
+declare function listLinkedCopies(skapi: any, service: string, maxPages?: number): Promise<Map<string, LinkedMarker> | null>;
+type IdenticalFileEntry = {
+    path: string;
+    group?: any;
+    uploader?: string | null;
+    indexed?: boolean;
+    indexed_at?: number | null;
+};
+type IdenticalGroup = {
+    content_key: string;
+    original: IdenticalFileEntry;
+    copies: IdenticalFileEntry[];
+};
+type IdenticalScan = {
+    complete: boolean;
+    scanned: number;
+    total: number;
+    groups: IdenticalGroup[];
+    skipped?: {
+        path: string;
+        reason: string;
+    }[];
+};
+/**
+ * The owner's scan for identical files that are indexed separately (MCP
+ * /internal/identical-files). Calls again while the server says it is not complete (each
+ * call keeps what the last one read), up to `maxCalls`. `onProgress` hears each answer.
+ * Rejects with the server's words when it refuses (not the owner, no session).
+ */
+declare function findIdenticalFiles(args: {
+    service: string;
+    owner?: string;
+    maxCalls?: number;
+    budgetS?: number;
+    onProgress?: (scan: IdenticalScan) => void;
+}): Promise<IdenticalScan>;
+/**
+ * Link one copy to an original the owner confirmed (MCP /internal/identical-link, no AI):
+ * the copy's own index is removed and it shares the original's. Resolves to the server's
+ * answer ({ linked: true, ... }) or { linked: false, reason } when it was refused. Never
+ * rejects.
+ */
+declare function linkIdenticalFile(args: {
+    service: string;
+    owner?: string;
+    copy: string;
+    original: string;
+}): Promise<{
+    linked: boolean;
+    reason?: string;
+    [k: string]: any;
+}>;
+/** Plain words for identical-link's refusal reasons. */
+declare function identicalLinkReasonText(reason?: string): string;
+
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, type AiAgentPlatform, type AnchorBoxEl, type AnchorRowEl, type AnswerMode, type AttachmentFailureGroup, type AttachmentParser, type AttachmentSaveInfo, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, type BgTaskEntry, type BoundedChatOptions, type BuildDisplayListOptions, type BuildIndexingUserMessageOptions, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTENT_CLAIM_PREFIX, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, type CallClaudeWithMcpParams, type ChatEngineConfig, type ChatGreetingParams, type ChatGreetingParts, type ChatHost, type ChatIdentity, type ChatMessage, ChatSession, type ChatState, type ChatStreamWiring, type ChatSystemPromptParams, type ChatTurnContext, type Citation, type CitationLinkPart, type ClaudeMcpServerRequest, type ClaudeMcpToolConfig, type ClaudeMessage, type ClaudeRole, type ComposedUserMessage, type CopyStatus, type CopyStatusKind, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SHARE_IDENTICAL_FILES, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, type DisplayEntry, type DuplicateUploadFile, type DuplicateUploadMatch, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, type EncodingClass, type ExtractDirective, type FillHistoryViewportOptions, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, type IdenticalFileEntry, type IdenticalGroup, type IdenticalScan, type ImagePreviewContext, type IndexQueueIdentity, type IndexQueueSnapshot, type IndexQueueWatchHandle, type IndexQueueWatchOptions, type IndexResetResult, type IndexRunPatch, type IndexRunStatus, type IndexingAttachmentInfo, type IndexingFileRef, type IndexingGroup, type IndexingGroupStatus, type IndexingRequestRef, type IndexingSystemPromptParams, type InlineLinkContext, type InlineLinkMarkupOptions, type InlineLinkPart, LINKED_COPY_TAG, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, type LinkedMarker, type LiveStreamUpdate, type LookOutcome, type LookRequest, LookScheduler, type LookTrigger, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, type MapHistoryOptions, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, type OpenAIMessage, type OpenItem, type OpenItemInit, type OriginalState, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, type ParsedAiAgent, type PinnedDispatchContext, type PreviewImageEl, type ProjectAccessSetting, type ProjectSettingsData, type ProjectSettingsReader, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, type RenderableInlineLink, type RescueDecisionContext, type RetrievalHit, type RetrievalNote, type RowAnchor, type RunStubInfo, SHARE_IDENTICAL_FILES_KEY, STREAM_POLL_INTERVAL, type ScrollAnchor, type ScrollAnchorOptions, type SseChunk, type SseParser, type SseProvider, type SseSnapshot, type SseToolCall, type StoredCopyIndexing, type StreamDispatchContext, TOOL_AND_RESPONSE_BUFFER, type TerminalContext, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, type UploadAccessGroup, type VisionProfile, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, copiesByOriginal, copiesToPromote, copyCountLabel, copyCountTitle, copyStatusOf, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fileNameOf, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, findIdenticalFiles, formatChatTimestamp, formatDuration, formatIndexDuration, formatLinkDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, identicalLinkReasonText, indexDoneUniqueId, indexGroupDurationLabel, indexGroupLinkedLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkIdenticalFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, linkedMarkerOf, linkedRowLabel, listClaudeModels, listContentClaims, listLinkedCopies, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeShareIdenticalFiles, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, parseLinkedReply, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectShareIdenticalFiles, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shareIdenticalFilesFrom, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };

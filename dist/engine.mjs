@@ -78,6 +78,14 @@ function normalizeSkipDuplicateFiles(value) {
 function skipDuplicateFilesFrom(data) {
   return data ? normalizeSkipDuplicateFiles(data.skip_duplicate_files) : DEFAULT_SKIP_DUPLICATE_FILES;
 }
+var SHARE_IDENTICAL_FILES_KEY = "share_identical_files";
+var DEFAULT_SHARE_IDENTICAL_FILES = true;
+function normalizeShareIdenticalFiles(value) {
+  return value !== false;
+}
+function shareIdenticalFilesFrom(data) {
+  return data ? normalizeShareIdenticalFiles(data.share_identical_files) : DEFAULT_SHARE_IDENTICAL_FILES;
+}
 var ANSWER_MODES = ["standard", "fast", "thorough"];
 var DEFAULT_ANSWER_MODE = "standard";
 var ANSWER_MODE_SETTING_LABEL = "Answer mode";
@@ -190,6 +198,9 @@ function projectWebAccess(service) {
 }
 function projectSkipDuplicateFiles(service) {
   return skipDuplicateFilesFrom(cachedProjectSettings(service));
+}
+function projectShareIdenticalFiles(service) {
+  return shareIdenticalFilesFrom(cachedProjectSettings(service));
 }
 function projectAnswerMode(service) {
   return answerModeFrom(cachedProjectSettings(service));
@@ -1083,6 +1094,7 @@ NUMBERS FROM A SPREADSHEET are computed from the ROWS, never from one page and n
 ${documentRules}
 ${accessGroupRule}
 COMPLETE ANSWERS: ONE file is routinely SPLIT ACROSS SEVERAL TABLES (a summary row in one, its page or row content in another, its extracted pictures in "__MEDIA__"), so for anything not scoped to a single file run the query in EVERY table that could hold the answer and combine the results. For any request that counts, sums, totals, lists every match, compares across records, finds which one, or asks whether something is present or ABSENT (for example "how many", "total spent", "which card", "is there any", "\uC5C6\uC5B4?", "\uD558\uB098\uB3C4 \uC5C6\uB098?"), read the COMPLETE matching set across every such table and file before answering. Never assert absence ("there is no X", "none", "not found", "\uC544\uB2C8\uC694, \uC5C6\uC2B5\uB2C8\uB2E4") until a complete scan has come back empty: a confident "no" that later turns out wrong is worse than telling the user you are still checking. If you answered from one table and then find another holds more, re-run the sweep and give the complete answer instead of only apologising.
+LINKED COPIES: files with the same content are indexed once. A file a tool reports as a linked copy (linked_copy, or listed in a hit's also_at) has no rows or pages of its own: its content is the original's, stored and tagged under the original's name. Cite the original file and say that the copy is the same file; never count the two as two documents.
 Embedded values: a search term is often stored inside a larger string (a merchant "BAKSA" as "DNH*BAKSA#4070277042", a card as "5860****5173"), which no index or tag filter matches. When the value may be embedded, fetch the full set with fetch_all and match the substring yourself.
 File attachments: an "Attached files:" section with markdown links in a user message points at short-lived signed URLs in this project's storage. Image files (.jpg, .jpeg, .png, .gif, .webp) are ALREADY in the message as image blocks: look at them directly. Every other attached file (office documents such as .docx/.xlsx/.pptx/.hwp/.hwpx/.ods, PDFs, email (.eml), text/data/code files such as .csv/.tsv/.json/.xml/.txt/.md) is ALREADY INDEXED: it was read end to end when it was uploaded, before this message reached you, so answer from its records (reference "src::<the storage path from the attachment link>"), and for its exact wording use searchText or readFileContent on that same path (see DOCUMENTS). Some turns instead carry the file text between "BEGIN FILE CONTENT" / "END FILE CONTENT" markers: read that block directly; a "[skapi: ...]" note inside it means that file could not be extracted. ${webAccess ? `Never web_fetch an attachment link (the picture is already in the message, everything else is in the database); a file the user gives as an outside web address may be fetched under the web rule above.` : `This chat has no web tool: never try to download or fetch an attachment link.`}
 Stored files: a file already in this project's storage was read end to end at upload time, so its records come first. For its exact wording find the page with searchText (DOCUMENTS); readFileContent re-reads the raw file (an older file without page text, a data file), and you read it to the end before concluding anything is absent there. If its pictures do not reach you, say so plainly and fall back to the indexed records; never call a file unreadable when its content is in the database.
@@ -2893,12 +2905,14 @@ async function notifyAgentSaveAttachment(info) {
   const singlePass = !visionFile && !windowedRead && !pagedRead && !continuing;
   const imageFile = singlePass && !parsedContent && !serverExtract ? indexingImageFile(attachment) : void 0;
   const fileUrlDetail = imageFile && platform === "openai" ? getOpenAIImageDetail(info.model || DEFAULT_OPENAI_MODEL) : void 0;
+  const shareIdentical = !continuing && info.shareIdentical !== false && (info.shareIdentical === true || projectShareIdenticalFiles(service));
   const skapiFileUrls = attachment.url && attachment.storagePath ? {
     _skapi_file_urls: [{
       path: attachment.storagePath,
       url: attachment.url,
       ...singlePass ? { index_end: true } : {},
-      ...fileUrlDetail ? { detail: fileUrlDetail } : {}
+      ...fileUrlDetail ? { detail: fileUrlDetail } : {},
+      ...shareIdentical ? { share_identical: true } : {}
     }]
   } : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
@@ -3233,6 +3247,288 @@ function messageTimeMs(m) {
   return typeof m._ts === "number" && m._ts > 0 ? m._ts : 0;
 }
 
+// src/engine/identical.ts
+var LINKED_COPY_TAG = "bq_linked";
+var CONTENT_CLAIM_PREFIX = "cas::";
+function linkedMarkerOf(data) {
+  if (!data || typeof data !== "object" || data.linked !== true) return null;
+  var original = typeof data.alias_of === "string" ? data.alias_of : "";
+  if (!original) return null;
+  var at = Number(data.completed_at || data.finished || data.linked_at);
+  return {
+    original,
+    claim: typeof data.alias_claim === "string" && data.alias_claim ? data.alias_claim : void 0,
+    linkedAt: isFinite(at) && at > 0 ? at : void 0,
+    group: data.copy_group !== void 0 ? data.copy_group : void 0,
+    owner: typeof data.copy_owner === "string" ? data.copy_owner : void 0
+  };
+}
+function fileNameOf(path) {
+  var s = String(path || "");
+  var at = s.lastIndexOf("/");
+  return at === -1 ? s : s.slice(at + 1);
+}
+function copyStatusOf(marker, original, liveClaims) {
+  var name = fileNameOf(marker.original);
+  var mk = function(kind, label, title, broken) {
+    return { kind, original: marker.original, label, title, broken };
+  };
+  var o = original || {};
+  var claimGone = !!(liveClaims && marker.claim && !liveClaims.has(marker.claim));
+  if (claimGone && !(o.run === "working")) {
+    return mk(
+      "original_removed",
+      "Original removed or failed",
+      'Linked to "' + name + '", which is no longer indexed. Reindex this file to index it on its own.',
+      true
+    );
+  }
+  if (o.run === "error" || o.run === "cancelled") {
+    return mk(
+      "original_failed",
+      "Original removed or failed",
+      'Linked to "' + name + '", whose indexing did not finish. Reindex this file to index it on its own.',
+      true
+    );
+  }
+  if (o.run === "working" && !o.done) {
+    return mk(
+      "waiting",
+      "Waiting for " + name,
+      'Same content as "' + name + '", which is still being indexed. This file shares its index when it finishes.',
+      false
+    );
+  }
+  if (!o.done && o.run !== "done" && liveClaims && !marker.claim) {
+    return mk(
+      "original_removed",
+      "Original removed or failed",
+      'Linked to "' + name + '", which is no longer indexed. Reindex this file to index it on its own.',
+      true
+    );
+  }
+  return mk(
+    "linked",
+    "Indexed via " + name,
+    'Same content as "' + name + '"; search and totals count it once.',
+    false
+  );
+}
+function copyCountLabel(n) {
+  return n === 1 ? "1 copy" : n + " copies";
+}
+function copyCountTitle(copies) {
+  var list = copies.slice(0, 10).map(function(p) {
+    return "/" + p;
+  }).join("\n");
+  var more = copies.length > 10 ? "\n...and " + (copies.length - 10) + " more" : "";
+  return "The same content is also stored as:\n" + list + more + "\nThey share this file's index; search and totals count it once.";
+}
+function copiesByOriginal(linked) {
+  var entries = linked instanceof Map ? Array.from(linked.entries()) : Object.keys(linked).map(function(k) {
+    return [k, linked[k]];
+  });
+  entries.sort(function(a, b) {
+    return (a[1].linkedAt || 0) - (b[1].linkedAt || 0) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  });
+  var out = /* @__PURE__ */ new Map();
+  for (var i = 0; i < entries.length; i++) {
+    var o = entries[i][1].original;
+    if (!out.has(o)) out.set(o, []);
+    out.get(o).push(entries[i][0]);
+  }
+  return out;
+}
+function formatLinkDuration(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 0) return "";
+  if (ms < 1e4) return (Math.max(ms, 100) / 1e3).toFixed(1) + " s";
+  return formatIndexDuration(ms);
+}
+function linkedRowLabel(original, ms) {
+  var took = formatLinkDuration(ms);
+  return "Same content as " + fileNameOf(original) + ": linked" + (took ? " in " + took : "") + ", no AI used";
+}
+function parseLinkedReply(text) {
+  if (typeof text !== "string" || text.indexOf('[skapi] Same content as "') === -1) return null;
+  var m = /\[skapi\] Same content as "([^"]+)": linked to its index(?: in ([0-9]+(?:\.[0-9]+)?) s)?/.exec(text);
+  if (!m) return null;
+  var secs = m[2] !== void 0 ? Number(m[2]) : NaN;
+  return { original: m[1], ms: isFinite(secs) ? Math.round(secs * 1e3) : void 0 };
+}
+function copiesToPromote(linked, removed, removedFolders) {
+  var gone = new Set(removed || []);
+  var folders = (removedFolders || []).filter(Boolean).map(function(f) {
+    return f.replace(/\/+$/, "") + "/";
+  });
+  var isGone = function(p) {
+    if (gone.has(p)) return true;
+    for (var i = 0; i < folders.length; i++) if (p.indexOf(folders[i]) === 0) return true;
+    return false;
+  };
+  var out = [];
+  copiesByOriginal(linked).forEach(function(copies, original) {
+    if (!isGone(original)) return;
+    var keep = copies.filter(function(c) {
+      return !isGone(c);
+    });
+    if (keep.length) out.push({ original, copies: keep });
+  });
+  return out;
+}
+function listOf(res) {
+  return res && Array.isArray(res.list) ? res.list : [];
+}
+async function listContentClaims(skapi, service, maxPages = 5) {
+  if (!skapi || typeof skapi.getUniqueId !== "function" || !service) return null;
+  try {
+    var out = /* @__PURE__ */ new Set();
+    var fetchMore = false;
+    for (var page = 0; page < maxPages; page++) {
+      var res = await skapi.getUniqueId(
+        { service, unique_id: CONTENT_CLAIM_PREFIX, condition: "gte" },
+        { limit: 1e3, fetchMore }
+      );
+      var list = listOf(res);
+      for (var i = 0; i < list.length; i++) {
+        var id = typeof list[i] === "string" ? list[i] : list[i] && list[i].unique_id;
+        if (typeof id === "string" && id.indexOf(CONTENT_CLAIM_PREFIX) === 0) out.add(id);
+      }
+      if (!res || res.endOfList !== false) return out;
+      fetchMore = true;
+    }
+    return null;
+  } catch (err) {
+    var msg = String(err && (err.code || err.message) || err || "");
+    if (/NOT_EXISTS|not exist/i.test(msg)) return /* @__PURE__ */ new Set();
+    return null;
+  }
+}
+async function listLinkedCopies(skapi, service, maxPages = 10) {
+  if (!skapi || typeof skapi.getRecords !== "function" || !service) return null;
+  var out = /* @__PURE__ */ new Map();
+  try {
+    var fetchMore = false;
+    for (var page = 0; page < maxPages; page++) {
+      var res = await skapi.getRecords(
+        { service, table: { name: "__INDEXING__", access_group: "authorized" }, tag: LINKED_COPY_TAG },
+        { limit: 1e3, fetchMore }
+      );
+      var list = listOf(res);
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i] || {};
+        var uid = String(r.unique_id || "");
+        if (uid.indexOf("done::") !== 0) continue;
+        var mk = linkedMarkerOf(r.data);
+        if (mk) out.set(uid.slice(6), mk);
+      }
+      if (!res || res.endOfList !== false) return out;
+      fetchMore = true;
+    }
+    return out;
+  } catch (err) {
+    var msg = String(err && (err.code || err.message) || err || "");
+    if (/NOT_EXISTS|not exist/i.test(msg)) return out;
+    return null;
+  }
+}
+function bodyOf(res) {
+  if (typeof res === "string") {
+    try {
+      return JSON.parse(res);
+    } catch (_) {
+      return res;
+    }
+  }
+  return res;
+}
+function errorText(err) {
+  var b = err && (err.body || err.data || err.response);
+  var bb = bodyOf(b);
+  if (bb && typeof bb === "object") {
+    if (typeof bb.reason === "string") return bb.reason;
+    if (typeof bb.message === "string") return bb.message;
+  }
+  if (typeof bb === "string" && bb) return bb;
+  return String(err && err.message || err || "The request failed.");
+}
+async function callMcpRoute(route, args, data) {
+  var base = String(chatEngineConfig().mcpBaseUrl || "").replace(/\/+$/, "");
+  if (!base) throw new Error("No BunnyQuery server is configured.");
+  var res = await resolveForwardRequest()({
+    service: args.service,
+    ...args.owner ? { owner: args.owner } : {},
+    url: base + route,
+    method: "POST",
+    headers: { "content-type": "application/json", Authorization: "Bearer $ACCESS_TOKEN" },
+    data: Object.assign({ project_id: args.service }, data)
+  });
+  return bodyOf(res);
+}
+async function findIdenticalFiles(args) {
+  var calls = Math.max(1, args.maxCalls || 12);
+  var last = null;
+  for (var i = 0; i < calls; i++) {
+    var body;
+    try {
+      body = await callMcpRoute("/internal/identical-files", args, { budget_s: args.budgetS || 8 });
+    } catch (err) {
+      var msg = errorText(err);
+      if (/timed? ?out|timeout|504/i.test(msg) && i < calls - 1) continue;
+      throw new Error(msg);
+    }
+    if (!body || typeof body !== "object" || !Array.isArray(body.groups)) {
+      throw new Error(typeof body === "string" && body ? body : "The server did not answer the scan.");
+    }
+    last = { complete: !!body.complete, scanned: Number(body.scanned) || 0, total: Number(body.total) || 0, groups: body.groups, skipped: body.skipped };
+    if (args.onProgress) args.onProgress(last);
+    if (last.complete) return last;
+  }
+  return last;
+}
+async function linkIdenticalFile(args) {
+  var last = "";
+  for (var attempt = 0; attempt < 4; attempt++) {
+    try {
+      var body = await callMcpRoute("/internal/identical-link", args, { copy: args.copy, original: args.original });
+      if (body && typeof body === "object" && typeof body.linked === "boolean") return body;
+      return { linked: false, reason: typeof body === "string" && body ? body : "unexpected answer" };
+    } catch (err) {
+      last = errorText(err);
+      if (!/timed? ?out|timeout|504/i.test(last)) return { linked: false, reason: last };
+      await new Promise(function(r) {
+        setTimeout(r, 8e3);
+      });
+    }
+  }
+  return { linked: false, reason: last || "timed out" };
+}
+function identicalLinkReasonText(reason) {
+  switch (reason) {
+    case "not_identical":
+      return "the two files no longer have the same content";
+    case "original_not_indexed":
+      return "the original is not indexed";
+    case "original_is_a_copy":
+      return "the original is itself a linked copy";
+    case "less_open_original":
+      return "the original can be read by fewer people than the copy";
+    case "private_original":
+      return "the original is private";
+    case "content_claimed_by_another_file":
+      return "another file already holds this content's index";
+    case "not_readable":
+      return "one of the files could not be read from storage";
+    case "different_kind":
+      return "the files are of different kinds";
+    case "no_file_record":
+      return "one of the files has no index record";
+    case "unshared_access_group":
+      return "the file's access group cannot share an index";
+    default:
+      return reason || "refused";
+  }
+}
+
 // src/engine/indexing_groups.ts
 function canonIndexKey(s) {
   return typeof s === "string" && s ? s.trim() : "";
@@ -3350,6 +3646,10 @@ function runRecordGroupDurationMs(grp, rec) {
 function indexGroupDurationLabel(group) {
   if (!group || group.status !== "done" || !group.finished || group.resolving || group.queued) return "";
   return formatIndexDuration(group.durationMs);
+}
+function indexGroupLinkedLabel(group) {
+  if (!group || !group.linked || group.status !== "done") return "";
+  return linkedRowLabel(group.linked.original, group.linked.ms);
 }
 function buildChatDisplayList(messages, opts) {
   var list = Array.isArray(messages) ? messages : [];
@@ -3546,6 +3846,14 @@ function buildChatDisplayList(messages, opts) {
       var vm = grp.members[vi];
       if (vm.msg._indexComplete) sawComplete = true;
       if (!isHiddenPass(vm.msg)) grp.visibleMembers.push(vm);
+      if (vm.msg.role === "assistant" && !vm.msg.isError && !grp.linked) {
+        var linkedReply = parseLinkedReply(vm.msg.content);
+        if (linkedReply) grp.linked = linkedReply;
+      }
+    }
+    if (grp.linked && grp.status !== "active" && grp.status !== "cancelled") {
+      grp.status = "done";
+      sawComplete = true;
     }
     grp.driver = !isPagedReadFile(grp.name, grp.mime) ? "single" : isImageVisionFile(grp.name, grp.mime) ? "worker" : windowedIndexing ? "worker" : "client";
     if (grp.status === "active") {
@@ -3557,7 +3865,7 @@ function buildChatDisplayList(messages, opts) {
     } else if (grp.driver === "client") {
       grp.finished = sawComplete || grp.status === "error" || grp.passCount >= MAX_INDEXING_RESUME_PASSES;
     } else {
-      grp.finished = !newestRunOfKey[order[oi]] || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
+      grp.finished = !newestRunOfKey[order[oi]] || !!grp.linked || !!doneKeys[grp.key] && !liveIndexKeys[grp.key] || liveIndexChecked && !liveIndexKeys[grp.key];
     }
     if (grp.status !== "done") {
       grp.resolving = false;
@@ -3708,7 +4016,8 @@ function buildChatDisplayList(messages, opts) {
         queued: waitingStub || live && !!runningKeys && !runningKeys[sp] && !runningKeys[canonIndexKey(sp)] && !runningKeys[fname] ? true : void 0,
         stubError: rec.error || (st === "error" && !rec.error ? "Indexing did not finish." : void 0),
         // The stub IS the record, so a 'done' record's span is this run's.
-        durationMs: st === "done" ? runRecordDurationMs(rec) : void 0
+        durationMs: st === "done" ? runRecordDurationMs(rec) : void 0,
+        linked: st === "done" && rec.linked && rec.alias_of ? { original: rec.alias_of, ms: typeof rec.link_ms === "number" ? rec.link_ms : void 0 } : void 0
       };
       stubList.push({ started: typeof rec.started === "number" ? rec.started : Infinity, group: sg });
     }
@@ -3728,6 +4037,9 @@ function buildChatDisplayList(messages, opts) {
       stubList.push({ started: trec.started, group: tg });
       overlayRunRecordVerdict(tg, trec, liveIndexKeys);
       tg.durationMs = runRecordGroupDurationMs(tg, trec);
+      if (trec.linked && trec.alias_of && trec.status === "done") {
+        tg.linked = { original: trec.alias_of, ms: tg.linked && tg.linked.ms !== void 0 ? tg.linked.ms : typeof trec.link_ms === "number" ? trec.link_ms : void 0 };
+      }
     }
   }
   stubList.sort(function(a, b) {
@@ -3769,7 +4081,7 @@ function isDuplicateCandidateId(uniqueId, name) {
   const tail = "/" + name;
   return uniqueId.length > SRC_PREFIX2.length + tail.length && uniqueId.slice(-tail.length) === tail;
 }
-function listOf(res) {
+function listOf2(res) {
   if (!res) return [];
   if (Array.isArray(res)) return res;
   return Array.isArray(res.list) ? res.list : [];
@@ -3786,14 +4098,14 @@ function nfc(text) {
 async function storedCopyIndexing(skapi, storagePath, service) {
   const doneId = "done::" + storagePath;
   try {
-    const done = listOf(await skapi.getUniqueId(Object.assign({ unique_id: doneId }, service), { fetchMore: false, limit: 1 }));
+    const done = listOf2(await skapi.getUniqueId(Object.assign({ unique_id: doneId }, service), { fetchMore: false, limit: 1 }));
     if (done.some(function(it) {
       return (it && typeof it === "object" ? it.unique_id : it) === doneId;
     })) return "done";
   } catch {
   }
   try {
-    const run = listOf(await skapi.getRecords(Object.assign({ unique_id: "run::" + storagePath }, service)))[0];
+    const run = listOf2(await skapi.getRecords(Object.assign({ unique_id: "run::" + storagePath }, service)))[0];
     const data = run && run.data && typeof run.data === "object" ? run.data : null;
     if (data && data.status === "working" && typeof data.started === "number" && Date.now() - data.started < RUN_RECORD_WORKING_STALE_MS) return "running";
   } catch {
@@ -3822,7 +4134,7 @@ async function lookupDuplicate(skapi, file, userId, opts) {
   const size = file && typeof file.size === "number" ? file.size : NaN;
   if (!name || !(size >= 0) || !userId) return null;
   const service = opts && opts.service ? { service: opts.service } : {};
-  const found = listOf(await skapi.getUniqueId(
+  const found = listOf2(await skapi.getUniqueId(
     Object.assign({ unique_id: name, condition: "<=" }, service),
     { fetchMore: false, limit: DUPLICATE_LOOKUP_LIMIT }
   ));
@@ -3835,7 +4147,7 @@ async function lookupDuplicate(skapi, file, userId, opts) {
   for (const uniqueId of ids) {
     let record = null;
     try {
-      record = listOf(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
+      record = listOf2(await skapi.getRecords(Object.assign({ unique_id: uniqueId }, service)))[0] || null;
     } catch {
       continue;
     }
@@ -6355,6 +6667,41 @@ var _ChatSession = class _ChatSession {
       self.drainBgTaskQueue();
       return queued;
     });
+  }
+  /**
+   * ONE SHARED INDEX FOR IDENTICAL FILES: the linked copies that lose their original when
+   * `removed` files (or every file under `folders`) go away, per original, oldest first
+   * (identical.ts copiesToPromote). Read through host.findLinkedCopies, fresh, and it has
+   * to be read BEFORE the delete or reset: those remove nothing from the copies' markers,
+   * but a later sweep could no longer tell whose copies they were once a new original
+   * exists. Never rejects; [] without the hook or on any failure.
+   */
+  collectLinkedCopies(removed, folders) {
+    if (typeof this.host.findLinkedCopies !== "function") return Promise.resolve([]);
+    return Promise.resolve(this.host.findLinkedCopies()).then(function(map) {
+      return map ? copiesToPromote(map, removed || [], folders) : [];
+    }).catch(function() {
+      return [];
+    });
+  }
+  /**
+   * Send the copies of a removed or overwritten original again (owner decision
+   * 2026-11-26): each list's oldest copy first, so its first pass claims the content and
+   * is indexed for real (one AI run), then the others, which link to it with no AI call.
+   * The share flag rides on every first pass while the project's switch is on (requests.ts
+   * notifyAgentSaveAttachment). Through reindexStoredFiles, so each copy keeps its access
+   * group and shows as a "Reindexing" row. Resolves to the number of files queued.
+   */
+  promoteLinkedCopies(plan) {
+    var list = [];
+    (plan || []).forEach(function(g) {
+      (g && g.copies || []).forEach(function(c) {
+        if (c) list.push({ storagePath: c });
+      });
+    });
+    if (!list.length) return Promise.resolve(0);
+    console.log("[chat-engine] identical files: sending " + list.length + " linked cop" + (list.length === 1 ? "y" : "ies") + " again, their original is gone:", plan);
+    return this.reindexStoredFiles(list);
   }
   /**
    * The same question, asked of the SERVER when this page cannot answer it.
@@ -13176,6 +13523,7 @@ var _ChatSession = class _ChatSession {
         checkCancel();
         var hadExists = false;
         var skipped = false;
+        var promotion = null;
         var duplicateOf = null;
         var existedBefore = false;
         var madeRecord = false;
@@ -13242,6 +13590,7 @@ var _ChatSession = class _ChatSession {
           return self.host.promptOverwrite(member.file.name).then(function(choice) {
             if (choice === "overwrite") {
               existedBefore = true;
+              promotion = self.collectLinkedCopies([member.storagePath]);
               markImagePreviewStale(self.host.getIdentity().projectId || "default", member.storagePath);
               return doMemberUpload(false);
             }
@@ -13418,6 +13767,14 @@ var _ChatSession = class _ChatSession {
                 });
                 self.noteBgQueueChanged();
                 self.drainBgTaskQueue();
+                if (promotion) {
+                  var plan = promotion;
+                  promotion = null;
+                  plan.then(function(pl) {
+                    return self.promoteLinkedCopies(pl);
+                  }).catch(function() {
+                  });
+                }
               }
             }, function(e) {
               console.error("[chat-engine] indexing request failed", e);
@@ -13540,6 +13897,6 @@ var _ChatSession = class _ChatSession {
 _ChatSession.RUN_PASS_PAGE = 10;
 var ChatSession = _ChatSession;
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, LookScheduler, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, formatChatTimestamp, formatDuration, formatIndexDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, indexDoneUniqueId, indexGroupDurationLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, listClaudeModels, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTENT_CLAIM_PREFIX, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SHARE_IDENTICAL_FILES, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINKED_COPY_TAG, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, LookScheduler, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, SHARE_IDENTICAL_FILES_KEY, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, copiesByOriginal, copiesToPromote, copyCountLabel, copyCountTitle, copyStatusOf, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fileNameOf, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, findIdenticalFiles, formatChatTimestamp, formatDuration, formatIndexDuration, formatLinkDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, identicalLinkReasonText, indexDoneUniqueId, indexGroupDurationLabel, indexGroupLinkedLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkIdenticalFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, linkedMarkerOf, linkedRowLabel, listClaudeModels, listContentClaims, listLinkedCopies, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeShareIdenticalFiles, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, parseLinkedReply, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectShareIdenticalFiles, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, providerBodyWasRead, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shareIdenticalFilesFrom, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

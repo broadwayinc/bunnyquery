@@ -32,6 +32,8 @@ export type FileUrlDirective = {
 	path: string;
 	/** The exact baked url string in the request body to replace with a fresh one. */
 	url: string;
+	/** Indexing first pass only: link to an indexed file with the same bytes (see requests.ts). */
+	share_identical?: boolean;
 };
 
 // Files whose text the worker extracts SERVER-SIDE and inlines for indexing,

@@ -474,6 +474,13 @@ export interface ChatHost {
 	 * usual"; the engine's findDuplicateUpload is the ready-made implementation.
 	 */
 	findDuplicateUpload?(file: { name: string; size: number }): Promise<{ storagePath: string } | null> | { storagePath: string } | null;
+	/**
+	 * Optional. Every linked copy of the project, read fresh (one shared index for
+	 * identical files; the engine's listLinkedCopies is the ready-made implementation).
+	 * With it, an Overwrite of an ORIGINAL sends its copies again afterwards (the oldest
+	 * becomes the new original, the others link to it). Missing or null: nothing is sent.
+	 */
+	findLinkedCopies?(): Promise<Map<string, { original: string; claim?: string; linkedAt?: number }> | null>;
 	/** Map a relative path to the consumer's db storage key (e.g. uid-prefixed). */
 	storagePathFor(relPath: string): string;
 	getMimeType(name: string): string | null;
