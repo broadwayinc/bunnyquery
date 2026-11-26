@@ -999,7 +999,7 @@ Extracted content of attached office files (read inline below; do NOT fetch thei
     const reindexHint = canUpload === false ? `asking the project's owner to re-index that file` : `re-indexing that file (attach the same file again and choose to reindex it)`;
     const groundingRules = `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
-A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files, the records when the value could be in a table), keep the answer short: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
+A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files; the records ONLY when the value could be a spreadsheet cell or a row, and then with ONE filtered getRecords on that value, never by paging through a whole table), keep the answer short. The text read from photos, scans and other images IS in the page text searchText covered, so a code, serial or phrase asked about a photo needs no records read: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
     const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
@@ -12971,6 +12971,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       att._storedCount = 0;
       att._indexQueuedCount = 0;
       att._indexQueued = false;
+      att._landedNew = [];
       var cancelError = function() {
         var e = new Error(UPLOAD_CANCELLED_MESSAGE);
         e.code = "CANCELLED";
@@ -13001,7 +13002,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           var duplicateOf = null;
           var existedBefore = false;
           var madeRecord = false;
+          var sentAll = false;
           var onProg = function(p) {
+            if (p && p.total && p.loaded >= p.total) sentAll = true;
             if (p && p.total) {
               att.progress = Math.floor((idx + p.loaded / p.total) / total * 100);
               self.host.renderAttachmentChips();
@@ -13009,6 +13012,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           };
           var doMemberUpload = function(checkExistence) {
             checkCancel();
+            sentAll = false;
             return self.host.uploadFile({
               file: member.file,
               storagePath: member.storagePath,
@@ -13030,10 +13034,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             }).then(function(r) {
               att._abort = null;
               att._storedCount = (att._storedCount || 0) + 1;
+              if (checkExistence) att._landedNew.push(member.storagePath);
               return r;
             }, function(err) {
               att._abort = null;
-              if (att._cancelled) throw cancelError();
+              if (att._cancelled) {
+                if (checkExistence && sentAll) att._landedNew.push(member.storagePath);
+                throw cancelError();
+              }
               throw err;
             });
           };
@@ -13189,6 +13197,9 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               if (alreadyIndexing) return;
               att._indexQueuedCount = (att._indexQueuedCount || 0) + 1;
               if (att.kind !== "folder") att._indexQueued = true;
+              att._landedNew = (att._landedNew || []).filter(function(p) {
+                return p !== member.storagePath;
+              });
               self.host.renderAttachmentChips();
               return self.trackIndexDispatch(notifyAgentSaveAttachment({
                 platform: id.platform,
@@ -13310,6 +13321,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
               att.status = "cancelled";
               att._abort = null;
               self.host.renderAttachmentChips();
+              if (typeof att._onCancelSettled === "function") {
+                try {
+                  att._onCancelSettled((att._landedNew || []).slice());
+                } catch (e) {
+                }
+              }
               return;
             }
             if (removed || aborted) return;
@@ -13350,7 +13367,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
   (function() {
     var MCP_PROD = "https://mcp.skapi.com";
     var MCP_DEV = "https://mcp.broadwayinc.computer";
-    var BQ_VERSION = "1.21.7" ;
+    var BQ_VERSION = "1.21.8" ;
     var ATTACHMENT_URL_EXPIRES_SECONDS = 600;
     var GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
     var GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -16367,14 +16384,19 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var cancelled = (atts || []).filter(isInFlightUpload);
       if (!cancelled.length) return;
       var ids = {};
+      var notice = { list: cancelled, text: "" };
       cancelled.forEach(function(a) {
+        a._onCancelSettled = function(landed) {
+          discardCancelledUploads(a, landed, notice);
+        };
         if (!session.cancelAttachmentUpload(a)) a._cancelled = true;
         ids[a.id] = true;
       });
       CS.attachments = CS.attachments.filter(function(a) {
         return !ids[a.id];
       });
-      CS.attachmentCancelNotice = uploadCancelNotice(cancelled);
+      notice.text = uploadCancelNotice(cancelled);
+      CS.attachmentCancelNotice = notice.text;
       CS.attachmentCapNotice = "";
       CS.visibleAttachmentCount = Infinity;
       recomputeAttachmentWarning();
@@ -16387,22 +16409,104 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         return a.kind === "folder" ? a.name + "/" : a.name;
       });
       var text = list.length === 1 ? "Upload cancelled: " + names[0] + "." : list.length + " uploads cancelled: " + names.slice(0, 3).join(", ") + (names.length > 3 ? " and " + (names.length - 3) + " more." : ".");
-      var queued = 0, stored = 0;
+      var queued = 0, checking = 0, removed = 0, kept = 0, reasons = [];
       list.forEach(function(a) {
         var q = a._indexQueuedCount || 0;
         queued += q;
+        var d = a._discard;
+        if (d && d.state === "done") {
+          removed += d.removed;
+          kept += d.kept;
+          if (d.reason && reasons.indexOf(d.reason) === -1) reasons.push(d.reason);
+          return;
+        }
+        if (d && d.state === "pending") {
+          checking += d.count;
+          return;
+        }
         var landed = Math.max(0, (a._storedCount || 0) - q);
         if (!landed && a.status === "uploading" && (a.progress || 0) >= 100) landed = 1;
-        stored += landed;
+        checking += landed;
       });
+      var one = list.length === 1 && !queued;
       if (queued) {
         text += " " + queued + (queued === 1 ? " file had" : " files had") + " already gone to indexing; stop " + (queued === 1 ? "it from its row" : "them from their rows") + " in the chat.";
       }
-      if (stored) {
-        var subject = list.length === 1 && stored === 1 && !queued ? "Its" : stored === 1 ? "One file's" : stored + " files'";
-        text += " " + subject + " bytes had already been sent, so " + (stored === 1 ? "it" : "they") + " may stay in storage, but " + (stored === 1 ? "it was" : "they were") + " not indexed or added to the chat.";
+      if (checking) {
+        text += " " + (one && checking === 1 ? "Its" : checking === 1 ? "One file's" : checking + " files'") + " bytes had already been sent; removing " + (checking === 1 ? "it" : "them") + " from storage.";
+      }
+      if (removed) {
+        text += " " + (one && removed === 1 && !kept ? "Its bytes had already reached storage and were removed again." : removed === 1 ? "One file had already reached storage and was removed again." : removed + " files had already reached storage and were removed again.");
+      }
+      if (kept) {
+        text += " " + (one && kept === 1 && !removed ? "It" : kept === 1 ? "One file" : kept + " files") + " had already reached storage and could not be removed, but " + (kept === 1 ? "it was" : "they were") + " not indexed or added to the chat." + (reasons.length ? " " + reasons.join(" ") : "");
       }
       return text;
+    }
+    function discardCancelledUploads(att, landed, notice) {
+      var paths = (landed || []).filter(function(p, i, all) {
+        return p && all.indexOf(p) === i;
+      });
+      if (!paths.length) {
+        att._discard = { state: "done", removed: 0, kept: 0, reason: "" };
+        refreshCancelNotice(notice);
+        return;
+      }
+      att._discard = { state: "pending", count: paths.length };
+      refreshCancelNotice(notice);
+      var removed = 0, kept = 0, reason = "";
+      paths.reduce(function(p, storagePath) {
+        return p.then(function() {
+          return discardUploadedFile(storagePath).then(function(out) {
+            if (out.removed) removed += 1;
+            else if (!out.gone) {
+              kept += 1;
+              if (!reason && out.message) reason = out.message.replace(/\s*(It|The file) was not removed\.$/, "");
+            }
+          });
+        });
+      }, Promise.resolve()).then(function() {
+        att._discard = { state: "done", removed, kept, reason };
+        refreshCancelNotice(notice);
+      });
+    }
+    function discardUploadedFile(storagePath) {
+      if (!S.skapi || typeof S.skapi.forwardRequest !== "function" || !S.projectId) {
+        return Promise.resolve({ removed: false, message: "This page cannot reach the BunnyQuery server." });
+      }
+      return Promise.resolve(S.skapi.forwardRequest(null, {
+        service: S.projectId,
+        owner: S.owner || void 0,
+        url: mcpBaseUrl() + "/internal/upload-discard",
+        method: "POST",
+        // "$ACCESS_TOKEN" is filled in by skapi with this user's own token: the
+        // server acts for the user it names and nobody else.
+        headers: { "content-type": "application/json", Authorization: "Bearer $ACCESS_TOKEN" },
+        data: { project_id: S.projectId, path: storagePath }
+      })).then(function(res) {
+        var body = res;
+        if (typeof body === "string") {
+          try {
+            body = JSON.parse(body);
+          } catch (e) {
+            body = { message: body };
+          }
+        }
+        if (!body || typeof body !== "object" || typeof body.removed !== "boolean") {
+          return { removed: false, message: "The server gave no answer about the file." };
+        }
+        return { removed: body.removed, gone: body.gone === true, message: typeof body.message === "string" ? body.message : "" };
+      }, function(err) {
+        var msg = err && (err.message || err.body && err.body.message) || (typeof err === "string" ? err : "");
+        return { removed: false, message: msg ? "The server answered: " + String(msg).slice(0, 200).replace(/\.?$/, ".") : "The server could not be reached." };
+      });
+    }
+    function refreshCancelNotice(notice) {
+      if (!notice || CS.attachmentCancelNotice !== notice.text) return;
+      notice.text = uploadCancelNotice(notice.list);
+      CS.attachmentCancelNotice = notice.text;
+      renderAttachmentChips();
+      scheduleAttachmentOverflowRecompute();
     }
     function clearAttachments() {
       CS.attachments = CS.attachments.filter(function(a) {

@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.7**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.8**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,11 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.8 (2026-11-26, not yet published)
+
+- **A cancelled upload whose bytes already landed is removed again.** Until now a widget cancel that came after the file's bytes reached storage ("Finalizing") stopped the indexing and the chat link, but the notice had to say the file might stay in storage, since an end user's page cannot delete a project file. The engine now reports, once a cancelled chip's upload has fully stopped, which NEW files' bytes reached storage (or may have: the whole body was sent before the abort) and have not gone to indexing (`att._landedNew`, handed to the host through `att._onCancelSettled(paths)`). A file replaced with Overwrite is never listed, so a cancel never removes a file the user had before. The widget then asks BunnyQuery's MCP to remove each one (`POST /internal/upload-discard` through `forwardRequest`, with the user's own token). The server removes it only when the caller is a project user of that project, the file is in the caller's own upload folder, it was stored within the last 15 minutes and no other account's index record describes it; it also clears the file's index setup. The notice says "removing it from storage" while that runs, then "had already reached storage and were removed again", or, when the server refused or could not be reached, that the file stays in storage (not indexed or added to the chat) with the server's reason. A cancel made while the bytes are still going up is unchanged (nothing is stored), and an upload that is not cancelled is never touched. Widget only; the dashboard (agent.vue) uploads through its own pipeline.
+- **A code, number or phrase that was not found: no table paging.** The not-found rule of 1.21.7 told the model to check the records "when the value could be in a table" before saying a value was not found, and a model read that as paging through whole tables. Records are now checked ONLY when the value could be a spreadsheet cell or a row, and then with ONE filtered getRecords on that value. The prompt also says the text read from photos, scans and other images is already in the page text searchText covered, so a code, serial or phrase asked about a photo needs no records read before answering that it was not found. Both clients.
 
 ## 1.21.7 (2026-11-26, not yet published)
 

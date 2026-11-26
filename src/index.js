@@ -3404,14 +3404,22 @@ import {
         var cancelled = (atts || []).filter(isInFlightUpload);
         if (!cancelled.length) return;
         var ids = {};
+        // The notice this cancel shows. Rewritten in place once each chip's upload has
+        // stopped and any bytes that reached storage were taken back (or could not be),
+        // as long as it is still the notice on screen.
+        var notice = { list: cancelled, text: "" };
         cancelled.forEach(function (a) {
+            // Called by the engine once this chip's upload has fully stopped, with the
+            // new files whose bytes reached storage (or may have) before the cancel.
+            a._onCancelSettled = function (landed) { discardCancelledUploads(a, landed, notice); };
             // A chip queued behind another one has nothing to abort yet: the flag
             // alone stops it (and the batch skips a chip that left the list).
             if (!session.cancelAttachmentUpload(a)) a._cancelled = true;
             ids[a.id] = true;
         });
         CS.attachments = CS.attachments.filter(function (a) { return !ids[a.id]; });
-        CS.attachmentCancelNotice = uploadCancelNotice(cancelled);
+        notice.text = uploadCancelNotice(cancelled);
+        CS.attachmentCancelNotice = notice.text;
         CS.attachmentCapNotice = "";
         CS.visibleAttachmentCount = Infinity;
         recomputeAttachmentWarning();
@@ -3428,27 +3436,115 @@ import {
         // What the cancel could not undo, said plainly rather than implied away.
         // Queued: a folder member whose indexing request had already gone out.
         // Stored: a member whose bytes had already landed (or were all sent and
-        // only the answer was outstanding), which this page has no way to delete.
-        var queued = 0, stored = 0;
+        // only the answer was outstanding). Once the chip's upload has stopped
+        // those are taken back (discardCancelledUploads) and `_discard` says how
+        // that went: removed, kept (with the server's reason) or still running.
+        var queued = 0, checking = 0, removed = 0, kept = 0, reasons = [];
         list.forEach(function (a) {
             var q = a._indexQueuedCount || 0;
             queued += q;
+            var d = a._discard;
+            if (d && d.state === "done") {
+                removed += d.removed;
+                kept += d.kept;
+                if (d.reason && reasons.indexOf(d.reason) === -1) reasons.push(d.reason);
+                return;
+            }
+            if (d && d.state === "pending") { checking += d.count; return; }
             var landed = Math.max(0, (a._storedCount || 0) - q);
             if (!landed && a.status === "uploading" && (a.progress || 0) >= 100) landed = 1;
-            stored += landed;
+            checking += landed;
         });
+        var one = list.length === 1 && !queued;
         if (queued) {
             text += " " + queued + (queued === 1 ? " file had" : " files had") + " already gone to indexing; stop "
                 + (queued === 1 ? "it from its row" : "them from their rows") + " in the chat.";
         }
-        if (stored) {
-            var subject = list.length === 1 && stored === 1 && !queued ? "Its"
-                : stored === 1 ? "One file's" : stored + " files'";
-            text += " " + subject + " bytes had already been sent, so "
-                + (stored === 1 ? "it" : "they") + " may stay in storage, but " + (stored === 1 ? "it was" : "they were")
-                + " not indexed or added to the chat.";
+        if (checking) {
+            text += " " + (one && checking === 1 ? "Its" : checking === 1 ? "One file's" : checking + " files'")
+                + " bytes had already been sent; removing " + (checking === 1 ? "it" : "them") + " from storage.";
+        }
+        if (removed) {
+            text += " " + (one && removed === 1 && !kept ? "Its bytes had already reached storage and were removed again."
+                : removed === 1 ? "One file had already reached storage and was removed again."
+                : removed + " files had already reached storage and were removed again.");
+        }
+        if (kept) {
+            text += " " + (one && kept === 1 && !removed ? "It" : kept === 1 ? "One file" : kept + " files")
+                + " had already reached storage and could not be removed, but " + (kept === 1 ? "it was" : "they were")
+                + " not indexed or added to the chat."
+                // The server's own reason, in its words (upload-discard.js).
+                + (reasons.length ? " " + reasons.join(" ") : "");
         }
         return text;
+    }
+    // Take back the stored bytes of a cancelled upload: the new files the engine
+    // reports as landed (see ChatSession.uploadSingleAttachment, att._landedNew).
+    // BunnyQuery's MCP removes each one (/internal/upload-discard) only when it is
+    // this user's own file, uploaded within the last minutes, and not described by
+    // anyone else's index record; it also drops the file's index setup. One at a
+    // time; the notice is rewritten when all of this chip's files are answered.
+    function discardCancelledUploads(att, landed, notice) {
+        var paths = (landed || []).filter(function (p, i, all) { return p && all.indexOf(p) === i; });
+        if (!paths.length) {
+            att._discard = { state: "done", removed: 0, kept: 0, reason: "" };
+            refreshCancelNotice(notice);
+            return;
+        }
+        att._discard = { state: "pending", count: paths.length };
+        refreshCancelNotice(notice);
+        var removed = 0, kept = 0, reason = "";
+        paths.reduce(function (p, storagePath) {
+            return p.then(function () {
+                return discardUploadedFile(storagePath).then(function (out) {
+                    if (out.removed) removed += 1;
+                    else if (!out.gone) {
+                        kept += 1;
+                        // The notice already says it stays; keep the server's why.
+                        if (!reason && out.message) reason = out.message.replace(/\s*(It|The file) was not removed\.$/, "");
+                    }
+                });
+            });
+        }, Promise.resolve()).then(function () {
+            att._discard = { state: "done", removed: removed, kept: kept, reason: reason };
+            refreshCancelNotice(notice);
+        });
+    }
+    // Resolves to { removed, gone, message }. Never rejects: a call that could not
+    // be made or answered says why in `message`, and the file is reported as kept.
+    function discardUploadedFile(storagePath) {
+        if (!S.skapi || typeof S.skapi.forwardRequest !== "function" || !S.projectId) {
+            return Promise.resolve({ removed: false, message: "This page cannot reach the BunnyQuery server." });
+        }
+        return Promise.resolve(S.skapi.forwardRequest(null, {
+            service: S.projectId,
+            owner: S.owner || undefined,
+            url: mcpBaseUrl() + "/internal/upload-discard",
+            method: "POST",
+            // "$ACCESS_TOKEN" is filled in by skapi with this user's own token: the
+            // server acts for the user it names and nobody else.
+            headers: { "content-type": "application/json", Authorization: "Bearer $ACCESS_TOKEN" },
+            data: { project_id: S.projectId, path: storagePath },
+        })).then(function (res) {
+            var body = res;
+            if (typeof body === "string") { try { body = JSON.parse(body); } catch (e) { body = { message: body }; } }
+            if (!body || typeof body !== "object" || typeof body.removed !== "boolean") {
+                return { removed: false, message: "The server gave no answer about the file." };
+            }
+            return { removed: body.removed, gone: body.gone === true, message: typeof body.message === "string" ? body.message : "" };
+        }, function (err) {
+            var msg = (err && (err.message || (err.body && err.body.message))) || (typeof err === "string" ? err : "");
+            return { removed: false, message: msg ? "The server answered: " + String(msg).slice(0, 200).replace(/\.?$/, ".") : "The server could not be reached." };
+        });
+    }
+    function refreshCancelNotice(notice) {
+        // Only while this cancel's notice is still the one on screen: a dismissed or
+        // replaced notice stays as the user left it.
+        if (!notice || CS.attachmentCancelNotice !== notice.text) return;
+        notice.text = uploadCancelNotice(notice.list);
+        CS.attachmentCancelNotice = notice.text;
+        renderAttachmentChips();
+        scheduleAttachmentOverflowRecompute();
     }
 
     // "Remove all" is a composer affordance: it drops what the user has staged for

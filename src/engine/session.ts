@@ -9309,6 +9309,12 @@ export class ChatSession {
 		// clean. `_cancelled` is NOT reset: a cancelled chip leaves the list and is
 		// never retried, and a cancel that raced the start must still stop it.
 		att._storedCount = 0; att._indexQueuedCount = 0; att._indexQueued = false;
+		// The storage paths of NEW files (uploaded with the existence check, so no file was
+		// there before) whose bytes reached storage, or may have (the abort came after the
+		// whole body was sent), and whose indexing request has not gone out. A cancel hands
+		// them to the host (att._onCancelSettled) so it can take the stored bytes back. A
+		// replaced file (Overwrite) is never listed: removing it would lose the user's file.
+		att._landedNew = [];
 		var cancelError = function (): Error {
 			var e: any = new Error(UPLOAD_CANCELLED_MESSAGE);
 			e.code = 'CANCELLED';
@@ -9357,7 +9363,11 @@ export class ChatSession {
 				// mint, or the step before the indexing request): a cancel that lands
 				// after it drops that record again.
 				var madeRecord = false;
+				// Every byte of this member's body was handed to the network: an abort after
+				// this point may come too late to keep the object out of storage.
+				var sentAll = false;
 				var onProg = function (p: any) {
+					if (p && p.total && p.loaded >= p.total) sentAll = true;
 					if (p && p.total) {
 						att.progress = Math.floor(((idx + p.loaded / p.total) / total) * 100);
 						self.host.renderAttachmentChips();
@@ -9366,6 +9376,7 @@ export class ChatSession {
 				var doMemberUpload = function (checkExistence: boolean) {
 					// Cancelled during the EXISTS prompt or between members: no bytes.
 					checkCancel();
+					sentAll = false;
 					return self.host.uploadFile({
 						file: member.file, storagePath: member.storagePath, checkExistence: checkExistence,
 						onProgress: onProg,
@@ -9380,12 +9391,16 @@ export class ChatSession {
 					}).then(function (r: any) {
 						att._abort = null;
 						att._storedCount = (att._storedCount || 0) + 1;
+						if (checkExistence) att._landedNew.push(member.storagePath);
 						return r;
 					}, function (err: any) {
 						att._abort = null;
 						// An abort the user asked for reads as the cancel it is, not as
 						// a failed upload.
-						if (att._cancelled) throw cancelError();
+						if (att._cancelled) {
+							if (checkExistence && sentAll) att._landedNew.push(member.storagePath);
+							throw cancelError();
+						}
 						throw err;
 					});
 				};
@@ -9581,6 +9596,8 @@ export class ChatSession {
 					// the view so it stops offering a cancel it cannot honour.
 					att._indexQueuedCount = (att._indexQueuedCount || 0) + 1;
 					if (att.kind !== 'folder') att._indexQueued = true;
+					// Queued for indexing: no longer a cancelled upload to take back.
+					att._landedNew = (att._landedNew || []).filter(function (p: string) { return p !== member.storagePath; });
 					self.host.renderAttachmentChips();
 					// Tracked so a chat waiting on awaitIndexingDrained cannot be sent
 					// in the window between this call and the queue accepting it.
@@ -9699,6 +9716,12 @@ export class ChatSession {
 						att.status = 'cancelled';
 						att._abort = null;
 						self.host.renderAttachmentChips();
+						// The chip's upload has fully stopped: tell the host which new
+						// files' bytes reached storage (or may have) so it can take them
+						// back. Set by the host when it cancelled; optional.
+						if (typeof att._onCancelSettled === 'function') {
+							try { att._onCancelSettled((att._landedNew || []).slice()); } catch (e) { }
+						}
 						return;
 					}
 					if (removed || aborted) return;

@@ -1066,7 +1066,7 @@ function buildChatSystemPrompt(params) {
   const reindexHint = canUpload === false ? `asking the project's owner to re-index that file` : client === "console" ? `re-indexing that file (select it on the Files page and choose Reindex)` : `re-indexing that file (attach the same file again and choose to reindex it)`;
   const groundingRules = `ANSWER ONLY FROM THE DATA. Every fact you state about this project's data - a name, a number, a date, a status, what a document says, whether something exists - must come from one of four places: a tool result returned in THIS conversation, a file or image attached to it (including one you read through its attachment link), the project description at the end of this prompt, or what the user told you themselves in this chat. Your general knowledge, the open internet and a plausible guess are NOT sources. Never use them to answer a question about the user's data, to fill a gap in it, or to complete a record that came back partial. A value that is not in what you retrieved is unknown: say it is not in the data instead of supplying a likely one.
 WHEN THE DATA DOES NOT HAVE IT, SAY SO. Once you have searched the way these rules require and nothing answers the question, tell the user plainly, in their language, that this project's data does not contain it, and say what you searched (the tables, files or terms) so they can tell missing data from a missed search. Do not answer from memory instead, and do not turn a missing answer into a general explanation of the topic. Offer what would let you answer it: ${canUpload === false ? `another name or file to look under, or asking the project's owner to add it` : `the document to upload, or another name or file to look under`}.
-A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files, the records when the value could be in a table), keep the answer short: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
+A CODE, NUMBER OR PHRASE THAT searchText DID NOT FIND: when it answers search_complete with no hit, and what its message says was NOT searched has been checked as it says (the skipped_without_page_text files; the records ONLY when the value could be a spreadsheet cell or a row, and then with ONE filtered getRecords on that value, never by paging through a whole table), keep the answer short. The text read from photos, scans and other images IS in the page text searchText covered, so a code, serial or phrase asked about a photo needs no records read: say plainly that it was not found, name what was searched (the file, and its pages when you searched only some of them, or files_searched files and total_pages_searched pages), and when a recently uploaded file or a photo should hold it, suggest ${reindexHint}, since small or handwritten characters can be misread at indexing. Never present a different file as the match, and never guess the value.
 KEEP WHAT THE DATA SAYS APART FROM WHAT YOU WORKED OUT. A total you computed, a comparison, a trend, an interpretation or a recommendation is yours, not the data's: label it as such ("calculated from...", "this suggests...") and name the rows or files it was made from. Never present an estimate, an assumption or an inference as something the data states.
 These rules govern every claim about the project's data. They do not limit the About BunnyQuery section (answer product questions from it), a greeting, or text the user explicitly asks you to write.`;
   const webRule = webAccess ? `WEB ACCESS IS ON for this project: when the user asks for something that is not in the project's data, you may search the web for it, but every such fact must be marked as coming from the web (name the site), kept apart from what the project's data says, and never used to fill in or complete a document's content or a record. This is the one exception to the four sources named above.` : `This chat has no web tool: the web is never a source here.`;
@@ -13150,6 +13150,7 @@ var _ChatSession = class _ChatSession {
     att._storedCount = 0;
     att._indexQueuedCount = 0;
     att._indexQueued = false;
+    att._landedNew = [];
     var cancelError = function() {
       var e = new Error(UPLOAD_CANCELLED_MESSAGE);
       e.code = "CANCELLED";
@@ -13180,7 +13181,9 @@ var _ChatSession = class _ChatSession {
         var duplicateOf = null;
         var existedBefore = false;
         var madeRecord = false;
+        var sentAll = false;
         var onProg = function(p) {
+          if (p && p.total && p.loaded >= p.total) sentAll = true;
           if (p && p.total) {
             att.progress = Math.floor((idx + p.loaded / p.total) / total * 100);
             self.host.renderAttachmentChips();
@@ -13188,6 +13191,7 @@ var _ChatSession = class _ChatSession {
         };
         var doMemberUpload = function(checkExistence) {
           checkCancel();
+          sentAll = false;
           return self.host.uploadFile({
             file: member.file,
             storagePath: member.storagePath,
@@ -13209,10 +13213,14 @@ var _ChatSession = class _ChatSession {
           }).then(function(r) {
             att._abort = null;
             att._storedCount = (att._storedCount || 0) + 1;
+            if (checkExistence) att._landedNew.push(member.storagePath);
             return r;
           }, function(err) {
             att._abort = null;
-            if (att._cancelled) throw cancelError();
+            if (att._cancelled) {
+              if (checkExistence && sentAll) att._landedNew.push(member.storagePath);
+              throw cancelError();
+            }
             throw err;
           });
         };
@@ -13368,6 +13376,9 @@ var _ChatSession = class _ChatSession {
             if (alreadyIndexing) return;
             att._indexQueuedCount = (att._indexQueuedCount || 0) + 1;
             if (att.kind !== "folder") att._indexQueued = true;
+            att._landedNew = (att._landedNew || []).filter(function(p) {
+              return p !== member.storagePath;
+            });
             self.host.renderAttachmentChips();
             return self.trackIndexDispatch(notifyAgentSaveAttachment({
               platform: id.platform,
@@ -13489,6 +13500,12 @@ var _ChatSession = class _ChatSession {
             att.status = "cancelled";
             att._abort = null;
             self.host.renderAttachmentChips();
+            if (typeof att._onCancelSettled === "function") {
+              try {
+                att._onCancelSettled((att._landedNew || []).slice());
+              } catch (e) {
+              }
+            }
             return;
           }
           if (removed || aborted) return;
