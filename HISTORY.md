@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.12**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.13**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.13 (2026-11-27, not yet published)
+
+- **Questions in another language than the files.** The chat prompt has a FILES IN ANOTHER LANGUAGE rule: when searches in the question's language find nothing (or searchText reports the files are in another language), search again with the key terms translated into the files' language before concluding. The "not found" rule is limited to codes, numbers and exact quotes. A Korean question about an English/Russian manual gave up after three Korean searches.
 
 ## 1.21.12 (2026-11-26, not yet published)
 
