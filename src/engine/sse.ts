@@ -133,6 +133,16 @@ export interface SseToolCall {
 	type: string;
 	/** Present on Anthropic mcp_tool_use only. */
 	serverName?: string;
+	/** The provider's id for the call (Anthropic block id, OpenAI item id), when it
+	 *  gave one. A result block names its call by this. */
+	id?: string;
+	/** The call's arguments, parsed, once they have fully arrived. Absent while they
+	 *  are still streaming and when they would not parse. Render-only: it is what a
+	 *  "searching for ..." line reads, never something to act on. */
+	input?: any;
+	/** The tool has answered (a result block or a finished item arrived for it, or
+	 *  the model went back to writing after it). False while it is still running. */
+	done?: boolean;
 }
 
 export interface SseSnapshot {
@@ -389,6 +399,8 @@ export function createSseParser(): SseParser {
 	var error: any = null;
 	var stopReason: string | null = null;
 	var toolCalls: SseToolCall[] = [];
+	/** OpenAI tool-argument deltas by output index, for SseToolCall.input only. */
+	var argBuf: Record<number, string> = {};
 	var malformedFrames = 0;
 	var malformedToolJson = 0;
 
@@ -590,7 +602,10 @@ export function createSseParser(): SseParser {
 					type: block.type,
 				};
 				if (typeof block.server_name === 'string') call.serverName = block.server_name;
+				if (typeof block.id === 'string' && block.id) call.id = block.id;
 				toolCalls.push(call);
+			} else if (block && typeof block.type === 'string') {
+				markClaudeCallsDone(block);
 			}
 			return;
 		}
@@ -620,6 +635,10 @@ export function createSseParser(): SseParser {
 			var j = numberOr(ev.index, -1);
 			var s = j >= 0 ? blocks.get(j) : undefined;
 			if (s && s.sawJson) finishToolJson(s);
+			if (s && s.block && s.block.input && typeof s.block.input === 'object') {
+				var sc = callAt(j);
+				if (sc) sc.input = s.block.input;
+			}
 			return;
 		}
 
@@ -701,6 +720,39 @@ export function createSseParser(): SseParser {
 		}
 	}
 
+	/** The tool call drawn from the block at `index`, newest first. Render-only. */
+	function callAt(index: number): SseToolCall | null {
+		for (var k = toolCalls.length - 1; k >= 0; k--) {
+			if (toolCalls[k].index === index) return toolCalls[k];
+		}
+		return null;
+	}
+
+	/** A non-tool block started. A result block finishes the call it names; text or
+	 *  thinking means the model is writing again, so every call before it answered.
+	 *  Feeds SseToolCall.done only, which nothing but a progress line reads. */
+	function markClaudeCallsDone(block: any): void {
+		var t = block.type as string;
+		if (/tool_result$/.test(t)) {
+			var ref = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
+			for (var k = 0; k < toolCalls.length; k++) {
+				if (ref && toolCalls[k].id === ref) toolCalls[k].done = true;
+			}
+			return;
+		}
+		if (t === 'text' || t === 'thinking' || t === 'redacted_thinking') {
+			for (var m = 0; m < toolCalls.length; m++) toolCalls[m].done = true;
+		}
+	}
+
+	/** OpenAI tool arguments arrive as a JSON string. Parsed for display only; a
+	 *  string that will not parse is simply not shown. */
+	function parseArgs(args: any): any {
+		if (args && typeof args === 'object') return args;
+		if (typeof args !== 'string' || !args) return undefined;
+		try { return JSON.parse(args); } catch (e) { return undefined; }
+	}
+
 	function deltaBlockType(deltaType: any): string {
 		if (deltaType === 'thinking_delta' || deltaType === 'signature_delta') return 'thinking';
 		if (deltaType === 'input_json_delta') return 'tool_use';
@@ -748,13 +800,63 @@ export function createSseParser(): SseParser {
 		if (type === 'response.output_item.added') {
 			var item = ev.item;
 			if (item && typeof item.type === 'string' && OPENAI_TOOL_ITEMS[item.type]) {
-				toolCalls.push({
+				var oc: SseToolCall = {
 					index: numberOr(ev.output_index, toolCalls.length),
 					// A built-in tool (web_search_call) has no name of its own, so the item
 					// type is the only label there is and a row can still be drawn.
 					name: typeof item.name === 'string' && item.name ? item.name : item.type,
 					type: item.type,
-				});
+				};
+				if (typeof item.id === 'string' && item.id) oc.id = item.id;
+				var oa = parseArgs(item.arguments);
+				if (oa !== undefined) oc.input = oa;
+				toolCalls.push(oc);
+			}
+			return;
+		}
+
+		// Progress-line bookkeeping only (SseToolCall.input / .done). None of these
+		// feed the text, the body or any keep/store decision.
+		//
+		// The DELTAS are read, not just the done frame: the relay cuts chunks where it
+		// likes, and a done frame split across two chunks has been seen to reach the
+		// browser only when the tool FINISHED (the rest sat in the relay while the
+		// tool ran and no new bytes came). The arguments are one small delta in
+		// practice, so the call's input is known the moment it starts.
+		if (type === 'response.mcp_call_arguments.delta' || type === 'response.function_call_arguments.delta') {
+			var gi = numberOr(ev.output_index, -1);
+			var gc = callAt(gi);
+			if (gc && gc.input === undefined && typeof ev.delta === 'string') {
+				argBuf[gi] = (argBuf[gi] || '') + ev.delta;
+				var gt = argBuf[gi].trim();
+				if (gt.charAt(gt.length - 1) === '}') {
+					var ga = parseArgs(gt);
+					if (ga !== undefined) gc.input = ga;
+				}
+			}
+			return;
+		}
+		if (type === 'response.mcp_call_arguments.done' || type === 'response.function_call_arguments.done') {
+			var ac = callAt(numberOr(ev.output_index, -1));
+			var aa = parseArgs(ev.arguments);
+			if (ac && aa !== undefined) ac.input = aa;
+			return;
+		}
+		if (type === 'response.mcp_call.completed' || type === 'response.mcp_call.failed') {
+			var cc = callAt(numberOr(ev.output_index, -1));
+			if (cc) cc.done = true;
+			return;
+		}
+		if (type === 'response.output_item.done') {
+			var di = ev.item;
+			if (di && typeof di.type === 'string' && OPENAI_TOOL_ITEMS[di.type]) {
+				var dc = callAt(numberOr(ev.output_index, -1));
+				if (dc) {
+					var da = parseArgs(di.arguments);
+					if (da !== undefined) dc.input = da;
+					else if (di.action && typeof di.action === 'object' && dc.input === undefined) dc.input = di.action;
+					dc.done = true;
+				}
 			}
 			return;
 		}
@@ -992,7 +1094,12 @@ export function createSseParser(): SseParser {
 			provider: provider,
 			text: currentText(),
 			thinkingText: currentThinking(),
-			toolCalls: toolCalls.slice(),
+			// Copied per call, not just per array: a call's input/done fill in after it
+			// is first seen, and a snapshot already handed out must not change under
+			// its reader.
+			toolCalls: toolCalls.map(function (t) {
+				return Object.assign({}, t);
+			}),
 			toolNames: toolCalls.map(function (t) {
 				return t.name;
 			}),

@@ -666,6 +666,19 @@ widget rather than approximately:
   for a reply (`retrievalNoteOfAnswer`) into the file-and-page citations the
   widget shows under an answer; `answerUsedNoDataTool` says whether a reply read
   no data at all.
+- **`chatActivityLine(msg, now?, lang?)`** is the progress line under a waiting
+  turn: "Reading your question", "Searching your files for "oil leak"",
+  "Reading BP-252.pdf", "Looking at what it found", "Writing the answer". The
+  engine records the step from the live stream (the tool the model called, its
+  input, whether it answered) and the sentence moves on every
+  `CHAT_ACTIVITY_ROTATE_MS` (4 seconds) while a step lasts, looping its list, so
+  call it again about once a second and update only the text. It returns the
+  sentence without dots: draw your animated dot trail right after it. `lang` is a
+  BCP 47 tag such as `navigator.language`; `ko` picks Korean, anything else
+  English. The widget and bunnyquery.com show it in a chat turn's own waiting
+  bubble (not on indexing rows), as a `span.bq-activity-text` before the
+  `.bq-loader` dots. A turn that does not stream shows the thinking sentences,
+  timed from when the bubble was first drawn.
 - **`ChatSession.cancelPendingReply(msg, idx)`** is the "stop waiting" control:
   handed the pending assistant bubble, it cancels the running request on the
   server, marks the question cancelled and promotes the next queued message.

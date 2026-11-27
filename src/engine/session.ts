@@ -52,6 +52,7 @@ import { LookScheduler, LOOK_STALE_MS, runSettleSideEffect, claimSideEffect, sid
 // The wire-format knowledge. skapi relays the provider's bytes without reading them,
 // so the session hands them straight to this parser and never inspects a frame itself.
 import { createSseParser, type SseParser } from './sse';
+import { noteChatActivity } from './activity';
 import { isErrorResponseBody, isAuthExpiredError, isNonRetryableRequestError, getErrorMessage, isCsrStatusEnvelope, isTransportFailure, isNotExistsError, isRetriedFailure } from './errors';
 import { buildBoundedChatMessages } from './budget';
 import { extractRetrievalNote, type RetrievalNote } from './retrieval_memory';
@@ -1942,6 +1943,10 @@ export class ChatSession {
 	private _paintLiveStream(st: LiveStreamState): void {
 		if (st.ended) return;
 		st.lastPaintAt = nowMs();
+		// The waiting bubble's progress line ("Searching your files for ..."). Noted
+		// before the on-screen checks below so a turn running in a chat the reader has
+		// left still has the right line when they come back. Display memory only.
+		noteChatActivity(st.id, st.parser.snapshot());
 		// Another project (or another platform) is on screen. The turn keeps parsing -
 		// its answer is still being assembled and will still be finalized - but nothing
 		// is painted, because the index would point into a different chat's list.

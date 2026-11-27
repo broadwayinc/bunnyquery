@@ -83,6 +83,12 @@
 .bq-message.is-assistant:not(.is-error):not(.is-cancelled):not(.bq-index-pass) .bq-bubble:has(> .bq-loader) > .bq-loader {
     vertical-align: middle;
 }
+/* The waiting turn's progress line ("Searching your files for ..."): a sentence
+   from the engine (chatActivityLine) sitting right before the dot trail, so the
+   dots read as its ending. Middle-aligned with the inline bunny like the dots. */
+.bq-bubble > .bq-activity-text {
+    vertical-align: middle;
+}
 /* The dot-trail cycles '.', '..', '...', so left to itself it is a box that
    changes width three times every 1.2s: the bubble pulsed with it, and the
    stop-waiting control that follows the dots moved each time, which made it hard

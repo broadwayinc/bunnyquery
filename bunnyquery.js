@@ -4454,6 +4454,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     var error = null;
     var stopReason = null;
     var toolCalls = [];
+    var argBuf = {};
     var malformedFrames = 0;
     var malformedToolJson = 0;
     var message = null;
@@ -4576,7 +4577,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             type: block.type
           };
           if (typeof block.server_name === "string") call.serverName = block.server_name;
+          if (typeof block.id === "string" && block.id) call.id = block.id;
           toolCalls.push(call);
+        } else if (block && typeof block.type === "string") {
+          markClaudeCallsDone(block);
         }
         return;
       }
@@ -4600,6 +4604,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var j = numberOr(ev.index, -1);
         var s = j >= 0 ? blocks.get(j) : void 0;
         if (s && s.sawJson) finishToolJson(s);
+        if (s && s.block && s.block.input && typeof s.block.input === "object") {
+          var sc = callAt(j);
+          if (sc) sc.input = s.block.input;
+        }
         return;
       }
       if (type === "message_delta") {
@@ -4660,6 +4668,34 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         malformedToolJson++;
       }
     }
+    function callAt(index) {
+      for (var k = toolCalls.length - 1; k >= 0; k--) {
+        if (toolCalls[k].index === index) return toolCalls[k];
+      }
+      return null;
+    }
+    function markClaudeCallsDone(block) {
+      var t = block.type;
+      if (/tool_result$/.test(t)) {
+        var ref = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
+        for (var k = 0; k < toolCalls.length; k++) {
+          if (ref && toolCalls[k].id === ref) toolCalls[k].done = true;
+        }
+        return;
+      }
+      if (t === "text" || t === "thinking" || t === "redacted_thinking") {
+        for (var m = 0; m < toolCalls.length; m++) toolCalls[m].done = true;
+      }
+    }
+    function parseArgs(args) {
+      if (args && typeof args === "object") return args;
+      if (typeof args !== "string" || !args) return void 0;
+      try {
+        return JSON.parse(args);
+      } catch (e) {
+        return void 0;
+      }
+    }
     function deltaBlockType(deltaType) {
       if (deltaType === "thinking_delta" || deltaType === "signature_delta") return "thinking";
       if (deltaType === "input_json_delta") return "tool_use";
@@ -4693,13 +4729,54 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (type === "response.output_item.added") {
         var item = ev.item;
         if (item && typeof item.type === "string" && OPENAI_TOOL_ITEMS[item.type]) {
-          toolCalls.push({
+          var oc = {
             index: numberOr(ev.output_index, toolCalls.length),
             // A built-in tool (web_search_call) has no name of its own, so the item
             // type is the only label there is and a row can still be drawn.
             name: typeof item.name === "string" && item.name ? item.name : item.type,
             type: item.type
-          });
+          };
+          if (typeof item.id === "string" && item.id) oc.id = item.id;
+          var oa = parseArgs(item.arguments);
+          if (oa !== void 0) oc.input = oa;
+          toolCalls.push(oc);
+        }
+        return;
+      }
+      if (type === "response.mcp_call_arguments.delta" || type === "response.function_call_arguments.delta") {
+        var gi = numberOr(ev.output_index, -1);
+        var gc = callAt(gi);
+        if (gc && gc.input === void 0 && typeof ev.delta === "string") {
+          argBuf[gi] = (argBuf[gi] || "") + ev.delta;
+          var gt = argBuf[gi].trim();
+          if (gt.charAt(gt.length - 1) === "}") {
+            var ga = parseArgs(gt);
+            if (ga !== void 0) gc.input = ga;
+          }
+        }
+        return;
+      }
+      if (type === "response.mcp_call_arguments.done" || type === "response.function_call_arguments.done") {
+        var ac = callAt(numberOr(ev.output_index, -1));
+        var aa = parseArgs(ev.arguments);
+        if (ac && aa !== void 0) ac.input = aa;
+        return;
+      }
+      if (type === "response.mcp_call.completed" || type === "response.mcp_call.failed") {
+        var cc = callAt(numberOr(ev.output_index, -1));
+        if (cc) cc.done = true;
+        return;
+      }
+      if (type === "response.output_item.done") {
+        var di = ev.item;
+        if (di && typeof di.type === "string" && OPENAI_TOOL_ITEMS[di.type]) {
+          var dc = callAt(numberOr(ev.output_index, -1));
+          if (dc) {
+            var da = parseArgs(di.arguments);
+            if (da !== void 0) dc.input = da;
+            else if (di.action && typeof di.action === "object" && dc.input === void 0) dc.input = di.action;
+            dc.done = true;
+          }
         }
         return;
       }
@@ -4850,7 +4927,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         provider,
         text: currentText(),
         thinkingText: currentThinking(),
-        toolCalls: toolCalls.slice(),
+        // Copied per call, not just per array: a call's input/done fill in after it
+        // is first seen, and a snapshot already handed out must not change under
+        // its reader.
+        toolCalls: toolCalls.map(function(t) {
+          return Object.assign({}, t);
+        }),
         toolNames: toolCalls.map(function(t) {
           return t.name;
         }),
@@ -4902,6 +4984,190 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (Object.prototype.hasOwnProperty.call(src, k)) target[k] = src[k];
     }
     return target;
+  }
+
+  // src/engine/activity.ts
+  var CHAT_ACTIVITY_ROTATE_MS = 4e3;
+  var byItem = /* @__PURE__ */ new Map();
+  var startByObj = /* @__PURE__ */ new WeakMap();
+  var startById = /* @__PURE__ */ new Map();
+  var MAX_IDS = 200;
+  function remember(map, key, value) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    if (map.size > MAX_IDS) {
+      var oldest = map.keys().next();
+      if (!oldest.done) map.delete(oldest.value);
+    }
+  }
+  function stepOf(snap) {
+    if (!snap) return { step: "thinking", count: 0 };
+    var calls = Array.isArray(snap.toolCalls) ? snap.toolCalls : [];
+    if (typeof snap.text === "string" && /\S/.test(snap.text)) return { step: "writing", count: calls.length };
+    if (!calls.length) return { step: "thinking", count: 0 };
+    var last = calls[calls.length - 1];
+    if (last && !last.done) return { step: "tool", call: last, count: calls.length };
+    return { step: "between", count: calls.length };
+  }
+  function noteChatActivity(serverItemId, snap, now) {
+    if (!serverItemId) return;
+    var t = Date.now();
+    var s = stepOf(snap);
+    var key = s.step + ":" + s.count;
+    var prev = byItem.get(serverItemId);
+    if (prev && prev.key === key) {
+      if (s.call && s.call.input !== void 0 && prev.input === void 0) prev.input = s.call.input;
+      return;
+    }
+    var act = { step: s.step, since: t, key };
+    if (s.call) {
+      act.tool = s.call.name;
+      if (s.call.input !== void 0) act.input = s.call.input;
+    }
+    remember(byItem, serverItemId, act);
+  }
+  function chatActivityOf(msg) {
+    var id = msg && typeof msg._serverItemId === "string" ? msg._serverItemId : "";
+    return id && byItem.get(id) || null;
+  }
+  function turnStart(msg, now) {
+    var ids = [];
+    if (msg && typeof msg._serverItemId === "string" && msg._serverItemId) ids.push(msg._serverItemId);
+    if (msg && typeof msg._localId === "string" && msg._localId) ids.push(msg._localId);
+    var t;
+    if (msg && typeof msg === "object") t = startByObj.get(msg);
+    for (var i = 0; t === void 0 && i < ids.length; i++) t = startById.get(ids[i]);
+    if (t === void 0) t = now;
+    if (msg && typeof msg === "object") startByObj.set(msg, t);
+    for (var j = 0; j < ids.length; j++) if (startById.get(ids[j]) !== t) remember(startById, ids[j], t);
+    return t;
+  }
+  function langOf(lang) {
+    return typeof lang === "string" && /^ko\b/i.test(lang) ? "ko" : "en";
+  }
+  function clip(v, max) {
+    if (typeof v !== "string") return "";
+    var s = v.replace(/\s+/g, " ").trim();
+    if (s.length > max) s = s.slice(0, max - 1).trim() + "\u2026";
+    return s;
+  }
+  function fileName(v) {
+    if (typeof v !== "string" || !v) return "";
+    var s = v.replace(/^(src::|db:)/, "");
+    var parts = s.split("/").filter(function(p) {
+      return !!p;
+    });
+    return clip(parts.length ? parts[parts.length - 1] : s, 40);
+  }
+  var T = {
+    en: {
+      thinking: ["Reading your question", "Thinking about where to look", "Planning the search", "Still thinking, this can take a moment", "Working out the best way to find it", "Getting ready to look through your data"],
+      between: ["Looking at what it found", "Deciding what to check next", "Putting the pieces together", "Checking that it has what it needs", "Still working on it"],
+      writing: ["Writing the answer"],
+      still: "Still working on it",
+      working: "Working"
+    },
+    ko: {
+      thinking: ["\uC9C8\uBB38\uC744 \uC77D\uB294 \uC911", "\uC5B4\uB514\uB97C \uCC3E\uC544\uBCFC\uC9C0 \uC0DD\uAC01\uD558\uB294 \uC911", "\uAC80\uC0C9 \uBC29\uBC95\uC744 \uC815\uD558\uB294 \uC911", "\uC544\uC9C1 \uC0DD\uAC01\uD558\uB294 \uC911, \uC7A0\uC2DC\uB9CC \uAE30\uB2E4\uB824 \uC8FC\uC138\uC694", "\uAC00\uC7A5 \uC88B\uC740 \uBC29\uBC95\uC744 \uCC3E\uB294 \uC911", "\uB370\uC774\uD130\uB97C \uC0B4\uD3B4\uBCFC \uC900\uBE44\uB97C \uD558\uB294 \uC911"],
+      between: ["\uCC3E\uC740 \uB0B4\uC6A9\uC744 \uC0B4\uD3B4\uBCF4\uB294 \uC911", "\uB2E4\uC74C\uC5D0 \uD655\uC778\uD560 \uAC83\uC744 \uC815\uD558\uB294 \uC911", "\uB0B4\uC6A9\uC744 \uC815\uB9AC\uD558\uB294 \uC911", "\uD544\uC694\uD55C \uB0B4\uC6A9\uC774 \uB2E4 \uC788\uB294\uC9C0 \uD655\uC778\uD558\uB294 \uC911", "\uC544\uC9C1 \uC791\uC5C5 \uC911"],
+      writing: ["\uB2F5\uBCC0\uC744 \uC791\uC131\uD558\uB294 \uC911"],
+      still: "\uC544\uC9C1 \uC791\uC5C5 \uC911",
+      working: "\uC791\uC5C5 \uC911"
+    }
+  };
+  function toolLines(tool, i, lang) {
+    var ko = lang === "ko";
+    var inp = i && typeof i === "object" ? i : {};
+    var q = clip(inp.query || inp.question, 40);
+    var f = fileName(inp.path);
+    var tbl = clip(inp.table_name, 30);
+    switch (tool) {
+      case "searchText":
+        return ko ? [
+          q ? f ? f + '\uC5D0\uC11C "' + q + '" \uCC3E\uB294 \uC911' : '\uD30C\uC77C\uC5D0\uC11C "' + q + '" \uCC3E\uB294 \uC911' : "\uD30C\uC77C\uC5D0\uC11C \uCC3E\uB294 \uC911",
+          "\uBAA8\uB4E0 \uD398\uC774\uC9C0\uB97C \uD655\uC778\uD558\uB294 \uC911",
+          "\uC544\uC9C1 \uCC3E\uB294 \uC911, \uD070 \uD504\uB85C\uC81D\uD2B8\uB294 \uC870\uAE08 \uB354 \uAC78\uB824\uC694",
+          "\uACC4\uC18D \uCC3E\uB294 \uC911, \uAE30\uB2E4\uB824 \uC8FC\uC154\uC11C \uAC10\uC0AC\uD574\uC694"
+        ] : [
+          q ? f ? "Searching " + f + ' for "' + q + '"' : 'Searching your files for "' + q + '"' : "Searching your files",
+          "Checking every page",
+          "Still searching, big projects take a bit longer",
+          "Still searching, thanks for waiting"
+        ];
+      case "readFileContent":
+        return ko ? [
+          f ? f + " \uC77D\uB294 \uC911" : "\uD30C\uC77C\uC744 \uC77D\uB294 \uC911",
+          "\uD398\uC774\uC9C0\uB97C \uC0B4\uD3B4\uBCF4\uB294 \uC911",
+          "\uC544\uC9C1 \uC77D\uB294 \uC911, \uAE34 \uD30C\uC77C\uC740 \uC870\uAE08 \uB354 \uAC78\uB824\uC694"
+        ] : [
+          f ? "Reading " + f : "Reading a file",
+          "Going through the pages",
+          "Still reading, long files take a bit longer"
+        ];
+      case "getFileOutline":
+        return ko ? [f ? f + " \uAD6C\uC131\uC744 \uC0B4\uD3B4\uBCF4\uB294 \uC911" : "\uD30C\uC77C \uAD6C\uC131\uC744 \uC0B4\uD3B4\uBCF4\uB294 \uC911", "\uBAA9\uCC28\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : [f ? "Looking at how " + f + " is laid out" : "Looking at how the file is laid out", "Checking the table of contents", T.en.still];
+      case "getRecords":
+        return ko ? [
+          tbl ? tbl + " \uD14C\uC774\uBE14\uC5D0\uC11C \uAE30\uB85D\uC744 \uCC3E\uB294 \uC911" : "\uAE30\uB85D\uC744 \uCC3E\uB294 \uC911",
+          "\uD589\uC744 \uC0B4\uD3B4\uBCF4\uB294 \uC911",
+          "\uC544\uC9C1 \uCC3E\uB294 \uC911, \uD070 \uD14C\uC774\uBE14\uC740 \uC870\uAE08 \uB354 \uAC78\uB824\uC694"
+        ] : [
+          tbl ? "Looking up records in " + tbl : "Looking up records",
+          "Going through the rows",
+          "Still looking, big tables take a bit longer"
+        ];
+      case "exportRecordsToFile":
+        return ko ? [tbl ? tbl + " \uAE30\uB85D\uC744 \uD30C\uC77C\uB85C \uB9CC\uB4DC\uB294 \uC911" : "\uAE30\uB85D\uC744 \uD30C\uC77C\uB85C \uB9CC\uB4DC\uB294 \uC911", "\uD30C\uC77C\uC744 \uB9CC\uB4DC\uB294 \uC911", "\uC544\uC9C1 \uB9CC\uB4DC\uB294 \uC911, \uD070 \uD14C\uC774\uBE14\uC740 \uC870\uAE08 \uB354 \uAC78\uB824\uC694"] : [tbl ? "Exporting records from " + tbl : "Exporting records", "Building the file", "Still exporting, big tables take a bit longer"];
+      case "writeReport":
+        return ko ? ["\uBCF4\uACE0\uC11C\uB97C \uC791\uC131\uD558\uB294 \uC911", "\uC544\uC9C1 \uC791\uC131\uD558\uB294 \uC911, \uAE34 \uBCF4\uACE0\uC11C\uB294 \uC870\uAE08 \uB354 \uAC78\uB824\uC694"] : ["Writing the report", "Still writing, long reports take a bit longer"];
+      case "getTables":
+        return ko ? ["\uC5B4\uB5A4 \uD14C\uC774\uBE14\uC774 \uC788\uB294\uC9C0 \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking which tables there are", T.en.still];
+      case "getTags":
+        return ko ? ["\uD0DC\uADF8\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking tags", T.en.still];
+      case "getIndexes":
+        return ko ? ["\uD14C\uC774\uBE14 \uD56D\uBAA9\uC744 \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking the table's fields", T.en.still];
+      case "getUniqueId":
+        return ko ? ["\uB808\uCF54\uB4DC ID\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking record IDs", T.en.still];
+      case "postRecords":
+        return ko ? ["\uAE30\uB85D\uC744 \uC800\uC7A5\uD558\uB294 \uC911", T.ko.still] : ["Saving records", T.en.still];
+      case "updateRecords":
+        return ko ? ["\uAE30\uB85D\uC744 \uC218\uC815\uD558\uB294 \uC911", T.ko.still] : ["Updating records", T.en.still];
+      case "deleteRecords":
+        return ko ? ["\uAE30\uB85D\uC744 \uC0AD\uC81C\uD558\uB294 \uC911", T.ko.still] : ["Deleting records", T.en.still];
+      case "getTemporaryUrl":
+        return ko ? [f ? f + " \uB9C1\uD06C\uB97C \uB9CC\uB4DC\uB294 \uC911" : "\uB9C1\uD06C\uB97C \uB9CC\uB4DC\uB294 \uC911", T.ko.still] : [f ? "Getting a link to " + f : "Getting a link", T.en.still];
+      case "getToolResponsePage":
+        return ko ? ["\uACB0\uACFC\uC758 \uB2E4\uC74C \uBD80\uBD84\uC744 \uC77D\uB294 \uC911", T.ko.still] : ["Reading the next part of the results", T.en.still];
+      case "correctSearchLink":
+        return ko ? ["\uD398\uC774\uC9C0 \uB9C1\uD06C\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking the page link", T.en.still];
+      case "getProjectInfos":
+        return ko ? ["\uD504\uB85C\uC81D\uD2B8 \uC815\uBCF4\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking the project details", T.en.still];
+      case "getProfile":
+        return ko ? ["\uACC4\uC815 \uC815\uBCF4\uB97C \uD655\uC778\uD558\uB294 \uC911", T.ko.still] : ["Checking your account", T.en.still];
+      case "web_search":
+      case "web_search_call":
+        return ko ? ["\uC6F9\uC5D0\uC11C \uCC3E\uB294 \uC911", T.ko.still] : ["Searching the web", T.en.still];
+      default:
+        return ko ? [T.ko.working, T.ko.still] : [T.en.working, T.en.still];
+    }
+  }
+  function pick(lines, elapsed, loopFrom) {
+    var n = Math.floor(Math.max(0, elapsed) / CHAT_ACTIVITY_ROTATE_MS);
+    if (n < lines.length) return lines[n];
+    var from = Math.min(Math.max(0, loopFrom || 0), lines.length - 1);
+    var span = lines.length - from;
+    return lines[from + (n - lines.length) % span];
+  }
+  function chatActivityLine(msg, now, lang) {
+    var t = typeof now === "number" ? now : Date.now();
+    var L = langOf(lang);
+    var start = turnStart(msg, t);
+    var act = chatActivityOf(msg);
+    if (!act || act.step === "thinking") return pick(T[L].thinking, t - start, 1);
+    var elapsed = t - act.since;
+    if (act.step === "writing") return pick(T[L].writing, elapsed);
+    if (act.step === "between") return pick(T[L].between, elapsed);
+    return pick(toolLines(act.tool || "", act.input, L), elapsed);
   }
 
   // src/engine/history.ts
@@ -5579,7 +5845,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       restore(anchor);
       return result;
     }
-    function remember() {
+    function remember2() {
       held = capture();
     }
     function hold() {
@@ -5625,7 +5891,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       capture,
       restore,
       preserve,
-      remember,
+      remember: remember2,
       hold,
       pinBottom,
       absorb,
@@ -6903,6 +7169,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     _paintLiveStream(st) {
       if (st.ended) return;
       st.lastPaintAt = nowMs();
+      noteChatActivity(st.id, st.parser.snapshot());
       if (this.getHistoryCacheKey() !== st.ownerKey) return;
       var idx = this._liveTargetIndex(st.id);
       if (idx === -1) {
@@ -11760,7 +12027,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
      * or waiting is left to the live queue check, which shows it as it settles; one already
      * in the chat is not read again. Never throws.
      */
-    loadRunPasses(storagePath, fileName) {
+    loadRunPasses(storagePath, fileName2) {
       var self = this;
       var cfg = chatEngineConfig();
       var list = cfg.listIndexPasses, lookup = cfg.csrHistoryItemLookup;
@@ -11779,7 +12046,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       p.error = void 0;
       this.host.notify();
       var svcId = id.projectId, owner = id.owner;
-      var name = fileName || storagePath.split("/").pop() || storagePath;
+      var name = fileName2 || storagePath.split("/").pop() || storagePath;
       var idsReady = p.ids.length ? Promise.resolve(p.ids) : Promise.resolve(list(svcId, storagePath)).then(function(ids) {
         var clean = (Array.isArray(ids) ? ids : []).filter(function(x) {
           return typeof x === "string" && !!x;
@@ -11941,14 +12208,14 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       });
     }
     /** The page progress to show for a file's row, or null (see _refreshPageProgress). */
-    pageProgressFor(storagePath, fileName) {
+    pageProgressFor(storagePath, fileName2) {
       var map = this.state.indexPageProgress;
       if (!map) return null;
       var p = storagePath ? map[storagePath] : void 0;
-      if (!p && fileName) {
+      if (!p && fileName2) {
         var hit = null;
         for (var k in map) {
-          if (k === fileName || k.slice(-(fileName.length + 1)) === "/" + fileName) {
+          if (k === fileName2 || k.slice(-(fileName2.length + 1)) === "/" + fileName2) {
             if (hit) {
               hit = null;
               break;
@@ -17349,6 +17616,34 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (CS.stickToBottom) chatScrollAnchor.pinBottom();
       if (nextH < prevH) ensureHistoryFillsViewport();
     }
+    var activityLineEls = [];
+    var activityTicker = null;
+    function activityLang() {
+      return typeof navigator !== "undefined" && navigator.language ? navigator.language : "";
+    }
+    function tickActivityLines() {
+      var now = Date.now();
+      var keep = [];
+      for (var i = 0; i < activityLineEls.length; i++) {
+        var el = activityLineEls[i];
+        if (!el.isConnected) continue;
+        keep.push(el);
+        var t = chatActivityLine(el._bqMsg, now, activityLang());
+        if (el.textContent !== t) el.textContent = t;
+      }
+      activityLineEls = keep;
+      if (!keep.length && activityTicker) {
+        clearInterval(activityTicker);
+        activityTicker = null;
+      }
+    }
+    function buildActivityText(msg) {
+      var text = h("span", { class: "bq-activity-text", text: chatActivityLine(msg, Date.now(), activityLang()) });
+      text._bqMsg = msg;
+      activityLineEls.push(text);
+      if (!activityTicker) activityTicker = setInterval(tickActivityLines, 1e3);
+      return text;
+    }
     function buildMessageEl(msg, idx) {
       var cls = ["bq-message"];
       cls.push(msg.role === "user" ? "is-user" : "is-assistant");
@@ -17359,7 +17654,12 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (msg._dimSending || msg._cancelling) cls.push("is-sending-to-server");
       var bubble;
       if (msg.isPending && !msg._streaming || streamRecoveryPhase(msg) === "active") {
-        bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+        bubble = h(
+          "div",
+          { class: "bq-bubble" },
+          msg.role === "assistant" && !msg.isBackgroundTask && !streamRecoveryPhase(msg) ? buildActivityText(msg) : null,
+          h("span", { class: "bq-loader" })
+        );
         if (msg.role === "assistant" && !msg.isBackgroundTask && !streamRecoveryPhase(msg)) {
           var waitDisabled = !msg._serverItemId || msg._cancelling;
           var stopWaitBtn = h("button", {

@@ -154,6 +154,9 @@ export * from './ai_agent';
 // to be on the barrel or the built engine bundle does not contain it and
 // www.skapi.com's `bunnyquery/engine` import resolves to undefined at runtime.
 export * from './sse';
+// The progress line under a waiting turn ("Searching your files for ..."), worded
+// once here so the widget and agent.vue say the same thing at the same moment.
+export * from './activity';
 export {
 	filterListByClearHorizon,
 	normalizeTextContent,

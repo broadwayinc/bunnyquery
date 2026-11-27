@@ -134,6 +134,9 @@ import {
     // own answers it differently, and the symptom is a bubble that spins forever.
     streamRecoveryPhase,
     streamRecoveryLabels,
+    // The sentence under a waiting turn ("Searching your files for ..."). Worded in
+    // the engine so this widget and agent.vue say the same thing.
+    chatActivityLine,
     extractLastUserTextFromRequest,
     mapHistoryListToMessages,
     buildChatDisplayList,
@@ -4299,6 +4302,41 @@ import {
         if (nextH < prevH) ensureHistoryFillsViewport();
     }
 
+    // THE WAITING TURN'S PROGRESS LINE. One sentence from the engine plus the usual
+    // animated dot trail. The sentence changes as the stream reports a new step and
+    // every few seconds while a step lasts, so it is refreshed by a 1 s ticker that
+    // rewrites ONLY the text node: rebuilding the bubble would restart the dot
+    // animation. The ticker runs only while a line is on screen. Mirrored in
+    // agent.vue (components/chatActivityText.vue).
+    var activityLineEls = [];
+    var activityTicker = null;
+    function activityLang() {
+        return typeof navigator !== "undefined" && navigator.language ? navigator.language : "";
+    }
+    function tickActivityLines() {
+        var now = Date.now();
+        var keep = [];
+        for (var i = 0; i < activityLineEls.length; i++) {
+            var el = activityLineEls[i];
+            if (!el.isConnected) continue;
+            keep.push(el);
+            var t = chatActivityLine(el._bqMsg, now, activityLang());
+            if (el.textContent !== t) el.textContent = t;
+        }
+        activityLineEls = keep;
+        if (!keep.length && activityTicker) { clearInterval(activityTicker); activityTicker = null; }
+    }
+    // The sentence span only. The dot trail stays a DIRECT child of the bubble, next
+    // to it, because the shared CSS keys the inline bunny and the fixed-width dots
+    // on `.bq-bubble > .bq-loader`.
+    function buildActivityText(msg) {
+        var text = h("span", { class: "bq-activity-text", text: chatActivityLine(msg, Date.now(), activityLang()) });
+        text._bqMsg = msg;
+        activityLineEls.push(text);
+        if (!activityTicker) activityTicker = setInterval(tickActivityLines, 1000);
+        return text;
+    }
+
     function buildMessageEl(msg, idx) {
         var cls = ["bq-message"];
         cls.push(msg.role === "user" ? "is-user" : "is-assistant");
@@ -4347,7 +4385,11 @@ import {
         // would make them un-diffable against a Vue template that cannot declare one.
         // See tests/stream-client-parity.cjs.
         if ((msg.isPending && !msg._streaming) || streamRecoveryPhase(msg) === "active") {
-            bubble = h("div", { class: "bq-bubble" }, h("span", { class: "bq-loader" }));
+            // A chat turn's own wait gets the progress line; an indexing pass and a
+            // recovery read keep the plain dot trail (nobody is waiting on a model).
+            bubble = h("div", { class: "bq-bubble" },
+                msg.role === "assistant" && !msg.isBackgroundTask && !streamRecoveryPhase(msg) ? buildActivityText(msg) : null,
+                h("span", { class: "bq-loader" }));
             // Stop waiting for this reply. Only on a chat turn's own "Thinking"
             // bubble: an indexing pass is stopped from its collapsed row
             // (cancelIndexingGroup, the whole chain at once), and a recovery read
