@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.15**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.14**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -25,13 +25,10 @@ A few notes on how to read this:
 
 ---
 
-## 1.21.15 (2026-11-27, not yet published)
-
-- **The files' language, not only their alphabet.** searchText's other-language hint keyed on the writing system, so an English question over German documents got no hint (both Latin script) and a German file was called "Latin script, e.g. English". searchText (MCP) now detects each page's language and the question's, names each file's language ("its text is in German"), and reports query_language and text_language with query_language_mismatch. FILES IN ANOTHER LANGUAGE now covers files in the same alphabet as the question and says to translate into the language searchText names.
-
 ## 1.21.14 (2026-11-27, not yet published)
 
 - **The files' text decides the search language, not their names.** After 1.21.13 a Korean question about the BP-252 manual was retried in Russian (its name has "РЭ") and missed, because the manual's text is English. searchText now names the script each file's text is in, and the prompt says to translate into that language, a file name can mislead, and to try the other likely language (English for technical manuals) when the first translation finds nothing.
+- **The files' language, not only their alphabet.** searchText's other-language hint keyed on the writing system, so an English question over German documents got no hint (both Latin script) and a German file was called "Latin script, e.g. English". searchText (MCP) now detects each page's language and the question's, names each file's language ("its text is in German"), and reports query_language and text_language with query_language_mismatch. FILES IN ANOTHER LANGUAGE now covers files in the same alphabet as the question and says to translate into the language searchText names.
 
 ## 1.21.13 (2026-11-27, not yet published)
 
