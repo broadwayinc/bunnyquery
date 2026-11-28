@@ -1162,10 +1162,41 @@ import {
         });
     }
 
-    function loadingBtnLabel(loading, label) {
-        return loading
-            ? h("span", { class: "bq-btn-spinner" })
-            : document.createTextNode(label);
+    // A button whose action is running keeps its size and its look: its label
+    // stays (see-through, which holds the width) and the running "." ".." "..."
+    // dots are drawn over it (widget.css .bq-busy). Every other button of the
+    // same dialog, or of the whole widget for a page form, stops taking clicks
+    // until it finishes; only the ones this turned off are turned back on.
+    function setBtnBusy(btn, busy) {
+        if (!btn) return;
+        busy = !!busy;
+        btn.disabled = busy;
+        btn.classList.toggle("bq-busy", busy);
+        if (busy) btn.setAttribute("aria-busy", "true");
+        else btn.removeAttribute("aria-busy");
+        // A view that starts its action while it is still being built (the
+        // re-enable page sends at once) has no buttons on screen yet: lock its
+        // siblings once it is mounted.
+        if (busy && !btn.isConnected) {
+            setTimeout(function () { if (btn.isConnected && btn.classList.contains("bq-busy")) lockOtherButtons(btn, true); }, 0);
+            return;
+        }
+        lockOtherButtons(btn, busy);
+    }
+    function lockOtherButtons(btn, busy) {
+        var scope = (btn.closest && btn.closest(".bq-modal")) || S.root;
+        if (!scope) return;
+        var others = scope.querySelectorAll("button");
+        for (var i = 0; i < others.length; i++) {
+            var o = others[i];
+            if (o === btn) continue;
+            if (busy) {
+                if (!o.disabled) { o.disabled = true; o.setAttribute("data-bq-busy-lock", ""); }
+            } else if (o.hasAttribute("data-bq-busy-lock")) {
+                o.disabled = false;
+                o.removeAttribute("data-bq-busy-lock");
+            }
+        }
     }
 
     function googleIconSvg() {
@@ -1210,8 +1241,7 @@ import {
                 busy = b;
                 emailInput.disabled = b;
                 pwInput.disabled = b;
-                submitBtn.disabled = b;
-                clear(submitBtn).appendChild(loadingBtnLabel(b, "Login"));
+                setBtnBusy(submitBtn, b);
             }
             function setError(msg) {
                 errorBox.style.display = msg ? "" : "none";
@@ -1350,8 +1380,7 @@ import {
                 busy = b;
                 [email, name, pw, pw2].forEach(function (i) { i.disabled = b; });
                 subscribe.disabled = b;
-                btn.disabled = b;
-                clear(btn).appendChild(loadingBtnLabel(b, "Create account"));
+                setBtnBusy(btn, b);
             }
             function setError(m) { errBox.style.display = m ? "" : "none"; errBox.textContent = m || ""; }
 
@@ -1393,7 +1422,7 @@ import {
             var btn = h("button", { class: "btn", type: "button" }, "Resend confirmation email");
             var note = h("div", { class: "bq-step-note" });
 
-            function setBusy(b) { busy = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, "Resend confirmation email")); }
+            function setBusy(b) { busy = b; setBtnBusy(btn, b); }
             function setNote(m, ok) {
                 note.className = ok ? "bq-success-box" : "bq-error";
                 note.style.display = m ? "" : "none";
@@ -1448,7 +1477,7 @@ import {
                 placeholder: "your@email.com", required: true, value: ctx.email });
             var btn = h("button", { class: "btn", type: "submit" }, "Send code");
             var errBox = h("div", { class: "bq-error", style: { display: "none" } });
-            function setBusy(b) { busy = b; email.disabled = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, "Send code")); }
+            function setBusy(b) { busy = b; email.disabled = b; setBtnBusy(btn, b); }
             function submit(e) {
                 e.preventDefault();
                 if (busy) return;
@@ -1511,7 +1540,7 @@ import {
                 placeholder: "Confirm new password", required: true, minlength: "6", maxlength: "60" });
             var btn = h("button", { class: "btn", type: "submit" }, "Reset password");
             var errBox = h("div", { class: "bq-error", style: { display: "none" } });
-            function setBusy(b) { busy = b; pw.disabled = b; pw2.disabled = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, "Reset password")); }
+            function setBusy(b) { busy = b; pw.disabled = b; pw2.disabled = b; setBtnBusy(btn, b); }
             function submit(e) {
                 e.preventDefault();
                 if (busy) return;
@@ -1576,7 +1605,7 @@ import {
             var resend = h("button", { class: "bq-link", type: "button", text: "Resend code",
                 onclick: function () { sendCode(note); } });
             var busy = false;
-            function setBusy(b) { busy = b; code.disabled = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, "Verify")); }
+            function setBusy(b) { busy = b; code.disabled = b; setBtnBusy(btn, b); }
             function submit(e) {
                 e.preventDefault();
                 if (busy || !code.value.trim()) return;
@@ -1790,7 +1819,7 @@ import {
             var err = h("div", { class: "bq-error", style: { display: "none" } });
             var btn = h("button", { class: "btn", type: "submit" }, submitLabel);
             var busy = false;
-            function setBusy(b) { busy = b; btn.disabled = b; clear(btn).appendChild(loadingBtnLabel(b, submitLabel)); }
+            function setBusy(b) { busy = b; setBtnBusy(btn, b); }
             function setErr(m) { err.style.display = m ? "" : "none"; err.textContent = m || ""; }
             function submit(e) {
                 e.preventDefault();
@@ -1854,11 +1883,11 @@ import {
                 if (busy) return;
                 if (!agree.checked) { err.style.display = ""; err.textContent = "Please confirm you want to disable your account."; return; }
                 err.style.display = "none";
-                busy = true; btn.disabled = true; clear(btn).appendChild(loadingBtnLabel(true, "Disable account"));
+                busy = true; setBtnBusy(btn, true);
                 Promise.resolve(S.skapi.disableAccount()).then(function () {
                     clearStoredMcpToken(); S.user = null; close(); renderBye();
                 }).catch(function (e2) {
-                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Disable account"));
+                    busy = false; setBtnBusy(btn, false);
                     err.style.display = ""; err.textContent = (e2 && e2.message) || "Could not disable account.";
                 });
             });
@@ -1889,12 +1918,12 @@ import {
             var note = h("div", { style: { display: "none" } });
             function send() {
                 if (busy) return;
-                busy = true; btn.disabled = true; clear(btn).appendChild(loadingBtnLabel(true, "Re-send recovery email"));
+                busy = true; setBtnBusy(btn, true);
                 Promise.resolve(S.skapi.recoverAccount(window.location.origin + window.location.pathname)).then(function () {
-                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+                    busy = false; setBtnBusy(btn, false);
                     note.style.display = ""; note.className = "bq-success-box"; note.textContent = "Recovery email sent. Check your inbox.";
                 }).catch(function (err) {
-                    busy = false; btn.disabled = false; clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+                    busy = false; setBtnBusy(btn, false);
                     note.style.display = ""; note.className = "bq-error"; note.textContent = (err && err.message) || "Could not send recovery email.";
                 });
             }
@@ -5148,11 +5177,11 @@ import {
         var cancelBtn = null;
         if (indexGroupStoppable(group) || group.cancelling) {
             cancelBtn = h("button", {
-                class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
+                class: "bq-index-cancel" + (group.cancelling ? " is-disabled bq-busy" : ""),
                 type: "button",
                 title: group.cancelling ? "Stopping..." : "Stop indexing this file",
                 "aria-label": "Stop indexing " + group.name,
-                text: group.cancelling ? "Stopping..." : "Stop",
+                text: "Stop",
             });
             if (group.cancelling) cancelBtn.disabled = true;
             else cancelBtn.addEventListener("click", function (e) {
@@ -5902,7 +5931,10 @@ import {
         var close = function () { if (root.parentNode) root.parentNode.removeChild(root); };
         // Non-dismissible modals (e.g. the overwrite/reindex prompt) have no
         // backdrop-click close and no × button — the user must pick an action.
-        if (dismissible) backdrop.addEventListener("click", close);
+        if (dismissible) backdrop.addEventListener("click", function () {
+            if (root.querySelector(".bq-busy")) return; // an action is running
+            close();
+        });
         root.appendChild(backdrop);
         root.appendChild(builder(close));
         document.body.appendChild(root);
@@ -6121,8 +6153,7 @@ import {
                 reindexBtn = h("button", { class: "btn", type: "button", onclick: function () {
                     if (reindexing) return;
                     reindexing = true;
-                    reindexBtn.disabled = true; closeBtn.disabled = true;
-                    reindexBtn.textContent = "Reindexing...";
+                    setBtnBusy(reindexBtn, true);
                     session.reindexStoredFiles(duplicates).then(function () { close(); });
                 } }, "Reindex");
             }

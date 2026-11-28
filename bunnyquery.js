@@ -14681,8 +14681,38 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     }
     var THEME_ICON_SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
     var THEME_ICON_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-    function loadingBtnLabel(loading, label) {
-      return loading ? h("span", { class: "bq-btn-spinner" }) : document.createTextNode(label);
+    function setBtnBusy(btn, busy) {
+      if (!btn) return;
+      busy = !!busy;
+      btn.disabled = busy;
+      btn.classList.toggle("bq-busy", busy);
+      if (busy) btn.setAttribute("aria-busy", "true");
+      else btn.removeAttribute("aria-busy");
+      if (busy && !btn.isConnected) {
+        setTimeout(function() {
+          if (btn.isConnected && btn.classList.contains("bq-busy")) lockOtherButtons(btn, true);
+        }, 0);
+        return;
+      }
+      lockOtherButtons(btn, busy);
+    }
+    function lockOtherButtons(btn, busy) {
+      var scope = btn.closest && btn.closest(".bq-modal") || S.root;
+      if (!scope) return;
+      var others = scope.querySelectorAll("button");
+      for (var i = 0; i < others.length; i++) {
+        var o = others[i];
+        if (o === btn) continue;
+        if (busy) {
+          if (!o.disabled) {
+            o.disabled = true;
+            o.setAttribute("data-bq-busy-lock", "");
+          }
+        } else if (o.hasAttribute("data-bq-busy-lock")) {
+          o.disabled = false;
+          o.removeAttribute("data-bq-busy-lock");
+        }
+      }
     }
     function googleIconSvg() {
       return '<svg viewBox="0 0 48 48" style="width:20px;height:20px;flex:none"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>';
@@ -14720,8 +14750,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           busy = b;
           emailInput.disabled = b;
           pwInput.disabled = b;
-          submitBtn.disabled = b;
-          clear(submitBtn).appendChild(loadingBtnLabel(b, "Login"));
+          setBtnBusy(submitBtn, b);
         }
         function setError(msg) {
           errorBox.style.display = msg ? "" : "none";
@@ -14900,8 +14929,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             i.disabled = b;
           });
           subscribe.disabled = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, "Create account"));
+          setBtnBusy(btn, b);
         }
         function setError(m) {
           errBox.style.display = m ? "" : "none";
@@ -14948,8 +14976,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var note = h("div", { class: "bq-step-note" });
         function setBusy(b) {
           busy = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, "Resend confirmation email"));
+          setBtnBusy(btn, b);
         }
         function setNote(m, ok) {
           note.className = ok ? "bq-success-box" : "bq-error";
@@ -15012,8 +15039,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         function setBusy(b) {
           busy = b;
           email.disabled = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, "Send code"));
+          setBtnBusy(btn, b);
         }
         function submit(e) {
           e.preventDefault();
@@ -15109,8 +15135,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           busy = b;
           pw.disabled = b;
           pw2.disabled = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, "Reset password"));
+          setBtnBusy(btn, b);
         }
         function submit(e) {
           e.preventDefault();
@@ -15200,8 +15225,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         function setBusy(b) {
           busy = b;
           code.disabled = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, "Verify"));
+          setBtnBusy(btn, b);
         }
         function submit(e) {
           e.preventDefault();
@@ -15478,8 +15502,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         var busy = false;
         function setBusy(b) {
           busy = b;
-          btn.disabled = b;
-          clear(btn).appendChild(loadingBtnLabel(b, submitLabel));
+          setBtnBusy(btn, b);
         }
         function setErr(m) {
           err.style.display = m ? "" : "none";
@@ -15582,8 +15605,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           }
           err.style.display = "none";
           busy = true;
-          btn.disabled = true;
-          clear(btn).appendChild(loadingBtnLabel(true, "Disable account"));
+          setBtnBusy(btn, true);
           Promise.resolve(S.skapi.disableAccount()).then(function() {
             clearStoredMcpToken();
             S.user = null;
@@ -15591,8 +15613,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
             renderBye();
           }).catch(function(e2) {
             busy = false;
-            btn.disabled = false;
-            clear(btn).appendChild(document.createTextNode("Disable account"));
+            setBtnBusy(btn, false);
             err.style.display = "";
             err.textContent = e2 && e2.message || "Could not disable account.";
           });
@@ -15637,19 +15658,16 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         function send() {
           if (busy) return;
           busy = true;
-          btn.disabled = true;
-          clear(btn).appendChild(loadingBtnLabel(true, "Re-send recovery email"));
+          setBtnBusy(btn, true);
           Promise.resolve(S.skapi.recoverAccount(window.location.origin + window.location.pathname)).then(function() {
             busy = false;
-            btn.disabled = false;
-            clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+            setBtnBusy(btn, false);
             note.style.display = "";
             note.className = "bq-success-box";
             note.textContent = "Recovery email sent. Check your inbox.";
           }).catch(function(err) {
             busy = false;
-            btn.disabled = false;
-            clear(btn).appendChild(document.createTextNode("Re-send recovery email"));
+            setBtnBusy(btn, false);
             note.style.display = "";
             note.className = "bq-error";
             note.textContent = err && err.message || "Could not send recovery email.";
@@ -18259,11 +18277,11 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var cancelBtn = null;
       if (indexGroupStoppable(group) || group.cancelling) {
         cancelBtn = h("button", {
-          class: "bq-index-cancel" + (group.cancelling ? " is-disabled" : ""),
+          class: "bq-index-cancel" + (group.cancelling ? " is-disabled bq-busy" : ""),
           type: "button",
           title: group.cancelling ? "Stopping..." : "Stop indexing this file",
           "aria-label": "Stop indexing " + group.name,
-          text: group.cancelling ? "Stopping..." : "Stop"
+          text: "Stop"
         });
         if (group.cancelling) cancelBtn.disabled = true;
         else cancelBtn.addEventListener("click", function(e) {
@@ -18803,7 +18821,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       var close = function() {
         if (root.parentNode) root.parentNode.removeChild(root);
       };
-      if (dismissible) backdrop.addEventListener("click", close);
+      if (dismissible) backdrop.addEventListener("click", function() {
+        if (root.querySelector(".bq-busy")) return;
+        close();
+      });
       root.appendChild(backdrop);
       root.appendChild(builder(close));
       document.body.appendChild(root);
@@ -19024,9 +19045,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
           reindexBtn = h("button", { class: "btn", type: "button", onclick: function() {
             if (reindexing) return;
             reindexing = true;
-            reindexBtn.disabled = true;
-            closeBtn.disabled = true;
-            reindexBtn.textContent = "Reindexing...";
+            setBtnBusy(reindexBtn, true);
             session.reindexStoredFiles(duplicates).then(function() {
               close();
             });

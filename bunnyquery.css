@@ -166,18 +166,43 @@
     66%  { content: '...'; }
 }
 
-/* spinner used inside primary buttons */
-.bq-btn-spinner {
-    display: inline-block;
-    width: 1rem;
-    height: 1rem;
-    border: 2px solid currentColor;
-    border-right-color: transparent;
-    border-radius: 50%;
-    animation: bq-spin 0.7s linear infinite;
+/* Busy button: same rule as the dashboards' base.less. A button whose action
+   is running keeps its size and look; its label turns see-through (that is
+   what holds the width) and the running "." ".." "..." dots are drawn over it
+   in the button's own text colour. setBtnBusy() also disables the button and
+   every other button of its dialog (or of the widget, for a page form). */
+.bq-agent .bq-busy,
+.bq-modal-root .bq-busy {
+    position: relative;
+    cursor: progress;
+    pointer-events: none;
+    /* full strength: a running action is not a disabled one */
+    opacity: 1 !important;
+    -webkit-text-fill-color: transparent;
 }
-@keyframes bq-spin {
-    to { transform: rotate(360deg); }
+.bq-agent .bq-busy > *,
+.bq-modal-root .bq-busy > * {
+    visibility: hidden;
+}
+.bq-agent .bq-busy::after,
+.bq-modal-root .bq-busy::after {
+    content: '.';
+    display: block;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    /* a fixed box centred on the button, the dots growing from its left edge:
+       "..." sits centred and "." / ".." never shift the others */
+    width: 2.6em;
+    margin-left: -1.2em;
+    transform: translateY(-50%);
+    text-align: left;
+    white-space: nowrap;
+    letter-spacing: 0.2em;
+    line-height: 1;
+    -webkit-text-fill-color: currentColor;
+    visibility: visible;
+    animation: bq-dots 1.2s steps(1) infinite;
 }
 
 /* jumping ASCII bunny — full-area "loading/fetching" indicator (page/gate loads,
