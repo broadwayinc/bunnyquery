@@ -1,0 +1,129 @@
+
+> bunnyquery@1.21.16 build
+> tsup && node scripts/build-css.mjs
+
+CLI Building entry: {"engine":"src/engine/index.ts"}
+CLI Using tsconfig: tsconfig.json
+CLI Building entry: {"bunnyquery":"src/index.js"}
+CLI Using tsconfig: tsconfig.json
+CLI tsup v8.5.1
+CLI Using tsup config: /home/ubuntu/skapi/dev/bunnyquery/tsup.config.ts
+CLI tsup v8.5.1
+CLI Using tsup config: /home/ubuntu/skapi/dev/bunnyquery/tsup.config.ts
+CLI Target: es2020
+CLI Target: es2020
+IIFE Build start
+CLI Cleaning output folder
+ESM Build start
+CJS Build start
+DTS Build start
+IIFE bunnyquery.js 865.11 KB
+IIFE ⚡️ Build success in 4996ms
+CJS dist/engine.cjs     642.08 KB
+CJS dist/engine.cjs.map 1.74 MB
+CJS ⚡️ Build success in 11168ms
+ESM dist/engine.mjs     632.07 KB
+ESM dist/engine.mjs.map 1.74 MB
+ESM ⚡️ Build success in 11168ms
+DTS ⚡️ Build success in 10666ms
+DTS dist/engine.d.mts 388.75 KB
+DTS dist/engine.d.ts  388.75 KB
+[build-css] bunnyquery.css = src/widget.css + styles/chat.css
+npm notice
+npm notice 📦  bunnyquery@1.21.16
+npm notice Tarball Contents
+npm notice 60.9kB README.md
+npm notice 81.8kB bunnyquery.css
+npm notice 886.1kB bunnyquery.js
+npm notice 657.7kB dist/engine.cjs
+npm notice 1.8MB dist/engine.cjs.map
+npm notice 398.4kB dist/engine.d.mts
+npm notice 398.4kB dist/engine.d.ts
+npm notice 647.5kB dist/engine.mjs
+npm notice 1.8MB dist/engine.mjs.map
+npm notice 1.3kB package.json
+npm notice 12.8kB src/engine/activity.ts
+npm notice 3.1kB src/engine/ai_agent.ts
+npm notice 3.7kB src/engine/attachment_parsers.ts
+npm notice 1.9kB src/engine/attachments.ts
+npm notice 22.4kB src/engine/budget.ts
+npm notice 7.9kB src/engine/citations.ts
+npm notice 40.6kB src/engine/config.ts
+npm notice 11.4kB src/engine/download_encoding.ts
+npm notice 8.7kB src/engine/duplicates.ts
+npm notice 16.3kB src/engine/errors.ts
+npm notice 3.1kB src/engine/greeting.ts
+npm notice 61.3kB src/engine/history.ts
+npm notice 28.0kB src/engine/host.ts
+npm notice 21.5kB src/engine/identical.ts
+npm notice 14.5kB src/engine/image_preview.ts
+npm notice 17.8kB src/engine/index.ts
+npm notice 71.1kB src/engine/indexing_groups.ts
+npm notice 10.0kB src/engine/link_markup.ts
+npm notice 35.8kB src/engine/links.ts
+npm notice 16.2kB src/engine/office.ts
+npm notice 23.1kB src/engine/project_settings.ts
+npm notice 36.8kB src/engine/prompts/chat_system_prompt.ts
+npm notice 828B src/engine/prompts/index.ts
+npm notice 24.0kB src/engine/prompts/indexing_system_prompt.ts
+npm notice 24.6kB src/engine/prompts/indexing_user_message.ts
+npm notice 23.0kB src/engine/reconciler.ts
+npm notice 94.7kB src/engine/requests.ts
+npm notice 17.5kB src/engine/retrieval_memory.ts
+npm notice 24.6kB src/engine/scroll_anchor.ts
+npm notice 517.6kB src/engine/session.ts
+npm notice 48.5kB src/engine/sse.ts
+npm notice 4.8kB src/engine/time.ts
+npm notice 11.2kB src/engine/viewport_fill.ts
+npm notice 36.7kB src/widget.css
+npm notice 44.9kB styles/chat.css
+npm notice Tarball Details
+npm notice name: bunnyquery
+npm notice version: 1.21.16
+npm notice filename: bunnyquery-1.21.16.tgz
+npm notice package size: 2.3 MB
+npm notice unpacked size: 8.1 MB
+npm notice shasum: afd8096638df595d282924883c97729a8af46284
+npm notice integrity: sha512-LC2kGQ2kDyL+H[...]TDZsKODvHSX8Q==
+npm notice total files: 45
+npm notice
+npm notice Publishing to https://registry.npmjs.org/ with tag latest and default access
+npm error code EOTP
+npm error This operation requires a one-time password from your authenticator.
+npm error You can provide a one-time password by passing --otp=<code> to the command you ran.
+npm error If you already provided a one-time password then it is likely that you either typoed
+npm error it, or it timed out. Please try again.
+npm error A complete log of this run can be found in: /home/ubuntu/.npm/_logs/2026-11-28T13_00_35_440Z-debug-0.log
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0100   262  100   262    0     0    248      0  0:00:01  0:00:01 --:--:--   248
+{
+  "id": "hUKDiQMgfAIUuTXt",
+  "status": "finished",
+  "timestamp": "2026-11-28T13:00:40.305Z",
+  "paths": {
+    "/npm/bunnyquery@latest/bunnyquery.css": {
+      "throttled": false,
+      "providers": {
+        "CF": true,
+        "FY": true
+      }
+    }
+  }
+}  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0100   261  100   261    0     0    255      0  0:00:01  0:00:01 --:--:--   255
+{
+  "id": "H4iw4XTryDubCuT5",
+  "status": "finished",
+  "timestamp": "2026-11-28T13:00:41.342Z",
+  "paths": {
+    "/npm/bunnyquery@latest/bunnyquery.js": {
+      "throttled": false,
+      "providers": {
+        "CF": true,
+        "FY": true
+      }
+    }
+  }
+}
