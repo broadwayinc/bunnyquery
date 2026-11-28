@@ -14101,33 +14101,57 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       _anonIdMemo = lsGet(key) || minted;
       return _anonIdMemo;
     }
-    function loadTheme() {
+    function storedTheme() {
       var stored = lsGet(SK.theme);
-      if (stored === "dark" || stored === "light") return stored;
-      if (S.opts.theme === "dark" || S.opts.theme === "light") return S.opts.theme;
-      try {
-        if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-          return "dark";
-        }
-      } catch (e) {
-      }
-      return "light";
+      return stored === "dark" || stored === "light" ? stored : null;
     }
-    function applyTheme(theme) {
+    function prefersDarkQuery() {
+      try {
+        return window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+      } catch (e) {
+        return null;
+      }
+    }
+    function loadTheme() {
+      var stored = storedTheme();
+      if (stored) return stored;
+      if (S.opts.theme === "dark" || S.opts.theme === "light") return S.opts.theme;
+      var mq = prefersDarkQuery();
+      return mq && mq.matches ? "dark" : "light";
+    }
+    var followingOsTheme = false;
+    function followOsTheme() {
+      if (followingOsTheme) return;
+      var mq = prefersDarkQuery();
+      if (!mq) return;
+      followingOsTheme = true;
+      var onChange = function(e) {
+        if (storedTheme()) return;
+        if (S.opts.theme === "dark" || S.opts.theme === "light") return;
+        applyTheme(e.matches ? "dark" : "light");
+      };
+      if (mq.addEventListener) mq.addEventListener("change", onChange);
+      else if (mq.addListener) mq.addListener(onChange);
+    }
+    function applyTheme(theme, save) {
       S.theme = theme === "dark" ? "dark" : "light";
       if (S.root) S.root.setAttribute("data-bq-theme", S.theme);
       var modals = document.querySelectorAll(".bq-modal-root");
       for (var i = 0; i < modals.length; i++) {
         modals[i].setAttribute("data-bq-theme", S.theme);
       }
-      lsSet(SK.theme, S.theme);
+      if (save) lsSet(SK.theme, S.theme);
       var toggles = document.querySelectorAll("[data-bq-theme-toggle]");
       for (var j = 0; j < toggles.length; j++) {
         toggles[j].innerHTML = S.theme === "dark" ? THEME_ICON_SUN : THEME_ICON_MOON;
       }
+      var radios = document.querySelectorAll('.bq-theme-radios input[name="bq-theme"]');
+      for (var k = 0; k < radios.length; k++) {
+        radios[k].checked = radios[k].value === S.theme;
+      }
     }
     function toggleTheme() {
-      applyTheme(S.theme === "dark" ? "light" : "dark");
+      applyTheme(S.theme === "dark" ? "light" : "dark", true);
     }
     function getProfile(refresh) {
       try {
@@ -15331,10 +15355,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
     function themeRow() {
       var current = S.theme === "dark" ? "dark" : "light";
       function themeRadio(value, label) {
-        var input = h("input", { type: "radio", name: "bq-theme" });
+        var input = h("input", { type: "radio", name: "bq-theme", value });
         input.checked = value === current;
         input.addEventListener("change", function() {
-          if (input.checked) applyTheme(value);
+          if (input.checked) applyTheme(value, true);
         });
         return h("label", { class: "bq-checkbox" }, input, h("span", { text: label }));
       }
@@ -19156,7 +19180,10 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       if (!mountEl) throw new Error("BunnyQuery.init: mount element not found: " + target);
       S.skapi = skapi;
       S.opts = Object.assign({
-        theme: "light",
+        // null follows the visitor's OS colour mode; "light" / "dark" fixes
+        // the starting mode. Either way a mode the visitor picks in the
+        // widget is saved and wins on later visits.
+        theme: null,
         // Header title. null keeps "BunnyQuery \u00b7 <project name>"; a string
         // replaces the whole line, "" hides it. See brandTitleText.
         title: null,
@@ -19250,6 +19277,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
         S.root.style.setProperty("--bq-bubble-face", 'url("' + S.opts.bubbleFace.replace(/"/g, '\\"') + '")');
       }
       applyTheme(loadTheme());
+      followOsTheme();
       S.booted = true;
       console.log("[bunnyquery] v" + BQ_VERSION);
       var canStream = skapiSupportsStreaming(S.skapi);
@@ -19410,7 +19438,7 @@ Index the REMAINING windows - one record per row/item, looking at any page image
       // Can be called before or after init(); also settable via init opts.attachmentParsers.
       registerAttachmentParser,
       setTheme: function(t) {
-        applyTheme(t);
+        applyTheme(t, true);
       },
       toggleTheme,
       logout,

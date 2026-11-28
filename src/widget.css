@@ -9,29 +9,38 @@
  * ==========================================================================*/
 
 /* ---- Tokens: light (default) ---------------------------------------------*/
+/* Same values as the BunnyQuery dashboard chat (web-bunnyquery bq-tokens.less +
+   agent.vue), so an embedded chat and the dashboard's chat look the same. The
+   widget is one card, so --bq-paper here is the dashboard's chat card colour
+   (its --bq-surface), not its page canvas. --bq-bubble is the reply bubble one
+   step above it (the dashboard's --bq-chat-bubble), --bq-field the text boxes. */
 .bq-agent,
 .bq-modal-root {
     --bq-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    --bq-ink: #111;
-    --bq-paper: #fff;
-    --bq-muted: #666;
-    --bq-line: #c8c8c8;
-    --bq-hover-bg: #ebebeb;
+    --bq-ink: #111113;
+    --bq-paper: #ffffff;
+    --bq-bubble: #ffffff;
+    --bq-field: #ffffff;
+    --bq-muted: #5e5e66;
+    --bq-line: #d6d6db;
+    /* control edges (text boxes); dividers stay on --bq-line */
+    --bq-input-line: #8a8a93;
+    --bq-hover-bg: #ececef;
     --bq-main: #c2185b;
     --bq-light-main: #f06292;
-    --bq-danger: #c44;
-    --bq-danger-bg: #fff5f5;
-    --bq-main-bg: #fff8fa;
-    --bq-success: #2a7d29;
-    --bq-success-bg: #eef9f0;
-    --bq-success-border: #b8dcbc;
-    --bq-warning: #8a6d00;
-    --bq-warning-bg: #fff8e1;
-    --bq-warning-border: #e2a300;
+    --bq-danger: #c03b3b;
+    --bq-danger-bg: #fdf1f1;
+    --bq-main-bg: #fcf0f5;
+    --bq-success: #25722a;
+    --bq-success-bg: #edf8ef;
+    --bq-success-border: #a9d4ae;
+    --bq-warning: #7a5f00;
+    --bq-warning-bg: #fff7de;
+    --bq-warning-border: #d99a00;
     --bq-info: #1a5bb5;
     --bq-info-bg: #e8f0fb;
-    --bq-info-border: #3c94ff;
-    --bq-placeholder: #aaaaaa;
+    --bq-info-border: #6aa5f0;
+    --bq-placeholder: #909098;
     /* hard offset shadow for bubbles; swapped for a light edge in dark */
     --bq-shadow: rgba(0, 0, 0, 0.12);
     --bq-code-bg: #1e1e1e;
@@ -40,31 +49,35 @@
 }
 
 /* ---- Tokens: dark --------------------------------------------------------*/
+/* Not #000: the dashboard's dark chat card (#161618), replies one step lighter
+   (#1f1f23) and text boxes recessed below the card (#101012). */
 .bq-agent[data-bq-theme="dark"],
 .bq-modal-root[data-bq-theme="dark"] {
-    --bq-ink: #ebebeb;
-    --bq-paper: #000;
-    --bq-muted: #a0a0a0;
-    /* was #3d3d3d — brighter edges, matching the admin's dark tokens */
-    --bq-line: #484848;
-    --bq-hover-bg: #252525;
-    --bq-main: #f06292;
-    --bq-light-main: #f48fb1;
-    --bq-danger: #ef5350;
-    --bq-danger-bg: #2d1616;
-    --bq-main-bg: #2b1520;
-    --bq-success: #6abf66;
-    --bq-success-bg: #192e1e;
-    --bq-success-border: #4caf50;
-    --bq-warning: #ffca28;
-    --bq-warning-bg: #2d2516;
-    --bq-warning-border: #f9a825;
-    --bq-info: #64b5f6;
-    --bq-info-bg: #162230;
-    --bq-info-border: #42a5f5;
-    --bq-placeholder: #787878;
-    /* light edge — a black hard shadow is invisible on the dark paper */
-    --bq-shadow: rgba(255, 255, 255, 0.16);
+    --bq-ink: #ececef;
+    --bq-paper: #161618;
+    --bq-bubble: #1f1f23;
+    --bq-field: #101012;
+    --bq-muted: #a9a9b2;
+    --bq-line: #333338;
+    --bq-input-line: #74747e;
+    --bq-hover-bg: #26262a;
+    --bq-main: #f2709c;
+    --bq-light-main: #f7a1bf;
+    --bq-danger: #f0706d;
+    --bq-danger-bg: #2a1617;
+    --bq-main-bg: #2a1620;
+    --bq-success: #6cc068;
+    --bq-success-bg: #142318;
+    --bq-success-border: #3f8a45;
+    --bq-warning: #f2c14e;
+    --bq-warning-bg: #29220f;
+    --bq-warning-border: #b8892a;
+    --bq-info: #6cb4f5;
+    --bq-info-bg: #131d29;
+    --bq-info-border: #3a7cc4;
+    --bq-placeholder: #6c6c75;
+    /* light edge: a black hard shadow is invisible on the dark card */
+    --bq-shadow: rgba(255, 255, 255, 0.11);
     --bq-icon-invert: 1;
 }
 
@@ -325,8 +338,8 @@
 .bq-input-text {
     width: 100%;
     padding: 0.7rem 0.8rem;
-    border: 1px solid var(--bq-line);
-    background: var(--bq-paper);
+    border: 1px solid var(--bq-input-line);
+    background: var(--bq-field);
     color: var(--bq-ink);
     font-family: var(--bq-mono);
     font-size: 0.9rem;
@@ -835,8 +848,8 @@
     box-sizing: border-box;
     overflow-y: hidden; /* autoGrowInput switches to auto only at the max-height cap */
     resize: none;
-    border: 1px solid var(--bq-line);
-    background: var(--bq-paper);
+    border: 1px solid var(--bq-input-line);
+    background: var(--bq-field);
     color: var(--bq-ink);
     padding: 0.7rem 0.7rem 0.7rem var(--chat-control-height);
     font-family: var(--bq-mono);
@@ -1024,7 +1037,7 @@
     max-width: 100%;
     max-height: 90vh;
     overflow-y: auto;
-    background: var(--bq-paper);
+    background: var(--bq-bubble);
     color: var(--bq-ink);
     border: 1px solid var(--bq-line);
     box-shadow: 4px 4px rgba(0, 0, 0, 0.2);
@@ -1144,4 +1157,18 @@
 .bq-agent[data-bq-theme="dark"] .bq-icon-invertible,
 .bq-modal-root[data-bq-theme="dark"] .bq-icon-invertible {
     filter: invert(var(--bq-icon-invert));
+}
+
+/* ---- Reply bubbles one step above the conversation -----------------------*/
+/* chat.css paints replies on --bq-paper, the conversation colour, so in dark
+   mode a reply was only a hairline on the card. Same rule as the dashboard
+   (agent.vue): replies on --bq-bubble; the user, error, cancelled and retried
+   variants keep their own chat.css colours, and the two "plain" notes stay on
+   the conversation colour. */
+.bq-messages .bq-bubble {
+    background: var(--bq-bubble);
+}
+.bq-messages .bq-message.is-error.is-retried .bq-bubble,
+.bq-messages .bq-message.bq-index-pass.is-user:not(.is-cancelled):not(.is-pending-older) .bq-bubble {
+    background: var(--bq-paper);
 }

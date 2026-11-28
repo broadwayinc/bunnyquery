@@ -449,23 +449,47 @@ import {
      * 4. THEME
      * ======================================================================*/
 
-    function loadTheme() {
-        // Fixed key (NOT per-service): theme is a global UI preference, and at
-        // init() projectId isn't known yet — a per-service key would save/load
-        // under different names and never persist.
+    // The colour mode follows the visitor's OS setting (or the host's
+    // opts.theme) until the visitor picks one in the widget; only that pick is
+    // saved, under a fixed key (NOT per-service: at init() projectId isn't known
+    // yet, and the choice is a global UI preference). Nothing is saved on load,
+    // or the first visit would pin the OS mode of that moment forever.
+    function storedTheme() {
         var stored = lsGet(SK.theme);
-        if (stored === "dark" || stored === "light") return stored;
-        if (S.opts.theme === "dark" || S.opts.theme === "light") return S.opts.theme;
-        // fall back to OS preference
-        try {
-            if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-                return "dark";
-            }
-        } catch (e) {}
-        return "light";
+        return stored === "dark" || stored === "light" ? stored : null;
     }
 
-    function applyTheme(theme) {
+    function prefersDarkQuery() {
+        try { return window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null; } catch (e) { return null; }
+    }
+
+    function loadTheme() {
+        var stored = storedTheme();
+        if (stored) return stored;
+        if (S.opts.theme === "dark" || S.opts.theme === "light") return S.opts.theme;
+        var mq = prefersDarkQuery();
+        return mq && mq.matches ? "dark" : "light";
+    }
+
+    // Live-follow the OS while nothing is saved and the host did not fix a mode.
+    var followingOsTheme = false;
+    function followOsTheme() {
+        if (followingOsTheme) return;
+        var mq = prefersDarkQuery();
+        if (!mq) return;
+        followingOsTheme = true;
+        var onChange = function (e) {
+            if (storedTheme()) return;
+            if (S.opts.theme === "dark" || S.opts.theme === "light") return;
+            applyTheme(e.matches ? "dark" : "light");
+        };
+        if (mq.addEventListener) mq.addEventListener("change", onChange);
+        else if (mq.addListener) mq.addListener(onChange);
+    }
+
+    // `save` is true only for the visitor's own pick (toggle, settings radio,
+    // the public setTheme); the load-time resolve and OS changes pass nothing.
+    function applyTheme(theme, save) {
         S.theme = theme === "dark" ? "dark" : "light";
         if (S.root) S.root.setAttribute("data-bq-theme", S.theme);
         // keep any open modal roots in sync
@@ -473,16 +497,21 @@ import {
         for (var i = 0; i < modals.length; i++) {
             modals[i].setAttribute("data-bq-theme", S.theme);
         }
-        lsSet(SK.theme, S.theme); // fixed key (see loadTheme) so the choice persists
+        if (save) lsSet(SK.theme, S.theme);
         // swap theme-toggle icons in place (avoids re-rendering / losing form input)
         var toggles = document.querySelectorAll("[data-bq-theme-toggle]");
         for (var j = 0; j < toggles.length; j++) {
             toggles[j].innerHTML = S.theme === "dark" ? THEME_ICON_SUN : THEME_ICON_MOON;
         }
+        // a settings page open at the time shows the current mode
+        var radios = document.querySelectorAll('.bq-theme-radios input[name="bq-theme"]');
+        for (var k = 0; k < radios.length; k++) {
+            radios[k].checked = radios[k].value === S.theme;
+        }
     }
 
     function toggleTheme() {
-        applyTheme(S.theme === "dark" ? "light" : "dark");
+        applyTheme(S.theme === "dark" ? "light" : "dark", true);
     }
 
     /* ========================================================================
@@ -1683,9 +1712,9 @@ import {
     function themeRow() {
         var current = S.theme === "dark" ? "dark" : "light";
         function themeRadio(value, label) {
-            var input = h("input", { type: "radio", name: "bq-theme" });
+            var input = h("input", { type: "radio", name: "bq-theme", value: value });
             input.checked = (value === current);
-            input.addEventListener("change", function () { if (input.checked) applyTheme(value); });
+            input.addEventListener("change", function () { if (input.checked) applyTheme(value, true); });
             return h("label", { class: "bq-checkbox" }, input, h("span", { text: label }));
         }
         return h("div", { class: "bq-account-row" },
@@ -6307,7 +6336,10 @@ import {
 
         S.skapi = skapi;
         S.opts = Object.assign({
-            theme: "light",
+            // null follows the visitor's OS colour mode; "light" / "dark" fixes
+            // the starting mode. Either way a mode the visitor picks in the
+            // widget is saved and wins on later visits.
+            theme: null,
             // Header title. null keeps "BunnyQuery \u00b7 <project name>"; a string
             // replaces the whole line, "" hides it. See brandTitleText.
             title: null,
@@ -6404,6 +6436,7 @@ import {
         }
 
         applyTheme(loadTheme());
+        followOsTheme();
         S.booted = true;
         console.log("[bunnyquery] v" + BQ_VERSION);
 
@@ -6634,7 +6667,7 @@ import {
         // widget parses matching uploads in-browser and sends the text for indexing.
         // Can be called before or after init(); also settable via init opts.attachmentParsers.
         registerAttachmentParser: registerAttachmentParser,
-        setTheme: function (t) { applyTheme(t); },
+        setTheme: function (t) { applyTheme(t, true); },
         toggleTheme: toggleTheme,
         logout: logout,
         version: BQ_VERSION,

@@ -108,7 +108,6 @@ call `BunnyQuery.init()`:
 
     // 2. Mount BunnyQuery into the container
     BunnyQuery.init(skapi, "chatbox", {
-      theme: "light",
       signup: true,
     });
   </script>
@@ -153,7 +152,7 @@ Mounts the widget. Returns the `BunnyQuery` object.
 
 | Option                   | Type      | Default  | Description                                                                                  |
 | ------------------------ | --------- | -------- | -------------------------------------------------------------------------------------------- |
-| `theme`                  | `string`  | `"light"`| Initial theme, `"light"` or `"dark"`. Overridden by a remembered choice or OS preference.    |
+| `theme`                  | `string`  | `null`   | Starting colour mode: `null` follows the visitor's OS setting (and changes with it), `"light"` or `"dark"` fixes it. A mode the visitor picks in the widget is saved and wins on later visits. |
 | `title`                  | `string`  | `null`   | Header title text. `null` keeps `"BunnyQuery · <project name>"`; any string replaces the whole line, and `""` leaves the header title empty. It is one element, so it ellipsizes as a unit. |
 | `inputPlaceholder`       | `string`  | `null`   | Placeholder in the chat composer. `null` keeps `"Ask anything about: <project name>"`; `""` shows no placeholder.                    |
 | `showLogin`              | `boolean` | `true`   | Whether an **anonymous** visitor is offered a `Login` button in the chat header. Signed-in users are unaffected: they get the settings gear in that slot either way. Set `false` for an embed that handles its own auth, or that does not want visitors making accounts. |
@@ -201,7 +200,7 @@ The `BunnyQuery` global also exposes:
 
 | Method                             | Description                                                                         |
 | ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `setTheme(theme)`                  | Apply `"light"` or `"dark"` and persist it.                                          |
+| `setTheme(theme)`                  | Apply `"light"` or `"dark"` and save it, like the visitor picking it.                |
 | `toggleTheme()`                    | Switch between light and dark.                                                       |
 | `logout()`                         | Sign the current user out and return to the login view.                             |
 | `registerAttachmentParser(parser)` | Register a client-side attachment parser. May be called before or after `init()`. See [Attachment parser plugins](#attachment-parser-plugins). |
@@ -521,7 +520,14 @@ To customize colors, override the variables in your own stylesheet **after**
 }
 ```
 
-The active theme is saved to `localStorage`, so a returning user keeps their choice.
+Until the visitor picks a mode, the widget follows their OS colour mode (or the
+`theme` option, when the host sets one). A mode picked with the toggle or in
+Settings is saved to `localStorage`, so a returning user keeps their choice.
+
+The default colours are the bunnyquery.com dashboard chat's: in dark mode the
+widget is a near-black card (`--bq-paper` `#161618`), replies sit one step
+lighter (`--bq-bubble` `#1f1f23`) and text boxes are recessed (`--bq-field`
+`#101012`, edged with `--bq-input-line`).
 
 ## Importing the chat engine
 
