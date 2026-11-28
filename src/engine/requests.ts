@@ -1253,6 +1253,14 @@ export type AttachmentSaveInfo = {
 	 * turned it off). `false` never asks. Never sent on a continue pass.
 	 */
 	shareIdentical?: boolean;
+	/**
+	 * Index this file in a FIFO group of its own (backend 2026-11-27, FILE_GROUP_HEADER): the
+	 * user's other files then run beside it instead of one after another, a few at a time.
+	 * For files indexed from the Files page, a reindex or a cloud import. Leave it off for a
+	 * chat attachment: the chat turn sent after it waits in the user's indexing line, and
+	 * only reads the file's records once the passes ahead of it in that line are done.
+	 */
+	fileGroup?: boolean;
 };
 
 // RESUME pass: continue indexing a large file a previous pass could not finish. Same
@@ -1450,6 +1458,9 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			}],
 		}
 		: {};
+	// The file's own FIFO group (AttachmentSaveInfo.fileGroup). On every pass of the file, so a
+	// pass the client sends itself joins the group the worker's own continuations use.
+	const groupHeader = info.fileGroup && attachment.storagePath ? fileGroupHeader(attachment.storagePath) : {};
 
 	const userMessage = (visionFile && renderPlaceholder)
 		? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom)
@@ -1516,6 +1527,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			headers: {
 				'content-type': 'application/json',
 				Authorization: 'Bearer $CLIENT_SECRET',
+				...groupHeader,
 			},
 			data: {
 				model: resolvedModel,
@@ -1567,6 +1579,7 @@ export async function notifyAgentSaveAttachment(info: AttachmentSaveInfo) {
 			'x-api-key': '$CLIENT_SECRET',
 			'anthropic-version': ANTHROPIC_VERSION,
 			'anthropic-beta': ANTHROPIC_BETA_HEADER,
+			...groupHeader,
 		},
 		data: {
 			model: resolvedModel,
@@ -1847,6 +1860,51 @@ export function upsertIndexRunRecordSafe(service: string, storagePath: string, p
 	}
 	const p = Promise.resolve(out).then(function () { return undefined; });
 	return report ? p : p.catch(function () { return undefined; });
+}
+
+/**
+ * The request header that puts one file's indexing in a FIFO group of its own (backend
+ * 2026-11-27, client_secret_key_request _file_group): the SHA-1 (hex) of the file's storage
+ * path, the digest the worker names that file's group by. A header and not a body field, so
+ * a backend that predates it forwards it to a provider that ignores it. Pass the same path
+ * for every request of the file (the index reset queued ahead of it, too): requests of one
+ * file keep their order in its group.
+ */
+export const FILE_GROUP_HEADER = 'x-bq-file-group';
+export function fileGroupHeader(groupKey: string): Record<string, string> {
+	return groupKey ? { [FILE_GROUP_HEADER]: sha1Hex(groupKey) } : {};
+}
+
+/** SHA-1 of a string's UTF-8 bytes, as hex. Synchronous, the same in a browser and in Node. */
+export function sha1Hex(text: string): string {
+	const bytes = new TextEncoder().encode(String(text));
+	const bitLen = bytes.length * 8;
+	const words = new Uint32Array((((bytes.length + 8) >> 6) + 1) * 16);
+	for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+	words[bytes.length >> 2] |= 0x80 << (24 - (bytes.length % 4) * 8);
+	words[words.length - 1] = bitLen >>> 0;
+	words[words.length - 2] = Math.floor(bitLen / 0x100000000);
+	let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+	const w = new Uint32Array(80);
+	for (let off = 0; off < words.length; off += 16) {
+		for (let t = 0; t < 16; t++) w[t] = words[off + t];
+		for (let t = 16; t < 80; t++) {
+			const x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+			w[t] = (x << 1) | (x >>> 31);
+		}
+		let a = h0, b = h1, c = h2, d = h3, e = h4;
+		for (let t = 0; t < 80; t++) {
+			let f: number, k: number;
+			if (t < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+			else if (t < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+			else if (t < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+			else { f = b ^ c ^ d; k = 0xca62c1d6; }
+			const tmp = (((a << 5) | (a >>> 27)) + f + e + k + w[t]) >>> 0;
+			e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = tmp;
+		}
+		h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+	}
+	return [h0, h1, h2, h3, h4].map(v => (v >>> 0).toString(16).padStart(8, '0')).join('');
 }
 
 /**

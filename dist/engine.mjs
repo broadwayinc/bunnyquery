@@ -2916,6 +2916,7 @@ async function notifyAgentSaveAttachment(info) {
       ...shareIdentical ? { share_identical: true } : {}
     }]
   } : {};
+  const groupHeader = info.fileGroup && attachment.storagePath ? fileGroupHeader(attachment.storagePath) : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : imageFile ? { imageFile } : void 0
@@ -2948,7 +2949,8 @@ async function notifyAgentSaveAttachment(info) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        Authorization: "Bearer $CLIENT_SECRET"
+        Authorization: "Bearer $CLIENT_SECRET",
+        ...groupHeader
       },
       data: {
         model: resolvedModel2,
@@ -2998,7 +3000,8 @@ async function notifyAgentSaveAttachment(info) {
       "content-type": "application/json",
       "x-api-key": "$CLIENT_SECRET",
       "anthropic-version": ANTHROPIC_VERSION,
-      "anthropic-beta": ANTHROPIC_BETA_HEADER
+      "anthropic-beta": ANTHROPIC_BETA_HEADER,
+      ...groupHeader
     },
     data: {
       model: resolvedModel,
@@ -3156,6 +3159,57 @@ function upsertIndexRunRecordSafe(service, storagePath, patch, opts) {
   return report ? p : p.catch(function() {
     return void 0;
   });
+}
+var FILE_GROUP_HEADER = "x-bq-file-group";
+function fileGroupHeader(groupKey) {
+  return groupKey ? { [FILE_GROUP_HEADER]: sha1Hex(groupKey) } : {};
+}
+function sha1Hex(text) {
+  const bytes = new TextEncoder().encode(String(text));
+  const bitLen = bytes.length * 8;
+  const words = new Uint32Array(((bytes.length + 8 >> 6) + 1) * 16);
+  for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << 24 - i % 4 * 8;
+  words[bytes.length >> 2] |= 128 << 24 - bytes.length % 4 * 8;
+  words[words.length - 1] = bitLen >>> 0;
+  words[words.length - 2] = Math.floor(bitLen / 4294967296);
+  let h0 = 1732584193, h1 = 4023233417, h2 = 2562383102, h3 = 271733878, h4 = 3285377520;
+  const w = new Uint32Array(80);
+  for (let off = 0; off < words.length; off += 16) {
+    for (let t = 0; t < 16; t++) w[t] = words[off + t];
+    for (let t = 16; t < 80; t++) {
+      const x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+      w[t] = x << 1 | x >>> 31;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let t = 0; t < 80; t++) {
+      let f, k;
+      if (t < 20) {
+        f = b & c | ~b & d;
+        k = 1518500249;
+      } else if (t < 40) {
+        f = b ^ c ^ d;
+        k = 1859775393;
+      } else if (t < 60) {
+        f = b & c | b & d | c & d;
+        k = 2400959708;
+      } else {
+        f = b ^ c ^ d;
+        k = 3395469782;
+      }
+      const tmp = (a << 5 | a >>> 27) + f + e + k + w[t] >>> 0;
+      e = d;
+      d = c;
+      c = b << 30 | b >>> 2;
+      b = a;
+      a = tmp;
+    }
+    h0 = h0 + a >>> 0;
+    h1 = h1 + b >>> 0;
+    h2 = h2 + c >>> 0;
+    h3 = h3 + d >>> 0;
+    h4 = h4 + e >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map((v) => (v >>> 0).toString(16).padStart(8, "0")).join("");
 }
 function bgIndexingQueueName(userId, service) {
   return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
@@ -14203,6 +14257,6 @@ var _ChatSession = class _ChatSession {
 _ChatSession.RUN_PASS_PAGE = 10;
 var ChatSession = _ChatSession;
 
-export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_ACTIVITY_ROTATE_MS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTENT_CLAIM_PREFIX, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SHARE_IDENTICAL_FILES, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINKED_COPY_TAG, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, LookScheduler, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, SHARE_IDENTICAL_FILES_KEY, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatActivityLine, chatActivityOf, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, copiesByOriginal, copiesToPromote, copyCountLabel, copyCountTitle, copyStatusOf, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fileNameOf, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, findIdenticalFiles, formatChatTimestamp, formatDuration, formatIndexDuration, formatLinkDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, identicalLinkReasonText, indexDoneUniqueId, indexGroupDurationLabel, indexGroupLinkedLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkIdenticalFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, linkedMarkerOf, linkedRowLabel, listClaudeModels, listContentClaims, listLinkedCopies, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeShareIdenticalFiles, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, noteChatActivity, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, parseLinkedReply, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectShareIdenticalFiles, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, promotableCopies, providerBodyWasRead, providerDocument, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, shareIdenticalFilesFrom, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
+export { ANSWER_MODES, ANSWER_MODE_HINTS, ANSWER_MODE_LABELS, ANSWER_MODE_OPTIONS, ANSWER_MODE_SETTING_LABEL, BG_INDEXING_QUEUE_SUFFIX, BOM, BOM_EXTS, CHAT_ACTIVITY_ROTATE_MS, CHAT_GREETING_MAX_LENGTH, CLAUDE_INPUT_CAP_RATIO, CLAUDE_PER_REQUEST_INPUT_CAP, CONTENT_CLAIM_PREFIX, CONTEXT_WINDOW_BY_MODEL, CONTEXT_WINDOW_DEFAULT, ChatSession, DATA_TOOL_NAMES, DEFAULT_ANSWER_MODE, DEFAULT_CLAUDE_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_OPENAI_MODEL, DEFAULT_SHARE_IDENTICAL_FILES, DEFAULT_SKIP_DUPLICATE_FILES, DEFAULT_UPLOAD_ACCESS_GROUP, DEFAULT_WEB_ACCESS, DUPLICATE_LOOKUP_LIMIT, DUPLICATE_LOOKUP_MAX_CANDIDATES, DUPLICATE_LOOKUP_TIMEOUT_MS, EMPTY_INDEXING_REPLY, EXPIRED_ATTACHMENT_URL_HOST, EXPIRED_ATTACHMENT_URL_ORIGIN, EXPIRED_LINK_REFRESH_EXPIRES_SECONDS, EXT_CONTENT_TYPES, FILE_GROUP_HEADER, HISTORY_BUDGET_RATIO, HISTORY_FILL_SLACK_PX, HISTORY_TOKEN_BUDGET, HTML_EXTS, HTML_HEAD_WINDOW, IMAGE_PREVIEWS_PER_MESSAGE, INDEXING_COMPLETE_MARKER, INDEXING_MAX_OUTPUT_TOKENS, INLINE_LINK_GLYPH, INLINE_LINK_UNAVAILABLE_GLYPH, INLINE_LINK_UNAVAILABLE_SUFFIX, INPUT_CAP_RATIO, LINKED_COPY_TAG, LINK_LABEL_MAX_DISPLAY_CHARS, LINK_REFRESH_WINDOW_MS, LOOK_DEADLINE_MS, LOOK_FAST_MS, LOOK_SLOW_MS, LOOK_STALE_MS, LookScheduler, MAX_CONCURRENT_BG_POLLS, MAX_HISTORY_FILL_PAGES, MAX_HISTORY_MESSAGES, MAX_OUTPUT_BY_MODEL, MAX_OUTPUT_TOKENS, MAX_PARSED_CONTENT_CHARS, MCP_NAME, MINT_CACHE_GENERATION, MIN_INPUT_TOKEN_BUDGET, MIN_PER_REQUEST_INPUT_CAP, NOT_SENT_TEXT, NO_DATA_TOOL_MARK, OUTPUT_TOKEN_RESERVE, PAGE_TEXT_TABLE, POLL_INTERVAL, PRESIGN_SAFETY_MARGIN_MS, PREVIEWABLE_IMAGE_CONTENT_TYPES, PREVIEW_BROWSER_CACHE_SECONDS, PREVIEW_LAYOUT_BOX_SELECTOR, PREVIEW_URL_EXPIRES_SECONDS, PROJECT_SETTINGS_ACCESS_GROUP, PROJECT_SETTINGS_TABLE, PROJECT_SETTINGS_UNIQUE_ID, RENDER_FROM_TOKEN, REQUEST_GONE_TEXT, REQUEST_UNREACHABLE_TEXT, RETRIEVAL_NOTES_MAX, RETRIEVAL_NOTES_TOKEN_BUDGET, RETRIEVAL_NOTE_MAX_CHARS, RETRIEVAL_NOTE_MAX_ITEMS, RETRIEVAL_NOTE_PREFIX, RTF_EXTS, RUN_RECORD_WORKING_STALE_MS, SHARE_IDENTICAL_FILES_KEY, STREAM_POLL_INTERVAL, TOOL_AND_RESPONSE_BUFFER, UPLOAD_ACCESS_GROUPS, UPLOAD_ACCESS_HINTS, UPLOAD_ACCESS_LABELS, UPLOAD_ACCESS_OPTIONS, UPLOAD_CANCELLED_MESSAGE, XML_EXTS, __resetSplitHistoryState, accessSettingFrom, adoptLiveTextIntoRunningRow, adoptLocalAnswerIntoPage, answerModeFrom, answerUsedNoDataTool, applyEncodingDeclaration, applyRetrievalNotes, asksUploadAccessFrom, bgIndexingQueueName, buildAiAgentValue, buildBoundedChatMessages, buildChatDisplayList, buildChatGreeting, buildChatSystemPrompt, buildDisplayExpiredAttachmentHref, buildHistoryItemFullId, buildIndexingContinueMessage, buildIndexingRenderContinueTemplate, buildIndexingRenderMessage, buildIndexingSystemPrompt, buildIndexingUserMessage, buildIndexingWindowMessage, cachedProjectSettings, callClaudeWithMcp, callClaudeWithPublicMcp, callOpenAIWithPublicMcp, canonicalizePathForm, chatActivityLine, chatActivityOf, chatCacheKey, chatEffortFields, chatEngineConfig, chatGreetingFrom, chatStreamWiring, citationFileName, citationLinkPart, citationsFor, classifyInlineLink, clearAttachmentParsers, clearImagePreviewCache, clearProjectSettings, composeUserMessage, configureChatEngine, configureProjectSettings, contentTypeForExt, copiesByOriginal, copiesToPromote, copyCountLabel, copyCountTitle, copyStatusOf, createHistoryFiller, createInlineLinkRegex, createScrollAnchor, createSseParser, crefSupported, csrEnvelopeError, encodePathSegments, encodingClassForExt, ensureHtmlCharset, ensureXmlEncoding, escapeInlineHtml, escapeRtfNonAscii, estimateMessageTokens, estimateTextTokens, extOf, extractClaudeText, extractLastUserTextFromRequest, extractOpenAIText, extractRemotePathFromAttachmentHref, extractRetrievalNote, fetchLiveIndexingKeys, fileGroupHeader, fileNameOf, fillHistoryViewport, filterListByClearHorizon, findAttachmentParser, findDuplicateUpload, findIdenticalFiles, formatChatTimestamp, formatDuration, formatIndexDuration, formatLinkDuration, formatRetrievalNote, getAttachmentParsers, getChatHistory, getContextWindow, getErrorMessage, getExpiredAttachmentVisiblePath, getInputTokenBudget, getMaxOutputTokens, getModelContextWindow, getProjectContextWindow, getSplitChatHistory, getVisionProfile, groupAttachmentFailures, hasBom, hydrateImagePreviews, identicalLinkReasonText, indexDoneUniqueId, indexGroupDurationLabel, indexGroupLinkedLabel, indexScopeKey, indexingAccessGroup, isAuthExpiredError, isBgIndexingQueue, isCsrStatusEnvelope, isDataToolName, isDuplicateCandidateId, isErrorResponseBody, isHttpUrlLike, isImageVisionFile, isIndexingRequestText, isLinkUnavailable, isNonRetryableRequestError, isNotExistsError, isOfficeFile, isPagedReadFile, isPreviewableImagePath, isProviderApiKeyError, isRetriedFailure, isRetrievalNote, isReturnTrigger, isServerExtractable, isServiceDbAttachmentHref, isTransportFailure, isUploadCancelledError, isWindowedReadFile, linkIdenticalFile, linkUnavailableKeyForHref, linkUnavailableKeyForPath, linkUnavailableKeysForPath, linkedMarkerOf, linkedRowLabel, listClaudeModels, listContentClaims, listLinkedCopies, listOpenAIModels, listedRequestText, liveSafePrefix, loadProjectSettings, looksLikeRtf, makeExtractPlaceholder, mapHistoryListToMessages, markImagePreviewStale, mayKeepStreamedAnswer, messageTimeMs, mintCacheBustStamp, needsBomForExt, newClientRef, normalizeAnswerMode, normalizeAttachmentPathCandidate, normalizeChatGreeting, normalizeExt, normalizeProjectAccessSetting, normalizeShareIdenticalFiles, normalizeSkipDuplicateFiles, normalizeStoredPathTarget, normalizeTextContent, normalizeTrailingInlineToken, normalizeUploadAccessGroup, normalizeWebAccess, noteChatActivity, notifyAgentSaveAttachment, parseAiAgentValue, parseAttachmentContent, parseIndexingLabel, parseIndexingRequestText, parseLinkedReply, patchProjectSettings, peekImagePreviewUrl, prepareDownloadText, presignExpiryEpochMs, previewImageContentType, previewLayoutBox, previewMintCacheToken, previewableExtOf, primeProjectSettings, projectAccessSetting, projectAnswerMode, projectAsksUploadAccess, projectChatGreeting, projectSettingsSettled, projectShareIdenticalFiles, projectSkipDuplicateFiles, projectUploadAccessGroup, projectWebAccess, promotableCopies, providerBodyWasRead, providerDocument, readExpiredAttachmentHref, readyProjectSettings, reconcilerReadsEnabled, registerAttachmentParser, registerModelContextWindows, renderInlineLinkHtml, repairUrlEntities, repairUrlWhitespace, requestIdTimeMs, resetFileIndexOnServer, resolveAnswerMode, resolveImagePreviewUrl, resolveSkipDuplicateFiles, resolveWebAccess, retrievalNoteFromText, retrievalNoteOfAnswer, runIndexUniqueId, runRecordDurationMs, runSettleSideEffect, safeDecodeURIComponent, sanitizeAttachmentLinksForHistory, setProjectContextWindow, setProjectSettings, sha1Hex, shareIdenticalFilesFrom, shouldRescueInFlightMessage, sideEffectDone, skapiSupportsStreaming, skipDuplicateFilesEnabled, skipDuplicateFilesFrom, splitLabelForFit, statusPushEnabled, statusPushLive, streamRecoveryEnabled, streamRecoveryLabels, streamRecoveryPhase, stripFileBlocksFromHistory, transformContentWithImages, transformContentWithOpenAIImages, truncateLabelForDisplay, typewriterResumeIndex, uploadAccessGroupFrom, upsertIndexRunRecordSafe, wallClockNow, webAccessEnabled, webAccessFrom };
 //# sourceMappingURL=engine.mjs.map
 //# sourceMappingURL=engine.mjs.map

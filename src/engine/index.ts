@@ -312,6 +312,11 @@ export {
 	chatEffortFields,
 	type ChatTurnContext,
 	notifyAgentSaveAttachment,
+	// A file's own FIFO group (AttachmentSaveInfo.fileGroup): the header every request of
+	// that file carries, including a queued index reset or a glossary window of it.
+	FILE_GROUP_HEADER,
+	fileGroupHeader,
+	sha1Hex,
 	listClaudeModels,
 	listOpenAIModels,
 	getChatHistory,

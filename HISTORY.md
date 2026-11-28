@@ -5,7 +5,7 @@ Changes to the widget (`bunnyquery.js` / `bunnyquery.css`) and the chat engine
 
 A few notes on how to read this:
 
-- **Published vs built.** The source tree is at **1.21.14**. The latest version on npm
+- **Published vs built.** The source tree is at **1.21.15**. The latest version on npm
   when this was written is 1.21.0. Versions that never reached npm on their own: 1.6.1, 1.6.3 and 1.6.4 (their changes shipped inside 1.6.2
   and 1.7.0) and the source bumps 1.8.7, 1.9.2, 1.9.12, 1.12.0, 1.14.0-beta.0 and
   1.15.0-beta.0. Two numbers were skipped outright and exist nowhere: 1.10.9 and 1.15.3.
@@ -24,6 +24,10 @@ A few notes on how to read this:
   and the dashboard's `bunnyquery` dependency is bumped.
 
 ---
+
+## 1.21.15 (2026-11-27, not yet published)
+
+- **A file can be indexed in a line of its own.** New `AttachmentSaveInfo.fileGroup`: when true, every request of that file carries the header `x-bq-file-group` (the SHA-1 of its storage path, `FILE_GROUP_HEADER` / `fileGroupHeader` / `sha1Hex`, all exported). A backend from 2026-11-27 on (`INDEX_PER_FILE_GROUPS=1`) then runs the file in a FIFO group of its own, so a batch of files is indexed side by side, as many at once as the project's AI key has room for (at least 3, at most 32), instead of one first pass after another. What each file's indexing does and writes is unchanged. An older backend forwards the header to the provider, which ignores it. Use it for files indexed from a files page, a reindex or a cloud import, and leave it off for a chat attachment: the turn sent after that attachment waits in the user's indexing line and must stay behind the file's passes. A queued index reset of the same file must carry the same header (bunnyquery.com's `queueFileIndexReset` takes `fileGroup`).
 
 ## 1.21.14 (2026-11-27, not yet published)
 

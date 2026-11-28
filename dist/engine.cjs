@@ -2918,6 +2918,7 @@ async function notifyAgentSaveAttachment(info) {
       ...shareIdentical ? { share_identical: true } : {}
     }]
   } : {};
+  const groupHeader = info.fileGroup && attachment.storagePath ? fileGroupHeader(attachment.storagePath) : {};
   const userMessage = visionFile && renderPlaceholder ? buildIndexingRenderMessage(attachment, renderPlaceholder, renderFrom) : windowedRead && windowPlaceholder ? buildIndexingWindowMessage(attachment, windowPlaceholder, false) : continuing ? buildIndexingContinueMessage(attachment) : buildIndexingUserMessage(
     attachment,
     parsedContent ? { inlineContent: parsedContent } : placeholder ? { inlineContentPlaceholder: placeholder } : pagedRead ? { pagedRead: true } : imageFile ? { imageFile } : void 0
@@ -2950,7 +2951,8 @@ async function notifyAgentSaveAttachment(info) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        Authorization: "Bearer $CLIENT_SECRET"
+        Authorization: "Bearer $CLIENT_SECRET",
+        ...groupHeader
       },
       data: {
         model: resolvedModel2,
@@ -3000,7 +3002,8 @@ async function notifyAgentSaveAttachment(info) {
       "content-type": "application/json",
       "x-api-key": "$CLIENT_SECRET",
       "anthropic-version": ANTHROPIC_VERSION,
-      "anthropic-beta": ANTHROPIC_BETA_HEADER
+      "anthropic-beta": ANTHROPIC_BETA_HEADER,
+      ...groupHeader
     },
     data: {
       model: resolvedModel,
@@ -3158,6 +3161,57 @@ function upsertIndexRunRecordSafe(service, storagePath, patch, opts) {
   return report ? p : p.catch(function() {
     return void 0;
   });
+}
+var FILE_GROUP_HEADER = "x-bq-file-group";
+function fileGroupHeader(groupKey) {
+  return groupKey ? { [FILE_GROUP_HEADER]: sha1Hex(groupKey) } : {};
+}
+function sha1Hex(text) {
+  const bytes = new TextEncoder().encode(String(text));
+  const bitLen = bytes.length * 8;
+  const words = new Uint32Array(((bytes.length + 8 >> 6) + 1) * 16);
+  for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << 24 - i % 4 * 8;
+  words[bytes.length >> 2] |= 128 << 24 - bytes.length % 4 * 8;
+  words[words.length - 1] = bitLen >>> 0;
+  words[words.length - 2] = Math.floor(bitLen / 4294967296);
+  let h0 = 1732584193, h1 = 4023233417, h2 = 2562383102, h3 = 271733878, h4 = 3285377520;
+  const w = new Uint32Array(80);
+  for (let off = 0; off < words.length; off += 16) {
+    for (let t = 0; t < 16; t++) w[t] = words[off + t];
+    for (let t = 16; t < 80; t++) {
+      const x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+      w[t] = x << 1 | x >>> 31;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let t = 0; t < 80; t++) {
+      let f, k;
+      if (t < 20) {
+        f = b & c | ~b & d;
+        k = 1518500249;
+      } else if (t < 40) {
+        f = b ^ c ^ d;
+        k = 1859775393;
+      } else if (t < 60) {
+        f = b & c | b & d | c & d;
+        k = 2400959708;
+      } else {
+        f = b ^ c ^ d;
+        k = 3395469782;
+      }
+      const tmp = (a << 5 | a >>> 27) + f + e + k + w[t] >>> 0;
+      e = d;
+      d = c;
+      c = b << 30 | b >>> 2;
+      b = a;
+      a = tmp;
+    }
+    h0 = h0 + a >>> 0;
+    h1 = h1 + b >>> 0;
+    h2 = h2 + c >>> 0;
+    h3 = h3 + d >>> 0;
+    h4 = h4 + e >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map((v) => (v >>> 0).toString(16).padStart(8, "0")).join("");
 }
 function bgIndexingQueueName(userId, service) {
   return (userId || service || "") + BG_INDEXING_QUEUE_SUFFIX;
@@ -14238,6 +14292,7 @@ exports.EXPIRED_ATTACHMENT_URL_HOST = EXPIRED_ATTACHMENT_URL_HOST;
 exports.EXPIRED_ATTACHMENT_URL_ORIGIN = EXPIRED_ATTACHMENT_URL_ORIGIN;
 exports.EXPIRED_LINK_REFRESH_EXPIRES_SECONDS = EXPIRED_LINK_REFRESH_EXPIRES_SECONDS;
 exports.EXT_CONTENT_TYPES = EXT_CONTENT_TYPES;
+exports.FILE_GROUP_HEADER = FILE_GROUP_HEADER;
 exports.HISTORY_BUDGET_RATIO = HISTORY_BUDGET_RATIO;
 exports.HISTORY_FILL_SLACK_PX = HISTORY_FILL_SLACK_PX;
 exports.HISTORY_TOKEN_BUDGET = HISTORY_TOKEN_BUDGET;
@@ -14372,6 +14427,7 @@ exports.extractOpenAIText = extractOpenAIText;
 exports.extractRemotePathFromAttachmentHref = extractRemotePathFromAttachmentHref;
 exports.extractRetrievalNote = extractRetrievalNote;
 exports.fetchLiveIndexingKeys = fetchLiveIndexingKeys;
+exports.fileGroupHeader = fileGroupHeader;
 exports.fileNameOf = fileNameOf;
 exports.fillHistoryViewport = fillHistoryViewport;
 exports.filterListByClearHorizon = filterListByClearHorizon;
@@ -14512,6 +14568,7 @@ exports.safeDecodeURIComponent = safeDecodeURIComponent;
 exports.sanitizeAttachmentLinksForHistory = sanitizeAttachmentLinksForHistory;
 exports.setProjectContextWindow = setProjectContextWindow;
 exports.setProjectSettings = setProjectSettings;
+exports.sha1Hex = sha1Hex;
 exports.shareIdenticalFilesFrom = shareIdenticalFilesFrom;
 exports.shouldRescueInFlightMessage = shouldRescueInFlightMessage;
 exports.sideEffectDone = sideEffectDone;
